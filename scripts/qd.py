@@ -138,6 +138,7 @@ COMMANDS: dict[str, tuple[str, list[str], str]] = {
     "daily-data-chain": ("run_daily_data_chain.py", [], "Update daily bars, critical minutes, the current analysis-pool minutes, features, and one truthful manifest."),
     "weekly-minute-wide-pool": ("run_weekly_minute_wide_pool.py", [], "Maintain existing canonical minute symbols outside the formal daily pool; offline and no-apply by default."),
     "weekly-daily-wide-pool": ("run_weekly_wide_pool_maintenance.py", [], "Maintain the audited weekly daily-wide and minute-residual pools; offline and no-apply by default."),
+    "full-a-reconcile": ("run_full_a_daily_reconciliation.py", [], "Reconcile every current-universe symbol to one complete trade date; offline and no-apply by default."),
     "morning-brief": ("run_morning_brief.py", [], "Build and optionally push the verified local research morning brief; external delivery requires --enable-network --push."),
     "minute-gap-backfill": ("run_round13_minute_gap_backfill.py", [], "Run the audited Round-13 minute gap backfill for the five authorized pairs; offline and no-apply by default."),
     "daily-retain": ("run_daily_data_retention.py", [], "Create a daily data retention manifest."),
@@ -388,6 +389,10 @@ OUTPUT_PATHS: dict[str, list[str]] = {
     "daily-data-chain": ["results/data_chain/daily_data_chain_latest.json"],
     "weekly-minute-wide-pool": ["results/data_chain/weekly_minute_wide_pool/runs"],
     "weekly-daily-wide-pool": ["results/data_chain/weekly_daily_wide_pool/runs"],
+    "full-a-reconcile": [
+        "results/data_chain/full_a_daily_reconciliation_latest.json",
+        "results/data_chain/full_a_daily_reconciliation/runs",
+    ],
     "morning-brief": [
         "results/morning_brief/morning_brief_latest.json",
         "reports/morning_brief/morning_brief_latest.md",
@@ -673,7 +678,7 @@ def main(argv: list[str] | None = None) -> int:
         print_help()
         return 0
     command = args.pop(0)
-    preserve_network_flags = command in {"data-update", "daily-data-chain", "weekly-minute-wide-pool", "weekly-daily-wide-pool", "morning-brief", "data-health-alerts", "minute-gap-backfill", "dev-preflight", "data-db", "data-universe", "build-universe", "data-query", "data-health", "data-quality"}
+    preserve_network_flags = command in {"data-update", "daily-data-chain", "weekly-minute-wide-pool", "weekly-daily-wide-pool", "full-a-reconcile", "morning-brief", "data-health-alerts", "minute-gap-backfill", "dev-preflight", "data-db", "data-universe", "build-universe", "data-query", "data-health", "data-quality"}
     args = _normalize_aliases(args, preserve_network_flags=preserve_network_flags)
     started_at = now_text()
     start_time = time.perf_counter()
@@ -748,6 +753,7 @@ def main(argv: list[str] | None = None) -> int:
         "stage4-final-evaluation": PROJECT_ROOT / "results" / "data_health" / "stage4_final_evaluation_latest.json",
         "daily-data-chain": PROJECT_ROOT / "results" / "data_chain" / "daily_data_chain_latest.json",
         "weekly-daily-wide-pool": PROJECT_ROOT / "results" / "data_chain" / "weekly_daily_wide_pool" / "runs",
+        "full-a-reconcile": PROJECT_ROOT / "results" / "data_chain" / "full_a_daily_reconciliation_latest.json",
         "morning-brief": PROJECT_ROOT / "results" / "morning_brief" / "morning_brief_latest.json",
         "minute-gap-backfill": PROJECT_ROOT / "results" / "data_chain" / "round13_minute_gap_backfill" / "runs",
         "data-bootstrap": PROJECT_ROOT / "results" / "data_bootstrap" / "data_bootstrap_latest.json",
