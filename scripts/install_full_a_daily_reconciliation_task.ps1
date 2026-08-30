@@ -12,14 +12,22 @@ param(
 # Managed installer for the full-A daily reconciliation task.
 #
 # Two weekday triggers by design (20:35 and 22:30). The daily chain owns the
-# shared daily-data lock during its own window, so the first trigger can hit
-# `deferred_upstream_busy` and exit without doing any provider work. The second
-# trigger then resumes the SAME target date. That is why the second run is not a
-# duplicate: it is the retry path for a deferral.
+# shared daily-data lock during its own window. The 20:35 run therefore WAITS on
+# that lock for up to --lock-timeout-seconds (1800 = 30 minutes) and only returns
+# `deferred_upstream_busy` if the wait expires - it does not give up
+# immediately. The 22:30 trigger then resumes the SAME target date, which is why
+# it is the retry path for a deferral rather than a duplicate run.
 #
 # The action carries --enable-network --apply because a reconciliation that may
-# not write cannot close its own contract. No SendKey appears in the action;
-# the Server chan dispatcher loads its credential behind its own gates.
+# not write cannot close its own contract.
+#
+# It also carries --enable-alert-network --alert-push so the post-run health
+# alert can actually reach Server chan. Without them the coordinator's alert
+# gates stay closed and the dispatcher can only preview, which would make the
+# scheduled task silently non-notifying. These are separate flags from the data
+# ones on purpose: authorizing a canonical write must never implicitly authorize
+# an outbound message. No SendKey appears in this action or in the launcher; the
+# dispatcher loads its credential behind its own env gate at the send point.
 #
 # This installer deliberately does NOT touch the legacy weekly Saturday task.
 # Retiring that one is a separate decision that the plan gates behind one
@@ -33,7 +41,7 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Runner = Join-Path $Root "scripts\run_full_a_daily_reconciliation.cmd"
 $Marker = "QuantDesk managed full-a-daily-reconciliation task; schema=1"
 $Execute = if ($env:ComSpec) { $env:ComSpec } else { "C:\Windows\System32\cmd.exe" }
-$Arguments = '/d /s /c ""{0}" --enable-network --apply --lock-timeout-seconds 1800 --json false"' -f $Runner
+$Arguments = '/d /s /c ""{0}" --enable-network --apply --lock-timeout-seconds 1800 --enable-alert-network --alert-push --json false"' -f $Runner
 $CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
 function Escape-Xml {
@@ -121,6 +129,8 @@ if ($Action -eq "Plan") {
         working_dir  = $Root
         logon_mode   = $LogonMode
         triggers     = @("Mon-Fri 20:35", "Mon-Fri 22:30 (retry path for a deferral)")
+        lock_wait_seconds = 1800
+        alert_delivery_authorized = $true
         touches_legacy_saturday_task = $false
         note         = "Plan only; nothing was registered."
     })

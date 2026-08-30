@@ -154,6 +154,78 @@ def test_installer_plan_authorizes_network_and_apply() -> None:
     assert "run_full_a_daily_reconciliation.cmd" in arguments
 
 
+def test_cli_exposes_alert_authorization_separately_from_data_writes() -> None:
+    """Authorizing a canonical write must not implicitly authorize a message."""
+    cli = _load_cli()
+    data_only = cli.build_parser().parse_args(["--enable-network", "--apply"])
+    assert data_only.enable_alert_network is False
+    assert data_only.alert_push == ""
+
+    both = cli.build_parser().parse_args(
+        ["--enable-network", "--apply", "--enable-alert-network", "--alert-push"]
+    )
+    assert both.enable_alert_network is True
+    assert both.alert_push == "true"
+
+
+def test_cli_forwards_alert_gates_to_the_coordinator() -> None:
+    """Without this the dispatcher runs but can only ever preview."""
+    cli = _load_cli()
+    captured: dict = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return {"status": "planned_offline", "target_date": kwargs["target_date"]}
+
+    original = cli.run_full_a_daily_reconciliation
+    cli.run_full_a_daily_reconciliation = fake_run
+    try:
+        rc = cli.main([
+            "--target-date", "2026-08-28", "--enable-network", "--apply",
+            "--enable-alert-network", "--alert-push", "--json", "false",
+        ])
+    finally:
+        cli.run_full_a_daily_reconciliation = original
+
+    assert rc == 0
+    assert captured["alert_network"] is True
+    assert captured["alert_push"] is True
+    assert captured["alert_dry_run"] is False, "authorized push must not stay dry-run"
+
+
+def test_cli_defaults_keep_alert_delivery_dry() -> None:
+    cli = _load_cli()
+    captured: dict = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return {"status": "planned_offline", "target_date": kwargs["target_date"]}
+
+    original = cli.run_full_a_daily_reconciliation
+    cli.run_full_a_daily_reconciliation = fake_run
+    try:
+        cli.main(["--target-date", "2026-08-28", "--json", "false"])
+    finally:
+        cli.run_full_a_daily_reconciliation = original
+
+    assert captured["alert_network"] is False
+    assert captured["alert_push"] is False
+    assert captured["alert_dry_run"] is True
+
+
+def test_installer_authorizes_alert_delivery_and_declares_the_lock_wait() -> None:
+    """The 20:35 run waits on the shared lock; it does not exit immediately."""
+    payload = _powershell_json(
+        ["-File", str(INSTALLER), "-Action", "Plan", "-Json"]
+    )
+    arguments = str(payload.get("arguments") or "")
+    assert "--enable-alert-network" in arguments
+    assert "--alert-push" in arguments
+    assert payload.get("alert_delivery_authorized") is True
+    assert int(payload.get("lock_wait_seconds") or 0) == 1800
+    assert "--lock-timeout-seconds 1800" in arguments
+
+
 def test_installer_plan_does_not_touch_the_legacy_saturday_task() -> None:
     """Retiring the weekly Saturday task is gated behind a natural run."""
     payload = _powershell_json(

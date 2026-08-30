@@ -48,6 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--lock-timeout-seconds", type=float, default=0.0)
     parser.add_argument("--json", default="true")
+    # Server chan authorization for the post-run health alert. The coordinator
+    # defaults every alert gate to off, so without these the dispatcher runs but
+    # can only ever preview - the scheduled task would never notify anyone.
+    # Kept as separate flags from --enable-network/--apply so authorizing a data
+    # write never silently authorizes an outbound message.
+    parser.add_argument("--enable-alert-network", action="store_true")
+    parser.add_argument("--alert-push", nargs="?", const="true", default="")
+    parser.add_argument("--alert-dry-run", default="")
     return parser
 
 
@@ -72,6 +80,15 @@ def main(argv: list[str] | None = None) -> int:
     network = bool(args.enable_network or truthy(args.network))
     apply_writes = truthy(args.apply) if str(args.apply).strip() else False
 
+    alert_network = bool(args.enable_alert_network)
+    alert_push = truthy(args.alert_push) if str(args.alert_push).strip() else False
+    # Mirrors the delivery CLI: dry-run unless the caller both authorizes the
+    # network and asks to push, and an explicit --alert-dry-run always wins.
+    if str(args.alert_dry_run).strip():
+        alert_dry_run = truthy(args.alert_dry_run)
+    else:
+        alert_dry_run = not (alert_network and alert_push)
+
     payload = run_full_a_daily_reconciliation(
         project_root=PROJECT_ROOT,
         target_date=target,
@@ -79,18 +96,23 @@ def main(argv: list[str] | None = None) -> int:
         apply=apply_writes,
         run_id=args.run_id.strip() or None,
         lock_timeout_seconds=args.lock_timeout_seconds,
+        alert_network=alert_network,
+        alert_push=alert_push,
+        alert_dry_run=alert_dry_run,
     )
 
     if truthy(args.json):
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         coverage = payload.get("coverage") or {}
+        delivery = payload.get("data_health_alert_delivery") or {}
         print(
             "full-a-reconcile "
             f"status={payload.get('status')} target={payload.get('target_date')} "
             f"pending={len((payload.get('partition') or {}).get('pending_symbols') or [])} "
             f"missing={coverage.get('missing_count', '-')} "
             f"stale={coverage.get('stale_count', '-')} "
+            f"alert={delivery.get('status', '-')}/sent={delivery.get('external_sent_count', '-')} "
             f"reasons={','.join(payload.get('reason_codes') or []) or '-'}"
         )
     return exit_code_for(payload.get("status"))

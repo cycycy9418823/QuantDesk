@@ -258,7 +258,7 @@ daily_research.js 语法  →  通过
 | 共享数据层 | `ai_trader/dashboard.py` | 无 Flask 依赖的只读 adapter；不重算权益/持仓/收益 |
 | 前端 | `app/templates/daily_research.html` + `app/static/js/daily_research.js` | 新增 `#ai-trader-section` 模块页（无 v2 文件） |
 | 兼容入口 | 8001 教室 | 保留为兼容/诊断入口，不再是主要入口 |
-| 已退休入口 | 8002 桌面 | 已外移至 `E:\codex\quant_slim_quarantine_20260827\R2_8002\`；不再属于产品契约 |
+| 已退休入口 | 8002 桌面 | 已外移至 `<repo-root>_slim_quarantine_20260827\R2_8002\`；不再属于产品契约 |
 
 不可协商边界（全部有测试钉住）：
 
@@ -270,3 +270,29 @@ daily_research.js 语法  →  通过
 6. proposed / committed / filled / rejected 四态在 API 与页面严格区分，
    提议绝不显示成已提交或已成交（journal 未来文案已同步修复，历史 journal 不改写）。
 7. 缺失/陈旧/损坏产物必须显示 degraded/warning，不得伪装成功。
+
+## 十四、2026-08-30：R4 迁移——代码仓换到 `<repo-root>_new`，老仓待归档
+
+用户裁决：**不再往外搬退役代码，改为往里拉产品闭包建新仓**。理由是往外搬的上限是
+历史堆积大小，且搬错不报错——那批"字节校验老 UI"的测试里混着现役护栏，整组降级会
+静默失去保护；往里拉，漏掉的直接 ImportError。
+
+| 项目 | 状态 |
+|------|------|
+| 新仓 | `<repo-root>_new`，`git init` + 基线提交已完成 |
+| `data/` | 48 GB 独立副本（425 目录 / 174415 文件 / 0 失败），**不再是目录联接** |
+| `state/` | 67 文件独立副本，逐项 SHA256 与老仓一致 |
+| `.venv` | 新仓自有 Python 3.13.2，不再借老仓 |
+| self_check | `450 pass / 8 warn / 0 fail`，与老仓一致 |
+| 8000 / 8001 | 均已在新仓实测启动，只读路由全 200 |
+| 7 个计划任务 | **仍全部指向老仓**，切换需管理员提权 |
+| 老仓 | HEAD `7a63103` 未动，待全部验收后改名 `_archive` 只读归档 |
+
+退役的 8765 闭包（老服务端、老 UI、`server_payloads`、`live_monitor`、sample 链）
+按设计不进新仓；`tools/git-hooks/check_staged.py` 硬拦它们重新进入。
+
+**`app/agent_chat.html` 不属于退役闭包**：现役 8000 服务器注册了 agent 路由
+（`scripts/quant_api_server.py`）且 `/agent` 读该文件。R1 清点原始清单从未列入它。
+
+不可协商边界不变：Research Only / Paper Account Only / 不接券商 / 不下单 /
+不构成投资建议。两仓在 `data/`、`state/` 独立后，**同一时刻只允许一边跑计划任务**。
