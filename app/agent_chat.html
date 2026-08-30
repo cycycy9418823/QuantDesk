@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>QuantDesk 观察助手</title>
+<style>
+  :root { --line:#dce7f3; --ink:#1f2a3a; --muted:#5b6b80; --bg:#f6f9fc; --accent:#2f6fb0; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:"Microsoft YaHei",system-ui,sans-serif; color:var(--ink); background:var(--bg); }
+  header { padding:12px 16px; background:#fff; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; }
+  header h1 { margin:0; font-size:16px; }
+  .boundary { margin-top:6px; font-size:12px; color:#9a3b3b; background:#fff4f4; border:1px solid #f3d2d2; border-radius:6px; padding:6px 8px; }
+  .status { margin-top:6px; font-size:12px; color:var(--muted); }
+  .wrap { max-width:920px; margin:0 auto; padding:12px 16px 96px; }
+  .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  select, textarea, button { font:inherit; }
+  select { padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  #transcript { display:flex; flex-direction:column; gap:10px; }
+  .msg { border:1px solid var(--line); border-radius:8px; padding:10px 12px; white-space:pre-wrap; line-height:1.6; background:#fff; }
+  .msg.user { background:#eef5fc; align-self:flex-end; max-width:80%; }
+  .msg.assistant { background:#fff; align-self:flex-start; max-width:90%; }
+  .msg .who { font-size:11px; color:var(--muted); margin-bottom:4px; }
+  .flags { margin-top:6px; font-size:11px; color:var(--muted); }
+  .flag-warn { color:#9a3b3b; }
+  .composer { position:fixed; bottom:0; left:0; right:0; background:#fff; border-top:1px solid var(--line); padding:10px 16px; }
+  .composer-inner { max-width:920px; margin:0 auto; display:flex; gap:8px; align-items:flex-end; }
+  textarea { flex:1; min-height:46px; max-height:160px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; resize:vertical; }
+  button.send { padding:10px 18px; border:none; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.send:disabled { background:#9bb6d2; cursor:not-allowed; }
+  .empty { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>QuantDesk 观察助手</h1>
+  <div class="boundary">仅基于本地只读证据做学习复盘 · 不构成投资建议 · 不预测价格 · 不下单</div>
+  <div class="status" id="status">正在检查 LLM 配置…</div>
+</header>
+<div class="wrap">
+  <div class="controls">
+    <label for="skill">报告/技能：</label>
+    <select id="skill"><option value="">自由问答</option></select>
+    <button class="send" id="clearBtn" style="background:#7a8aa0;">清空对话</button>
+  </div>
+  <div id="transcript"><div class="empty">先问点什么吧，例如：「今天的数据是否完整？还缺哪些？」「解释一下排名第一的候选为什么入选。」</div></div>
+</div>
+<div class="composer">
+  <div class="composer-inner">
+    <textarea id="input" placeholder="输入问题，Enter 发送，Shift+Enter 换行…"></textarea>
+    <button class="send" id="sendBtn">发送</button>
+  </div>
+</div>
+
+<script>
+const history = [];
+const transcript = document.getElementById("transcript");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("sendBtn");
+const skillSel = document.getElementById("skill");
+const statusEl = document.getElementById("status");
+
+function esc(s){ return String(s==null?"":s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+
+function addMsg(role, text, flags){
+  const first = transcript.querySelector(".empty");
+  if (first) first.remove();
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  let html = `<div class="who">${role === "user" ? "我" : "观察助手"}</div>${esc(text)}`;
+  if (flags) html += `<div class="flags">${flags}</div>`;
+  div.innerHTML = html;
+  transcript.appendChild(div);
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+async function loadStatus(){
+  try {
+    const r = await fetch("/api/agent/skills");
+    const d = await r.json();
+    (d.skills || []).forEach(name => {
+      const o = document.createElement("option"); o.value = name; o.textContent = name; skillSel.appendChild(o);
+    });
+    const llm = d.llm || {};
+    const provider = (d.config && d.config.default_provider) || "?";
+    const model = (((d.config||{}).providers||{}).openai_compatible||{}).model || "?";
+    if (llm.llm_enabled) {
+      statusEl.textContent = `LLM 已启用 · provider=${provider} · model=${model}`;
+    } else {
+      statusEl.innerHTML = `<span class="flag-warn">LLM 未启用</span>：在 config/llm_config.json 设 "llm_enabled": true 并设置环境变量 QUANTDESK_LLM_API_KEY 后重启服务。`;
+    }
+  } catch (e) {
+    statusEl.textContent = "无法读取 LLM 状态：" + e;
+  }
+}
+
+async function send(){
+  const q = input.value.trim();
+  if (!q) return;
+  input.value = "";
+  sendBtn.disabled = true;
+  addMsg("user", q);
+  history.push({role:"user", content:q});
+  addMsg("assistant", "（思考中…）");
+  const pending = transcript.lastChild;
+  try {
+    const r = await fetch("/api/agent/chat", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ question:q, skill: skillSel.value || null, history: history.slice(0, -1) })
+    });
+    const d = await r.json();
+    const reply = d.reply || "(无回复)";
+    let flags = "";
+    if (d.policy_guard_status && d.policy_guard_status !== "passed" && d.policy_guard_status !== "not_checked")
+      flags += `<span class="flag-warn">已净化建议类措辞</span> `;
+    const g = d.grounding || {};
+    if (g && g.ok === false)
+      flags += `<span class="flag-warn">注意：部分内容可能缺乏证据支撑</span> `;
+    if (d.llm_used === false && d.ok === false) flags += esc(d.status || "");
+    pending.remove();
+    addMsg("assistant", reply, flags || null);
+    if (d.ok && d.llm_used) history.push({role:"assistant", content: reply});
+    else history.pop(); // drop the user turn if the call failed, keep history clean
+  } catch (e) {
+    pending.remove();
+    addMsg("assistant", "请求失败：" + e);
+    history.pop();
+  } finally {
+    sendBtn.disabled = false;
+    input.focus();
+  }
+}
+
+sendBtn.addEventListener("click", send);
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+document.getElementById("clearBtn").addEventListener("click", () => {
+  history.length = 0;
+  transcript.innerHTML = '<div class="empty">对话已清空。</div>';
+});
+loadStatus();
+</script>
+</body>
+</html>

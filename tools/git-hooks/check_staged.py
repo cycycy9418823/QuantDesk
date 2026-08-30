@@ -43,13 +43,16 @@ RETIRED_CLOSURE = {
     "quantdesk/server_payloads.py",
     "quantdesk/live_monitor.py",
     "app/index.html",
-    "app/agent_chat.html",
     "app/static/app.js",
     "app/static/styles.css",
     "run_report_sample.cmd",
     "run_ui_sample.cmd",
     "run_ui_sample.sh",
 }
+# NOT retired, despite living next to the old UI: app/agent_chat.html is served
+# by the ACTIVE 8000 server (scripts/quant_api_server.py registers the agent
+# routes, and /agent reads this file). It was briefly mis-blacklisted during the
+# migration; the R1 closure inventory never listed it. Do not add it back here.
 
 # Legacy test closures that travel with the retired stack.
 RETIRED_TEST_PREFIXES = (
