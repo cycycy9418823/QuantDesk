@@ -1,0 +1,14 @@
+pandas>=2.0,<3.0
+numpy>=1.24,<3.0
+PyYAML>=6,<7
+pyarrow>=14,<26
+matplotlib>=3.7,<4.0
+quantstats>=0.0.62,<0.1
+openpyxl>=3.1,<4.0
+jinja2>=3.1,<4.0
+tabulate>=0.9,<1.0
+python-docx>=1.1,<2.0
+# Web server for the 8000 daily-research service (scripts/quant_api_server.py)
+flask>=3.0,<4.0
+flask-cors>=4.0,<5.0
+requests>=2.31,<3.0

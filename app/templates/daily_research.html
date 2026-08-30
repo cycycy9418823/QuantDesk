@@ -1,0 +1,4261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>每日股票研究</title>
+    <!-- Google Fonts removed for offline-first compliance.
+         Fira Code / Fira Sans fall back to system fonts below.
+         To use them, place .woff2 files in app/static/fonts/ and add @font-face rules. -->
+    <style>
+        /* ============================================================
+           QuantDesk Design System — Financial Dashboard / Warm Khaki
+           User preference: warm beige/cream tone (NOT cold blue-grey).
+           Chinese A-share convention: red = up, green = down.
+           ============================================================ */
+
+        :root {
+            /* Core background — warm cream/khaki (NOT cold blue-grey).
+               v3.8 terminal refresh: deeper page tone + pure-white cards for
+               crisper card separation; richer A-share red/green. */
+            --bg-page: #ECEAE3;
+            --bg-primary: #ECEAE3;
+            --bg-secondary: #FFFFFF;
+            --bg-tertiary: #F3F1EA;
+            --bg-elevated: #FFFFFF;
+            --bg-sunken: #E4E1D7;
+            --bg-glass: rgba(255, 255, 255, 0.86);
+            --bg-chart-dark: #1a1a2e;
+            --bg-chart-dark-border: #2a2a3e;
+
+            /* Text */
+            --text-primary: #16150F;
+            --text-secondary: #45433A;
+            --text-muted: #807C6D;
+            --text-chart-light: #a0a0b8;
+            --text-chart-muted: #6a6a80;
+
+            /* Borders — hairline, low-contrast; depth comes from shadow not lines */
+            --border-primary: #DAD5C7;
+            --border-subtle: #E7E3D8;
+            --border-strong: #C6C0AF;
+
+            /* Semantic — Chinese A-share convention (红涨绿跌) */
+            --color-up: #D11F1F;
+            --color-up-soft: rgba(209, 31, 31, 0.10);
+            --color-up-line: rgba(209, 31, 31, 0.30);
+            --color-down: #1F8A4C;
+            --color-down-soft: rgba(31, 138, 76, 0.10);
+            --color-down-line: rgba(31, 138, 76, 0.30);
+            --color-flat: #807C6D;
+            --color-warn: #B5740E;
+            --color-warn-soft: rgba(181, 116, 14, 0.12);
+            --color-info: #2563C9;
+            --color-info-soft: rgba(37, 99, 201, 0.10);
+            --color-status-ok: #2563C9;
+            --color-status-ok-soft: rgba(37, 99, 201, 0.10);
+            --color-status-bad: #8A4F14;
+            --color-status-bad-soft: rgba(138, 79, 20, 0.12);
+            --color-accent: #7C3AA6;
+            --color-accent-soft: rgba(124, 58, 166, 0.10);
+
+            /* Typography — Dashboard Data (#42) */
+            --font-sans: 'Fira Sans', -apple-system, BlinkMacSystemFont, 'Microsoft YaHei', sans-serif;
+            --font-mono: 'Fira Code', 'SF Mono', 'Cascadia Code', monospace;
+            --font-size-base: 14px;
+            --font-size-sm: 12px;
+            --font-size-xs: 11px;
+            --font-size-lg: 15px;
+            --font-size-xl: 18px;
+            --font-size-data: 12px;
+
+            /* Spacing scale (4px base) */
+            --space-1: 4px;
+            --space-2: 8px;
+            --space-3: 12px;
+            --space-4: 16px;
+            --space-5: 20px;
+            --space-6: 24px;
+            --card-gap: 14px;
+            --section-gap: 26px;
+            --panel-padding: 14px;
+            --module-stack-gap: 14px;
+
+            /* Radius scale */
+            --radius: 10px;
+            --radius-sm: 6px;
+            --radius-lg: 14px;
+            --radius-pill: 999px;
+
+            /* Shadow scale — soft, multi-layer; this is what lifts cards */
+            --shadow-xs: 0 1px 2px rgba(40, 34, 18, 0.04);
+            --shadow-sm: 0 1px 2px rgba(40, 34, 18, 0.04);
+            --shadow-md: 0 2px 4px rgba(40, 34, 18, 0.05), 0 6px 16px rgba(40, 34, 18, 0.08);
+            --shadow-lg: 0 8px 24px rgba(40, 34, 18, 0.10), 0 18px 48px rgba(40, 34, 18, 0.12);
+            --shadow-focus: 0 0 0 3px rgba(37, 99, 201, 0.28);
+
+            /* Z-index */
+            --z-modal: 50;
+            --z-toast: 60;
+
+            color-scheme: light;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            background: var(--bg-page);
+            background-image:
+                radial-gradient(circle at 1px 1px, rgba(40, 34, 18, 0.022) 1px, transparent 0);
+            background-size: 26px 26px;
+            background-attachment: fixed;
+            color: var(--text-primary);
+            font-family: var(--font-sans);
+            font-size: var(--font-size-base);
+            line-height: 1.55;
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
+        }
+
+        body.modal-open {
+            overflow: hidden;
+        }
+
+        /* Monospace for numbers and prices */
+        .metric-value, .candidate-price, .info-value, .price, .number, .value, .home-kpi-value {
+            font-family: var(--font-mono);
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* ============================================================
+           Layout
+           ============================================================ */
+        .app {
+            width: min(1600px, calc(100vw - 28px));
+            margin: 0 auto;
+            padding: 14px 0 36px;
+            display: grid;
+            grid-template-columns: 220px minmax(0, 1fr);
+            gap: 18px;
+            align-items: start;
+            transition: grid-template-columns 180ms ease;
+        }
+
+        .main-panel {
+            min-width: 0;
+        }
+
+        .side-rail {
+            position: sticky;
+            top: 14px;
+            height: calc(100vh - 28px);
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            padding: 14px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: rgba(244, 243, 238, 0.9);
+            backdrop-filter: blur(10px);
+            overflow: hidden;
+        }
+
+        .side-brand {
+            width: 100%;
+            display: grid;
+            grid-template-columns: 32px minmax(0, 1fr);
+            align-items: center;
+            gap: 10px;
+            border: 0;
+            background: transparent;
+            color: var(--text-primary);
+            padding: 4px 2px 12px;
+            border-bottom: 1px solid var(--border-primary);
+            font-family: var(--font-sans);
+            text-align: left;
+            cursor: pointer;
+        }
+
+        .side-brand-mark {
+            width: 32px;
+            height: 32px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: var(--radius);
+            background: var(--text-primary);
+            color: var(--bg-secondary);
+            font-family: var(--font-mono);
+            font-weight: 700;
+        }
+
+        .side-brand-title {
+            display: block;
+            font-size: var(--font-size-lg);
+            font-weight: 700;
+            line-height: 1.1;
+        }
+
+        .side-brand-sub {
+            display: block;
+            margin-top: 2px;
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+            font-size: var(--font-size-xs);
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .side-nav {
+            display: grid;
+            gap: 4px;
+            min-height: 0;
+            min-width: 0;
+            overflow-y: auto;
+            scrollbar-width: thin;
+        }
+
+        .side-collapse-button {
+            min-height: 32px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: rgba(255, 255, 255, 0.66);
+            color: var(--text-secondary);
+            font-family: var(--font-sans);
+            font-size: var(--font-size-sm);
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+        }
+
+        .side-collapse-button:hover,
+        .side-collapse-button:focus-visible {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border-color: var(--text-primary);
+            outline: none;
+        }
+
+        .side-collapse-icon {
+            font-family: var(--font-mono);
+            font-size: var(--font-size-lg);
+            line-height: 1;
+            transition: transform 150ms ease;
+        }
+
+        .side-nav-label {
+            margin: 4px 0 2px;
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+            font-size: var(--font-size-xs);
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+
+        .side-nav-button {
+            width: 100%;
+            min-height: 36px;
+            display: grid;
+            grid-template-columns: 24px minmax(0, 1fr);
+            align-items: center;
+            gap: 8px;
+            border: 0;
+            border-left: 3px solid transparent;
+            border-radius: var(--radius);
+            background: transparent;
+            color: var(--text-secondary);
+            padding: 6px 8px 6px 7px;
+            font-family: var(--font-sans);
+            font-size: var(--font-size-base);
+            text-align: left;
+            cursor: pointer;
+            transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
+        }
+
+        .side-nav-button:hover,
+        .side-nav-button:focus-visible {
+            background: rgba(0,0,0,0.03);
+            color: var(--text-primary);
+            outline: none;
+        }
+
+        .side-nav-button[aria-current="page"] {
+            background: rgba(124, 58, 166, 0.08);
+            border-left-color: var(--color-accent);
+            color: var(--text-primary);
+            font-weight: 700;
+        }
+
+        .side-nav-icon {
+            width: 24px;
+            height: 24px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 6px;
+            background: rgba(20, 20, 15, 0.06);
+            font-size: var(--font-size-xs);
+            font-weight: 700;
+            line-height: 1;
+        }
+
+        .side-nav-button[aria-current="page"] .side-nav-icon {
+            background: var(--color-accent-soft);
+            color: var(--color-accent);
+        }
+
+        .side-boundary {
+            margin-top: auto;
+            display: grid;
+            gap: 6px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border-primary);
+        }
+
+        .side-boundary .badge {
+            width: 100%;
+            justify-content: center;
+            background: rgba(255, 255, 255, 0.68);
+            font-size: var(--font-size-xs);
+            padding: 3px 6px;
+        }
+
+        body.nav-collapsed .app {
+            grid-template-columns: 52px minmax(0, 1fr);
+        }
+
+        body.nav-collapsed .side-rail {
+            align-items: center;
+            padding: 10px 8px;
+        }
+
+        body.nav-collapsed .side-brand {
+            grid-template-columns: 1fr;
+            justify-items: center;
+            padding: 4px 0 10px;
+        }
+
+        body.nav-collapsed .side-brand-title,
+        body.nav-collapsed .side-brand-sub,
+        body.nav-collapsed .side-nav-label,
+        body.nav-collapsed .side-nav-button span:not(.side-nav-icon),
+        body.nav-collapsed .side-boundary,
+        body.nav-collapsed .side-collapse-label {
+            display: none;
+        }
+
+        body.nav-collapsed .side-nav {
+            width: 100%;
+        }
+
+        body.nav-collapsed .side-nav-button {
+            grid-template-columns: 1fr;
+            justify-items: center;
+            padding: 6px;
+        }
+
+        body.nav-collapsed .side-nav-icon {
+            width: 28px;
+            height: 28px;
+        }
+
+        body.nav-collapsed .side-collapse-button {
+            width: 100%;
+        }
+
+        body.nav-collapsed .side-collapse-icon {
+            transform: rotate(180deg);
+        }
+
+        .topbar {
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 18px;
+            padding: 20px 22px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            background:
+                linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(255, 255, 255, 0.72));
+            box-shadow: var(--shadow-sm);
+        }
+        .topbar-right {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 10px;
+        }
+
+        /* ============================================================
+           Duty status strip — dark-cockpit principle: a lamp only takes
+           color when something needs attention; normal state stays ink.
+           Fed by existing loaders only (zero extra requests).
+           ============================================================ */
+        .duty-strip {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2px;
+            margin: 14px 0 0;
+            padding: 8px 10px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            box-shadow: var(--shadow-xs);
+        }
+        .duty-lamp {
+            appearance: none;
+            display: grid;
+            gap: 2px;
+            min-width: 128px;
+            padding: 6px 14px;
+            border: 0;
+            border-right: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: transparent;
+            text-align: left;
+            font-family: inherit;
+            cursor: pointer;
+        }
+        .duty-lamp:last-child { border-right: 0; }
+        .duty-lamp:hover { background: var(--bg-tertiary); }
+        .duty-lamp:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+        .duty-lamp-label {
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            letter-spacing: 0.02em;
+        }
+        .duty-lamp-value {
+            color: var(--text-primary);
+            font-family: var(--font-mono);
+            font-variant-numeric: tabular-nums;
+            font-size: var(--font-size-base);
+            font-weight: 600;
+            line-height: 1.3;
+        }
+        .duty-lamp-sub {
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+        }
+        .duty-lamp.warn .duty-lamp-value { color: var(--color-warn); }
+        .duty-lamp.bad .duty-lamp-value { color: var(--color-status-bad); }
+
+        h1, h2, h3, h4, p { margin: 0; }
+        h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+        h2 { font-size: 16px; font-weight: 600; }
+        h3 { font-size: var(--font-size-lg); font-weight: 600; }
+        h4 { font-size: var(--font-size-base); font-weight: 600; }
+
+        .subtitle {
+            margin-top: 6px;
+            max-width: 560px;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+            line-height: 1.5;
+        }
+
+        /* ============================================================
+           Badges
+           ============================================================ */
+        .badge-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            min-height: 26px;
+            padding: 3px 11px;
+            border: 1px solid var(--color-info-soft);
+            border-radius: var(--radius-pill);
+            background: var(--color-info-soft);
+            color: var(--color-info);
+            font-size: var(--font-size-xs);
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .badge::before {
+            content: "";
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+            opacity: 0.7;
+        }
+        .badge-degraded {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: var(--radius-pill);
+            background: var(--color-warn-soft);
+            color: var(--color-warn);
+            font-size: var(--font-size-xs);
+            font-weight: 600;
+            line-height: 1.7;
+            white-space: nowrap;
+        }
+
+        /* ============================================================
+           Sections
+           ============================================================ */
+        .section {
+            padding: var(--section-gap) 0 8px;
+            border-top: 1px solid var(--border-subtle);
+        }
+        .section:first-of-type { border-top: none; }
+
+        .section-head {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 12px;
+        }
+
+        .section-actions {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+            gap: 10px;
+            overflow: visible;
+        }
+
+        .section-note {
+            max-width: 640px;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+        }
+
+        .module-view {
+            scroll-margin-top: 96px;
+        }
+
+        .module-view[hidden] {
+            display: none !important;
+        }
+
+        .module-back-button {
+            border-color: var(--border-primary);
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+        }
+
+        .module-back-button:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        /* ============================================================
+           Buttons
+           ============================================================ */
+        .action-button {
+            min-height: 36px;
+            border: 1px solid var(--color-info);
+            border-radius: var(--radius);
+            background: rgba(47, 92, 140, 0.1);
+            color: var(--color-info);
+            padding: 8px 14px;
+            font-family: var(--font-sans);
+            font-size: var(--font-size-base);
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 150ms ease, border-color 150ms ease;
+        }
+        .action-button:hover { background: rgba(47, 92, 140, 0.18); }
+        .action-button:disabled { cursor: wait; opacity: .55; }
+        .action-button:focus-visible {
+            outline: 2px solid var(--color-info);
+            outline-offset: 2px;
+        }
+
+        .action-button.is-danger {
+            border-color: rgba(138, 79, 20, 0.45);
+            background: var(--color-status-bad-soft);
+            color: var(--color-status-bad);
+        }
+
+        .action-button.is-muted {
+            border-color: var(--border-primary);
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+        }
+
+        .action-button.secondary-action {
+            border-color: var(--border-primary);
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+        }
+
+        .action-button.secondary-action:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .close-button {
+            width: 36px;
+            height: 36px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: var(--font-size-xl);
+            transition: background 150ms ease;
+        }
+        .close-button:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+
+        /* ============================================================
+           Market Overview Grid
+           ============================================================ */
+        .market-layout {
+            display: grid;
+            grid-template-columns: minmax(0, 1.2fr) minmax(380px, .8fr);
+            gap: var(--card-gap);
+        }
+
+        .market-grid, .sector-grid, .candidate-grid, .focus-grid, .info-grid {
+            display: grid;
+            gap: var(--card-gap);
+        }
+        .market-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .sector-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .candidate-grid { grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); }
+        .focus-grid { grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+
+        /* ============================================================
+           Cards & Panels
+           ============================================================ */
+        .metric, .sector-panel, .candidate-card, .info-item, .text-panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow-sm);
+        }
+
+        .metric {
+            position: relative;
+            padding: var(--panel-padding);
+            min-height: 138px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            transition: box-shadow 180ms ease, transform 180ms ease;
+        }
+        .metric::before {
+            content: "";
+            position: absolute;
+            inset: 0 0 auto 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--color-info), var(--color-accent));
+            opacity: 0.85;
+        }
+        .metric:hover {
+            box-shadow: var(--shadow-md);
+            transform: translateY(-2px);
+        }
+
+        .metric-label, .info-label {
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }
+
+        .metric-value {
+            margin-top: 8px;
+            font-size: var(--font-size-xl);
+            font-weight: 700;
+            line-height: 1.05;
+            letter-spacing: -0.01em;
+            color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
+        }
+
+        .metric-change {
+            display: inline-flex;
+            align-items: center;
+            align-self: flex-start;
+            gap: 4px;
+            margin-top: 10px;
+            padding: 3px 9px;
+            border-radius: var(--radius-pill);
+            font-size: var(--font-size-base);
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+        }
+        .metric-change.up { color: var(--color-up); background: var(--color-up-soft); }
+        .metric-change.down { color: var(--color-down); background: var(--color-down-soft); }
+        .metric-change.neutral { color: var(--color-flat); background: rgba(128, 124, 109, 0.10); }
+        .metric-change.up::before { content: "▲"; font-size: var(--font-size-xs); }
+        .metric-change.down::before { content: "▼"; font-size: var(--font-size-xs); }
+
+        .metric-hint, .missing-note {
+            margin-top: 8px;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+            line-height: 1.5;
+        }
+
+        /* Sentiment box */
+        .sentiment {
+            margin-top: var(--card-gap);
+            padding: 12px 14px;
+            border-left: 3px solid var(--color-info);
+            background: rgba(59, 130, 246, 0.08);
+            border-radius: var(--radius-sm);
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.7;
+        }
+
+        /* ============================================================
+           Sector Panels
+           ============================================================ */
+        .sector-panel { padding: 16px; }
+        .sector-panel h3 {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: var(--font-size-base);
+            margin-bottom: 12px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border-subtle);
+            color: var(--text-primary);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .sector-list {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr);
+            gap: 6px;
+            counter-reset: sector;
+        }
+        .sector-list li {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            min-width: 0;
+            padding: 8px 12px;
+            border-radius: var(--radius-sm);
+            background: var(--bg-tertiary);
+            font-size: var(--font-size-base);
+            transition: transform 140ms ease;
+        }
+        .sector-list li > :first-child {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .sector-list li:hover { transform: translateX(2px); }
+        .sector-list li:last-child { border-bottom: 0; }
+        .sector-list .sector-name {
+            color: var(--text-primary);
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .sector-list .sector-name::before {
+            counter-increment: sector;
+            content: counter(sector);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px;
+            height: 18px;
+            margin-right: 8px;
+            border-radius: var(--radius-sm);
+            background: var(--bg-sunken);
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+            font-size: var(--font-size-xs);
+            font-weight: 700;
+        }
+        .sector-list .sector-change {
+            font-family: var(--font-mono);
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+        }
+        .sector-list .sector-change.up { color: var(--color-up); }
+        .sector-list .sector-change.down { color: var(--color-down); }
+        /* Heatmap intensity — set on <li> by JS via .heat-up-N / .heat-down-N */
+        .sector-list li.heat-up-1 { background: rgba(209, 31, 31, 0.07); }
+        .sector-list li.heat-up-2 { background: rgba(209, 31, 31, 0.13); }
+        .sector-list li.heat-up-3 { background: rgba(209, 31, 31, 0.20); }
+        .sector-list li.heat-up-4 { background: rgba(209, 31, 31, 0.28); }
+        .sector-list li.heat-down-1 { background: rgba(31, 138, 76, 0.07); }
+        .sector-list li.heat-down-2 { background: rgba(31, 138, 76, 0.13); }
+        .sector-list li.heat-down-3 { background: rgba(31, 138, 76, 0.20); }
+        .sector-list li.heat-down-4 { background: rgba(31, 138, 76, 0.28); }
+
+        /* ============================================================
+           Candidate Cards
+           ============================================================ */
+        .candidate-card {
+            width: 100%;
+            padding: var(--panel-padding);
+            padding-left: calc(var(--panel-padding) + 4px);
+            text-align: left;
+            cursor: pointer;
+            color: inherit;
+            font-family: inherit;
+            transition: border-color 160ms ease, box-shadow 200ms ease, transform 200ms ease;
+            position: relative;
+            overflow: hidden;
+        }
+        .candidate-card::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+            background: var(--color-info);
+            opacity: 0.85;
+        }
+        .candidate-card.lane-board::before { background: var(--color-up); }
+        .candidate-card.lane-long::before { background: var(--color-down); }
+        .candidate-card.lane-today::before { background: var(--color-accent); }
+        .candidate-card:hover, .candidate-card:focus-visible {
+            outline: none;
+            border-color: var(--border-strong);
+            box-shadow: var(--shadow-md);
+            transform: translateY(-3px);
+        }
+        .candidate-card:focus-visible {
+            box-shadow: var(--shadow-focus);
+        }
+
+        .candidate-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+        }
+        .candidate-title { font-size: var(--font-size-lg); font-weight: 700; letter-spacing: -0.01em; }
+        .candidate-code {
+            display: inline-block;
+            margin-top: 4px;
+            padding: 1px 7px;
+            border-radius: var(--radius-sm);
+            background: var(--bg-sunken);
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+            font-size: var(--font-size-xs);
+            letter-spacing: 0.04em;
+        }
+        .candidate-price {
+            text-align: right;
+            font-size: var(--font-size-xl);
+            font-weight: 700;
+            white-space: nowrap;
+            color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
+        }
+        .candidate-change {
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            margin-top: 4px;
+            padding: 2px 8px;
+            border-radius: var(--radius-pill);
+            font-size: var(--font-size-sm);
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+        }
+        .candidate-change.up { color: var(--color-up); background: var(--color-up-soft); }
+        .candidate-change.down { color: var(--color-down); background: var(--color-down-soft); }
+        .candidate-change.neutral { color: var(--color-flat); background: rgba(128, 124, 109, 0.10); }
+
+        .reason {
+            margin: 10px 0;
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.65;
+        }
+
+        .candidate-brief {
+            display: grid;
+            gap: 6px;
+            margin: 10px 0;
+            padding: 10px 10px 10px 12px;
+            border-left: 3px solid var(--color-accent);
+            border-radius: var(--radius-sm);
+            background: rgba(110, 61, 110, 0.07);
+        }
+
+        .candidate-brief-line {
+            display: grid;
+            grid-template-columns: 42px minmax(0, 1fr);
+            gap: 8px;
+            align-items: start;
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.55;
+        }
+
+        .brief-label {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 20px;
+            border-radius: 999px;
+            background: rgba(47, 92, 140, 0.12);
+            color: var(--color-info);
+            font-weight: 700;
+            line-height: 1;
+        }
+
+        .brief-label-status { background: rgba(245, 158, 11, 0.13); color: var(--color-warn); }
+        .brief-label-verify { background: var(--color-status-ok-soft); color: var(--color-status-ok); }
+        .brief-label-data { background: var(--color-status-bad-soft); color: var(--color-status-bad); }
+
+        .reason-mark {
+            display: inline;
+            padding: 1px 3px;
+            border-radius: 4px;
+            background: rgba(245, 158, 11, 0.16);
+            color: var(--text-primary);
+            font-weight: 700;
+        }
+
+        .reason-mark.reason-positive {
+            background: var(--color-status-ok-soft);
+            color: var(--color-status-ok);
+        }
+
+        .reason-mark.reason-warning {
+            background: var(--color-status-bad-soft);
+            color: var(--color-status-bad);
+        }
+
+        .indicator-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+        .indicator {
+            padding: 4px 9px;
+            border-radius: var(--radius-sm);
+            background: var(--bg-sunken);
+            color: var(--text-secondary);
+            font-size: var(--font-size-xs);
+            font-family: var(--font-mono);
+            font-variant-numeric: tabular-nums;
+            line-height: 1.35;
+        }
+
+        .tag-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+        .tag {
+            display: inline-flex;
+            align-items: center;
+            min-height: 23px;
+            padding: 2px 9px;
+            border-radius: var(--radius-pill);
+            border: 1px solid transparent;
+            background: var(--bg-sunken);
+            color: var(--text-secondary);
+            font-size: var(--font-size-xs);
+            font-weight: 600;
+        }
+        .tag-ok { background: var(--color-status-ok-soft); color: var(--color-status-ok); }
+        .tag-watch { background: var(--color-warn-soft); color: var(--color-warn); }
+        .tag-warn, .tag-missing { background: var(--color-status-bad-soft); color: var(--color-status-bad); }
+        .tag-market-up { background: var(--color-up-soft); color: var(--color-up); }
+        .tag-market-down { background: var(--color-down-soft); color: var(--color-down); }
+        .tag-priority {
+            border-color: var(--color-accent-soft);
+            background: var(--color-accent-soft);
+            color: var(--color-accent);
+            font-weight: 700;
+        }
+
+        .tracking-line, .data-gap-line {
+            margin-top: 10px;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+            line-height: 1.5;
+        }
+
+        /* ============================================================
+           Pool Group Headers
+           ============================================================ */
+        .candidate-zone {
+            grid-column: 1 / -1;
+            display: grid;
+            gap: 14px;
+            margin-top: 18px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border-subtle);
+        }
+        .candidate-zone:first-child {
+            margin-top: 0;
+            padding-top: 0;
+            border-top: 0;
+        }
+        .candidate-zone-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 12px 14px;
+            border-left: 4px solid var(--color-info);
+            border-radius: var(--radius-sm);
+            background: rgba(47, 92, 140, 0.06);
+        }
+        .candidate-zone-head h3 {
+            margin: 0;
+            font-size: var(--font-size-xl);
+            font-weight: 800;
+            color: var(--text-primary);
+        }
+        .candidate-zone-head p {
+            margin: 4px 0 0;
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.55;
+        }
+        .candidate-zone-today .candidate-zone-head {
+            border-left-color: var(--color-accent);
+            background: rgba(110, 61, 110, 0.08);
+        }
+        .candidate-zone-history .candidate-zone-head {
+            border-left-color: var(--color-info);
+            background: rgba(47, 92, 140, 0.06);
+        }
+        .candidate-zone-exit .candidate-zone-head {
+            border-left-color: var(--color-warn);
+            background: rgba(245, 158, 11, 0.10);
+        }
+        .pool-group { grid-column: 1 / -1; margin-top: 4px; }
+        .pool-group-head {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+        .pool-group-head h3 { font-size: var(--font-size-lg); font-weight: 600; }
+        .pool-group-note { color: var(--text-muted); font-size: var(--font-size-sm); line-height: 1.45; text-align: right; }
+        .strategy-subgroups {
+            display: grid;
+            gap: 14px;
+        }
+        .strategy-subgroup {
+            display: grid;
+            gap: 8px;
+        }
+        .strategy-subgroup-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            padding: 8px 10px;
+            border-left: 3px solid var(--color-info);
+            background: rgba(47, 92, 140, 0.06);
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+        }
+        .strategy-subgroup-title {
+            color: var(--text-primary);
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .strategy-subgroup-note {
+            color: var(--text-muted);
+            text-align: right;
+        }
+        .strategy-subgroup.board .strategy-subgroup-head {
+            border-left-color: var(--color-up);
+            background: rgba(200, 57, 45, 0.07);
+        }
+        .strategy-subgroup.long .strategy-subgroup-head {
+            border-left-color: var(--color-down);
+            background: rgba(61, 122, 85, 0.07);
+        }
+        .strategy-subgroup.other .strategy-subgroup-head {
+            border-left-color: var(--color-warn);
+            background: rgba(245, 158, 11, 0.08);
+        }
+        .degrade-policy {
+            display: grid;
+            gap: 8px;
+            padding: 12px 14px;
+            border-left: 4px solid var(--color-warn);
+            border-radius: var(--radius-sm);
+            background: rgba(245, 158, 11, 0.08);
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.6;
+        }
+        .degrade-policy-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 12px;
+        }
+        .degrade-policy-head strong {
+            color: var(--text-primary);
+            font-size: var(--font-size-base);
+        }
+        .degrade-policy p { margin: 0; }
+        .degrade-policy-list {
+            display: grid;
+            gap: 5px;
+            margin: 0;
+            padding-left: 18px;
+        }
+
+        /* ============================================================
+           Data Gap Panel
+           ============================================================ */
+        .gap-panel {
+            margin-bottom: 12px;
+            padding: 12px 14px;
+            border: 1px dashed var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.6;
+        }
+        .gap-panel strong { color: var(--text-primary); }
+
+        .candidate-generation-panel {
+            margin-bottom: 12px;
+            padding: 12px 14px;
+            border: 1px solid rgba(29, 78, 216, 0.22);
+            border-radius: var(--radius);
+            background: rgba(29, 78, 216, 0.05);
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.6;
+        }
+        .candidate-generation-head {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+        .candidate-generation-head strong { color: var(--text-primary); }
+
+        .llm-analysis-card {
+            margin-bottom: 16px;
+            padding: 14px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--bg-secondary);
+            box-shadow: var(--shadow-xs);
+        }
+        .llm-analysis-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+        .llm-analysis-header h3 {
+            margin: 0;
+            font-size: var(--font-size-lg);
+        }
+        .llm-analysis-content {
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.65;
+        }
+        .llm-analysis-content p {
+            margin: 4px 0;
+        }
+        .llm-analysis-content .llm-warning {
+            color: var(--color-warn);
+            font-weight: 600;
+        }
+        .llm-analysis-content .llm-ok {
+            color: var(--color-info);
+            font-weight: 600;
+        }
+        .strategy-recommendation-list {
+            grid-column: 1 / -1;
+            display: grid;
+            gap: 10px;
+        }
+        .strategy-recommendation-row {
+            width: 100%;
+            display: grid;
+            grid-template-columns: minmax(150px, 0.8fr) minmax(150px, 0.8fr) minmax(220px, 1.3fr) minmax(120px, 0.55fr) minmax(120px, 0.7fr);
+            gap: 10px;
+            align-items: start;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            padding: 12px 14px;
+            color: var(--text-primary);
+            font-family: var(--font-sans);
+            text-align: left;
+            cursor: pointer;
+            box-shadow: var(--shadow-xs);
+        }
+        .strategy-recommendation-row:hover,
+        .strategy-recommendation-row:focus-visible {
+            border-color: var(--color-info);
+            background: rgba(37, 99, 201, 0.04);
+            outline: none;
+        }
+        .strategy-recommendation-main strong {
+            display: block;
+            font-size: var(--font-size-base);
+        }
+        .entry-reasons {
+            margin: 4px 0 0;
+            padding-left: 16px;
+            color: var(--text-secondary);
+            font-size: var(--font-size-xs);
+            line-height: 1.45;
+        }
+        .entry-reasons li {
+            margin: 2px 0;
+        }
+        .paper-entry-zone {
+            margin-top: 20px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border-primary);
+        }
+
+        .candidate-confidence-panel {
+            margin-bottom: 12px;
+            padding: 12px 14px;
+            border: 1px solid rgba(124, 58, 237, 0.22);
+            border-radius: var(--radius);
+            background: rgba(124, 58, 237, 0.06);
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.6;
+        }
+        .confidence-summary-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 10px;
+        }
+        .confidence-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 8px;
+            margin: 8px 0 10px;
+        }
+        .confidence-group {
+            padding: 9px 10px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius-sm);
+            background: var(--bg-card);
+        }
+        .confidence-group strong {
+            display: block;
+            color: var(--text-primary);
+            font-size: var(--font-size-xl);
+            line-height: 1.2;
+        }
+        .confidence-group span { color: var(--text-muted); font-size: var(--font-size-sm); }
+        .confidence-gap-list {
+            display: grid;
+            gap: 6px;
+            margin: 8px 0 0;
+        }
+        .confidence-gap-item {
+            padding: 8px 10px;
+            border-radius: var(--radius-sm);
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px dashed var(--border-primary);
+        }
+        .confidence-gap-title {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            flex-wrap: wrap;
+            color: var(--text-primary);
+            font-weight: 700;
+        }
+        .confidence-gap-action {
+            margin-top: 3px;
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+        }
+
+        /* ============================================================
+           Quant Daily Summary
+           ============================================================ */
+        .quant-summary {
+            display: grid;
+            gap: 12px;
+        }
+        .quant-summary-head {
+            display: grid;
+            gap: 10px;
+            padding: 14px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+        }
+        .quant-summary-head strong {
+            color: var(--text-primary);
+            font-size: var(--font-size-lg);
+        }
+        .quant-summary-metrics {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .quant-summary-metric {
+            display: inline-flex;
+            gap: 4px;
+            align-items: center;
+            padding: 5px 8px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius-sm);
+            background: var(--bg-primary);
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+        }
+        .quant-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 12px;
+        }
+        .quant-summary-card {
+            padding: 14px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-primary);
+        }
+        .quant-summary-card h3 {
+            margin: 0;
+            font-size: var(--font-size-lg);
+        }
+        .quant-summary-card p {
+            margin: 8px 0 0;
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.6;
+        }
+        .quant-summary-card .tag-row { margin-top: 8px; }
+        .quant-summary-card .summary-line {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--border-subtle);
+        }
+        .quant-summary-limit {
+            display: grid;
+            gap: 10px;
+            padding: 14px;
+            border: 1px solid rgba(124, 58, 237, 0.22);
+            border-radius: var(--radius);
+            background: rgba(255, 255, 255, 0.76);
+        }
+        .quant-summary-limit-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+        }
+        .quant-summary-limit-head strong {
+            color: var(--text-primary);
+            font-size: var(--font-size-lg);
+        }
+        .quant-summary-limit-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .quant-summary-limit-grid h4 {
+            margin: 0 0 8px;
+            font-size: var(--font-size-base);
+            color: var(--text-primary);
+        }
+        .quant-summary-limit-item {
+            display: grid;
+            gap: 3px;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.55;
+        }
+        .quant-summary-limit-item:last-child { border-bottom: 0; }
+        .quant-summary-limit-item strong {
+            color: var(--text-primary);
+        }
+        @media (max-width: 760px) {
+            .quant-summary-limit-head { display: grid; }
+            .quant-summary-limit-grid { grid-template-columns: 1fr; }
+        }
+
+        /* ============================================================
+           Limit-Up Review
+           ============================================================ */
+        .limit-review {
+            display: grid;
+            gap: 12px;
+        }
+        .limit-review-head {
+            display: grid;
+            gap: 10px;
+            padding: 14px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+        }
+        .limit-review-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 8px;
+        }
+        .limit-review-metric {
+            padding: 10px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius-sm);
+            background: var(--bg-primary);
+        }
+        .limit-review-metric span {
+            display: block;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+        }
+        .limit-review-metric strong {
+            display: block;
+            margin-top: 4px;
+            color: var(--text-primary);
+            font-size: var(--font-size-xl);
+            font-family: var(--font-mono);
+        }
+        .limit-review-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1.2fr) minmax(260px, 0.8fr);
+            gap: 12px;
+        }
+        .limit-review-panel {
+            padding: 14px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-primary);
+        }
+        .limit-review-panel h3 {
+            margin: 0 0 10px;
+            font-size: var(--font-size-lg);
+        }
+        .limit-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: var(--font-size-sm);
+        }
+        .limit-table th, .limit-table td {
+            padding: 8px 6px;
+            border-bottom: 1px solid var(--border-subtle);
+            text-align: left;
+            vertical-align: top;
+        }
+        .limit-table th {
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+        .limit-theme-list, .limit-intersection-list {
+            display: grid;
+            gap: 8px;
+        }
+        .limit-theme-item, .limit-intersection-item {
+            padding: 10px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--bg-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.55;
+        }
+        .limit-theme-item strong, .limit-intersection-item strong {
+            color: var(--text-primary);
+        }
+        .evidence-stack {
+            display: grid;
+            gap: 5px;
+            min-width: 150px;
+        }
+        .evidence-pill {
+            display: inline-flex;
+            align-items: center;
+            width: fit-content;
+            max-width: 240px;
+            padding: 3px 7px;
+            border: 1px solid var(--border-subtle);
+            border-radius: 999px;
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            font-size: var(--font-size-xs);
+            line-height: 1.35;
+            white-space: normal;
+        }
+        .evidence-news {
+            border-color: rgba(124, 58, 237, 0.28);
+            background: rgba(124, 58, 237, 0.08);
+            color: var(--color-accent);
+        }
+        .evidence-mapped {
+            border-color: rgba(29, 78, 216, 0.28);
+            background: rgba(29, 78, 216, 0.07);
+            color: var(--color-info);
+        }
+        .evidence-provider {
+            border-color: rgba(180, 83, 9, 0.28);
+            background: rgba(245, 158, 11, 0.08);
+            color: var(--color-warn);
+        }
+        @media (max-width: 860px) {
+            .limit-review-grid { grid-template-columns: 1fr; }
+        }
+
+        /* ============================================================
+           Theme Map
+           ============================================================ */
+        .theme-map-panel {
+            display: grid;
+            gap: 12px;
+            padding: 14px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+        }
+        .theme-map-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 8px;
+        }
+        .theme-map-metric {
+            padding: 10px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--bg-primary);
+        }
+        .theme-map-metric span {
+            display: block;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+        }
+        .theme-map-metric strong {
+            display: block;
+            margin-top: 4px;
+            color: var(--text-primary);
+            font-family: var(--font-mono);
+            font-size: var(--font-size-xl);
+        }
+        .theme-map-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(300px, .8fr);
+            gap: 12px;
+        }
+        .theme-map-subpanel {
+            padding: 12px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--bg-primary);
+            min-width: 0;
+        }
+        .theme-map-subpanel h3 {
+            margin: 0 0 8px;
+            font-size: var(--font-size-lg);
+        }
+        .compact-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: var(--font-size-sm);
+        }
+        .compact-table th, .compact-table td {
+            min-height: 32px;
+            padding: 7px 8px;
+            border-bottom: 1px solid var(--border-subtle);
+            text-align: left;
+            vertical-align: top;
+        }
+        .compact-table th {
+            background: var(--bg-tertiary);
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            font-weight: 500;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+        }
+        .provider-list {
+            display: grid;
+            gap: 6px;
+        }
+        .provider-list-item {
+            display: grid;
+            gap: 2px;
+            padding: 7px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: var(--font-size-sm);
+        }
+        .provider-list-item:last-child { border-bottom: 0; }
+        @media (max-width: 860px) {
+            .theme-map-grid { grid-template-columns: 1fr; }
+        }
+
+        /* ============================================================
+           Risk Level
+           ============================================================ */
+        .risk-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-top: 12px;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+        }
+        .risk {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 44px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: var(--font-size-sm);
+            font-weight: 700;
+        }
+        .risk-low { background: var(--color-status-ok-soft); color: var(--color-status-ok); }
+        .risk-mid { background: rgba(245, 158, 11, 0.12); color: var(--color-warn); }
+        .risk-high { background: var(--color-status-bad-soft); color: var(--color-status-bad); }
+
+        /* ============================================================
+           Color Semantics — Chinese market (up=red→green, down=green→red)
+           ============================================================ */
+        .positive { color: var(--color-up); }
+        .negative { color: var(--color-down); }
+        .neutral { color: var(--color-flat); }
+
+        /* ============================================================
+           Empty / Loading States
+           ============================================================ */
+        .empty-state {
+            padding: 18px;
+            background: var(--bg-secondary);
+            border: 1px dashed var(--border-primary);
+            border-radius: var(--radius);
+            color: var(--text-muted);
+            font-size: var(--font-size-base);
+            line-height: 1.7;
+        }
+
+        /* ============================================================
+           Startup Update / News Banner
+           ============================================================ */
+        .startup-update {
+            display: grid;
+            gap: 8px;
+            margin: 14px 0 0;
+            padding: 13px 16px;
+            border: 1px solid var(--border-subtle);
+            border-left: 3px solid var(--color-info);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            box-shadow: var(--shadow-xs);
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.55;
+        }
+        .startup-update strong { color: var(--text-primary); }
+        .startup-update-explain {
+            display: grid;
+            gap: 4px;
+            padding: 9px 11px;
+            border: 1px solid rgba(29, 78, 216, 0.16);
+            border-radius: var(--radius-sm);
+            background: rgba(255, 255, 255, 0.62);
+        }
+        .startup-update-explain span {
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.55;
+        }
+        .startup-update-actions {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            margin-top: 2px;
+        }
+        .startup-update-actions .action-button {
+            min-height: 32px;
+            padding: 6px 12px;
+        }
+        .startup-update-actions span {
+            color: var(--text-muted);
+        }
+        .startup-update-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+        }
+        .startup-update-ok { border-left-color: var(--color-status-ok); background: var(--color-status-ok-soft); }
+        .startup-update-warning { border-left-color: var(--color-warn); background: var(--color-warn-soft); }
+        .startup-update-pending { border-left-style: dashed; }
+
+        /* Compact banner: one-line summary, full detail behind <details>. */
+        .startup-update-line {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            gap: 10px;
+        }
+        .startup-update-brief {
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+        }
+        .startup-update-details summary {
+            width: max-content;
+            color: var(--color-info);
+            font-size: var(--font-size-sm);
+            cursor: pointer;
+            user-select: none;
+        }
+        .startup-update-details > * + * { margin-top: 8px; }
+        .startup-update-details[open] summary { margin-bottom: 8px; }
+
+        .news-status-banner {
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .news-status-banner .badge-warning {
+            border-color: rgba(245, 158, 11, 0.4);
+            background: rgba(245, 158, 11, 0.08);
+            color: var(--color-warn);
+        }
+        .news-status-banner .badge-info {
+            border-color: rgba(59, 130, 246, 0.4);
+            background: rgba(59, 130, 246, 0.08);
+            color: var(--color-info);
+        }
+        /* News status text tones (kept as variables so theme stays consistent) */
+        .news-status-ok { color: var(--color-status-ok); }   /* fresh news/status is not a price move */
+        .news-status-empty { color: var(--color-warn); } /* no/aged news → amber */
+
+        /* ============================================================
+           Realtime Observation Layer
+           ============================================================ */
+        .realtime-section {
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-lg);
+            background: var(--bg-secondary);
+            box-shadow: var(--shadow-sm);
+            padding: 20px;
+            margin-top: 18px;
+        }
+        .realtime-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 16px;
+            margin-bottom: 12px;
+        }
+        .realtime-title-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+        }
+        .realtime-boundary {
+            display: inline-flex;
+            align-items: center;
+            min-height: 24px;
+            padding: 2px 8px;
+            border: 1px solid rgba(180, 83, 9, 0.32);
+            border-radius: 999px;
+            background: rgba(245, 158, 11, 0.1);
+            color: var(--color-warn);
+            font-size: var(--font-size-sm);
+            font-weight: 600;
+        }
+        .realtime-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(360px, 0.9fr);
+            gap: var(--card-gap);
+        }
+        .realtime-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: var(--card-gap);
+            margin-bottom: var(--card-gap);
+        }
+        .realtime-card, .stock-search-panel, .stock-observation-panel {
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            box-shadow: var(--shadow-xs);
+            padding: 15px;
+        }
+        .realtime-card-label {
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .realtime-card-value {
+            margin-top: 6px;
+            font-family: var(--font-mono);
+            font-size: var(--font-size-xl);
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            letter-spacing: -0.01em;
+        }
+        .realtime-card-stale {
+            border-color: rgba(180, 83, 9, 0.45);
+            background: rgba(245, 158, 11, 0.08);
+        }
+        .realtime-card-stale .realtime-card-value {
+            color: var(--color-warn);
+        }
+        .realtime-provider-error {
+            color: var(--color-warn);
+            word-break: break-word;
+        }
+        .realtime-list-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: var(--card-gap);
+        }
+        .mini-list {
+            list-style: none;
+            margin: 8px 0 0;
+            padding: 0;
+            display: grid;
+            gap: 6px;
+        }
+        .mini-list li {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 8px;
+            padding: 7px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: var(--font-size-sm);
+        }
+        .mini-list li:last-child { border-bottom: 0; }
+        .mini-list small {
+            display: block;
+            margin-top: 2px;
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+        }
+        .stock-search-controls {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .stock-search-input {
+            min-height: 36px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            padding: 8px 10px;
+            font-family: var(--font-sans);
+            font-size: var(--font-size-base);
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+        }
+        .stock-search-input:focus-visible {
+            outline: 2px solid var(--color-info);
+            outline-offset: 1px;
+        }
+        .stock-search-results {
+            display: grid;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .search-result-button {
+            width: 100%;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 8px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--bg-tertiary);
+            padding: 8px 10px;
+            cursor: pointer;
+            color: var(--text-primary);
+            font-family: var(--font-sans);
+            text-align: left;
+        }
+        .search-result-button:hover, .search-result-button:focus-visible {
+            border-color: var(--color-info);
+            outline: none;
+        }
+        .observation-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .observation-note {
+            margin-top: 8px;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+            line-height: 1.6;
+        }
+
+        /* ============================================================
+           Modal
+           ============================================================ */
+        .modal {
+            display: none;
+            position: fixed;
+            inset: 0;
+            z-index: var(--z-modal);
+            background: rgba(36, 30, 16, 0.34);
+            backdrop-filter: blur(3px);
+            padding: 18px;
+            overflow: hidden;
+        }
+        .modal.open { display: block; animation: modalFade 200ms ease-out; }
+
+        .modal-content {
+            width: min(1320px, 100%);
+            height: calc(100vh - 36px);
+            max-height: calc(100vh - 36px);
+            margin: 0 auto;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+            box-shadow: var(--shadow-lg);
+            animation: modalRise 240ms cubic-bezier(0.16, 1, 0.3, 1);
+            display: flex;
+            flex-direction: column;
+        }
+        @keyframes modalFade { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes modalRise {
+            from { opacity: 0; transform: translateY(12px) scale(0.99); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        .modal-header {
+            position: sticky;
+            top: 0;
+            z-index: 4;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border-subtle);
+            background: rgba(255, 255, 255, 0.97);
+            backdrop-filter: blur(12px);
+        }
+
+        .modal-title { font-size: var(--font-size-xl); font-weight: 700; }
+
+        .modal-body {
+            flex: 1 1 auto;
+            min-height: 0;
+            display: flex;
+            overflow: hidden;
+            padding: 0;
+        }
+
+        .detail-shell {
+            flex: 1 1 auto;
+            display: grid;
+            grid-template-rows: auto minmax(0, 1fr);
+            min-height: 0;
+            height: 100%;
+            width: 100%;
+            overflow: hidden;
+        }
+
+        .detail-nav {
+            min-height: 0;
+            overflow: hidden;
+            padding: 12px 14px 10px;
+            border-right: 0;
+            border-bottom: 1px solid var(--border-subtle);
+            background: linear-gradient(180deg, rgba(243, 241, 234, 0.92), rgba(255, 255, 255, 0.96));
+            display: grid;
+            grid-template-columns: minmax(150px, 190px) minmax(0, 1fr);
+            align-items: center;
+            gap: 10px;
+        }
+
+        .detail-nav-head {
+            display: grid;
+            gap: 4px;
+            margin-bottom: 0;
+        }
+
+        .detail-nav-head strong {
+            color: var(--text-primary);
+            font-size: var(--font-size-base);
+        }
+
+        .detail-nav-strip {
+            display: flex;
+            gap: 8px;
+            min-height: 0;
+            overflow-x: auto;
+            overflow-y: hidden;
+            padding: 2px 2px 4px 0;
+            scrollbar-width: thin;
+        }
+
+        .detail-nav-button {
+            flex: 0 0 150px;
+            min-height: 54px;
+            display: grid;
+            gap: 4px;
+            padding: 8px 10px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: rgba(255, 255, 255, 0.82);
+            color: var(--text-primary);
+            font-family: var(--font-sans);
+            text-align: left;
+            cursor: pointer;
+            transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+        }
+
+        .detail-nav-button:hover,
+        .detail-nav-button:focus-visible {
+            border-color: var(--color-info);
+            background: rgba(37, 99, 201, 0.07);
+            box-shadow: var(--shadow-sm);
+            outline: none;
+        }
+
+        .detail-nav-button[aria-current="page"] {
+            border-color: var(--text-primary);
+            background: var(--text-primary);
+            box-shadow: var(--shadow-sm);
+            color: var(--bg-secondary);
+        }
+
+        .detail-nav-title {
+            display: block;
+            font-size: var(--font-size-base);
+            font-weight: 700;
+            line-height: 1.35;
+            white-space: nowrap;
+        }
+
+        .detail-nav-summary {
+            display: block;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            line-height: 1.35;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .detail-nav-button[aria-current="page"] .detail-nav-summary {
+            color: rgba(255, 255, 255, 0.72);
+        }
+
+        .detail-panel-area {
+            min-width: 0;
+            min-height: 0;
+            overflow: auto;
+            overscroll-behavior: contain;
+            padding: 18px 20px 24px;
+        }
+
+        .detail-pane[hidden] {
+            display: none !important;
+        }
+
+        .detail-pane-grid {
+            display: grid;
+            gap: 18px;
+        }
+
+        .detail-section { margin: 0; }
+        .detail-pane .detail-section + .detail-section { margin-top: 22px; }
+        .detail-section h3 {
+            margin-bottom: 10px;
+            padding-left: 10px;
+            border-left: 3px solid var(--color-accent);
+            font-size: var(--font-size-lg);
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .info-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+        .info-item { padding: 12px; }
+        .info-value {
+            margin-top: 4px;
+            font-size: var(--font-size-lg);
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .info-value.ok { color: var(--color-status-ok); }
+        .info-value.watch { color: var(--color-warn); }
+        .info-value.warn, .info-value.missing { color: var(--color-status-bad); }
+
+        .text-panel {
+            padding: 14px 16px;
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.8;
+        }
+        .text-panel p + p, .text-panel h4 { margin-top: 12px; }
+        .text-panel h4 { color: var(--text-primary); font-size: var(--font-size-base); }
+        .text-panel strong { color: var(--text-primary); }
+
+        .detail-emphasis strong {
+            display: inline-flex;
+            align-items: center;
+            min-height: 22px;
+            margin-right: 4px;
+            padding: 1px 7px;
+            border-radius: 999px;
+            background: rgba(110, 61, 110, 0.10);
+            color: var(--color-accent);
+            font-weight: 700;
+        }
+
+        .key-review-panel {
+            display: grid;
+            gap: 8px;
+            padding: 12px;
+            border: 1px solid var(--border-subtle);
+            border-left: 3px solid var(--color-accent);
+            border-radius: var(--radius);
+            background: rgba(255, 255, 255, 0.74);
+        }
+
+        .key-review-row {
+            display: flex;
+            gap: 10px;
+            align-items: start;
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.65;
+        }
+
+        .key-review-row > span:last-child {
+            flex: 1 1 auto;
+            min-width: 0;
+            padding-top: 2px;
+        }
+
+        .key-review-label {
+            flex: 0 0 auto;
+            min-width: 76px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 24px;
+            padding: 3px 8px;
+            border-radius: 999px;
+            background: rgba(47, 92, 140, 0.11);
+            color: var(--color-info);
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        .key-review-label.reason { background: rgba(110, 61, 110, 0.12); color: var(--color-accent); }
+        .key-review-label.status { background: rgba(245, 158, 11, 0.13); color: var(--color-warn); }
+        .key-review-label.risk { background: var(--color-status-bad-soft); color: var(--color-status-bad); }
+        .key-review-label.data { background: var(--color-status-ok-soft); color: var(--color-status-ok); }
+
+        .candidate-action-panel {
+            display: grid;
+            gap: 10px;
+            padding: 12px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            background: rgba(255, 255, 255, 0.78);
+        }
+
+        .candidate-action-head {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.6;
+        }
+
+        .candidate-action-status {
+            display: inline-flex;
+            align-items: center;
+            min-height: 24px;
+            padding: 3px 8px;
+            border-radius: 999px;
+            background: rgba(47, 92, 140, 0.10);
+            color: var(--color-info);
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        .candidate-action-status.ok { background: var(--color-status-ok-soft); color: var(--color-status-ok); }
+        .candidate-action-status.watch { background: rgba(245, 158, 11, 0.13); color: var(--color-warn); }
+        .candidate-action-status.warn, .candidate-action-status.missing { background: var(--color-status-bad-soft); color: var(--color-status-bad); }
+
+        .candidate-action-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .candidate-action-note {
+            min-height: 22px;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+            line-height: 1.5;
+        }
+
+        .scenario-chart {
+            min-height: 300px;
+            margin-top: 12px;
+        }
+
+        .scenario-chart-panel {
+            margin-top: 12px;
+            padding: 12px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            background: rgba(255, 255, 255, 0.74);
+        }
+
+        .scenario-thesis {
+            margin: 0 0 8px;
+            color: var(--text-primary);
+            font-size: var(--font-size-base);
+            line-height: 1.7;
+            font-weight: 600;
+        }
+
+        .scenario-structure {
+            margin: 0 0 10px;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+            line-height: 1.6;
+        }
+
+        .scenario-list {
+            display: grid;
+            gap: 8px;
+        }
+
+        .scenario-row {
+            display: grid;
+            gap: 4px;
+            padding: 9px 10px;
+            border-left: 3px solid var(--color-info);
+            background: rgba(47, 92, 140, 0.06);
+        }
+
+        .scenario-row.strong {
+            border-left-color: var(--color-status-ok);
+            background: var(--color-status-ok-soft);
+        }
+
+        .scenario-row.neutral {
+            border-left-color: var(--color-info);
+            background: rgba(47, 92, 140, 0.06);
+        }
+
+        .scenario-row.risk {
+            border-left-color: var(--color-warn);
+            background: rgba(245, 158, 11, 0.08);
+        }
+
+        .scenario-row-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            color: var(--text-primary);
+            font-size: var(--font-size-base);
+            font-weight: 700;
+        }
+
+        .scenario-row p {
+            margin: 0;
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.6;
+        }
+
+        /* ============================================================
+           Charts
+           ============================================================ */
+        .chart-stack { display: grid; gap: 12px; }
+
+        .chart-stack {
+            background: var(--bg-chart-dark);
+            border-radius: var(--radius-sm);
+            padding: 14px 12px 8px;
+            border: 1px solid var(--bg-chart-dark-border);
+        }
+        .chart-stack .echarts-chart,
+        .chart-stack > div[style*="height"] {
+            background: transparent;
+        }
+        .chart-stack h4,
+        .chart-stack .chart-title,
+        .chart-stack label {
+            color: #a0a0b8;
+            font-size: var(--font-size-xs);
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin: 0 0 6px;
+        }
+
+        .chart-card {
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            overflow: hidden;
+        }
+
+        .chart-card-head {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border-subtle);
+            background: var(--bg-tertiary);
+        }
+
+        .chart-card-head h4 {
+            margin: 0;
+            font-size: var(--font-size-base);
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .chart-note {
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            line-height: 1.45;
+            text-align: right;
+        }
+
+        .split-chart { width: 100%; height: 260px; }
+        .split-chart-price { height: 380px; }
+        .split-chart-volume { height: 220px; }
+
+        /* ============================================================
+           Responsive
+           ============================================================ */
+        @media (max-width: 980px) {
+            .app {
+                width: min(100% - 20px, 980px);
+                grid-template-columns: 1fr;
+                gap: 10px;
+                padding-top: 10px;
+            }
+            .side-rail {
+                position: sticky;
+                top: 8px;
+                z-index: 24;
+                height: auto;
+                display: grid;
+                grid-template-columns: minmax(150px, auto) minmax(0, 1fr);
+                align-items: start;
+                gap: 10px;
+                padding: 10px;
+            }
+            .side-brand {
+                padding: 2px 8px 2px 2px;
+                border-bottom: 0;
+                border-right: 1px solid var(--border-primary);
+            }
+            .side-nav {
+                display: flex;
+                gap: 6px;
+                overflow-x: auto;
+                padding-bottom: 2px;
+            }
+            .side-nav-label, .side-boundary { display: none; }
+            .side-nav-button {
+                flex: 0 0 auto;
+                width: auto;
+                white-space: nowrap;
+            }
+            .side-collapse-button { display: none; }
+            body.nav-collapsed .app { grid-template-columns: 1fr; }
+            body.nav-collapsed .side-rail {
+                align-items: start;
+                padding: 10px;
+            }
+            body.nav-collapsed .side-brand {
+                grid-template-columns: 32px minmax(0, 1fr);
+                justify-items: stretch;
+                padding: 2px 8px 2px 2px;
+            }
+            body.nav-collapsed .side-brand-title,
+            body.nav-collapsed .side-brand-sub,
+            body.nav-collapsed .side-nav-button span:not(.side-nav-icon) {
+                display: inline;
+            }
+            body.nav-collapsed .side-nav {
+                width: auto;
+            }
+            body.nav-collapsed .side-nav-button {
+                grid-template-columns: 24px minmax(0, 1fr);
+                justify-items: stretch;
+                padding: 6px 8px;
+            }
+            body.nav-collapsed .side-nav-icon {
+                width: 24px;
+                height: 24px;
+            }
+            .topbar { align-items: flex-start; flex-direction: column; }
+            .badge-row { justify-content: flex-start; }
+            .market-layout, .market-grid, .sector-grid, .focus-grid, .realtime-grid, .realtime-metrics, .realtime-list-grid { grid-template-columns: 1fr; }
+            .realtime-head { flex-direction: column; }
+            .candidate-zone-head { align-items: flex-start; flex-direction: column; }
+            .pool-group-head { align-items: flex-start; flex-direction: column; }
+            .pool-group-note { text-align: left; }
+            .strategy-subgroup-head { align-items: flex-start; flex-direction: column; }
+            .strategy-subgroup-note { text-align: left; }
+            .degrade-policy-head { flex-direction: column; }
+            .modal { padding: 10px; }
+            .modal-content {
+                height: calc(100vh - 20px);
+                max-height: calc(100vh - 20px);
+            }
+            .modal-body { padding: 0; }
+            .detail-shell {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto minmax(0, 1fr);
+            }
+            .detail-nav {
+                min-height: auto;
+                padding: 12px 14px;
+                border-right: 0;
+                border-bottom: 1px solid var(--border-subtle);
+                overflow: hidden;
+                display: grid;
+                grid-template-columns: 1fr;
+                grid-template-rows: auto auto;
+                gap: 8px;
+            }
+            .detail-nav-strip {
+                display: flex;
+                gap: 8px;
+                overflow-x: auto;
+                overflow-y: hidden;
+                padding-bottom: 2px;
+            }
+            .detail-nav-button {
+                flex: 0 0 150px;
+            }
+            .detail-panel-area {
+                padding: 14px;
+                overflow: auto;
+                min-height: 0;
+            }
+            .section-head { align-items: flex-start; flex-direction: column; }
+            .section-actions { justify-content: flex-start; }
+            .topbar-right { align-items: flex-start; width: 100%; }
+            .chart-card-head { align-items: flex-start; flex-direction: column; }
+            .chart-note { text-align: left; }
+            .split-chart { height: 240px; }
+            .split-chart-price { height: 330px; }
+            .split-chart-volume { height: 200px; }
+            .metric-row,
+            .data-health-home-grid,
+            .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .paper-desk-grid { grid-template-columns: 1fr; }
+            .paper-strategy-row {
+                grid-template-columns: 72px minmax(0, 1fr);
+            }
+            .paper-strategy-row > :nth-child(n+3) {
+                grid-column: span 1;
+            }
+            .strategy-recommendation-row,
+            .report-row {
+                grid-template-columns: 1fr;
+            }
+            .candidate-brief-line { grid-template-columns: 1fr; gap: 5px; }
+            .key-review-row { flex-wrap: wrap; gap: 5px; }
+            .agent-layout { grid-template-columns: 1fr; }
+            .agent-composer { grid-template-columns: 1fr; }
+            .agent-message { max-width: 100%; }
+        }
+
+        @media (max-width: 900px) {
+            .side-rail {
+                grid-template-columns: 1fr;
+            }
+            .side-brand { border-right: 0; }
+            .side-nav {
+                width: 100%;
+                overflow-x: auto;
+            }
+        }
+
+        @media (min-width: 1600px) {
+            .app {
+                width: min(1800px, calc(100vw - 28px));
+            }
+        }
+
+        /* ============================================================
+           Reduced Motion
+           ============================================================ */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+        /* ============================================================
+           Glossary / Learning Zone
+           ============================================================ */
+        .glossary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: var(--card-gap);
+        }
+        .glossary-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            padding: var(--panel-padding);
+        }
+        .glossary-card h4 {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 8px;
+            font-size: var(--font-size-base);
+            color: var(--color-info);
+        }
+        .glossary-term {
+            display: inline-flex;
+            align-items: center;
+            min-height: 22px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(29,78,216,0.08);
+            color: var(--color-info);
+            font-size: var(--font-size-sm);
+            font-weight: 600;
+            cursor: help;
+        }
+        .glossary-card p { color: var(--text-secondary); font-size: var(--font-size-base); line-height: 1.65; }
+        .glossary-card .stock-status {
+            margin-top: 8px;
+            padding: 6px 8px;
+            border-radius: 6px;
+            font-size: var(--font-size-base);
+            line-height: 1.55;
+        }
+        .indicator-positive { background: rgba(220,38,38,0.06); color: #991B1B; }
+        .indicator-negative { background: rgba(21,128,61,0.06); color: #14532D; }
+        .indicator-neutral  { background: rgba(71,85,105,0.06); color: var(--text-secondary); }
+
+        /* ============================================================
+           Data ops / Performance / Backtest modules
+           ============================================================ */
+        .inline-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            white-space: nowrap;
+        }
+        .health-grid, .perf-strategy-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: var(--card-gap);
+        }
+        .health-card, .perf-card {
+            padding: 14px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            box-shadow: var(--shadow-xs);
+        }
+        .health-card h4, .perf-card h4 {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin: 0 0 8px;
+            font-size: var(--font-size-base);
+        }
+        .health-card p, .perf-card p {
+            margin: 4px 0 0;
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.6;
+        }
+        /* Compact paper-pool card: key info only; the whole card is clickable
+           and opens the stock detail modal (charts / reason / paper contract),
+           so the list stays short instead of expanding inline. */
+        .paper-card-compact { cursor: pointer; transition: box-shadow .15s, border-color .15s; }
+        .paper-card-compact:hover { border-color: var(--accent, #b6792d); box-shadow: var(--shadow-sm, 0 2px 10px rgba(20,18,14,.12)); }
+        .paper-summary-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .paper-summary-title strong { font-size: var(--font-size-base); }
+        .paper-summary-metrics {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px 14px;
+            font-size: var(--font-size-sm);
+            color: var(--text-secondary);
+            margin-top: 6px;
+        }
+        .paper-summary-metrics b { color: var(--text-primary); }
+        .paper-summary-decision { font-weight: 600; color: var(--text-primary); }
+        .paper-summary-foot {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+        .paper-open-hint { font-size: var(--font-size-sm); color: var(--text-tertiary); white-space: nowrap; }
+        .paper-card-compact .paper-action-row { margin: 0; }
+        /* Direct, beginner-friendly research brief inside the stock detail. */
+        .detail-brief .research-brief { display: flex; flex-direction: column; gap: 8px; }
+        .research-brief .rb-line { display: flex; gap: 10px; align-items: flex-start; }
+        .research-brief .rb-line p { margin: 0; line-height: 1.6; font-size: var(--font-size-base); }
+        .research-brief .rb-tag {
+            flex: 0 0 auto;
+            min-width: 84px;
+            text-align: center;
+            font-size: var(--font-size-sm);
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 6px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-secondary);
+        }
+        .research-brief .rb-tag-lean { background: rgba(120, 110, 60, .12); color: #8a6d1f; border-color: rgba(138,109,31,.3); }
+        .research-brief .rb-tag-go { background: var(--color-up-soft, rgba(200,40,40,.10)); color: var(--color-up, #c22); border-color: rgba(200,40,40,.3); }
+        .research-brief .rb-tag-stop { background: var(--color-down-soft, rgba(30,140,70,.10)); color: var(--color-down, #1e8c46); border-color: rgba(30,140,70,.3); }
+        .research-brief .rb-levels { display: flex; gap: 16px; flex-wrap: wrap; font-size: var(--font-size-sm); color: var(--text-secondary); padding-left: 94px; }
+        .research-brief .rb-levels b { color: var(--text-primary); }
+        .research-brief .rb-boundary { margin: 4px 0 0; font-size: var(--font-size-xs); color: var(--text-tertiary); }
+        .paper-contract-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .paper-contract-item,
+        .paper-condition-list {
+            padding: 10px 11px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--bg-primary);
+        }
+        .paper-contract-wide {
+            grid-column: 1 / -1;
+        }
+        .paper-contract-item span,
+        .paper-condition-list span {
+            display: block;
+            margin-bottom: 4px;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            font-weight: 700;
+        }
+        .paper-contract-item strong {
+            display: block;
+            color: var(--text-primary);
+            font-size: var(--font-size-sm);
+            line-height: 1.55;
+        }
+        .paper-contract-item em {
+            display: inline-flex;
+            margin-top: 6px;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            font-style: normal;
+        }
+        .paper-llm-opinion {
+            border-color: rgba(124, 58, 237, 0.28);
+            background: rgba(124, 58, 237, 0.06);
+        }
+        .paper-condition-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .paper-condition-list ul {
+            margin: 0;
+            padding-left: 18px;
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.65;
+        }
+        .paper-condition-list p {
+            margin: 0;
+        }
+        .paper-action-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid var(--border-subtle);
+        }
+        .paper-action-row .action-button {
+            min-height: 32px;
+            padding: 6px 11px;
+            font-size: var(--font-size-sm);
+        }
+        .health-badge {
+            display: inline-flex;
+            align-items: center;
+            min-height: 22px;
+            padding: 2px 9px;
+            border-radius: 999px;
+            font-size: var(--font-size-sm);
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .health-ok { background: var(--color-status-ok-soft); color: var(--color-status-ok); }
+        .health-warn { background: var(--color-warn-soft); color: var(--color-warn); }
+        .health-bad { background: var(--color-status-bad-soft); color: var(--color-status-bad); }
+        .next-steps {
+            margin: 10px 0 0;
+            padding-left: 18px;
+            color: var(--text-secondary);
+            font-size: var(--font-size-base);
+            line-height: 1.75;
+        }
+        .metric-row {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+        .metric-box {
+            min-width: 0;
+            padding: 10px 12px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--bg-secondary);
+            box-shadow: none;
+        }
+        .metric-box span {
+            display: block;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            letter-spacing: .04em;
+            text-transform: uppercase;
+        }
+        .metric-box strong {
+            display: block;
+            margin-top: 4px;
+            font-family: var(--font-mono);
+            font-size: var(--font-size-data);
+            font-weight: 600;
+            font-variant-numeric: tabular-nums;
+            color: var(--text-primary);
+            overflow-wrap: anywhere;
+        }
+        .equity-chart { width: 100%; height: 340px; }
+        .panel-disclaimer {
+            margin-top: 12px;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+            line-height: 1.5;
+        }
+
+        .data-health-home-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+        /* Reason codes and machine identifiers are long unbroken tokens;
+           without this they blow the 4-col grid out of the viewport. */
+        .data-health-home-card { min-width: 0; overflow-wrap: anywhere; }
+        .data-health-home-card,
+        .settings-info-card {
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--bg-secondary);
+            padding: 12px;
+        }
+        .data-health-home-card span,
+        .settings-info-card span {
+            display: block;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            letter-spacing: .04em;
+            text-transform: uppercase;
+        }
+        .data-health-home-card strong,
+        .settings-info-card strong {
+            display: block;
+            margin-top: 4px;
+            color: var(--text-primary);
+            font-family: var(--font-mono);
+            font-size: var(--font-size-data);
+        }
+        .data-health-home-card.card-tone-warn {
+            border-color: var(--color-warn);
+            background: var(--color-warn-soft);
+        }
+        .settings-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 12px;
+        }
+        .paper-desk-grid {
+            display: grid;
+            grid-template-columns: minmax(280px, 1fr) minmax(0, 1.5fr);
+            gap: 14px;
+            margin-bottom: 16px;
+        }
+        .paper-strategy-panel,
+        .paper-positions-panel,
+        .paper-trades-panel {
+            min-width: 0;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            padding: 14px;
+        }
+        .paper-strategy-panel h3,
+        .paper-positions-panel h3,
+        .paper-trades-panel h3 {
+            font-size: var(--font-size-lg);
+            margin: 0 0 10px;
+        }
+        .paper-positions-panel h4 {
+            font-size: var(--font-size-base);
+            margin: 0 0 6px;
+        }
+        .paper-strategy-row {
+            display: grid;
+            grid-template-columns: 80px minmax(0, 1fr) 86px 86px auto;
+            gap: 8px;
+            align-items: center;
+            padding: 7px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: var(--font-size-sm);
+        }
+        .paper-table-wrap {
+            overflow-x: auto;
+        }
+        .position-summary-strip {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 10px 0 12px;
+        }
+        .position-summary-strip span {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 4px;
+            border: 1px solid var(--border-subtle);
+            border-radius: 999px;
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            padding: 4px 9px;
+            font-size: var(--font-size-xs);
+        }
+        .position-summary-strip b {
+            color: var(--text-primary);
+            font-family: var(--font-mono);
+            font-size: var(--font-size-sm);
+        }
+        .position-subsection {
+            margin-top: 14px;
+        }
+        .paper-positions-table,
+        .paper-trades-table {
+            width: 100%;
+            min-width: 760px;
+            border-collapse: collapse;
+            font-size: var(--font-size-sm);
+        }
+        .paper-positions-table th,
+        .paper-trades-table th {
+            text-align: left;
+            padding: 6px 8px;
+            background: var(--bg-tertiary);
+            font-size: var(--font-size-xs);
+            text-transform: uppercase;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border-primary);
+        }
+        .paper-positions-table td,
+        .paper-trades-table td {
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--border-subtle);
+            min-height: 32px;
+            vertical-align: top;
+        }
+        .paper-positions-table tr:hover,
+        .paper-trades-table tr:hover {
+            background: rgba(0,0,0,0.02);
+        }
+        .paper-trades-table tr.pending-row {
+            background: var(--color-warn-soft);
+        }
+        .paper-daily-report {
+            margin-bottom: 16px;
+            padding: 14px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--bg-secondary);
+            box-shadow: var(--shadow-xs);
+        }
+        .paper-daily-report h3 {
+            margin: 0 0 8px;
+            font-size: var(--font-size-lg);
+        }
+        .paper-report-section {
+            margin-top: 12px;
+        }
+        .paper-report-section h4 {
+            margin: 0 0 8px;
+            font-size: var(--font-size-base);
+        }
+        .report-row {
+            display: grid;
+            grid-template-columns: minmax(130px, 0.75fr) minmax(92px, 0.5fr) minmax(180px, 1fr) minmax(220px, 1.3fr);
+            gap: 8px;
+            align-items: start;
+            padding: 7px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: var(--font-size-sm);
+        }
+        .report-row > * {
+            min-width: 0;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+        .report-symbol {
+            color: var(--text-primary);
+            font-weight: 700;
+        }
+        .report-detail {
+            font-family: var(--font-mono);
+            color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
+        }
+        .report-reason {
+            color: var(--text-secondary);
+            font-size: var(--font-size-xs);
+            line-height: 1.5;
+        }
+        .badge-ok {
+            background: var(--color-status-ok-soft);
+            color: var(--color-status-ok);
+        }
+        .badge-exit {
+            background: var(--color-warn-soft);
+            color: var(--color-warn);
+        }
+        .research-path-badge {
+            word-break: break-all;
+            overflow-wrap: anywhere;
+        }
+        .paper-desk-note {
+            margin-top: 8px;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            line-height: 1.5;
+        }
+
+        .agent-layout {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(320px, 0.42fr);
+            gap: var(--card-gap);
+            align-items: start;
+        }
+        .agent-chat-panel,
+        .agent-context-panel {
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            padding: var(--panel-padding);
+            box-shadow: var(--shadow-xs);
+        }
+        .agent-toolbar {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+        .agent-transcript {
+            min-height: 280px;
+            max-height: 520px;
+            overflow: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            padding: 10px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            background: var(--bg-tertiary);
+        }
+        .agent-message {
+            max-width: 86%;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            padding: 10px 12px;
+            line-height: 1.65;
+            white-space: pre-wrap;
+        }
+        .agent-message.user {
+            align-self: flex-end;
+            border-color: rgba(37, 99, 201, 0.24);
+            background: rgba(37, 99, 201, 0.08);
+        }
+        .agent-message.assistant { align-self: flex-start; }
+        .agent-message .who {
+            margin-bottom: 4px;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+            font-weight: 700;
+        }
+        .agent-flags {
+            margin-top: 6px;
+            color: var(--color-warn);
+            font-size: var(--font-size-sm);
+        }
+        .agent-decision-card {
+            margin-top: 10px;
+            padding: 10px 11px;
+            border: 1px solid rgba(124, 58, 237, 0.28);
+            border-radius: var(--radius-sm);
+            background: rgba(124, 58, 237, 0.06);
+            white-space: normal;
+        }
+        .agent-decision-card strong {
+            display: block;
+            color: var(--text-primary);
+            font-size: var(--font-size-base);
+        }
+        .agent-decision-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 6px;
+            margin: 8px 0;
+        }
+        .agent-decision-grid span,
+        .agent-decision-card p {
+            margin: 4px 0 0;
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.55;
+        }
+        .agent-composer {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 10px;
+            margin-top: 12px;
+            align-items: end;
+        }
+        .agent-input {
+            min-height: 76px;
+            resize: vertical;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            padding: 10px 12px;
+            font: inherit;
+            line-height: 1.5;
+        }
+        .agent-input:focus-visible {
+            outline: 2px solid var(--color-info);
+            outline-offset: 2px;
+        }
+        .agent-context-grid {
+            display: grid;
+            gap: 10px;
+        }
+        .agent-context-item {
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--bg-tertiary);
+            padding: 10px;
+        }
+        .agent-context-item span {
+            display: block;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+        }
+        .agent-context-item strong {
+            display: block;
+            margin-top: 3px;
+            color: var(--text-primary);
+            font-size: var(--font-size-base);
+        }
+
+        /* ---- 今日速览首屏仪表盘 ---- */
+        .home-kpi-row {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+        .home-kpi-card {
+            display: block;
+            width: 100%;
+            text-align: left;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            padding: 10px 12px;
+            cursor: pointer;
+            font: inherit;
+            color: var(--text-primary);
+        }
+        .home-kpi-card:hover,
+        .home-kpi-card:focus-visible {
+            border-color: var(--color-info);
+        }
+        .home-kpi-label {
+            display: block;
+            color: var(--text-muted);
+            font-size: var(--font-size-sm);
+        }
+        .home-kpi-value {
+            display: block;
+            margin-top: 2px;
+            font-size: 1.3rem;
+            font-weight: 700;
+            line-height: 1.25;
+        }
+        .home-kpi-value.positive { color: #DC2626; }
+        .home-kpi-value.negative { color: #15803D; }
+        .home-kpi-sub {
+            display: block;
+            margin-top: 2px;
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.4;
+        }
+        .home-dash-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+            gap: 12px;
+        }
+        .home-dash-panel {
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            padding: 10px 12px;
+            min-width: 0;
+        }
+        .home-dash-panel h3 {
+            margin: 0 0 4px;
+            font-size: var(--font-size-base);
+            color: var(--text-primary);
+        }
+        .home-dash-panel .section-note {
+            margin: 0 0 6px;
+        }
+        .home-dash-chart {
+            width: 100%;
+            height: 280px;
+        }
+        .home-dash-chart.tall {
+            height: 320px;
+        }
+        .home-dash-chart[hidden] {
+            display: none;
+        }
+        .boundary-details summary {
+            cursor: pointer;
+            list-style: none;
+            display: inline-block;
+        }
+        .boundary-details summary::-webkit-details-marker {
+            display: none;
+        }
+        .boundary-details[open] summary {
+            margin-bottom: 6px;
+        }
+        @media (max-width: 1100px) {
+            .home-kpi-row {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .home-dash-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 900px) {
+            .metric-row,
+            .data-health-home-grid,
+            .settings-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .paper-desk-grid {
+                grid-template-columns: 1fr;
+            }
+            .paper-table-wrap {
+                overflow-x: auto;
+            }
+        }
+
+        @media (max-width: 720px) {
+            .paper-daily-report,
+            .paper-report-section,
+            .report-row,
+            .report-row > * {
+                min-width: 0;
+                max-width: 100%;
+            }
+            .report-row {
+                grid-template-columns: minmax(0, 1fr);
+            }
+            .report-symbol,
+            .report-detail,
+            .report-reason {
+                overflow-wrap: anywhere;
+                word-break: break-word;
+            }
+        }
+
+        @media (max-width: 520px) {
+            .metric-row,
+            .data-health-home-grid,
+            .settings-grid {
+                grid-template-columns: minmax(0, 1fr);
+            }
+            .data-health-home-card,
+            .data-health-home-card > *,
+            .settings-info-card,
+            .settings-info-card > *,
+            .paper-desk-note,
+            .badge-row {
+                min-width: 0;
+                max-width: 100%;
+            }
+            .data-health-home-card,
+            .data-health-home-card > *,
+            .settings-info-card,
+            .settings-info-card > *,
+            .paper-desk-note {
+                overflow-wrap: anywhere;
+                word-break: break-word;
+            }
+            .badge {
+                max-width: 100%;
+                white-space: normal;
+                overflow-wrap: anywhere;
+            }
+        }
+
+        /* ==================== AI 纸面交易员（独立纸面账本，只读） ==================== */
+        .ai-trader-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 14px;
+            align-items: start;
+        }
+        .ai-trader-card {
+            border: 1px solid var(--border-subtle);
+            border-radius: 10px;
+            padding: 12px 14px;
+            background: var(--bg-secondary);
+            min-width: 0;
+        }
+        .ai-trader-card h3 {
+            margin: 0 0 8px;
+            font-size: var(--font-size-base);
+        }
+        .ai-trader-kv {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            padding: 4px 0;
+            border-bottom: 1px dashed var(--border-subtle);
+            font-size: var(--font-size-sm);
+        }
+        .ai-trader-kv:last-child { border-bottom: 0; }
+        .ai-trader-kv span:first-child { color: var(--text-muted); flex-shrink: 0; }
+        .ai-trader-kv span:last-child {
+            text-align: right;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+            font-variant-numeric: tabular-nums;
+        }
+        .ai-trader-stage-committed { color: #7C3AED; font-weight: 600; }
+        .ai-trader-stage-proposed { color: #B45309; }
+        .ai-pnl-up { color: var(--color-up); font-variant-numeric: tabular-nums; }
+        .ai-pnl-down { color: var(--color-down); font-variant-numeric: tabular-nums; }
+        .ai-trader-chat-log {
+            max-height: 340px;
+            overflow-y: auto;
+            display: grid;
+            gap: 12px;
+            margin: 10px 0;
+        }
+        .ai-trader-chat-turn { border-bottom: 1px solid var(--border-subtle); padding-bottom: 8px; }
+        .ai-trader-chat-q { font-weight: 600; margin: 0 0 4px; font-size: var(--font-size-sm); }
+        .ai-trader-chat-a { margin: 0; white-space: pre-wrap; font-size: var(--font-size-sm); overflow-wrap: anywhere; }
+        .ai-trader-composer { display: flex; gap: 8px; align-items: stretch; }
+        .ai-trader-composer textarea {
+            flex: 1;
+            min-width: 0;
+            font: inherit;
+            padding: 8px;
+            border-radius: 6px;
+            border: 1px solid var(--border-subtle);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            resize: vertical;
+        }
+    </style>
+</head>
+<body>
+    <main class="app">
+        <aside class="side-rail" aria-label="QuantDesk 导航">
+            <button class="side-brand" type="button" data-module-home aria-pressed="true">
+                <span class="side-brand-mark" aria-hidden="true">Q</span>
+                <span>
+                    <span class="side-brand-title">QuantDesk</span>
+                    <span class="side-brand-sub">Research Desk</span>
+                </span>
+            </button>
+            <button id="sideCollapseButton" class="side-collapse-button" type="button" aria-pressed="false" aria-label="收起导航" title="收起导航">
+                <span class="side-collapse-icon" aria-hidden="true">‹</span>
+                <span class="side-collapse-label">收起导航</span>
+            </button>
+            <nav class="side-nav" aria-label="研究视图">
+                <div class="side-nav-label">模块</div>
+                <button class="side-nav-button" type="button" data-module-home aria-pressed="true">
+                    <span class="side-nav-icon" aria-hidden="true">览</span>
+                    <span>Dashboard</span>
+                </button>
+                <button class="side-nav-button" type="button" data-side-module-target="ai-log-section" aria-pressed="false">
+                    <span class="side-nav-icon" aria-hidden="true">智</span>
+                    <span>AI 日志</span>
+                </button>
+                <button class="side-nav-button" type="button" data-side-module-target="paper-watchlist-section" aria-pressed="false">
+                    <span class="side-nav-icon" aria-hidden="true">池</span>
+                    <span>Watch Pool</span>
+                </button>
+                <button class="side-nav-button" type="button" data-side-module-target="decision-history-section" aria-pressed="false">
+                    <span class="side-nav-icon" aria-hidden="true">溯</span>
+                    <span>Decision History</span>
+                </button>
+                <button class="side-nav-button" type="button" data-side-module-target="performance-section" aria-pressed="false">
+                    <span class="side-nav-icon" aria-hidden="true">策</span>
+                    <span>Strategy Center</span>
+                </button>
+                <div class="side-nav-label">研究工具</div>
+                <button class="side-nav-button" type="button" data-side-module-target="daily-focus-section" aria-pressed="false">
+                    <span class="side-nav-icon" aria-hidden="true">荐</span>
+                    <span>每日研究候选</span>
+                </button>
+                <button class="side-nav-button" type="button" data-side-module-target="agent-section" aria-pressed="false">
+                    <span class="side-nav-icon" aria-hidden="true">研</span>
+                    <span>LLM 研究室</span>
+                </button>
+                <button class="side-nav-button" type="button" data-side-module-target="ai-trader-section" aria-pressed="false">
+                    <span class="side-nav-icon" aria-hidden="true">AI</span>
+                    <span>AI 纸面交易员</span>
+                </button>
+                <button class="side-nav-button" type="button" data-side-module-target="backtest-section" aria-pressed="false">
+                    <span class="side-nav-icon" aria-hidden="true">测</span>
+                    <span>回测</span>
+                </button>
+                <button class="side-nav-button" type="button" data-side-module-target="strategy-lab-section" aria-pressed="false">
+                    <span class="side-nav-icon" aria-hidden="true">因</span>
+                    <span>因子分析</span>
+                </button>
+                <button class="side-nav-button" type="button" data-side-module-target="data-ops-section" aria-pressed="false">
+                    <span class="side-nav-icon" aria-hidden="true">设</span>
+                    <span>设置</span>
+                </button>
+            </nav>
+            <div class="side-boundary" aria-label="系统边界">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+        </aside>
+
+        <div class="main-panel">
+        <header class="topbar">
+            <div>
+                <h1 id="topbarTitle">研究概览</h1>
+                <p class="subtitle">QuantDesk · 本地数据驱动的 A 股研究工具。不接券商、不下真实订单、不构成投资建议。主流程收敛为：今日重点 → LLM 研究室 → 纸面模拟池 → 策略成绩单 → 数据状态。</p>
+            </div>
+            <div class="topbar-right">
+                <div class="section-actions">
+                    <button id="refreshResearchLoopButton" class="action-button" type="button" title="后台刷新当前研究池。Research Only，不扫描全 A，不接券商。">刷新研究闭环</button>
+                    <button id="globalUpdateButton" class="action-button secondary-action" type="button" title="只联网更新当前候选池的日线数据（不扫描全 A，不接券商）">更新候选日线</button>
+                </div>
+                <details class="boundary-details" aria-label="边界说明">
+                    <summary class="badge">边界声明 · 研究/纸面 7 项</summary>
+                    <div class="badge-row">
+                        <span class="badge">Research Only</span>
+                        <span class="badge">Paper Account Only</span>
+                        <span class="badge">No Broker Route</span>
+                        <span class="badge">Live Execution Locked</span>
+                        <span class="badge">QMT Order Route Locked</span>
+                        <span class="badge">Not Investment Advice</span>
+                        <span class="badge">Not Position Advice</span>
+                    </div>
+                </details>
+            </div>
+        </header>
+
+        <div id="dutyStatusStrip" class="duty-strip" aria-label="值班状态灯排" role="group">
+            <button class="duty-lamp" type="button" data-duty-lamp="t0" data-duty-target="forwardPitHomeSection" title="跳到 Forward PIT / T0 状态">
+                <span class="duty-lamp-label">T0</span>
+                <span class="duty-lamp-value">—</span>
+                <span class="duty-lamp-sub">读取中</span>
+            </button>
+            <button class="duty-lamp" type="button" data-duty-lamp="data" data-duty-target="dataHealthHomeSection" title="跳到数据健康">
+                <span class="duty-lamp-label">数据健康</span>
+                <span class="duty-lamp-value">—</span>
+                <span class="duty-lamp-sub">读取中</span>
+            </button>
+            <button class="duty-lamp" type="button" data-duty-lamp="batch" data-duty-target="startupUpdateStatus" title="跳到候选批次说明">
+                <span class="duty-lamp-label">候选批次</span>
+                <span class="duty-lamp-value">—</span>
+                <span class="duty-lamp-sub">读取中</span>
+            </button>
+            <button class="duty-lamp" type="button" data-duty-lamp="brain" data-duty-target="homeDashboardSection" title="跳到今日速览">
+                <span class="duty-lamp-label">市场大脑</span>
+                <span class="duty-lamp-value">—</span>
+                <span class="duty-lamp-sub">读取中</span>
+            </button>
+            <button class="duty-lamp" type="button" data-duty-lamp="paper" data-duty-target="homeDashboardSection" title="跳到今日速览">
+                <span class="duty-lamp-label">Paper 净值</span>
+                <span class="duty-lamp-value">—</span>
+                <span class="duty-lamp-sub">读取中</span>
+            </button>
+        </div>
+
+        <section id="startupUpdateStatus" class="startup-update startup-update-pending" aria-live="polite">
+            正在读取启动数据更新状态...
+        </section>
+
+        <div id="newsStatusBanner" class="news-status-banner" aria-live="polite" hidden>
+            <span id="newsStatus" class="badge">新闻状态加载中…</span>
+        </div>
+
+        <section id="homeDashboardSection" class="section home-dashboard" aria-labelledby="homeDashboardTitle" data-home-section>
+            <div class="section-head">
+                <div>
+                    <h2 id="homeDashboardTitle">今日速览</h2>
+                    <p class="section-note">本地研究数据的图形化总览；Research Only，不构成投资建议。点击卡片进入对应模块，点击候选条形直接打开个股详情。</p>
+                </div>
+            </div>
+            <div class="home-kpi-row">
+                <button id="kpiCandidatesCard" class="home-kpi-card" type="button" data-module-target="daily-focus-section" title="进入每日研究候选">
+                    <span class="home-kpi-label">今日候选</span>
+                    <span class="home-kpi-value" id="kpiCandidatesValue">—</span>
+                    <span class="home-kpi-sub" id="kpiCandidatesSub">正在加载候选数据…</span>
+                </button>
+                <button id="kpiPaperCard" class="home-kpi-card" type="button" data-module-target="paper-watchlist-section" title="进入纸面模拟">
+                    <span class="home-kpi-label">Paper 账户（模拟）</span>
+                    <span class="home-kpi-value" id="kpiPaperValue">—</span>
+                    <span class="home-kpi-sub" id="kpiPaperSub">正在加载净值数据…</span>
+                </button>
+                <button id="kpiDataHealthCard" class="home-kpi-card" type="button" data-module-target="data-ops-section" title="进入设置查看完整数据诊断">
+                    <span class="home-kpi-label">数据健康</span>
+                    <span class="home-kpi-value" id="kpiDataHealthValue">—</span>
+                    <span class="home-kpi-sub" id="kpiDataHealthSub">正在加载健康状态…</span>
+                </button>
+                <button id="kpiPrevBatchCard" class="home-kpi-card" type="button" data-module-target="performance-section" title="进入策略成绩单">
+                    <span class="home-kpi-label">昨日批次复盘</span>
+                    <span class="home-kpi-value" id="kpiPrevBatchValue">—</span>
+                    <span class="home-kpi-sub" id="kpiPrevBatchSub">正在加载复盘数据…</span>
+                </button>
+                <button id="kpiMarketBrainCard" class="home-kpi-card" type="button" data-module-target="performance-section" title="Market Brain 市场状态（研究观察，shadow）">
+                    <span class="home-kpi-label">市场状态（Market Brain）</span>
+                    <span class="home-kpi-value" id="kpiMarketBrainValue">—</span>
+                    <span class="home-kpi-sub" id="kpiMarketBrainSub">正在加载市场状态快照…</span>
+                </button>
+            </div>
+            <div class="home-dash-grid">
+                <article class="home-dash-panel">
+                    <h3>今日候选 Top10（研究优先分）</h3>
+                    <p class="section-note" id="homeCandidateNote">条长为研究优先分（含策略权重）；点击条形打开个股详情。仅为研究排序，不是买卖建议。</p>
+                    <div id="homeCandidateChart" class="home-dash-chart tall" hidden></div>
+                    <div id="homeCandidateChartEmpty" class="empty-state">正在加载今日候选…</div>
+                </article>
+                <article class="home-dash-panel">
+                    <h3>板块涨跌 Top5</h3>
+                    <p class="section-note">来自本地板块缓存；深红为涨、深绿为跌（A 股约定）。</p>
+                    <div id="homeSectorChart" class="home-dash-chart tall" hidden></div>
+                    <div id="homeSectorChartEmpty" class="empty-state">正在加载板块数据…</div>
+                </article>
+                <article class="home-dash-panel">
+                    <h3>Paper 净值 vs 沪深300</h3>
+                    <p class="section-note">纸面模拟账户累计收益与基准指数对比；历史表现不代表未来。</p>
+                    <div id="homeEquityChart" class="home-dash-chart" hidden></div>
+                    <div id="homeEquityChartEmpty" class="empty-state">正在加载净值数据…</div>
+                </article>
+                <article class="home-dash-panel">
+                    <h3>昨日候选逐股表现</h3>
+                    <p class="section-note" id="homePrevBatchNote">上一批候选自入选以来的涨跌复盘；用于验证策略是否兑现，不代表推荐。</p>
+                    <div id="homePrevBatchChart" class="home-dash-chart" hidden></div>
+                    <div id="homePrevBatchChartEmpty" class="empty-state">正在加载复盘数据…</div>
+                </article>
+            </div>
+        </section>
+
+        <section id="forwardPitHomeSection" class="section" aria-labelledby="forwardPitHomeTitle" data-home-section>
+            <div class="section-head">
+                <div>
+                    <h2 id="forwardPitHomeTitle">Forward PIT / T0 状态</h2>
+                    <p class="section-note">前瞻性 PIT 板块证据进展；只读展示既有 readiness 工件，不重算。T0 由计划任务自然运行产生。</p>
+                </div>
+                <button id="refreshForwardPitHomeButton" class="action-button secondary-action" type="button">刷新</button>
+            </div>
+            <div id="forwardPitHomePanel" class="data-health-home-grid">
+                <div class="empty-state">正在加载 Forward PIT 状态...</div>
+            </div>
+        </section>
+
+        <section id="dataHealthHomeSection" class="section" aria-labelledby="dataHealthHomeTitle" data-home-section>
+            <div class="section-head">
+                <div>
+                    <h2 id="dataHealthHomeTitle">数据健康</h2>
+                    <p class="section-note">本地数据完整性和新鲜度状态；这里只展示简版，完整诊断在设置页。</p>
+                </div>
+                <button id="refreshDataHealthHomeButton" class="action-button secondary-action" type="button">刷新</button>
+            </div>
+            <div id="dataHealthHomePanel" class="data-health-home-grid">
+                <div class="empty-state">正在加载数据健康状态...</div>
+            </div>
+        </section>
+
+        <section id="marketHomeSection" class="section" aria-labelledby="marketTitle" data-home-section>
+            <div class="section-head">
+                <h2 id="marketTitle">市场全景</h2>
+                <div class="section-actions">
+                    <p class="section-note" id="marketDataNote">正在读取本地市场数据…</p>
+                    <button id="refreshSectorButton" class="action-button" type="button">刷新板块</button>
+                </div>
+            </div>
+            <div class="market-layout">
+                <div>
+                    <div class="market-grid" id="marketOverview">
+                        <div class="empty-state">正在加载市场全景…</div>
+                    </div>
+                    <div class="sentiment" id="marketSentiment">正在生成市场情绪…</div>
+                </div>
+                <div class="sector-grid" id="sectorBoard">
+                    <div class="empty-state">正在加载板块涨跌榜…</div>
+                </div>
+            </div>
+            <div id="candidateConfidenceHomePanel" class="candidate-confidence-panel" data-candidate-confidence-panel>正在汇总候选参考可信度…</div>
+        </section>
+
+        <section id="realtimeHomeSection" class="realtime-section" aria-labelledby="realtimeTitle" data-home-section>
+            <div class="realtime-head">
+                <div>
+                    <div class="realtime-title-row">
+                        <h2 id="realtimeTitle">实时观察层</h2>
+                        <span class="realtime-boundary">盘中/实时临时数据</span>
+                        <span class="badge">不覆盖正式日线</span>
+                        <span class="badge">Not Position Advice</span>
+                    </div>
+                    <p class="subtitle">用于随时查看当前快照、板块变化和单股观察；正式候选复核仍使用完整日线。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="realtimeStatusNote">正在读取实时快照缓存…</p>
+                    <button id="refreshRealtimeButton" class="action-button" type="button">刷新实时观察</button>
+                </div>
+            </div>
+            <div class="realtime-grid">
+                <div>
+                    <div class="realtime-metrics" id="realtimeMetrics">
+                        <div class="empty-state">正在加载实时观察数据…</div>
+                    </div>
+                    <div class="realtime-list-grid" id="realtimeLists">
+                        <div class="empty-state">正在加载实时涨跌榜…</div>
+                    </div>
+                </div>
+                <aside class="stock-search-panel" aria-labelledby="stockSearchTitle">
+                    <h3 id="stockSearchTitle">单股查询观察</h3>
+                    <p class="section-note">输入股票代码或名称，查看实时快照、完整日线、K线/MACD/KDJ/RSI 和研究性情景参考。</p>
+                    <div class="stock-search-controls">
+                        <input id="stockSearchInput" class="stock-search-input" type="search" placeholder="例如 000802 或 北京文化" autocomplete="off">
+                        <button id="stockSearchButton" class="action-button" type="button">查询</button>
+                    </div>
+                    <div id="stockSearchResults" class="stock-search-results"></div>
+                </aside>
+            </div>
+        </section>
+
+        <section id="limit-review-section" class="section module-view" aria-labelledby="limitReviewTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="limitReviewTitle">涨停复盘报告</h2>
+                    <p class="section-note">涨停池、连板、封板率、题材归因，以及与 Quant 候选的交集。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="limitReviewNote">正在读取本地涨停复盘缓存…</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="refreshLimitReviewButton" class="action-button" type="button">刷新涨停复盘</button>
+                </div>
+            </div>
+            <div id="limitReviewPanel" class="limit-review">
+                <div class="empty-state">正在加载涨停复盘报告…</div>
+            </div>
+        </section>
+
+        <section id="theme-map-section" class="section module-view" aria-labelledby="themeMapTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="themeMapTitle">板块/题材映射</h2>
+                    <p class="section-note">补齐 stock_theme_map.csv 后，涨停复盘和 Quant 日总结会优先使用可追溯题材，不再只能退回行业线索。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="themeMapNote">正在读取本地映射状态…</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="refreshThemeMapStatusButton" class="action-button" type="button">读取状态</button>
+                    <button id="rebuildThemeMapLocalButton" class="action-button" type="button">本地重建</button>
+                    <button id="refreshThemeMapNetworkButton" class="action-button" type="button">显式联网补全</button>
+                    <button id="generateThemeMapDraftButton" class="action-button" type="button">生成导入草稿</button>
+                    <button id="importThemeMapButton" class="action-button" type="button">导入草稿</button>
+                </div>
+            </div>
+            <div id="themeMapPanel" class="theme-map-panel">
+                <div class="empty-state">正在加载板块/题材映射覆盖率…</div>
+            </div>
+        </section>
+
+        <section id="daily-focus-section" class="section module-view" aria-labelledby="dailyFocusTitle" data-module-view hidden>
+            <div class="section-head">
+                <h2 id="dailyFocusTitle">每日研究候选</h2>
+                <div class="section-actions">
+                    <p class="section-note" id="candidateDataNote">正在读取本地候选数据…</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="updateCandidatesButton" class="action-button" type="button">联网更新当前候选日线</button>
+                    <button id="generateRecommendationsButton" class="action-button" type="button">生成今日研究候选</button>
+                    <button class="action-button secondary-action" type="button" data-module-target="candidate-pool-section" title="观察/讨论暂存区：历史候选、观察池与待降级复盘样本。这里不是主舞台，主验证在纸面模拟池。">观察 / 讨论候选池</button>
+                    <button class="action-button secondary-action" type="button" data-module-target="quant-summary-section" title="Quant 日总结：复盘已选股票当前是否符合入选策略假设，并标记回测可用性。">Quant 日总结</button>
+                </div>
+            </div>
+            <div id="dailyStrategySummary" class="candidate-generation-panel">正在读取今日策略研究摘要…</div>
+            <div class="badge-row" aria-label="今日候选边界" style="justify-content:flex-start;margin-bottom:12px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <div id="llmSelectionAnalysis" class="llm-analysis-card">
+                <div class="llm-analysis-header">
+                    <h3>LLM 选股分析</h3>
+                    <span id="llmAnalysisStatus" class="section-note">分析中...</span>
+                </div>
+                <div id="llmAnalysisContent" class="llm-analysis-content">
+                    <div class="empty-state">正在分析今日选股...</div>
+                </div>
+            </div>
+            <div id="candidateGenerationPanel" class="candidate-generation-panel">正在读取今日研究候选生成状态…</div>
+            <div id="candidateConfidencePanel" class="candidate-confidence-panel" data-candidate-confidence-panel>正在汇总候选参考可信度…</div>
+            <div id="candidateGapPanel" class="gap-panel">正在检查候选数据缺口…</div>
+            <div class="focus-grid" id="dailyFocusGrid">
+                <div class="empty-state">正在加载每日重点复核…</div>
+            </div>
+            <div class="paper-entry-zone">
+                <h3>执行今日纸面策略</h3>
+                <p class="paper-desk-note">点击后把今日策略候选同步到本地纸面研究池，进入持仓跟踪与每日复盘；不会连接券商，不会生成真实订单，不构成投资建议或真实配置指令。</p>
+                <div class="badge-row" style="justify-content:flex-start;margin-bottom:10px">
+                    <span class="badge">Research Only</span>
+                    <span class="badge">Paper Account Only</span>
+                    <span class="badge">No Broker Route</span>
+                    <span class="badge">Live Execution Locked</span>
+                    <span class="badge">QMT Order Route Locked</span>
+                    <span class="badge">Not Investment Advice</span>
+                    <span class="badge">Not Position Advice</span>
+                </div>
+                <button id="executeStrategyButton" class="action-button" type="button">执行今日纸面策略（同步入池）</button>
+                <span id="strategyExecuteStatus" class="section-note"></span>
+            </div>
+        </section>
+
+        <section id="quant-summary-section" class="section module-view" aria-labelledby="quantSummaryTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="quantSummaryTitle">Quant 日总结</h2>
+                    <p class="section-note">复盘我们选出的股票当前是否符合入选策略假设，并标记回测可用性。</p>
+                </div>
+                <div class="section-actions">
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <div class="badge-row" aria-label="日总结边界">
+                        <span class="badge">Research Only</span>
+                        <span class="badge">No Broker Route</span>
+                        <span class="badge">Not Position Advice</span>
+                    </div>
+                </div>
+            </div>
+            <div id="quantSummaryPanel" class="quant-summary">
+                <div class="empty-state">正在生成 Quant 日总结…</div>
+            </div>
+        </section>
+
+        <section id="candidate-pool-section" class="section module-view" aria-labelledby="candidateTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="candidateTitle">候选股票池</h2>
+                    <p class="section-note">长期、打板和只观察分层独立展示。</p>
+                </div>
+                <div class="section-actions">
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                </div>
+            </div>
+            <div class="badge-row" aria-label="候选池边界" style="justify-content:flex-start;margin-bottom:12px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <div class="candidate-grid" id="candidatesGrid">
+                <div class="empty-state">正在加载候选股票…</div>
+            </div>
+        </section>
+
+        <section id="agent-section" class="section module-view" aria-labelledby="agentTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="agentTitle">研究助手</h2>
+                    <p class="section-note">读取当前本地研究证据、候选池和数据状态后回答问题；默认不联网，勾选后才调用已配置的 LLM API。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="agentStatusNote">正在读取 Agent 配置…</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="refreshAgentContextButton" class="action-button" type="button">刷新上下文</button>
+                </div>
+            </div>
+            <div class="badge-row" aria-label="Agent 边界" style="justify-content:flex-start;margin-bottom:12px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <div class="agent-layout">
+                <div class="agent-chat-panel">
+                    <div class="agent-toolbar">
+                        <label class="inline-toggle">技能
+                            <select id="agentSkillSelect" class="stock-search-input" style="min-width:180px">
+                                <option value="">自由问答</option>
+                            </select>
+                        </label>
+                        <label class="inline-toggle">
+                            <input type="checkbox" id="agentNetworkToggle">
+                            允许调用已配置 LLM API
+                        </label>
+                        <button id="clearAgentChatButton" class="action-button is-muted" type="button">清空对话</button>
+                        <button id="addDiscussedCandidateToPaperButton" class="action-button" type="button" hidden>带本次意见加入纸面模拟池</button>
+                    </div>
+                    <div id="agentTranscript" class="agent-transcript" aria-live="polite">
+                        <div class="empty-state">可以问：今天数据是否完整？最值得复盘的候选是谁？某只股票为什么入选？当前风险点在哪里？</div>
+                    </div>
+                    <div class="agent-composer">
+                        <textarea id="agentQuestionInput" class="agent-input" placeholder="输入你的问题，Enter 发送，Shift+Enter 换行"></textarea>
+                        <button id="sendAgentQuestionButton" class="action-button" type="button">发送</button>
+                    </div>
+                    <p class="panel-disclaimer">研究助手只使用本地只读证据和你显式提供的问题；回答会经过策略边界过滤和证据校验，不连接券商、不下单、不提供仓位指令。</p>
+                </div>
+                <aside class="agent-context-panel">
+                    <h3>当前可读上下文</h3>
+                    <p class="section-note" style="margin:6px 0 12px">这里显示 Agent 能读取到的本地证据概况。缺失就会明确显示，不会伪造成完整数据。</p>
+                    <div id="agentContextPanel" class="agent-context-grid">
+                        <div class="empty-state">正在读取本地上下文…</div>
+                    </div>
+                </aside>
+            </div>
+        </section>
+
+        <section id="ai-trader-section" class="section module-view" aria-labelledby="aiTraderTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="aiTraderTitle">AI 纸面交易员（独立纸面账本）</h2>
+                    <p class="section-note">只读展示独立 AI 交易员的纸面账户、复盘与自选理由；账本为 state/ai_trader/ledger.json，与正式 QuantDesk 纸面账本相互独立。唯一自动决策入口是晚间 20:20 计划任务，本页不提供运行/重跑控制。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="aiTraderStatusNote">正在读取 AI 纸面交易员状态…</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="refreshAiTraderButton" class="action-button secondary-action" type="button">刷新数据</button>
+                </div>
+            </div>
+            <div class="badge-row" aria-label="AI 纸面交易员边界" style="justify-content:flex-start;margin-bottom:10px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <p class="section-note" style="margin:0 0 12px"><strong>聊天不能下单：</strong>聊天只能解释它的想法，仓位只在每晚纸面复盘流程中变化。</p>
+            <div id="aiTraderWarningsPanel"></div>
+            <div class="ai-trader-grid">
+                <article class="ai-trader-card" aria-label="账户摘要">
+                    <h3>账户摘要（模拟盘）</h3>
+                    <div id="aiTraderAccountPanel">
+                        <div class="empty-state">正在加载账户摘要…</div>
+                    </div>
+                </article>
+                <article class="ai-trader-card" aria-label="调度状态">
+                    <h3>最近一次晚间复盘状态</h3>
+                    <div id="aiTraderSchedulePanel">
+                        <div class="empty-state">正在加载调度状态…</div>
+                    </div>
+                </article>
+                <article class="ai-trader-card" aria-label="当前纸面持仓" style="grid-column: 1 / -1;">
+                    <h3>当前纸面持仓</h3>
+                    <div id="aiTraderPositionsPanel">
+                        <div class="empty-state">正在加载纸面持仓…</div>
+                    </div>
+                </article>
+                <article class="ai-trader-card" aria-label="最近复盘" style="grid-column: 1 / -1;">
+                    <h3>今晚 / 最近一次复盘</h3>
+                    <div id="aiTraderJournalPanel">
+                        <div class="empty-state">正在加载复盘…</div>
+                    </div>
+                </article>
+                <article class="ai-trader-card" aria-label="提议与提交">
+                    <h3>LLM 提议 vs 实际提交</h3>
+                    <p class="section-note">「提议」是大模型今晚提出过的想法；「提交」是通过账户约束后真正写入次日纸面计划的委托；两者不相等时页面会显式标注。</p>
+                    <div id="aiTraderProposedPanel">
+                        <div class="empty-state">正在加载提议与提交…</div>
+                    </div>
+                </article>
+                <article class="ai-trader-card" aria-label="成交与拒绝">
+                    <h3>最近成交与被拒原因</h3>
+                    <div id="aiTraderFillsPanel">
+                        <div class="empty-state">正在加载成交记录…</div>
+                    </div>
+                </article>
+                <article class="ai-trader-card" aria-label="投资主张与风格战绩">
+                    <h3>它自己的主张与风格战绩</h3>
+                    <div id="aiTraderPhilosophyPanel">
+                        <div class="empty-state">正在加载投资主张…</div>
+                    </div>
+                </article>
+                <article class="ai-trader-card" aria-label="推荐来源">
+                    <h3>研究台推荐来源 vs AI 自选来源</h3>
+                    <div id="aiTraderSourcePanel">
+                        <div class="empty-state">正在加载来源归因…</div>
+                    </div>
+                </article>
+            </div>
+            <article class="ai-trader-card" aria-label="与 AI 交易员对话" style="margin-top:14px;">
+                <h3>问它两句（只能聊，不能下单）</h3>
+                <p class="section-note">回答由已配置的 LLM 服务生成；下方会实时显示该服务是本地（Local LLM）还是外部（External LLM）端点、模型与厂商，以及「数据离开本机」提示。未配置或不可用时这里会显示真实原因。聊天记录只追加到它自己的日志，不写任何账本或计划。</p>
+                <div id="aiTraderLlmRuntimePanel"></div>
+                <div id="aiTraderLlmDisclosurePanel"></div>
+                <div id="aiTraderChatLog" class="ai-trader-chat-log" aria-live="polite">
+                    <div class="empty-state">还没聊过。可以问：600172 为什么还拿着？你现在怎么看中线做法？</div>
+                </div>
+                <div class="ai-trader-composer">
+                    <label class="sr-only" for="aiTraderChatInput" hidden>问 AI 交易员一个问题</label>
+                    <textarea id="aiTraderChatInput" rows="2" maxlength="2000" placeholder="例如：今天为什么选这只？你现在的止损思路是什么？（仅讨论，不能下单）"></textarea>
+                    <button id="sendAiTraderChatButton" class="action-button" type="button">发送</button>
+                </div>
+                <p class="section-note" id="aiTraderChatStatus"></p>
+            </article>
+        </section>
+
+        <section id="data-ops-section" class="section module-view" aria-labelledby="dataOpsTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="dataOpsTitle">设置</h2>
+                    <p class="section-note">数据健康完整诊断、数据更新操作、环境信息和系统边界；所有操作保持 Research Only / Paper Account Only。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="dataOpsNote">正在读取数据健康状态…</p>
+                    <label class="inline-toggle"><input type="checkbox" id="dataOpsAutoCheck"> 每 5 分钟自动检查</label>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="refreshDataHealthButton" class="action-button" type="button">刷新看板</button>
+                    <button id="updateCandidatesDailyButton" class="action-button" type="button">更新候选日线</button>
+                    <button id="updateAllDataButton" class="action-button" type="button">有界更新（最多120只）</button>
+                    <button id="repairDailyButton" class="action-button" type="button" title="扫描并修正本地日线里损坏的价格（自动备份原文件）">修复日线坏值</button>
+                </div>
+            </div>
+            <div id="dataHealthPanel" class="data-health-panel">
+                <div class="empty-state">正在加载数据健康看板…</div>
+            </div>
+            <div class="settings-grid" id="settingsEnvironmentPanel">
+                <div class="settings-info-card"><span>服务版本</span><strong>正在读取...</strong></div>
+                <div class="settings-info-card"><span>主服务</span><strong>8000 / Flask</strong></div>
+                <div class="settings-info-card"><span>边界</span><strong>Research Only</strong></div>
+            </div>
+        </section>
+
+        <section id="ai-log-section" class="section module-view" aria-labelledby="aiFundDailyLogTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="aiFundDailyLogTitle">AI 日志</h2>
+                    <p class="section-note">按“市场观察 → 策略证据 → 纸面风险 → 决策事件”汇总当天可审计研究证据。各项仅显示后端证据时点；LLM 关闭或证据缺失时保留 missing/degraded，不补造 AI 思考过程或时间线。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="aiFundDailyLogNote">正在读取当天研究证据…</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回 Dashboard</button>
+                    <button id="refreshAiFundDailyLogButton" class="action-button" type="button">刷新 AI 日志</button>
+                </div>
+            </div>
+            <div class="badge-row" aria-label="AI 日志边界" style="justify-content:flex-start;margin-bottom:12px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <div id="aiFundDailyLogPanel" class="performance-panel">
+                <div class="empty-state">正在加载 AI 日志…</div>
+            </div>
+        </section>
+
+        <section id="decision-history-section" class="section module-view" aria-labelledby="decisionHistoryTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="decisionHistoryTitle">Decision History</h2>
+                    <p class="section-note">合并展示后端权威事件与 Watch Pool 生命周期状态；每条记录保留日期、动作、策略、原因和证据状态。浏览器不推算持有天数、盈亏或复核阈值。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="decisionHistoryNote">正在读取决策事件…</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回 Dashboard</button>
+                    <button id="refreshDecisionHistoryButton" class="action-button" type="button">刷新决策历史</button>
+                </div>
+            </div>
+            <div class="badge-row" aria-label="决策历史边界" style="justify-content:flex-start;margin-bottom:12px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <div id="decisionHistoryPanel" class="performance-panel">
+                <div class="empty-state">正在加载决策历史…</div>
+            </div>
+        </section>
+
+        <section id="paper-watchlist-section" class="section module-view" aria-labelledby="paperWatchlistTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="paperWatchlistTitle">Watch Pool · 纸面模拟</h2>
+                    <p class="section-note">纸面模拟账户持仓跟踪与每日操作记录。策略候选只同步到本地纸面研究池，退出只进入复核报告。Research Only · Paper Account Only · 不构成投资建议 · 不接券商。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="paperWatchlistNote">正在加载...</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回</button>
+                    <button id="syncPaperWatchlistButton" class="action-button" type="button">同步今日候选</button>
+                    <button id="refreshPaperWatchlistButton" class="action-button" type="button">刷新纸面跟踪</button>
+                    <button id="resetPaperAccountButton" class="action-button secondary-action" type="button">重置视图</button>
+                </div>
+            </div>
+            <div class="badge-row" aria-label="纸面模拟边界" style="justify-content:flex-start;margin-bottom:12px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <p class="panel-disclaimer">当前页面是纸面研究复核台：后端开放同步候选、刷新跟踪、继续验证、降级复盘、归档和恢复；不开放真实买入/卖出/重置账本，不生成成交、费用或订单。</p>
+            <div id="decisionBoardEnvelope" class="metric-row" aria-label="决策看板证据封套">
+                <article class="metric-box"><span>决策看板</span><strong>正在读取后端证据…</strong></article>
+            </div>
+            <div id="paperWatchlistPanel">
+                <div id="paperAccountSummary" class="metric-row"></div>
+                <div class="paper-desk-grid">
+                    <div id="paperStrategyPanel" class="paper-strategy-panel"></div>
+                    <div id="paperPositionsPanel" class="paper-positions-panel"></div>
+                </div>
+                <div id="paperDailyReport" class="paper-daily-report">
+                    <h3>纸面复核提醒</h3>
+                    <p class="paper-desk-note" id="paperDailyReportDate"></p>
+                    <div id="paperDailyBuySection" class="paper-report-section">
+                        <h4>纸面入池记录</h4>
+                        <div id="paperDailyBuyList"></div>
+                    </div>
+                    <div id="paperDailySellSection" class="paper-report-section">
+                        <h4>待验证复核</h4>
+                        <div id="paperDailySellList"></div>
+                    </div>
+                </div>
+                <div id="llmDailyReview" class="llm-analysis-card" style="margin-top:14px">
+                    <div class="llm-analysis-header">
+                        <h3>LLM 复盘点评</h3>
+                        <span id="llmReviewStatus" class="section-note">分析中...</span>
+                    </div>
+                    <div id="llmReviewContent" class="llm-analysis-content">
+                        <div class="empty-state">正在生成今日复盘...</div>
+                    </div>
+                </div>
+                <div id="paperTradesPanel" class="paper-trades-panel"></div>
+            </div>
+        </section>
+
+        <section id="strategy-lab-section" class="section module-view" aria-labelledby="strategyLabTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="strategyLabTitle">策略实验室</h2>
+                    <p class="section-note">读取本地策略家族排行榜、候选/信号统计和映射覆盖率，用来解释“为什么这类策略值得复盘”。这里只展示证据，不自动改评分、不接券商、不生成交易指令。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="strategyLabNote">正在读取策略实验室证据...</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="refreshStrategyLabButton" class="action-button" type="button">刷新策略实验室</button>
+                </div>
+            </div>
+            <div class="badge-row" aria-label="策略实验室边界" style="justify-content:flex-start;margin-bottom:12px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <div id="strategyLabPanel" class="performance-panel">
+                <div class="empty-state">正在加载策略实验室证据...</div>
+            </div>
+        </section>
+
+        <section id="performance-section" class="section module-view" aria-labelledby="performanceTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="performanceTitle">Strategy Center · 策略成绩单</h2>
+                    <p class="section-note">汇总今日重点、纸面模拟池、原始预期兑现、分策略表现、降级复盘原因和数据缺口。历史样本不代表未来收益，不构成投资建议。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="performanceNote">正在读取绩效样本…</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="syncPaperCandidatesButton" class="action-button" type="button">同步今日候选到纸面池</button>
+                    <button id="refreshPaperSimulationButton" class="action-button" type="button">刷新纸面模拟池</button>
+                    <button id="rebuildPerformanceButton" class="action-button" type="button">重建绩效样本</button>
+                </div>
+            </div>
+            <div id="strategyBrainShadowPanel" class="performance-panel">
+                <div class="empty-state">正在加载 Strategy Brain 影子选择快照…</div>
+            </div>
+            <div id="performancePanel" class="performance-panel">
+                <div class="empty-state">正在加载绩效复盘…</div>
+            </div>
+        </section>
+
+        <section id="risk-notifications-section" class="section module-view" aria-labelledby="riskNotificationsTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="riskNotificationsTitle">风险/通知看板</h2>
+                    <p class="section-note">只读汇总纸面模拟池的观察退出参考、风险告警、通知中心只读试运行状态和每日防护诊断；不连接券商、不下单、不提供仓位指令。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="riskNotificationsNote">正在读取本地风险/通知状态...</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="refreshRiskNotificationsButton" class="action-button" type="button">刷新风险/通知</button>
+                    <button id="refreshPaperRiskButton" class="action-button" type="button">刷新纸面风险线</button>
+                </div>
+            </div>
+            <div class="badge-row" aria-label="风险通知边界" style="justify-content:flex-start;margin-bottom:12px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <div id="riskNotificationsPanel" class="performance-panel">
+                <div class="empty-state">正在加载风险/通知看板...</div>
+            </div>
+        </section>
+
+        <section id="smart-stop-section" class="section module-view" aria-labelledby="smartStopTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="smartStopTitle">观察退出参考</h2>
+                    <p class="section-note">只读展示纸面观察名单里的观察退出参考状态、风险线触发和强制复核规则。触发后只进入纸面复核，不自动下单、不连接券商。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="smartStopNote">正在读取观察退出参考状态...</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="refreshSmartStopButton" class="action-button" type="button">刷新观察退出参考</button>
+                </div>
+            </div>
+            <div class="badge-row" aria-label="观察退出参考边界" style="justify-content:flex-start;margin-bottom:12px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <div id="smartStopPanel" class="performance-panel">
+                <div class="empty-state">正在加载观察退出参考状态...</div>
+            </div>
+        </section>
+
+        <section id="notification-center-section" class="section module-view" aria-labelledby="notificationCenterTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="notificationCenterTitle">通知中心</h2>
+                    <p class="section-note">只读展示通知中心试运行、本地提醒和风险告警摘要。这里不发送外部通知、不触发交易动作，只帮助你看到需要复盘的提醒。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="notificationCenterNote">正在读取通知中心...</p>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="refreshNotificationCenterButton" class="action-button" type="button">刷新通知中心</button>
+                </div>
+            </div>
+            <div class="badge-row" aria-label="通知中心边界" style="justify-content:flex-start;margin-bottom:12px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Local Dry Run</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <div id="notificationCenterPanel" class="performance-panel">
+                <div class="empty-state">正在加载通知中心...</div>
+            </div>
+        </section>
+
+        <section id="backtest-section" class="section module-view" aria-labelledby="backtestTitle" data-module-view hidden>
+            <div class="section-head">
+                <div>
+                    <h2 id="backtestTitle">策略回测</h2>
+                    <p class="section-note">基于本地完整日线对所选策略做有界历史回测；权益曲线 / 夏普 / 回撤为研究模拟，不代表未来收益。</p>
+                </div>
+                <div class="section-actions">
+                    <p class="section-note" id="backtestNote">正在读取回测状态…</p>
+                    <label class="inline-toggle">策略
+                        <select id="backtestStrategy" class="stock-search-input" style="min-width:160px"></select>
+                    </label>
+                    <label class="inline-toggle">样本上限
+                        <input id="backtestMaxSymbols" class="stock-search-input" type="number" min="1" max="50" value="20" style="width:80px">
+                    </label>
+                    <label class="inline-toggle">起始日期
+                        <input id="backtestStartDate" class="stock-search-input" type="date" value="2015-01-01" style="width:130px">
+                    </label>
+                    <label class="inline-toggle">截止日期
+                        <input id="backtestEndDate" class="stock-search-input" type="date" value="" placeholder="最新" style="width:130px">
+                    </label>
+                    <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
+                    <button id="runBacktestButton" class="action-button" type="button">运行回测</button>
+                </div>
+            </div>
+            <div id="backtestPanel" class="backtest-panel">
+                <div class="empty-state">选择策略后点击“运行回测”。</div>
+            </div>
+            <div class="badge-row" aria-label="回测边界" style="justify-content:flex-start;margin-top:12px">
+                <span class="badge">Research Only</span>
+                <span class="badge">Paper Account Only</span>
+                <span class="badge">No Broker Route</span>
+                <span class="badge">Live Execution Locked</span>
+                <span class="badge">QMT Order Route Locked</span>
+                <span class="badge">Not Investment Advice</span>
+                <span class="badge">Not Position Advice</span>
+            </div>
+            <div class="quant-summary-head" style="margin-top:14px">
+                <strong>策略筛选漏斗（后台）</strong>
+                <div class="section-note" id="strategyScreeningNote">默认限样本并启用特征缓存；用于研究候选与纸面模拟池的证据衔接，不默认全 A 扫描。</div>
+                <div class="section-actions" style="justify-content:flex-start">
+                    <label class="inline-toggle">样本上限
+                        <input id="strategyScreeningMaxSymbols" class="stock-search-input" type="number" min="20" max="1500" value="600" style="width:92px">
+                    </label>
+                    <label class="inline-toggle">策略上限
+                        <input id="strategyScreeningMaxStrategies" class="stock-search-input" type="number" min="1" max="30" value="8" style="width:76px">
+                    </label>
+                    <label class="inline-toggle">
+                        <input id="strategyScreeningFeatureCache" type="checkbox" checked>
+                        特征缓存
+                    </label>
+                    <label class="inline-toggle" title="显式全量扫描会更慢，仍然只做研究模拟，不接券商。">
+                        <input id="strategyScreeningFullScan" type="checkbox">
+                        显式全量扫描
+                    </label>
+                    <button id="refreshStrategyScreeningButton" class="action-button is-muted" type="button">刷新漏斗状态</button>
+                    <button id="runStrategyScreeningButton" class="action-button" type="button">后台运行漏斗</button>
+                </div>
+                <div class="badge-row" aria-label="策略筛选边界" style="justify-content:flex-start">
+                    <span class="badge">Research Only</span>
+                    <span class="badge">Paper Account Only</span>
+                    <span class="badge">No Broker Route</span>
+                    <span class="badge">Live Execution Locked</span>
+                    <span class="badge">QMT Order Route Locked</span>
+                    <span class="badge">Not Investment Advice</span>
+                    <span class="badge">Not Position Advice</span>
+                </div>
+            </div>
+            <div id="strategyScreeningPanel" class="backtest-panel" style="margin-top:12px">
+                <div class="empty-state">尚未读取策略筛选漏斗状态。</div>
+            </div>
+        </section>
+        </div>
+    </main>
+
+    <div id="detailModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <article class="modal-content">
+            <header class="modal-header">
+                <div>
+                    <div class="modal-title" id="modalTitle">股票详情</div>
+                    <div class="section-note" id="modalSubtitle">本地日线研究</div>
+                </div>
+                <button class="close-button" id="closeModalButton" type="button" aria-label="关闭详情">&times;</button>
+            </header>
+            <div class="modal-body" id="modalBody"></div>
+        </article>
+    </div>
+
+    <script>
+        window.__QD_DAILY_RESEARCH_ASSET_VERSION__ = "{{ asset_versions.daily_research | default('dev') }}";
+    </script>
+    <script src="/static/echarts.min.js?v={{ asset_versions.echarts | default('dev') }}" defer></script>
+    <script src="/static/js/daily_research.js?v={{ asset_versions.daily_research | default('dev') }}" defer></script>
+</body>
+</html>

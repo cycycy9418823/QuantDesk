@@ -1,0 +1,15 @@
+{
+  "schema_version": "3.3.0",
+  "app_version": "3.3.0-consolidation-and-schema-contracts",
+  "status": "warning",
+  "ok": true,
+  "generated_at": "2026-05-21 10:00:00",
+  "target_date": "2026-05-19",
+  "symbols": ["600744", "002115"],
+  "freshness_status": "warning",
+  "stale_count": 1,
+  "missing_daily_count": 0,
+  "intraday_coverage_rate": 0.5,
+  "warnings": ["schema example only"],
+  "disclaimer": "仅为 schema 示例，不构成投资建议。"
+}

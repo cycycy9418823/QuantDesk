@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 纸面交易员 · 10万教室</title>
+  <style>
+    :root {
+      --bg-page: #ECEAE3;
+      --bg-card: #FFFFFF;
+      --text: #16150F;
+      --muted: #807C6D;
+      --body: #45433A;
+      --border: #DAD5C7;
+      --up: #D11F1F;
+      --down: #1F8A4C;
+      --warn: #B5740E;
+      --info: #2563C9;
+      --shadow: 0 8px 24px rgba(22, 21, 15, 0.06);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg-page);
+      color: var(--text);
+    }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 24px 20px 48px; }
+    h1 { font-size: 28px; margin: 0 0 6px; }
+    .sub { color: var(--body); margin: 0 0 16px; }
+    .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+    .badge {
+      font-size: 12px;
+      border: 1px solid var(--border);
+      background: #F3F1EA;
+      padding: 4px 8px;
+      border-radius: 999px;
+    }
+    .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: var(--shadow);
+    }
+    .card h2 { font-size: 16px; margin: 0 0 10px; }
+    .kpi { font-size: 12px; color: var(--muted); }
+    .kpi strong { display: block; font-size: 22px; color: var(--text); margin-top: 4px; }
+    .up { color: var(--up); }
+    .down { color: var(--down); }
+    .actions { display: flex; gap: 10px; margin-bottom: 16px; }
+    button {
+      border: 0;
+      background: var(--info);
+      color: #fff;
+      padding: 10px 16px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button.secondary { background: #45433A; }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #E7E3D8; }
+    th { color: var(--muted); font-weight: 600; }
+    .warn { color: var(--warn); }
+    .note { color: var(--body); line-height: 1.6; }
+    .lesson { margin: 0 0 8px; padding-left: 0; list-style: none; }
+    .lesson li { margin: 0 0 8px; padding: 8px 10px; background: #F3F1EA; border-radius: 8px; }
+    .status { text-transform: none; font-size: 12px; }
+    @media (max-width: 800px) {
+      .row { grid-template-columns: 1fr 1fr; }
+    }
+
+    .chat-log { max-height: 320px; overflow-y: auto; margin: 10px 0; }
+    .chat-turn { margin-bottom: 12px; }
+    .chat-q { font-weight: 600; margin: 0 0 4px; }
+    .chat-a { margin: 0; white-space: pre-wrap; line-height: 1.55; }
+    .chat-input-row { display: flex; gap: 8px; align-items: flex-start; }
+    .chat-input-row textarea { flex: 1; font: inherit; padding: 8px; }
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>AI 纸面交易员</h1>
+    <p class="sub">收盘后复盘的新人短线波段股民：先看手里的票，故事还在就拿着；新开打算拿几天；开盘追得太凶就放弃。不是打板，不是盘中盯盘，不用最高最低成交。</p>
+    <div class="badges">
+      <span class="badge">Research Only</span>
+      <span class="badge">Paper Account Only</span>
+      <span class="badge">No Broker Route</span>
+      <span class="badge">Live Execution Locked</span>
+      <span class="badge">Not Investment Advice</span>
+      <span class="badge">Not Position Advice</span>
+      <span class="badge">次日开盘成交 · 预设点次日验收</span>
+      <span class="badge">默认联网拉公告 · --offline 可关</span>
+      <span class="badge">方法未过门也可开观察仓</span>
+      <span class="badge">不是打板 · 开盘太疯就放弃</span>
+      <span class="badge">按故事拿几天 · 不按名单换血</span>
+    </div>
+    <div class="actions">
+      <button id="runBtn" type="button">今晚复盘（验收今天 + 布置明天）</button>
+      <button id="refreshBtn" class="secondary" type="button">刷新</button>
+    </div>
+    <p id="statusLine" class="note">正在读取快照…</p>
+    <div class="row" id="kpis"></div>
+    <div class="card" style="margin-bottom:16px">
+      <h2>今日评估</h2>
+      <p id="headline" class="note"></p>
+      <p id="thought" class="note"></p>
+    </div>
+    <div class="row" style="grid-template-columns: 1fr 1fr">
+      <div class="card">
+        <h2>方法生死</h2>
+        <table>
+          <thead><tr><th>方法</th><th>状态</th><th>样本外净收益</th></tr></thead>
+          <tbody id="methods"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>你可以学到的</h2>
+        <ul class="lesson" id="lessons"></ul>
+      </div>
+    </div>
+    <div class="row" style="grid-template-columns: 1fr 1fr; margin-top:16px">
+      <div class="card">
+        <h2>明天开盘计划 / 预设点</h2>
+        <p id="planNote" class="note"></p>
+        <table>
+          <thead><tr><th>方向</th><th>代码</th><th>预设点</th><th>预测涨跌</th><th>仓位性质</th></tr></thead>
+          <tbody id="planBody"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>昨夜计划的今晚验收</h2>
+        <p id="reviewNote" class="note"></p>
+        <table>
+          <thead><tr><th>代码</th><th>开盘成交</th><th>方向</th><th>点位触及</th></tr></thead>
+          <tbody id="reviewBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="row" style="grid-template-columns: 1fr 1fr; margin-top:16px">
+      <div class="card">
+        <h2>纸面持仓</h2>
+        <table>
+          <thead><tr><th>代码</th><th>数量</th><th>市值</th><th>故事</th></tr></thead>
+          <tbody id="positions"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>今日动作</h2>
+        <table>
+          <thead><tr><th>动作</th><th>代码</th><th>结果</th><th>原因</th></tr></thead>
+          <tbody id="acts"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+    <section class="card" id="chatCard">
+      <h2>问问它</h2>
+      <p class="note">
+        它会带上账户实况、自己写下的主张和最近几篇复盘来回答。
+        只能说话，不能下单：仓位只在每晚 20:20 的复盘流程里变动。
+      </p>
+      <div id="chatLog" class="chat-log" aria-live="polite"></div>
+      <div class="chat-input-row">
+        <label class="sr-only" for="chatInput">问它一个问题</label>
+        <textarea id="chatInput" rows="2"
+          placeholder="比如：600172 为什么还拿着？你现在怎么看自己的中线做法？"></textarea>
+        <button id="chatSend" type="button">发送</button>
+      </div>
+      <p class="note" id="chatStatus"></p>
+    </section>
+
+  <script>
+    const money = (n) => Number(n || 0).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+    const pct = (n) => (Number(n || 0) * 100).toFixed(2) + "%";
+    function clsPnl(n) { return Number(n) > 0 ? "up" : Number(n) < 0 ? "down" : ""; }
+    function render(data) {
+      const j = data.journal || {};
+      const acc = j.account || data.ledger || {};
+      const pnl = acc.pnl ?? ((acc.equity || 0) - 100000);
+      const netTag = data.network_news === false ? "离线公告" : "已允许联网拉公告";
+      const convTag = data.conviction === "probation"
+        ? "观察仓·未验证"
+        : (data.conviction === "live" ? "已验证方法" : (data.conviction || ""));
+      document.getElementById("statusLine").textContent = data.degraded
+        ? (data.reason || "尚未复盘")
+        : ("复盘日 " + (data.as_of || "—") + " · " + netTag + (convTag ? " · " + convTag : "") + " · " + (data.disclaimer || ""));
+      document.getElementById("kpis").innerHTML = [
+        ["净值", money(acc.equity)],
+        ["现金", money(acc.cash)],
+        ["持仓市值", money(acc.market_value)],
+        ["相对10万盈亏", money(pnl)],
+      ].map(([k, v], i) => `<div class="card"><div class="kpi">${k}<strong class="${i===3?clsPnl(pnl):""}">${v}</strong></div></div>`).join("");
+      document.getElementById("headline").textContent = j.headline || "";
+      document.getElementById("thought").textContent = j.thought || "";
+      const plan = (j.tomorrow_plan || data.plan || {});
+      const intents = plan.intents || [];
+      const conviction = plan.conviction || data.conviction || "";
+      document.getElementById("planNote").textContent = (
+        (conviction === "probation" ? "【观察仓·未验证】" : "") +
+        (plan.prediction_note || data.prediction_note || "没有明日计划。")
+      );
+      document.getElementById("planBody").innerHTML = intents.length ? intents.map(it =>
+        `<tr><td>${it.side || ""}</td><td>${it.symbol || ""}</td><td>${it.preset_touch_price ?? "—"}</td><td>${it.predicted_direction || ""}</td><td>${it.conviction === "probation" || conviction === "probation" ? "观察仓·未验证" : (it.conviction || conviction || "live")}</td></tr>`
+      ).join("") : `<tr><td colspan="5">明日空仓 / 无指令</td></tr>`;
+      const review = j.last_review || data.review || {};
+      const summary = review.score_summary || {};
+      document.getElementById("reviewNote").textContent = review.plan_id
+        ? (`开盘成交 ${summary.open_fills || 0}/${summary.intents || 0} · 放弃 ${summary.abandoned || 0} · 方向 ${summary.direction_hits || 0} · 点位 ${summary.touch_hits || 0}`)
+        : "还没有上一笔计划可验收。";
+      const cards = review.scorecard || [];
+      document.getElementById("reviewBody").innerHTML = cards.length ? cards.map(c =>
+        `<tr><td>${c.symbol || ""}</td><td>${c.open_fill || ""} ${c.fill_price ?? ""}</td><td>${c.direction_hit ? "对" : "错"}</td><td>${c.touch_hit ? "触及" : "未触及"}</td></tr>`
+      ).join("") : `<tr><td colspan="4">无验收行</td></tr>`;
+      const methods = data.hypotheses || j.methods || [];
+      document.getElementById("methods").innerHTML = methods.length ? methods.map(m =>
+        `<tr><td>${m.title || m.hypothesis_id}</td><td class="status">${m.status}</td><td>${m.holdout_mean_net==null?"—":pct(m.holdout_mean_net)}</td></tr>`
+      ).join("") : `<tr><td colspan="3">还没有方法记录</td></tr>`;
+      const lessons = j.lessons || [];
+      document.getElementById("lessons").innerHTML = lessons.map(x => `<li>${x}</li>`).join("") || "<li>暂无</li>";
+      const pos = (data.ledger && data.ledger.positions) || [];
+      document.getElementById("positions").innerHTML = pos.length ? pos.map(p =>
+        `<tr><td>${p.symbol}</td><td>${p.quantity}</td><td>${money(p.market_value)}</td><td>${p.thesis || p.hypothesis_id || "—"}</td></tr>`
+      ).join("") : `<tr><td colspan="4">空仓</td></tr>`;
+      const acts = data.actions || j.actions || [];
+      document.getElementById("acts").innerHTML = acts.length ? acts.map(a =>
+        `<tr><td>${a.action || a.side || ""}</td><td>${a.symbol || ""}</td><td>${a.status || ""}</td><td>${a.reason || ""}</td></tr>`
+      ).join("") : `<tr><td colspan="4">无动作</td></tr>`;
+    }
+    async function loadSnap() {
+      const res = await fetch("/api/snapshot");
+      render(await res.json());
+    }
+    document.getElementById("refreshBtn").onclick = loadSnap;
+    document.getElementById("runBtn").onclick = async () => {
+      const btn = document.getElementById("runBtn");
+      btn.disabled = true;
+      btn.textContent = "正在验收今天并布置明天…可能要一两分钟";
+      try {
+        const res = await fetch("/api/cycle", { method: "POST" });
+        render(await res.json());
+      } catch (err) {
+        document.getElementById("statusLine").textContent = "复盘失败：" + err;
+      }
+      btn.disabled = false;
+      btn.textContent = "今晚复盘（验收今天 + 布置明天）";
+    };
+    loadSnap();
+
+    // --- chat -------------------------------------------------------------
+    const chatLog = document.getElementById("chatLog");
+    const chatInput = document.getElementById("chatInput");
+    const chatSend = document.getElementById("chatSend");
+    const chatStatus = document.getElementById("chatStatus");
+
+    function renderChat(messages) {
+      if (!chatLog) return;
+      chatLog.innerHTML = "";
+      if (!messages || !messages.length) {
+        const empty = document.createElement("p");
+        empty.className = "note";
+        empty.textContent = "还没聊过。问它点什么吧。";
+        chatLog.appendChild(empty);
+        return;
+      }
+      messages.forEach((turn) => {
+        const wrap = document.createElement("div");
+        wrap.className = "chat-turn";
+        const q = document.createElement("p");
+        q.className = "chat-q";
+        q.textContent = "你：" + (turn.question || "");
+        const a = document.createElement("p");
+        a.className = "chat-a";
+        a.textContent = turn.answer || "";
+        wrap.appendChild(q);
+        wrap.appendChild(a);
+        chatLog.appendChild(wrap);
+      });
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    async function loadChat() {
+      try {
+        const resp = await fetch("/api/chat");
+        const data = await resp.json();
+        renderChat(data.messages);
+      } catch (err) {
+        if (chatStatus) chatStatus.textContent = "聊天记录读取失败。";
+      }
+    }
+
+    async function sendChat() {
+      if (!chatInput || !chatSend) return;
+      const question = (chatInput.value || "").trim();
+      if (!question) {
+        if (chatStatus) chatStatus.textContent = "先写点什么。";
+        return;
+      }
+      chatSend.disabled = true;
+      if (chatStatus) chatStatus.textContent = "它在想…";
+      try {
+        const resp = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          // Distinguish "brain unavailable" from "it had nothing to say".
+          const reason = data.reason || data.error || "unknown";
+          chatStatus.textContent = "它没能回答（" + reason + "）。";
+        } else {
+          chatInput.value = "";
+          chatStatus.textContent = "";
+          await loadChat();
+        }
+      } catch (err) {
+        if (chatStatus) chatStatus.textContent = "请求失败：" + err;
+      } finally {
+        chatSend.disabled = false;
+      }
+    }
+
+    if (chatSend) chatSend.addEventListener("click", sendChat);
+    if (chatInput) {
+      chatInput.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+          ev.preventDefault();
+          sendChat();
+        }
+      });
+    }
+    loadChat();
+  </script>
+</body>
+</html>

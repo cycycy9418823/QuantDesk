@@ -1,0 +1,15 @@
+{
+  "schema_version": "3.3.0",
+  "app_version": "3.3.0-consolidation-and-schema-contracts",
+  "status": "warning",
+  "ok": true,
+  "generated_at": "2026-05-21 10:00:00",
+  "target_date": "2026-05-19",
+  "symbols": ["600744"],
+  "parameter_count": 3,
+  "combination_count": 20,
+  "robustness_score": 0.62,
+  "overfit_warnings": [{"type": "narrow_peak", "message": "仅少数组合表现较好。"}],
+  "warnings": ["schema example only"],
+  "disclaimer": "仅为 schema 示例，不构成投资建议。"
+}

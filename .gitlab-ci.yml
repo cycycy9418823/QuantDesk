@@ -1,0 +1,81 @@
+stages:
+  - validate
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_CACHE_DIR: "1"
+  QUANTDESK_CI: "true"
+  QUANTDESK_NETWORK: "false"
+  QUANTDESK_LLM: "false"
+
+python_offline_contracts:
+  stage: validate
+  image: python:3.11-slim
+  before_script:
+    - python -m pip install --upgrade pip
+    - python -m pip install -r requirements.txt -r requirements-dev.txt
+  script:
+    - python -m compileall -q quantdesk scripts tests
+    - python scripts/qd.py maintenance test-tier-runner --tier tier0_fast_unit --limit 0 --timeout-seconds 300 --dry-run false --json true --summary true
+    - python -m pytest tests/test_reported_quality_fixes.py tests/test_backtest_metrics.py tests/test_data_audit.py tests/test_v21_strategy_core.py tests/test_v241_research_validation.py tests/test_v278_intraday_swing_execution.py tests/test_v360_smart_stop_and_risk_alerts.py tests/test_rc14_mainline.py tests/test_walk_forward_hold_period_warning.py -q
+    - python scripts/qd.py maintenance frontend-api-contract --json true --summary true
+    - python scripts/qd.py maintenance dependency-contract --json true --summary true
+    - python scripts/qd.py maintenance data-backtest-contract --json true --summary true
+    - python scripts/qd.py maintenance coverage-contract --require-pytest-cov true --json true --summary true
+    - python -m unittest tests.test_script_inventory_governance tests.test_test_inventory_governance tests.test_test_discovery_diagnostics_governance tests.test_test_tier_runner_governance tests.test_frontend_api_contract_governance tests.test_dependency_contract_governance tests.test_data_backtest_contract_governance tests.test_coverage_contract_governance tests.test_gitlab_ci_governance -v
+    - python scripts/self_check.py
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - results/maintenance/
+      - reports/maintenance/
+      - reports/coverage/
+
+frontend_syntax:
+  stage: validate
+  image: node:20-alpine
+  script:
+    - node --check app/static/js/daily_research.js
+
+full_regression:
+  stage: validate
+  image: python:3.11-slim
+  before_script:
+    - python -m pip install --upgrade pip
+    - python -m pip install -r requirements.txt -r requirements-dev.txt
+  script:
+    - python -m unittest discover -s tests -p "test_*.py" -q
+  artifacts:
+    when: always
+    expire_in: 3 days
+    paths:
+      - reports/coverage/
+  allow_failure: true
+  when: manual
+  except:
+    - schedules
+
+# Nightly automated full-suite regression. The manual job above is
+# on-demand only, so the full 500+ test file suite previously never ran
+# unless someone remembered to click it. This job runs the identical
+# suite automatically on scheduled pipelines (create a GitLab schedule
+# targeting any branch; the job only appears in schedule pipelines).
+# It stays offline: QUANTDESK_NETWORK/LLM are false via the global
+# variables, and the suite itself is offline-first.
+full_regression_scheduled:
+  stage: validate
+  image: python:3.11-slim
+  before_script:
+    - python -m pip install --upgrade pip
+    - python -m pip install -r requirements.txt -r requirements-dev.txt
+  script:
+    - python -m unittest discover -s tests -p "test_*.py" -q
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - reports/coverage/
+  only:
+    refs:
+      - schedules

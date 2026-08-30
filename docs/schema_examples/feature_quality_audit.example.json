@@ -1,0 +1,21 @@
+{
+  "schema_version": "3.3.0",
+  "app_version": "3.3.0-consolidation-and-schema-contracts",
+  "status": "warning",
+  "ok": true,
+  "generated_at": "2026-05-21 10:00:00",
+  "target_date": "2026-05-19",
+  "symbols": ["600744"],
+  "row_count": 120,
+  "feature_count": 12,
+  "features": {
+    "ma20": {
+      "missing_rate": 0.03,
+      "nan_count": 3,
+      "inf_count": 0,
+      "status": "passed"
+    }
+  },
+  "warnings": ["schema example only"],
+  "disclaimer": "仅为 schema 示例，不构成投资建议。"
+}

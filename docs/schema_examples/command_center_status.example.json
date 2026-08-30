@@ -1,0 +1,19 @@
+{
+  "schema_version": "3.3.0",
+  "app_version": "3.3.0-consolidation-and-schema-contracts",
+  "status": "warning",
+  "ok": true,
+  "generated_at": "2026-05-21 10:00:00",
+  "target_date": "",
+  "symbols": [],
+  "recent_operation_count": 2,
+  "commands": [
+    {
+      "command": "schema-check",
+      "last_status": "warning",
+      "output_paths": ["results/schema_validation_latest.json"]
+    }
+  ],
+  "warnings": ["schema example only"],
+  "disclaimer": "仅为 schema 示例，不构成投资建议。"
+}

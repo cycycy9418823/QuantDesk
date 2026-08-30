@@ -1,0 +1,26 @@
+# Data and runtime state live outside git (junction to the archive repo).
+data/
+state/
+results/
+reports/
+logs/
+dist/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.quantdesk_test_tmp/
+test_runtime/
+*.tmp
+tmp_factor_out.txt
+tmp_factor_err.txt
+
+# pytest --basetemp scratch trees and local junit/report artifacts
+_tmp_*/
+_r4_*.xml
+agent_workspace/
+
+# Secrets
+*.env
+llm.env

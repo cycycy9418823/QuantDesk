@@ -1,0 +1,47 @@
+{
+  "schema_version": "3.5.0",
+  "synthetic_sample_data": true,
+  "network": false,
+  "description": "Small reproducible QuantDesk sample-data manifest. Data generated from this manifest is synthetic and is not real market data.",
+  "symbols": [
+    "000001",
+    "000002",
+    "000063",
+    "000333",
+    "000651",
+    "000725",
+    "002027",
+    "002142",
+    "002230",
+    "002415",
+    "002475",
+    "002594",
+    "002714",
+    "300014",
+    "300015",
+    "300033",
+    "300059",
+    "300122",
+    "300124",
+    "300274",
+    "300308",
+    "300750",
+    "600000",
+    "600030",
+    "600036",
+    "600048",
+    "600276",
+    "600519",
+    "601318",
+    "601688"
+  ],
+  "date_range": {
+    "start": "2020-01-02",
+    "end": "2020-03-31"
+  },
+  "included_templates": [
+    "docs/examples/historical_listings.example.csv",
+    "config/multi_strategy_account_book.example.yaml"
+  ],
+  "disclaimer": "Synthetic sample data is for onboarding and software verification only. It is not investment advice."
+}

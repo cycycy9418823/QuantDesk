@@ -1,0 +1,52 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[project]
+name = "quantdesk-local"
+dynamic = ["version"]
+readme = "README.md"
+description = "Local A-share learning, research, backtest, paper-simulation, and observation workbench."
+requires-python = ">=3.10"
+dependencies = [
+  "pandas>=2.0,<3.0",
+  "numpy>=1.24,<3.0",
+  "PyYAML>=6,<7",
+  "pyarrow>=14,<26",
+  "matplotlib>=3.7,<4.0",
+  "quantstats>=0.0.62,<0.1",
+  "openpyxl>=3.1,<4.0",
+  "jinja2>=3.1,<4.0",
+  "tabulate>=0.9,<1.0",
+  "python-docx>=1.1,<2.0",
+  "flask>=3.0,<4.0",
+  "flask-cors>=4.0,<5.0",
+  "requests>=2.31,<3.0",
+]
+
+[project.optional-dependencies]
+data = ["akshare>=1.16,<2.0", "mootdx>=0.11,<1.0"]
+dev = ["pytest>=8,<9", "pytest-cov>=6,<8", "ruff>=0.11,<1.0", "mypy>=1.10,<2.0"]
+
+[tool.setuptools.dynamic]
+version = {attr = "quantdesk.version.PACKAGE_VERSION"}
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [
+  ".venv",
+  "data",
+  "logs",
+  "reports",
+  "results",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = "(.venv|data|logs|reports|results)"
