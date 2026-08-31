@@ -69,6 +69,7 @@ data/quantdesk.db
 .claude/
 .codex/
 .workbuddy/
+.worktrees/
 screenshots/
 build/
 *.spec
