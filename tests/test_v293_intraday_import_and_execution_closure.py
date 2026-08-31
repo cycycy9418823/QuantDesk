@@ -431,15 +431,6 @@ class V293IntradayImportAndExecutionClosureTests(unittest.TestCase):
         out = simulate_conditional_plan_file({"plan_id": "p4", "trade_date": "2026-05-18", "symbols": [_new_plan()]}, write=False)
         self.assertIn(out["schema_version"], {"2.9.3", "2.9.4", "2.9.5", "2.9.6", "2.9.7", "2.9.8", "2.9.9", "3.0.0", "3.0.1", "3.0.2", "3.0.3", "3.0.4", "3.1.0", "3.1.1", "3.1.2", "3.1.3", "3.2.0", "3.2.1", "3.2.2", "3.2.3", "3.2.4", "3.2.5", "3.2.6", "3.2.6.1", "3.2.7", "3.2.8", "3.2.9", "3.3.0", "3.3.1", "3.3.2", "3.3.2.1", "3.3.2.2", "3.3.2.3", "3.3.2.4", "3.3.2.5", "3.3.3", "3.3.4", "3.3.5", "3.3.6", "3.3.7", "3.4.0", "3.4.1", "3.4.2", "3.4.2.1", "3.4.2.2", "3.4.2.3", "3.4.2.4", "3.4.2.5", "3.7.0", "3.7.0.1", "3.7.0.2", "3.7.0.3", "3.7.0.4", "3.7.0.5", "3.7.0.6"})
 
-    def test_api_routes_are_post_or_get_as_required(self) -> None:
-        text = (ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8")
-        get_block = text[text.index("def do_GET"):text.index("def do_POST")]
-        post_block = text[text.index("def do_POST"):]
-        self.assertIn("/api/intraday/status", get_block)
-        self.assertNotIn("/api/intraday/import", get_block)
-        self.assertIn("/api/intraday/import", post_block)
-        self.assertIn("/api/intraday/generate-template", post_block)
-        self.assertIn("/api/conditional-execution/run", post_block)
 
     def test_import_script_supports_new_input_flags(self) -> None:
         text = (ROOT / "scripts" / "import_intraday_1m.py").read_text(encoding="utf-8")
@@ -462,10 +453,6 @@ class V293IntradayImportAndExecutionClosureTests(unittest.TestCase):
         self_check_text = (ROOT / "scripts" / "self_check.py").read_text(encoding="utf-8")
         self.assertIn("default_path_binding_guard", self_check_text)
 
-    def test_ui_contains_intraday_status_controls(self) -> None:
-        html = (ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        self.assertIn("盘中分钟线状态", html)
-        self.assertIn("生成当前候选/虚拟持仓分钟线导入模板", html)
 
     def test_report_contains_daily_intraday_boundary_phrase(self) -> None:
         text = (ROOT / "quantdesk" / "daily_workflow_orchestrator.py").read_text(encoding="utf-8")
@@ -474,11 +461,5 @@ class V293IntradayImportAndExecutionClosureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
-
-
-
 
 

@@ -122,31 +122,26 @@ class ChanlunKnowledgeBaseTests(unittest.TestCase):
         for phrase in ("推荐买入", "稳赚", "必涨"):
             self.assertNotIn(phrase, report)
 
-    def test_ui_contains_chanlun_learning_tab(self) -> None:
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        self.assertIn("缠论学习", html)
 
-    def test_ui_states_buy_sell_points_are_observation_signals(self) -> None:
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        self.assertIn("买卖点仅作为观察信号", html)
+    def test_report_states_buy_sell_points_are_observation_signals(self) -> None:
+        """Buy/sell points must never read as instructions.
+
+        Re-anchored from the retired app/index.html onto the generated report,
+        which is where this disclaimer now lives. The active 8000 desk exposes no
+        chanlun surface at all, so the report is the only place the promise can be
+        made - and the only place a reader actually sees it.
+        """
+        payload = self.build_payload()
+        report = Path(payload["paths"]["report"]).read_text(encoding="utf-8")
+        self.assertIn("买卖点在 QuantDesk 中仅作为观察", report)
+        self.assertIn("不构成投资建议", report)
 
     def test_clean_zip_excludes_sources(self) -> None:
         ps1 = (PROJECT_ROOT / "export_project.ps1").read_text(encoding="utf-8")
         self.assertIn("data\\knowledge\\sources", ps1)
 
-    def test_get_status_route_is_read_only(self) -> None:
-        server = (PROJECT_ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8")
-        self.assertIn('path == "/api/chanlun/knowledge/status"', server)
-        self.assertIn("chanlun_knowledge_status_response()", server)
-
-    def test_post_build_route_generates_knowledge_base(self) -> None:
-        server = (PROJECT_ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8")
-        self.assertIn('path == "/api/chanlun/knowledge/build"', server)
-        self.assertIn("chanlun_knowledge_build_response(payload)", server)
-
 
 if __name__ == "__main__":
     unittest.main()
-
 
 

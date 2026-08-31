@@ -169,28 +169,26 @@ class V337DataUpdateOutputSlimMobileVisualCheckTests(unittest.TestCase):
         self.assertIn(symbols[-1], text)
         self.assertIn("symbols_checked", payload)
 
-    def test_mobile_css_contains_overflow_and_single_column_guards(self) -> None:
-        css = (PROJECT_ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
-        self.assertIn("@media (max-width: 768px)", css)
-        self.assertIn("overflow-x: auto", css)
-        self.assertIn("overflow-wrap: anywhere", css)
-        self.assertIn("min-width: 0", css)
-        self.assertIn("body", css)
-        self.assertNotIn("writing-mode", css)
+    def test_active_template_mobile_layout_guards(self) -> None:
+        """A narrow screen must stay readable, and text must never rotate.
 
-    def test_frontend_contains_long_command_and_artifact_preview_markers(self) -> None:
-        js = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("查看完整命令", js)
-        self.assertIn("已省略长 symbols 列表", js)
-        self.assertIn("未生成", js)
-        self.assertIn("JSON 预览摘要", js)
-        self.assertIn("Markdown 预览", js)
-        self.assertIn("复制命令", js)
+        Re-anchored from the retired app/static/styles.css: the active desk carries
+        its CSS inline in the template. The old exact 768px breakpoint is not one the
+        active desk uses - it defines 760/860/900/980px - so this asserts that a
+        narrow-screen breakpoint exists rather than pinning a pixel value the product
+        never chose.
+        """
+        html = (PROJECT_ROOT / "app" / "templates" / "daily_research.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(html, r"@media\s*\(max-width:\s*[0-9]{3}px\)")
+        self.assertIn("overflow-x", html)
+        self.assertIn("overflow-wrap: anywhere", html)
+        self.assertIn("min-width: 0", html)
+        self.assertNotIn("writing-mode", html)
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
 
 

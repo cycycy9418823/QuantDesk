@@ -165,36 +165,49 @@ class ChanlunFractalEngineTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("chanlun_fractal_analysis", result.stdout)
 
-    def test_api_get_status_is_read_only(self) -> None:
-        text = (PROJECT_ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8")
-        self.assertIn('/api/chanlun/fractals/status', text)
-        self.assertIn("chanlun_fractals_status_response", text)
 
-    def test_api_post_run_executes_analysis(self) -> None:
-        text = (PROJECT_ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8")
-        self.assertIn('/api/chanlun/fractals/run', text)
-        self.assertIn("chanlun_fractals_run_response", text)
+    def test_result_carries_learning_boundary(self) -> None:
+        """Fractal output is structure-learning only, never a signal to act on.
 
-    def test_ui_contains_chanlun_fractal_block(self) -> None:
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        self.assertIn("缠论分型识别", html)
-
-    def test_ui_contains_learning_boundary(self) -> None:
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        self.assertIn("分型仅用于结构学习", html)
+        Re-anchored from the retired app/index.html. The active 8000 desk ships no
+        chanlun surface, so the boundary is asserted where a consumer actually
+        receives it: the result payload's disclaimer field. Verified that the
+        markdown report carries only 不构成投资建议, so asserting the full phrase
+        against the report would be asserting something the engine never writes
+        there.
+        """
+        out = run_chanlun_fractal_analysis("600744", input_path=FIXTURE, write=False, report=False)
+        self.assertIn("仅用于结构学习", out["disclaimer"])
+        self.assertIn("不构成投资建议", out["disclaimer"])
 
     def test_report_contains_disclaimer(self) -> None:
         out = run_chanlun_fractal_analysis("600744", input_path=FIXTURE, write=True, report=True)
         report = Path(out["report_path"]).read_text(encoding="utf-8")
         self.assertIn("不构成投资建议", report)
 
-    def test_ui_and_report_avoid_aggressive_phrases(self) -> None:
+    def test_generated_report_avoids_aggressive_phrases(self) -> None:
+        """The fractal report must never promise a return or push a trade."""
         out = run_chanlun_fractal_analysis("600744", input_path=FIXTURE, write=True, report=True)
         report = Path(out["report_path"]).read_text(encoding="utf-8")
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        combined = report + "\n" + html
         for phrase in ("推荐买入", "稳赚", "必涨"):
-            self.assertNotIn(phrase, combined)
+            self.assertNotIn(phrase, report)
+
+    def test_active_desk_avoids_aggressive_phrases(self) -> None:
+        """Split from the report scan above; twin of the bi/segment engine cases.
+
+        The old method also scanned the retired app/index.html. That file is gone,
+        but the phrase ban is a GENERAL product boundary, so it re-anchors onto the
+        active template and bundle. Not a claim that the active desk renders
+        chanlun output.
+        """
+        html = (PROJECT_ROOT / "app" / "templates" / "daily_research.html").read_text(
+            encoding="utf-8", errors="ignore"
+        )
+        bundle = (PROJECT_ROOT / "app" / "static" / "js" / "daily_research.js").read_text(
+            encoding="utf-8", errors="ignore"
+        )
+        for phrase in ("推荐买入", "稳赚", "必涨"):
+            self.assertNotIn(phrase, html + bundle)
 
 
 if __name__ == "__main__":

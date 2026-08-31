@@ -205,12 +205,21 @@ class V334DailyOutputSummaryArtifactFollowthroughTests(unittest.TestCase):
         self.assertIn("python scripts/qd.py daily --network false --with-guardrails true", completed.stdout)
         self.assertIn("python scripts/qd.py status", completed.stdout)
 
-    def test_app_js_contains_daily_followthrough_markers(self) -> None:
-        text = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("warning=", text)
-        self.assertIn("failed=", text)
-        self.assertIn("每日流程", text)
-        self.assertIn("未生成", text)
+    def test_active_bundle_surfaces_degraded_daily_states(self) -> None:
+        """A daily step that warned, failed or produced nothing must say so.
+
+        Re-anchored from the retired app/static/app.js. The old 每日流程 label and
+        the literal "warning="/"failed=" forms do not appear on the active bundle, so
+        this asserts the same property through the state vocabulary the active bundle
+        actually renders.
+        """
+        text = (PROJECT_ROOT / "app" / "static" / "js" / "daily_research.js").read_text(
+            encoding="utf-8"
+        )
+        for token in ("warning", "failed", "未生成", "每日"):
+            self.assertIn(token, text, f"active bundle no longer surfaces {token}")
+        # a degraded run must be visibly degraded, not silently blank
+        self.assertIn("degraded", text)
 
 
 if __name__ == "__main__":

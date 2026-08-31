@@ -185,15 +185,17 @@ class StrategyObservationContractAndAgentBridgeTests(unittest.TestCase):
         self.assertIn("results", export_text)
         self.assertIn("reports", export_text)
 
-    def test_docs_and_ui_text_are_wired(self) -> None:
+    def test_docs_and_cli_wiring(self) -> None:
+        """The observation report stays reachable from the CLI and documented.
+
+        Split from the retired UI half: 生成学习复盘报告 and 当前报告模式 exist on
+        neither the active template nor the active bundle, so those assertions
+        retire rather than being pointed at a weaker substitute.
+        """
         qd = (PROJECT_ROOT / "scripts" / "qd.py").read_text(encoding="utf-8")
         readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        app = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("run_strategy_observation_report.py", qd)
         self.assertIn("Strategy Observation Contract And Agent Safe Bridge", readme)
-        self.assertIn("生成学习复盘报告", html + app)
-        self.assertIn("当前报告模式", html + app)
 
 
 if __name__ == "__main__":

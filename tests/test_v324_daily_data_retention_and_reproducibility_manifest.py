@@ -140,14 +140,20 @@ class DailyRetentionAndManifestTests(unittest.TestCase):
         self.assertIn('"reports"', export_text)
         self.assertIn('"data\\calendar"', export_text)
 
-    def test_docs_and_ui_are_wired(self) -> None:
+    def test_docs_are_wired(self) -> None:
+        """Retention and the reproducibility manifest stay documented.
+
+        Split from the retired app/index.html half: 每日数据留存 and 复现 manifest do
+        not exist on the active desk, so those assertions retired rather than being
+        replaced by a weaker token. The README and workflow-doc halves are active and
+        keep the guarantee.
+        """
         readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-        docs = (PROJECT_ROOT / "docs" / "daily_data_retention_workflow.md").read_text(encoding="utf-8")
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
+        docs = (PROJECT_ROOT / "docs" / "daily_data_retention_workflow.md").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("Daily Data Retention And Reproducibility Manifest", readme)
         self.assertIn("daily-retain", docs)
-        self.assertIn("每日数据留存", html)
-        self.assertIn("复现 manifest", html)
 
 
 if __name__ == "__main__":

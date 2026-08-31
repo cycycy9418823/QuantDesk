@@ -35,20 +35,6 @@ class V336RemediationUiCopyArtifactPreviewPolishTests(unittest.TestCase):
         self.assertIn(API_SCHEMA_VERSION, {"3.4.2.2", "3.4.2.3", "3.4.2.4", "3.4.2.5", "3.5.1", "3.5.1.1", "3.5.2", "3.6.0", "3.6.1", "3.6.2", "3.7.0", "3.7.0.1", "3.7.0.2", "3.7.0.3", "3.7.0.4", "3.7.0.5", "3.7.0.6"})
         self.assertTrue(APP_VERSION.startswith(API_SCHEMA_VERSION))
 
-    def test_frontend_contains_remediation_copy_and_grouping_markers(self) -> None:
-        js = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-
-        self.assertIn("我现在该怎么修", js + html)
-        self.assertIn("复制命令", js)
-        self.assertIn("复制全部修复命令", js)
-        self.assertIn("需要显式联网授权", js)
-        self.assertIn("离线可运行", js)
-        self.assertIn("function copyTextToClipboard", js)
-        self.assertIn("function renderCopyCommandButton", js)
-        self.assertIn("function renderCommandBlock", js)
-        self.assertIn("function showCopyToast", js)
-        self.assertIn("查看完整命令", js)
 
     def test_artifact_center_preview_payload_supports_json_and_markdown(self) -> None:
         from quantdesk.workbench_overview import build_workbench_artifacts
@@ -82,13 +68,6 @@ class V336RemediationUiCopyArtifactPreviewPolishTests(unittest.TestCase):
         self.assertTrue(daily_md["preview_truncated"])
         self.assertIn("line 0", daily_md["preview_summary_text"])
 
-    def test_artifact_center_ui_contains_preview_and_missing_language(self) -> None:
-        js = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("未生成", js)
-        self.assertIn("JSON 预览摘要", js)
-        self.assertIn("Markdown 预览", js)
-        self.assertIn("展开更多", js)
-        self.assertIn("重新生成 / 修复命令", js)
 
     def test_fix_plan_formatter_groups_offline_and_network_commands(self) -> None:
         from quantdesk.remediation_advisor import format_remediation_console
@@ -172,6 +151,5 @@ class V336RemediationUiCopyArtifactPreviewPolishTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 
 

@@ -511,7 +511,14 @@ class V335CommandOutputRemediationFlowTests(unittest.TestCase):
         self.assertIn("建议", buf.getvalue())
         self.assertIn("data-update", buf.getvalue())
 
-    def test_qd_help_and_frontend_contain_remediation_markers(self) -> None:
+    def test_qd_help_offers_the_fix_plan_command(self) -> None:
+        """A user who hits an error must be told how to find the fix plan.
+
+        Split from the retired app/static/app.js half: the old bundle's
+        "remediation" / 复制命令 copy has no counterpart on the active desk, so that
+        assertion retired instead of being pointed at a weaker substitute. The CLI
+        half is fully active and keeps the guarantee.
+        """
         completed = subprocess.run(
             [sys.executable, "scripts/qd.py", "help"],
             cwd=PROJECT_ROOT,
@@ -525,9 +532,6 @@ class V335CommandOutputRemediationFlowTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("fix-plan", completed.stdout)
-        app_js = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("remediation", app_js)
-        self.assertIn("复制命令", app_js)
 
 
 if __name__ == "__main__":

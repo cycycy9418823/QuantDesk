@@ -1,0 +1,16 @@
+{
+  "candidate_id": "portfolio_low_vol_rev120_candidate",
+  "research_only": true,
+  "prohibited_usage": [
+    "live_trading",
+    "broker_connection",
+    "auto_execution",
+    "buy_sell_recommendation",
+    "real_money_allocation_instruction"
+  ],
+  "monitoring_status": "human_review_required",
+  "warnings": [],
+  "human_review_required_reasons": [
+    "fixture review reason"
+  ]
+}

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sanitized deterministic copy of the Windows Task Scheduler export shape.
+  Source artifact SHA256: BBE147AB098D5E6CA597D60BA6472F0B93615A73512C2BD1227F8AF569BA54A9
+  Machine-specific SID, executable path, and project root use test placeholders.
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>QuantDesk managed weekly-minute-wide-pool task; schema=1</Description>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>__CURRENT_SID__</UserId>
+      <LogonType>S4U</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT6H</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>
+    <StartWhenAvailable>true</StartWhenAvailable>
+  </Settings>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-08-06T09:30:00</StartBoundary>
+      <ScheduleByWeek>
+        <WeeksInterval>1</WeeksInterval>
+        <DaysOfWeek><Saturday /></DaysOfWeek>
+      </ScheduleByWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>__COMSPEC__</Command>
+      <Arguments>/d /s /c ""__PROJECT_ROOT__\scripts\run_weekly_minute_wide_pool.cmd" --enable-network --apply --lock-timeout-seconds 21600"</Arguments>
+      <WorkingDirectory>__PROJECT_ROOT__</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

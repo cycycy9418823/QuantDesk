@@ -182,16 +182,26 @@ class RealTencentProviderAndEntrypointTests(unittest.TestCase):
         text = qd.read_text(encoding="utf-8")
         self.assertIn("self_check.py", text)
 
-    def test_readme_ui_and_safety_text(self) -> None:
+    def test_readme_and_active_desk_safety_text(self) -> None:
+        """The three boundary promises must be visible wherever a user reads.
+
+        Re-anchored from the retired app.js / index.html onto the active template
+        and bundle, which carry all three phrases. The old 默认未联网检测 wording
+        exists only in the README on this tree, so it is asserted there rather than
+        against a desk that never uses that exact phrase.
+        """
         readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-        app = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
+        html = (PROJECT_ROOT / "app" / "templates" / "daily_research.html").read_text(
+            encoding="utf-8"
+        )
+        bundle = (PROJECT_ROOT / "app" / "static" / "js" / "daily_research.js").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("新手只需要记住 5 个命令", readme)
-        self.assertIn("默认未联网检测", app)
-        self.assertIn("默认未联网检测", html)
-        self.assertIn("不接券商", readme + app + html)
-        self.assertIn("不真实下单", readme + app + html)
-        self.assertIn("不构成投资建议", readme + app + html)
+        self.assertIn("默认未联网检测", readme)
+        desk = html + bundle
+        for phrase in ("不接券商", "不真实下单", "不构成投资建议"):
+            self.assertIn(phrase, desk, f"active desk no longer states {phrase}")
 
 
 if __name__ == "__main__":

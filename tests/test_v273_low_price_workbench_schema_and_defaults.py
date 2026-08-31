@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -125,53 +126,99 @@ class PaperTradingDefaultsTests(unittest.TestCase):
         )
         self.assertIn("--lookback-days", result.stdout)
 
-    def test_ui_start_date_not_hardcoded_2025(self) -> None:
-        text = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        # The start date input should not have value="2025-01-01"
+    def test_active_template_start_date_not_hardcoded_2025(self) -> None:
+        """A backtest start date must not ship frozen to a single year.
+
+        Re-anchored from the retired app/index.html onto the active template, which
+        does carry date inputs (verified: two type="date" inputs present), so the
+        assertion still has a real subject.
+        """
+        text = (PROJECT_ROOT / "app" / "templates" / "daily_research.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('type="date"', text, "active template has no date input to guard")
         self.assertNotIn('value="2025-01-01"', text)
+        self.assertNotIn('value="2026-01-01"', text)
 
 
 class UIWorkbenchTests(unittest.TestCase):
-    def test_index_has_low_price_workbench(self) -> None:
-        text = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        self.assertTrue("低价学习池" in text or "低价工作台" in text)
+    """Re-anchored onto the ACTIVE 8000 desk.
 
-    def test_index_shows_file_paths(self) -> None:
-        text = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        self.assertTrue(
-            "low_price_learning_symbols" in text
-            or "low_price_learning_report" in text
-            or "paper_trading_latest" in text,
+    The retired app/index.html and app/static/app.js are gone. Each method below
+    keeps the property it protected and points it at the subject the product
+    actually serves. Two former methods in this class had no active subject and
+    were retired instead of being propped up with a weaker assertion:
+    the 低价学习池 / 低价工作台 heading (zero 低价 hits anywhere on the active desk).
+    """
+
+    @staticmethod
+    def _bundle() -> str:
+        return (PROJECT_ROOT / "app" / "static" / "js" / "daily_research.js").read_text(
+            encoding="utf-8"
         )
 
-    def test_app_js_no_auto_run_on_load(self) -> None:
-        text = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertNotIn("runPaperTradingSimulation()", text.split("addEventListener")[0])
+    @staticmethod
+    def _template() -> str:
+        return (PROJECT_ROOT / "app" / "templates" / "daily_research.html").read_text(
+            encoding="utf-8"
+        )
 
-    def test_app_js_defines_number_format_helpers(self) -> None:
-        text = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("function formatNumber", text)
-        self.assertIn("function formatMoney", text)
-        self.assertIn("function formatPercent", text)
+    def test_active_desk_names_the_artifact_files_it_reads(self) -> None:
+        """A reader must be able to see which file a number came from."""
+        combined = self._template() + self._bundle()
+        for path in (
+            "results/data_health/extended_data_gates_latest.json",
+            "state/ai_trader/ledger.json",
+            "state/paper_watchlist.json",
+        ):
+            self.assertIn(path, combined, f"active desk no longer names {path}")
 
-    def test_app_js_format_number_before_low_price_table(self) -> None:
-        text = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertLess(text.index("function formatNumber"), text.index("function renderLowPriceReportTable"))
+    def test_active_bundle_has_no_auto_run_before_user_interaction(self) -> None:
+        """Nothing that touches the paper account may fire on page load.
 
-    def test_app_js_format_number_calls_have_definition(self) -> None:
-        text = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("function formatNumber", text)
-        self.assertGreater(text.count("formatNumber("), 1)
+        The retired bundle was guarded against runPaperTradingSimulation() firing
+        before the first addEventListener. The active bundle must satisfy the same
+        rule for every paper-related entry point, not just one name.
+        """
+        text = self._bundle()
+        self.assertIn("addEventListener", text, "no event wiring found to split on")
+        preamble = text.split("addEventListener")[0]
+        offenders = re.findall(r"\b(\w*[Pp]aper\w*)\s*\(\s*\)", preamble)
+        self.assertEqual(
+            [], sorted(set(offenders)),
+            f"paper-account code runs before any user interaction: {sorted(set(offenders))}",
+        )
 
-    def test_low_price_report_missing_amount_uses_dash_safe_helper(self) -> None:
-        text = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        helper_start = text.index("function formatMoney")
-        helper_end = text.index("let polling", helper_start)
-        helper_body = text[helper_start:helper_end]
-        self.assertIn('value === ""', helper_body)
-        self.assertIn('return "-"', helper_body)
-        self.assertIn("Number.isNaN(Number(value))", helper_body)
-        self.assertIn("formatMoney(row.amount_ma20)", text)
+    def test_active_bundle_defines_number_format_helpers(self) -> None:
+        """Numbers must go through shared formatters, not ad-hoc string building.
+
+        Asserts the formatters the active bundle actually defines. The retired
+        bundle's formatMoney / formatPercent do not exist here, so asserting those
+        names would be asserting a function the product never had.
+        """
+        text = self._bundle()
+        for name in ("formatNumber", "formatPercentValue", "formatYiAmount",
+                     "formatSignedPercent"):
+            self.assertIn(f"function {name}", text, f"missing shared formatter {name}")
+
+    def test_active_bundle_renders_missing_values_explicitly(self) -> None:
+        """A missing number must read as 数据缺失, never as NaN/undefined/blank.
+
+        The retired bundle expressed this as formatMoney returning "-". The active
+        bundle centralises it in safeText()/hasValue(); this asserts that mechanism
+        exists and is actually used, which is the property that matters.
+        """
+        text = self._bundle()
+        self.assertIn("function safeText", text)
+        self.assertIn("数据缺失", text)
+        self.assertIn("hasValue(", text)
+        # the helper must be the routine path, not a single decorative call
+        self.assertGreater(text.count("safeText("), 50)
+        for forbidden in ("undefined", "NaN%"):
+            self.assertNotIn(
+                f">{forbidden}<", text,
+                f"raw {forbidden} is rendered straight into the DOM",
+            )
 
     def test_version(self) -> None:
         from quantdesk.version import API_SCHEMA_VERSION, APP_VERSION

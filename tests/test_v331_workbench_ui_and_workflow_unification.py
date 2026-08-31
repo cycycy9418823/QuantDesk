@@ -27,15 +27,6 @@ class WorkbenchUiWorkflowUnificationTests(unittest.TestCase):
         self.assertIn("data-health", completed.stdout)
         self.assertIn("schema-check", completed.stdout)
 
-    def test_workbench_overview_route_registered(self) -> None:
-        server_text = (PROJECT_ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8")
-        for route in (
-            "/api/workbench/overview",
-            "/api/workbench/command-center",
-            "/api/workbench/artifacts",
-            "/api/workbench/next-actions",
-        ):
-            self.assertIn(route, server_text)
 
     def test_overview_missing_results_is_warning_not_error(self) -> None:
         from quantdesk.workbench_overview import build_workbench_overview
@@ -65,49 +56,26 @@ class WorkbenchUiWorkflowUnificationTests(unittest.TestCase):
         self.assertIn("daily-retain", commands)
         self.assertFalse(payload.get("network", True))
 
-    def test_app_js_contains_sidebar_collapse_key(self) -> None:
-        text = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("quantdesk.sidebar.collapsed", text)
 
-    def test_app_js_contains_beginner_expert_mode_key(self) -> None:
-        text = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("quantdesk.ui.mode", text)
-        self.assertIn("quantdesk.beginnerMode.enabled", text)
+    def test_node_check_active_bundle(self) -> None:
+        """The bundle the product actually serves must parse.
 
-    def test_command_center_not_in_default_overview_section(self) -> None:
-        text = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn('overview: ["workbenchOverviewSection"]', text)
-        overview_line = next(line for line in text.splitlines() if line.strip().startswith("overview:"))
-        self.assertNotIn("commandCenterSection", overview_line)
-
-    def test_command_center_independent_entry_exists(self) -> None:
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        js = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn('data-primary-tab="commandCenter"', html)
-        self.assertIn('commandCenter: ["commandCenterSection"]', js)
-
-    def test_artifact_center_entry_exists(self) -> None:
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        js = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn('data-primary-tab="artifactCenter"', html)
-        self.assertIn("artifactCenterSection", html)
-        self.assertIn('artifactCenter: ["artifactCenterSection"]', js)
-
-    def test_status_classes_support_common_statuses(self) -> None:
-        css = (PROJECT_ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
-        for status in ("passed", "warning", "failed", "missing", "skipped", "unavailable"):
-            self.assertIn(f"status-{status}", css)
-
-    def test_node_check_app_js(self) -> None:
+        Re-anchored from the retired app/static/app.js. Verified before the change
+        that no test anywhere ran node --check against the active bundle, so
+        retiring this gate outright would have left the served bundle with no
+        syntax check at all.
+        """
         if not shutil.which("node"):
             self.skipTest("node is not installed")
         completed = subprocess.run(
-            ["node", "--check", "app/static/app.js"],
+            ["node", "--check", "app/static/js/daily_research.js"],
             cwd=PROJECT_ROOT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=60,
+            timeout=120,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 

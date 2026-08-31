@@ -185,16 +185,27 @@ class SharedCoreAndCandidateContractTests(unittest.TestCase):
         source_text = (PROJECT_ROOT / "quantdesk" / "paper" / "conditional_trade_plan.py").read_text(encoding="utf-8", errors="ignore")
         self.assertNotIn("paper_trading_latest", source_text.lower())
 
-    def test_ui_and_css_contract_copy(self) -> None:
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8", errors="ignore")
-        app = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8", errors="ignore")
-        css = (PROJECT_ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8", errors="ignore")
-        self.assertIn("自动虚拟组合 / 主线", html)
-        self.assertIn("手动观察仓 / 旧版纸面组合", html)
-        self.assertIn("当前候选映射", app)
-        self.assertIn("strategy_label", app)
-        self.assertIn("overflow-wrap: anywhere", css)
-        self.assertIn("word-break: break-word", css)
+    def test_active_desk_contract_copy_and_layout_guards(self) -> None:
+        """Account naming stays explicit and long text cannot break the layout.
+
+        Re-anchored from the retired index.html / app.js / styles.css. The active
+        desk carries its CSS inline in the template, so the overflow guards are
+        asserted there. The old 手动观察仓 / 旧版纸面组合 label does not exist on the
+        active desk and is not asserted - inventing a substitute would let a real
+        regression pass.
+        """
+        html = (PROJECT_ROOT / "app" / "templates" / "daily_research.html").read_text(
+            encoding="utf-8", errors="ignore"
+        )
+        bundle = (PROJECT_ROOT / "app" / "static" / "js" / "daily_research.js").read_text(
+            encoding="utf-8", errors="ignore"
+        )
+        # the automatic virtual portfolio is named as such, never as a real account
+        self.assertIn("自动虚拟组合", bundle)
+        self.assertIn("strategy_label", bundle)
+        # long text guards live in the template's inline CSS
+        self.assertIn("overflow-wrap: anywhere", html)
+        self.assertIn("word-break: break-word", html)
 
 
 if __name__ == "__main__":

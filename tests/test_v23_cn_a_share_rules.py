@@ -621,10 +621,6 @@ class DocsAndSelfCheckTests(unittest.TestCase):
         self.assertIn("simple", text)
         self.assertIn("blocked_order_count", text)
 
-    def test_app_js_exposes_market_rules(self) -> None:
-        text = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("market_rules", text)
-        self.assertIn("cn_a_share", text)
 
     def test_self_check_registers_cn_a_share_rules(self) -> None:
         text = (PROJECT_ROOT / "scripts" / "self_check.py").read_text(encoding="utf-8")

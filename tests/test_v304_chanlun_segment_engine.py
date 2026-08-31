@@ -151,22 +151,19 @@ class ChanlunSegmentEngineTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("chanlun_segment_analysis", completed.stdout)
 
-    def test_api_get_status_is_read_only(self):
-        text = (PROJECT_ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8", errors="ignore")
-        self.assertIn('/api/chanlun/segments/status', text)
 
-    def test_api_post_run_executes(self):
-        text = (PROJECT_ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8", errors="ignore")
-        self.assertIn('/api/chanlun/segments/run', text)
-        self.assertIn("chanlun_segments_run_response", text)
+    def test_report_contains_learning_boundary(self):
+        """Segment output is structure-learning only, never a signal to act on.
 
-    def test_ui_contains_chanlun_segment_block(self):
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8", errors="ignore")
-        self.assertIn("缠论线段识别", html)
-
-    def test_ui_contains_learning_boundary(self):
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8", errors="ignore")
-        self.assertIn("线段识别仅用于结构学习", html)
+        Re-anchored from the retired app/index.html onto the generated report. The
+        active 8000 desk ships no chanlun surface.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_chanlun_segment_analysis(
+                "600744", input_path=FIXTURE, output_dir=tmp, min_bi_count=3, write=True
+            )
+            report = Path(result["report_path"]).read_text(encoding="utf-8")
+        self.assertIn("仅用于结构学习", report)
 
     def test_report_contains_disclaimer(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -175,15 +172,30 @@ class ChanlunSegmentEngineTests(unittest.TestCase):
             self.assertIn("不构成投资建议", report_path.read_text(encoding="utf-8"))
             self.assertIn(DISCLAIMER, result["disclaimer"])
 
-    def test_ui_and_report_avoid_aggressive_phrases(self):
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8", errors="ignore")
-        app = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8", errors="ignore")
+    def test_generated_report_avoids_aggressive_phrases(self):
+        """The segment report must never promise a return or push a trade."""
         with tempfile.TemporaryDirectory() as tmp:
-            result = run_chanlun_segment_analysis("600744", input_path=FIXTURE, output_dir=tmp, min_bi_count=3, write=True)
+            result = run_chanlun_segment_analysis(
+                "600744", input_path=FIXTURE, output_dir=tmp, min_bi_count=3, write=True
+            )
             report = Path(result["report_path"]).read_text(encoding="utf-8")
-        combined = html + app + report
         for phrase in ["推荐买入", "稳赚", "必涨"]:
-            self.assertNotIn(phrase, combined)
+            self.assertNotIn(phrase, report)
+
+    def test_active_desk_avoids_aggressive_phrases(self):
+        """Split from the report scan above; see the bi-engine twin for the rationale.
+
+        General phrase ban re-anchored onto the active template and bundle. Not a
+        claim that the active desk renders chanlun output.
+        """
+        html = (PROJECT_ROOT / "app" / "templates" / "daily_research.html").read_text(
+            encoding="utf-8", errors="ignore"
+        )
+        bundle = (PROJECT_ROOT / "app" / "static" / "js" / "daily_research.js").read_text(
+            encoding="utf-8", errors="ignore"
+        )
+        for phrase in ["推荐买入", "稳赚", "必涨"]:
+            self.assertNotIn(phrase, html + bundle)
 
 
 if __name__ == "__main__":

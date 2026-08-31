@@ -647,29 +647,43 @@ class DataUpdateWorkbenchPreflightTests(unittest.TestCase):
         self.assertEqual(selected["symbol_source"], "current_analysis_pool")
         self.assertFalse(selected["full_scan"])
 
-    def test_workbench_data_update_route_registered_and_readonly_builder(self) -> None:
-        server_text = (PROJECT_ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8")
-        self.assertIn("/api/workbench/data-update", server_text)
-        self.assertIn("/api/workbench/data-update/run", server_text)
+    def test_data_update_builder_never_defaults_to_network(self) -> None:
+        """Split from the retired-route half; this is the live safety guard.
+
+        The old method also asserted /api/workbench/data-update route strings inside
+        scripts/quant_app_server.py. Those routes never migrated - the active
+        analogue is POST /api/data/update-all, whose explicit-network gate is pinned
+        by tests/test_r4_data_update_route_safety.py. What must survive here is the
+        builder contract: it reports readiness WITHOUT turning the network on.
+        """
         from quantdesk.data_update_orchestrator import build_workbench_data_update
 
         payload = build_workbench_data_update(project_root=PROJECT_ROOT)
         self.assertTrue(payload["ok"])
-        self.assertFalse(payload["network_default"])
+        self.assertFalse(payload["network_default"], "builder must not default to network")
         self.assertIn(payload["status"], {"passed", "warning", "missing"})
         self.assertIn("suggested_commands", payload)
 
-    def test_app_ui_contains_data_update_entry_and_workflow_step(self) -> None:
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        js = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn('data-primary-tab="dataUpdateWorkbench"', html)
-        self.assertIn("dataUpdateWorkbenchSection", html)
-        self.assertIn("数据更新", js)
-        self.assertIn("更新 / 检查数据", js + html)
-        self.assertIn("data-update", js)
-        self.assertIn("data-health", html)
-        self.assertIn("数据更新：补数据 / 拉数据 / 导入数据", html)
-        self.assertIn("数据健康：检查数据是否新鲜和完整", html)
+    def test_active_desk_separates_data_update_from_data_health(self) -> None:
+        """A user must be able to tell "fetch data" from "check data".
+
+        Re-anchored from the retired index.html / app.js. The old tab-wiring tokens
+        (data-primary-tab="dataUpdateWorkbench", dataUpdateWorkbenchSection) and the
+        two long Chinese explanations do not exist on the active desk, so this
+        asserts the distinction through what the active desk does carry: both labels
+        plus two distinct endpoints.
+        """
+        html = (PROJECT_ROOT / "app" / "templates" / "daily_research.html").read_text(
+            encoding="utf-8"
+        )
+        bundle = (PROJECT_ROOT / "app" / "static" / "js" / "daily_research.js").read_text(
+            encoding="utf-8"
+        )
+        desk = html + bundle
+        self.assertIn("数据更新", desk)
+        self.assertIn("数据健康", desk)
+        self.assertIn("/api/data/update-all", bundle)
+        self.assertIn("/api/data-health/dashboard", bundle)
 
     def test_daily_retain_snapshot_records_stale_data_warning(self) -> None:
         from quantdesk.daily_data_retention import collect_daily_retention_snapshot
@@ -729,20 +743,6 @@ class DataUpdateWorkbenchPreflightTests(unittest.TestCase):
             self.assertFalse(any(name.startswith("results/data_update/") for name in names))
             self.assertFalse(any(name == "reports/data_update_report_latest.md" for name in names))
 
-    def test_node_check_app_js(self) -> None:
-        if not shutil.which("node"):
-            self.skipTest("node is not installed")
-        completed = subprocess.run(
-            ["node", "--check", "app/static/app.js"],
-            cwd=PROJECT_ROOT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=60,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_v331_test_file_still_present(self) -> None:
         self.assertTrue((PROJECT_ROOT / "tests" / "test_v331_workbench_ui_and_workflow_unification.py").exists())

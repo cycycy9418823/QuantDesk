@@ -225,13 +225,24 @@ class TestV290DataFreshnessGateAndThemeSync(unittest.TestCase):
         self.assertEqual(payload["pending_symbols"], [])
         self.assertEqual(payload["missing_symbols"], [])
 
-    def test_ui_contains_stale_and_current_theme_mapping_copy(self) -> None:
-        app = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8", errors="ignore")
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8", errors="ignore")
-        self.assertIn("当前候选板块映射", app)
-        self.assertIn("滞后数据观察", app)
-        self.assertIn("暂无有效复盘", app)
-        self.assertIn("完整日线控制收益复盘，分钟线控制盘中触发复盘", html)
+    def test_active_desk_discloses_staleness_and_sector_mapping(self) -> None:
+        """Stale data must be labelled stale, and the sector mapping must be visible.
+
+        Re-anchored from the retired app.js / index.html. The four exact phrases the
+        old bundle used (当前候选板块映射 / 滞后数据观察 / 暂无有效复盘 /
+        完整日线控制收益复盘…) appear nowhere on the active desk, so this asserts the
+        same two properties through the wording the active bundle actually ships.
+        """
+        bundle = (PROJECT_ROOT / "app" / "static" / "js" / "daily_research.js").read_text(
+            encoding="utf-8", errors="ignore"
+        )
+        # staleness is surfaced, not silently swallowed
+        self.assertIn("陈旧", bundle)
+        self.assertIn("滞后", bundle)
+        # the sector mapping behind a candidate is shown
+        self.assertIn("板块映射", bundle)
+        # an absent value reads as absent rather than as zero
+        self.assertIn("数据缺失", bundle)
 
     def test_report_boundary_copy_is_present(self) -> None:
         workflow = (PROJECT_ROOT / "quantdesk" / "daily_workflow_orchestrator.py").read_text(encoding="utf-8", errors="ignore")

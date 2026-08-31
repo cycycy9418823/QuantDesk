@@ -385,21 +385,40 @@ class BeginnerDataHealthDashboardTests(unittest.TestCase):
         self.assertTrue(payload["beginner_next_steps"])
         self.assertIn("不构成投资建议", payload["risk_disclaimer"])
 
-    def test_get_data_health_dashboard_is_read_only(self):
-        server_text = (PROJECT_ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8")
-        self.assertIn('path == "/api/data-health/dashboard"', server_text)
-        self.assertIn("build_data_health_dashboard(write=False)", server_text)
-        self.assertIn('path == "/api/data-health/rebuild"', server_text)
+    def test_active_data_health_dashboard_route_is_read_only(self):
+        """Opening the data-health page must never download or rewrite anything.
 
-    def test_ui_contains_beginner_home_sections(self):
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        for token in ["数据健康状态", "今日操作指南", "今日 Top3 观察候选", "不构成投资建议"]:
-            self.assertIn(token, html)
+        Re-anchored from the retired scripts/quant_app_server.py onto the active
+        route module. The old assertion looked for
+        build_data_health_dashboard(write=False); the active route instead calls the
+        cached reader build_cached_data_health_dashboard(), so this asserts the real
+        shape: GET-only, dispatching to the reader, with no write-capable builder.
+        """
+        route_text = (
+            PROJECT_ROOT / "scripts" / "server" / "routes" / "data.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"/api/data-health/dashboard"', route_text)
+        self.assertIn('methods=["GET"]', route_text)
+        self.assertIn("build_cached_data_health_dashboard", route_text)
+        # a read route must not be able to write or be reached by a write verb
+        self.assertNotIn("write=True", route_text)
+        for verb in ('"POST"', '"PUT"', '"DELETE"'):
+            self.assertNotIn(verb, route_text, f"read-only data route exposes {verb}")
 
-    def test_app_js_beginner_expert_mode_and_local_storage(self):
-        app_js = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        for token in ["小白模式", "专家模式", "localStorage", "enabled = saved === null ? true"]:
-            self.assertIn(token, app_js)
+    def test_active_home_surfaces_data_health_and_the_advice_boundary(self):
+        """The home view must show data health and disclaim investment advice.
+
+        Re-anchored from the retired app/index.html. Of the four old tokens only
+        数据健康状态 and 不构成投资建议 exist on the active desk; 今日操作指南 and
+        今日 Top3 观察候选 do not, and are therefore not asserted rather than being
+        replaced by something weaker.
+        """
+        html = (PROJECT_ROOT / "app" / "templates" / "daily_research.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("数据健康状态", html)
+        self.assertIn("不构成投资建议", html)
+
 
     def test_main_dashboard_home_surfaces_verified_minute_pool(self):
         script = (PROJECT_ROOT / "app" / "static" / "js" / "daily_research.js").read_text(encoding="utf-8")
@@ -469,16 +488,33 @@ class BeginnerDataHealthDashboardTests(unittest.TestCase):
         html = (PROJECT_ROOT / "app" / "templates" / "daily_research.html").read_text(encoding="utf-8")
         self.assertIn("card-tone-warn", html)
 
-    def test_ui_localizes_internal_values(self):
-        app_js = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        for token in ["缺少分钟线，无法验证盘中触发", "计划未触发", "仅日线复盘"]:
-            self.assertIn(token, app_js)
+    def test_active_bundle_localizes_internal_values(self):
+        """Internal enum values must never reach the user raw.
 
-    def test_css_prevents_long_text_overflow(self):
-        css = (PROJECT_ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
-        self.assertIn("overflow-wrap: anywhere", css)
-        self.assertIn("word-break: break-word", css)
-        self.assertIn("max-width: 100%", css)
+        Re-anchored from the retired app.js. Of the three old phrases only
+        缺少分钟线 survives on the active bundle; 计划未触发 and 仅日线复盘 do not, so
+        this asserts the surviving phrase plus the bundle's general localisation
+        mechanism instead of inventing replacements.
+        """
+        bundle = (PROJECT_ROOT / "app" / "static" / "js" / "daily_research.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("缺少分钟线", bundle)
+        self.assertIn("数据缺失", bundle)
+        self.assertIn("function safeText", bundle)
+
+    def test_active_template_css_prevents_long_text_overflow(self):
+        """Long text must not break the layout.
+
+        Re-anchored from the retired app/static/styles.css: the active desk carries
+        its CSS inline in the template.
+        """
+        html = (PROJECT_ROOT / "app" / "templates" / "daily_research.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("overflow-wrap: anywhere", html)
+        self.assertIn("word-break: break-word", html)
+        self.assertIn("max-width: 100%", html)
 
 
 if __name__ == "__main__":

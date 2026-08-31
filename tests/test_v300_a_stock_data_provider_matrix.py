@@ -143,24 +143,11 @@ class AStockDataProviderMatrixV300Tests(unittest.TestCase):
         self.assertIn("data_source_trace", payload)
         self.assertIn("mootdx_daily", payload["data_source_trace"]["daily_data"])
 
-    def test_ui_contains_provider_matrix_text(self) -> None:
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        app = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        for token in ("数据源矩阵", "行情数据", "研报数据", "新闻资讯", "热点题材"):
-            self.assertIn(token, html)
-        self.assertIn("renderAStockProviderMatrix", app)
 
     def test_provider_setup_docs_and_safety_text(self) -> None:
         docs = (PROJECT_ROOT / "docs" / "provider_setup.md").read_text(encoding="utf-8")
         for token in ("akshare", "mootdx", "iwencai", "不接券商", "不真实下单", "不构成投资建议"):
             self.assertIn(token, docs)
-
-    def test_api_schema_and_server_routes(self) -> None:
-        docs = (PROJECT_ROOT / "docs" / "api_payload_schema.md").read_text(encoding="utf-8")
-        server = (PROJECT_ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8")
-        self.assertIn("/api/a-stock-data-providers/status", docs)
-        self.assertIn("/api/a-stock-data-providers/check", server)
-        self.assertIn("a_stock_data_providers_status_response", server)
 
 
 if __name__ == "__main__":

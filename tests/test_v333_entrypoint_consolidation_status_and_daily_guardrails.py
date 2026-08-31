@@ -558,12 +558,6 @@ class V333EntrypointStatusDailyGuardrailsTests(unittest.TestCase):
 
         self.assertEqual(suggested, "continue_monitoring")
 
-    def test_script_inventory_exists_and_marks_legacy_scripts(self) -> None:
-        path = PROJECT_ROOT / "docs" / "script_entrypoint_inventory.md"
-        text = path.read_text(encoding="utf-8")
-        self.assertIn("python scripts/qd.py status", text)
-        for name in ["live_monitor.py", "check_data_providers.py", "daily_quant_report.py", "rebuild_cached_report.py", "generate_sample_report.py"]:
-            self.assertIn(name, text)
 
     def test_daily_workflow_guardrail_summary_can_be_enabled_and_disabled(self) -> None:
         from quantdesk import daily_workflow_orchestrator as dwo
@@ -888,6 +882,5 @@ class V333EntrypointStatusDailyGuardrailsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 
 

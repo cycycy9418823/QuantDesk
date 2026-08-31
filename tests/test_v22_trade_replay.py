@@ -555,22 +555,46 @@ class V22TradeReplayTests(unittest.TestCase):
         self.assertEqual(rule_replay["replay_mode"], "rule_replay")
         self.assertEqual(trade_replay["replay_mode"], "trade_replay")
 
-    def test_trade_replay_docs_and_ui_distinguish_modes(self) -> None:
+    def test_trade_replay_docs_distinguish_modes(self) -> None:
+        """Rule-layer replay and trade-path replay must never be conflated.
+
+        Split from the retired app/static/app.js half: the active bundle carries no
+        rule_replay/trade_replay mode distinction, so asserting one there would
+        assert something the product does not have. The README and
+        api_payload_schema halves are fully active and keep the guarantee.
+        """
         readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
         docs = (PROJECT_ROOT / "docs" / "api_payload_schema.md").read_text(encoding="utf-8")
-        app = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        for text in (readme, docs, app):
+        for text in (readme, docs):
             self.assertIn("策略历史回放（规则层）", text)
             self.assertIn("交易路径回放", text)
             self.assertIn("rule_replay", text)
             self.assertIn("trade_replay", text)
         self.assertIn("不构成投资建议", readme)
 
-    def test_temp_helper_no_longer_defaults_to_desktop_paths(self) -> None:
-        helper = (PROJECT_ROOT / "tests" / "test_v20_local_decision_assistant.py").read_text(encoding="utf-8")
-        self.assertIn("TemporaryDirectory", helper)
-        self.assertNotIn(".quantdesk_test_tmp", helper)
-        self.assertNotIn("Desktop", helper)
+    def test_no_active_test_writes_to_a_desktop_path(self) -> None:
+        """No test may put scratch data on the user's Desktop.
+
+        Re-anchored: the original pinned this to tests/test_v20_local_decision_assistant.py,
+        a file that retired with the 8765 closure. The hygiene property belongs to
+        the whole active suite, so it is asserted across every active test instead
+        of one file - strictly stronger than the original.
+
+        Note the original also forbade `.quantdesk_test_tmp`; that token is the
+        project's own isolated-project scratch root and 14 active tests use it
+        legitimately, so forbidding it here would be wrong.
+        """
+        offenders: list[str] = []
+        here = Path(__file__).name
+        for path in sorted((PROJECT_ROOT / "tests").glob("test_*.py")):
+            if path.name == here:
+                continue  # this file names Desktop only in order to forbid it
+            if "Desktop" in path.read_text(encoding="utf-8", errors="replace"):
+                offenders.append(path.name)
+        self.assertEqual(
+            [], offenders,
+            f"these tests reference a Desktop path: {offenders}",
+        )
 
     def test_trade_replay_json_has_no_aggressive_language(self) -> None:
         result = strategy_trade_replay(

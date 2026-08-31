@@ -1,0 +1,88 @@
+{
+  "account": {
+    "initial_cash": 100000.0,
+    "cash": 98800.0,
+    "currency": "CNY"
+  },
+  "positions": [
+    {
+      "symbol": "000001",
+      "name": "样例银行",
+      "shares": 100,
+      "buy_price": 12.0,
+      "buy_date": "2026-06-13",
+      "stop_loss": "",
+      "notes": "策略演示人工确认的虚拟建仓记录",
+      "estimate_only": true,
+      "settlement_status": "no_quote",
+      "settlement_message": "当前报告缺少该股票行情，无法更新虚拟持仓。"
+    }
+  ],
+  "trades": [
+    {
+      "trade_id": "20260613_225833_000001_BUY",
+      "trade_time": "2026-06-13 22:58:33",
+      "date": "2026-06-13 22:58:33",
+      "symbol": "000001",
+      "name": "样例银行",
+      "side": "BUY",
+      "action_type": "virtual_entry",
+      "action_label": "虚拟建仓",
+      "strategy_name": "均线突破",
+      "strategy_version": "v1.7.0",
+      "source": "strategy_demo_manual_confirmation",
+      "price": 12.0,
+      "shares": 100,
+      "quantity": 100,
+      "amount": 1200.0,
+      "cash_change": -1200.0,
+      "position_change": 100,
+      "quote_date": "",
+      "daily_bar_date": "2026-05-06",
+      "feature_freshness": "daily_bar",
+      "estimate_only": false,
+      "settlement_status": "基于完整日线：2026-05-06",
+      "matched_conditions": [
+        "数据可信度足够高",
+        "收盘价高于20日均线",
+        "成交活跃度高于20日均值的1.5倍"
+      ],
+      "failed_conditions": [],
+      "missing_fields": [],
+      "risk_notes": [
+        "价格触及该线时只表示观察假设需要重新复核，不代表真实动作。",
+        "计划动作仅用于虚拟组合或人工确认，不会触发真实交易。"
+      ],
+      "market_regime": "",
+      "fundamental_status": "",
+      "data_health_status": "基于完整日线：2026-05-06",
+      "manual_note": "",
+      "notes": "策略演示人工确认的虚拟建仓记录",
+      "paper_trading_only": true,
+      "disclaimer": "虚拟投资组合仅用于观察和复盘，不构成投资建议，也不代表真实收益。"
+    }
+  ],
+  "paper_trading_only": true,
+  "disclaimer": "虚拟投资组合仅用于观察和复盘，不构成投资建议，也不代表真实收益。",
+  "created_at": "2026-06-13 22:58:33",
+  "updated_at": "2026-06-13 22:58:33",
+  "summary": {
+    "initial_cash": 100000.0,
+    "cash": 98800.0,
+    "total_market_value": 0.0,
+    "total_equity": 98800.0,
+    "total_pnl": -1200.0,
+    "total_pnl_pct": -1.2,
+    "position_count": 1,
+    "updated_at": "2026-06-13 22:58:33",
+    "settlement_status": "no_positions",
+    "settlement_message": "虚拟投资组合仅用于观察和复盘，不是真实交易。",
+    "latest_quote_date": "",
+    "expected_settlement_date": "",
+    "positions_waiting_for_close": 0,
+    "positions_waiting_for_quote_update": 0,
+    "positions_settled": 0,
+    "paper_trading_only": true,
+    "disclaimer": "虚拟投资组合仅用于观察和复盘，不构成投资建议，也不代表真实收益。"
+  }
+}

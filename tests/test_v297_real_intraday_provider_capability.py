@@ -263,11 +263,6 @@ class RealIntradayProviderCapabilityTests(unittest.TestCase):
         self.assertFalse(payload["update_portfolio"])
         self.assertTrue(payload["portfolio_update"]["skipped"])
 
-    def test_ui_contains_provider_support_text(self) -> None:
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        app_js = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("真实分钟线样本验证", html + app_js)
-        self.assertIn("provider 是否支持历史分钟线", html + app_js)
 
     def test_report_contains_required_disclaimer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

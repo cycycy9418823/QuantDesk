@@ -158,16 +158,6 @@ class IntradayReplaySelfValidationTests(unittest.TestCase):
         self.assertGreaterEqual(summary["reliable_event_count"], 4)
         self.assertGreaterEqual(summary["missing_intraday_count"], 1)
 
-    def test_api_routes_are_wired(self) -> None:
-        text = (PROJECT_ROOT / "scripts" / "quant_app_server.py").read_text(encoding="utf-8")
-        self.assertIn("/api/intraday/self-validation/latest", text)
-        self.assertIn("/api/intraday/self-validation/run", text)
-
-    def test_ui_entry_is_wired(self) -> None:
-        html = (PROJECT_ROOT / "app" / "index.html").read_text(encoding="utf-8")
-        app_js = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("运行盘中回放自检", html)
-        self.assertIn("runIntradaySelfValidation", app_js)
 
     def test_keep_artifacts_false_removes_runtime_dir(self) -> None:
         runtime_dir = self.tmp_root / "delete_runtime"
@@ -198,11 +188,5 @@ class IntradayReplaySelfValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
-
-
-
 
 
