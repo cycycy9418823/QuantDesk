@@ -20,6 +20,59 @@ tmp_factor_err.txt
 _tmp_*/
 _r4_*.xml
 agent_workspace/
+.pytest_tmp*/
+.mypy_cache/
+.ruff_cache/
+.tmp/
+.tmp_tests/
+# tests/_artifacts contains tiny deterministic fixtures that must remain
+# source-controlled. Runtime artifacts belong under test_runtime/ instead.
+*_verify.json
+*_cli_verify.json
+*.log
+*.bak
+*.py[cod]
+*.db-shm
+*.db-wal
+*.zip
+
+# Local configuration and credentials. These are per-machine, never source:
+# tracking config/llm_config.json would silently commit an API key the moment
+# somebody fills one in.
+config.local.yaml
+config/llm_config.json
+config/provider_secrets.json
+config/parameter_sensitivity.json
+
+# Data subtrees. data/ above already covers these; listed explicitly because the
+# clean-zip and hygiene governance tests assert the specific paths.
+data/raw/
+data/daily/
+data/features/
+data/news/
+data/cache/
+data/universe/
+data/intraday/
+data/update_staging/
+data/vendor_staging/
+data/test_runtime/
+data/sector_history/
+data/tracking/
+data/metadata/*.csv
+data/benchmark/*.csv
+data/.locks/
+data/quantdesk.db
+/quantdesk.db
+
+# Editor / tool state
+.vscode/
+.claude/
+.codex/
+.workbuddy/
+screenshots/
+build/
+*.spec
+external_refs/
 
 # Secrets
 *.env

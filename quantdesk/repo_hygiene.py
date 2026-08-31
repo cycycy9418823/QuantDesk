@@ -749,21 +749,60 @@ _HANDOFF_BLOCKED_CATEGORIES = {
 }
 
 
+def _split_staged_entry(raw: str) -> tuple[str, str]:
+    """Split one ``git diff --cached`` line into ``(status, path)``.
+
+    Accepts both shapes so callers can pass either:
+      ``--name-only``   -> ``"config/llm_config.json"``        -> ("", path)
+      ``--name-status`` -> ``"D\\tconfig/llm_config.json"``     -> ("D", path)
+      renames/copies    -> ``"R100\\told\\tnew"``               -> ("R100", new)
+
+    For a rename or copy the DESTINATION decides: moving a source file onto a
+    runtime path must still be blocked, while moving a blocked path out to an
+    allowed name is a legitimate cleanup.
+    """
+
+    text = str(raw).strip()
+    if not text:
+        return "", ""
+    parts = [p for p in text.split("\t") if p != ""]
+    if len(parts) == 1:
+        return "", parts[0].strip()
+    status = parts[0].strip().upper()
+    # A bare path containing a tab is not a git status line; only treat the first
+    # field as a status when it looks like one (A/M/D/R100/C75/T/U...).
+    if not status or not status[0].isalpha():
+        return "", parts[-1].strip()
+    return status, parts[-1].strip()
+
+
 def validate_staged_source_handoff(staged_paths: list[str]) -> dict[str, Any]:
-    """Classify staged paths and block any local data / runtime artifacts.
+    """Classify staged changes and block any local data / runtime artifacts.
 
     A clean source handoff (quant work-tree -> quant_clean_repo) must contain
     only source code, tests, and docs. Local market data, generated evidence,
     review packs, runtime caches, and scratch files must never be staged for
     handoff. Returns a report with ``blocked_count`` / ``blocked_paths`` so
     callers (e.g. ``scripts/self_check.py``) can fail fast.
+
+    Deletions are always allowed. A removal cannot introduce data into the
+    repository, and untracking a file that should never have been tracked - a
+    config file able to hold an API key, for instance - is exactly the cleanup
+    this guard exists to encourage. Blocking it forced the operator to choose
+    between a green self_check and the correct fix.
+    ``tools/git-hooks/check_staged.py`` has always skipped deletions; this keeps
+    the two gates from contradicting each other.
     """
 
     allowed: list[dict[str, str]] = []
     blocked: list[dict[str, str]] = []
+    skipped_deletions: list[str] = []
     for raw_path in staged_paths:
-        path = str(raw_path).strip()
+        status, path = _split_staged_entry(raw_path)
         if not path:
+            continue
+        if status.startswith("D"):
+            skipped_deletions.append(path)
             continue
         category = category_for(path)
         protected = is_protected(path)
@@ -785,5 +824,7 @@ def validate_staged_source_handoff(staged_paths: list[str]) -> dict[str, Any]:
         "blocked_count": len(blocked),
         "blocked_paths": [item["path"] for item in blocked],
         "blocked_detail": blocked,
+        "deletion_count": len(skipped_deletions),
+        "deletion_paths": skipped_deletions,
         "ok": not blocked,
     }

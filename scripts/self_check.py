@@ -4618,11 +4618,17 @@ def check_runtime_artifact_hygiene() -> CheckResult:
 
 
 def check_staged_source_handoff_guard() -> CheckResult:
-    """Fail fast if staged files contain local data or runtime artifacts."""
+    """Fail fast if staged files contain local data or runtime artifacts.
+
+    Asks git for --name-status rather than --name-only: the status letter is the
+    only thing that tells a deletion apart from an addition. Without it,
+    untracking a file this guard itself forbids looked identical to adding one,
+    so the correct cleanup could not be staged without turning self_check red.
+    """
 
     try:
         completed = subprocess.run(
-            ["git", "diff", "--cached", "--name-only"],
+            ["git", "diff", "--cached", "--name-status"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
