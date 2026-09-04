@@ -1,7 +1,8 @@
 # AGENTS.md
 
-> **⚠️ 对齐文档：`ALIGNMENT.md`** — 所有 AI Agent 必须先读 `ALIGNMENT.md`，了解当前工作方向、正确的服务端口、设计系统、已完成和待办事项。不要再各干各的。
-> **当前项目状态速览：`docs/CURRENT_STATE.md`** — 开工与交接前先核对数据资产、能力接线状态和唯一行动队列。
+> **与 `CHARTER.md` 冲突以 `CHARTER.md` 为准。** 文档顺序：宪章 > `STATUS.md` > `AGENT_HANDBOOK.md` > 本文件 > 其他一切。
+> **⚠️ 对齐文档：`ALIGNMENT.md`** — 端口与设计系统仍看这里；方向与硬边界以宪章为准。不要再各干各的。
+> **当前项目状态速览：`STATUS.md`** — 开工先读宪章和状态页。`docs/CURRENT_STATE.md` 与 16 页全图、09-04 briefing 是历史材料，不作依据。
 
 ## Project Purpose
 
@@ -140,10 +141,11 @@ orders.
 - Do not connect live trading.
 - Do not place real orders.
 - Do not store real account secrets.
-- Do not provide investment advice, promised returns, deterministic predictions, target prices, stop-loss prices, or position instructions.
-- Do not default to network access. Network fetches require explicit `--enable-network` or `--network true`.
-- Do not default to full-A scans.
-- Do not default to LLM usage.
+- Do not promise returns or claim deterministic predictions. Advisory-style research outputs (entry prices, stop-loss levels, target prices, position suggestions) ARE ALLOWED since the 2026-09-01 user ruling, provided they carry an honest validation-status label (e.g. 研究输出·未验证) and never claim proven edge. They remain paper/research outputs, never executable orders.
+- Do not default to network access, **except** the AI trader process and the snapshot collector, which may fetch quotes and (for the AI trader) call a model as part of their job. All other processes still require explicit `--enable-network` or `--network true`.
+- Full-A data acquisition via list/snapshot APIs (daily bars, valuation) is the DEFAULT daily path since 2026-09-01 (the fast path made it a 2-minute, 56-request job). Deep full-A analysis sweeps that fetch per-symbol history (thousands of requests) remain opt-in, for rate-limit protection only.
+- Do not default to LLM usage, **except** the AI trader process. Other processes stay LLM-off unless the owner opens that scope.
+- Two paper ledgers are both formal and must not impersonate each other: the strategy book (`state/auto_paper_portfolio.json`) and the AI trader book (`state/ai_trader/ledger.json`). Neither is "the only" paper book.
 - Do not fabricate news, sector heat, minute bars, OHLCV data, or provider results.
 - Do not add new strategies unless the user explicitly asks for that stage.
 - Do not change strategy parameters, scoring formulas, or backtest return logic without explicit approval.
@@ -181,6 +183,139 @@ orders.
   source, tests, docs, schemas, templates, or tiny deterministic fixtures are
   staged.
 
+## Multi-Agent Git and Workspace Governance
+
+### User-appointed roles
+
+- Every task must explicitly name its `implementer`, `acceptor`, `integrator`,
+  `base_commit`, `worktree`, `branch`, `writable_paths`, `commit_permission`,
+  and `runtime_write_permission` in the Active Agent Ownership table in
+  `docs/internal/NEXT_TASKS_AND_WORKTREE_RULES.md`.
+- No role is inferred from an Agent name, a previous task, the current chat, or
+  the tool being used. Codex, Claude, GLM, and every other Agent have no default
+  acceptance or integration authority.
+- Only the user may appoint or replace the `acceptor` and `integrator`.
+- If `acceptor` is absent, nobody may mark the task accepted. If `integrator`
+  is absent, nobody may merge, cherry-pick into an integration branch, update
+  the canonical branch, or perform a production cutover.
+- `implementer`, `acceptor`, and `integrator` are separate permissions. The
+  user may appoint one Agent to more than one role, but one role never implies
+  another.
+
+### Canonical checkout and worktrees
+
+- The canonical checkout is the only directory used by Windows scheduled
+  tasks. It runs accepted code and is not the default development workspace.
+- Every parallel implementation task must use its own Git worktree and task
+  branch created from the declared `base_commit`.
+- Unless the user explicitly authorizes a canonical-checkout exception, no
+  Agent may develop, switch branches, commit, merge, rebase, or cherry-pick in
+  the canonical checkout.
+- Agents must never edit another Agent's worktree. Copying a file from another
+  worktree and creating a competing fix is also prohibited.
+- A path may have only one active write owner. If another task owns a target
+  path or the path already contains overlapping uncommitted changes, stop and
+  report the conflict before editing.
+
+### Default Worker permissions
+
+Unless the task row explicitly grants more authority, a Worker Agent:
+
+- may edit only its declared `writable_paths` in its own worktree;
+- may not run `git commit`, merge, rebase, cherry-pick, push, tag, delete a
+  branch, or remove a worktree;
+- may not modify scheduled tasks or the canonical checkout;
+- may not perform real network updates, AI cycles, external notifications, or
+  writes to canonical `data/`, `state/`, `results/`, `reports/`, or `logs/`;
+- may not modify `AGENTS.md`, `ALIGNMENT.md`, `docs/CURRENT_STATE.md`,
+  `docs/internal/NEXT_TASKS_AND_WORKTREE_RULES.md`, `.gitignore`, Git hooks, or
+  task-installation/cutover scripts;
+- may not expand scope or implement an unrelated fix discovered while working.
+
+Anything not granted in the task row is not authorized. Requests such as
+"start", "continue", "fix", or "implement" authorize scoped working-tree
+changes only; they do not implicitly authorize commit, merge, push, scheduled
+task changes, runtime writes, or external messages.
+
+### Commit permissions
+
+- `commit_permission: none` is the default. The Agent leaves a working-tree
+  diff and an external handoff report.
+- `commit_permission: task_branch` must be explicitly granted by the user. It
+  permits local commits only on the declared task branch; it does not permit
+  merge, push, tag, or canonical-branch updates.
+- `commit_permission: integration` must be explicitly granted to the
+  user-appointed integrator. It permits integration commits only after the
+  declared acceptor has accepted the contributing task commits.
+- Updating the canonical branch, pushing a remote, tagging a release, or
+  switching production tasks requires separate explicit user authorization.
+
+### Cross-agent defect protocol
+
+- An Agent may inspect and reproduce a defect outside its writable scope, but
+  may not modify the owning Agent's worktree or create an independent competing
+  implementation.
+- Every cross-scope defect must receive a `cross_defect_id` in the Cross-Agent
+  Defect Registry and be classified as one of:
+  1. `common_base_defect`;
+  2. `introduced_by_active_task`;
+  3. `integration_only_defect`.
+- The discovering Agent may provide read-only evidence, a minimal reproduction,
+  a diagnostic failing test in its own task scope, and a handoff report. It may
+  mark its own task `blocked_by: <cross_defect_id>` when necessary.
+- The user appoints a `fix_owner` and `acceptor` for every cross-scope defect.
+- A common-base defect receives exactly one canonical fix branch and one
+  accepted fix commit created from the shared `base_commit`. Every affected
+  task consumes that same commit SHA; Agents must not reimplement it separately.
+- A defect introduced by an active task is fixed by that task's current path
+  owner. Ownership may move only through an explicit user-approved ownership
+  transfer recorded in the registry before either Agent edits the path.
+- An integration-only defect is reproduced and fixed on a fresh integration
+  branch by the user-appointed integration fix owner. The original task
+  branches retain their handoff history.
+- If two branches modify the same path without an approved ownership transfer,
+  integration stops. The user decides which implementation remains.
+
+### Runtime writer ownership
+
+- Only one canonical runtime writer may operate at a time. Parallel source
+  work does not authorize parallel writes to shared market data or state.
+- Real runtime writes require explicit user authorization naming the writer,
+  target paths, network permission, and time window. The writer must verify
+  that no natural scheduled task is active, use the existing OS lock, and
+  record protected-file hashes before and after.
+- Unit and integration tests must use `tmp_path`, deterministic fixtures, or
+  injected paths. Never modify real runtime evidence to make a test pass.
+- Never delete a lock file or kill a process to bypass contention without
+  explicit authority and exact process/lock evidence.
+
+### Scheduled tasks and external effects
+
+Unless the user explicitly authorizes the exact action, no Agent may install,
+remove, enable, disable, re-register, or manually trigger a scheduled task;
+change the repository it targets; send a real Server Chan or other external
+notification; run a real LLM cycle; modify secrets or production configuration;
+or start a real market-data backfill. Installer scripts may be delivered as
+source while remaining unexecuted.
+
+### Reproducible handoff and integration
+
+- Every Worker handoff must declare `task_id`, Agent name, `base_commit`,
+  `task_head` (when commits are authorized), `dependency_commits`, worktree,
+  branch, modified paths, exact test commands/results, remaining failures,
+  network/runtime/external effects, and `git status --short` plus
+  `git diff --check`.
+- Worker handoff reports live outside the repository by default at
+  `<project-parent>/claude/<TASK_ID>_<AGENT>_HANDOFF.md`. Workers do not update
+  shared governance documents unless the user explicitly assigns that scope.
+- Final acceptance runs on a fresh integration branch constructed from the
+  declared `base_commit`, accepted common-fix commits, and accepted task commits
+  in recorded order. Individual worktree tests do not prove the integrated
+  product is valid.
+- Only the user-appointed integrator updates shared governance documents after
+  acceptance and prepares an integration commit. No chat summary or Agent
+  self-report substitutes for this integrated verification.
+
 ## Deep Agent Operating Mode
 
 - Spend enough time on repo-context thinking before making edits. Read
@@ -208,7 +343,7 @@ orders.
 - Stopping point after acceptance is `research-only` and `paper-only`; do not extend the goal into broker integration, QMT/PTrade order routing, live execution, Docker deployment, WeChat notification deployment, release packaging, or production candidate upgrade.
 - Generated strategy pages may show `current evidence best`, `excluded_pending_research`, `metric_conflict_unresolved`, `partial`, `proxy`, `missing`, or `degraded`; they must not turn those labels into formal solved data or trading conclusions.
 - `data/daily` and canonical equity outputs are protected. v580 audit and dashboard work may read them, but must not write, overwrite, clean, reset, or regenerate them.
-- UI copy should say `Research Only`, `Paper Account Only`, `No Broker Route`, `Live Execution Locked`, `QMT Order Route Locked`, `Not Investment Advice`, and `Not Position Advice` where the boundary matters.
+- UI copy should say `Research Only`, `Paper Account Only`, `No Broker Route`, `Live Execution Locked`, `QMT Order Route Locked` where the boundary matters. Advisory-style panels (buy/sell levels, targets, position suggestions) are allowed per the 2026-09-01 ruling but must show their validation-status label.
 - Docker and WeChat notification work is intentionally deferred unless the user explicitly opens that scope again.
 
 ## Windows Python Rule
@@ -375,19 +510,24 @@ Every substantial round must report:
 
 ## Handoff Protocol
 
-Every task handoff must leave the repository's governance state current. Before
-claiming a task or Stage complete:
+Worker Agents leave an external handoff report and do not edit shared governance
+documents by default. After the user-appointed acceptor approves the task and
+the user-appointed integrator verifies the integrated tree, the integrator must:
 
-1. Append a dated checkpoint to
-   `docs/internal/NEXT_TASKS_AND_WORKTREE_RULES.md` with the exact verification
-   commands and observed results.
-2. Update `docs/CURRENT_STATE.md` so its data status, capability wiring, action
-   queue, and final update stamp match that checkpoint.
-3. Update `ALIGNMENT.md` whenever the project direction, active port, design
-   boundary, or non-negotiable scope changes.
+1. append a dated checkpoint to
+   `docs/internal/NEXT_TASKS_AND_WORKTREE_RULES.md` with the accepted commit
+   order, exact verification commands, and observed results;
+2. update `docs/CURRENT_STATE.md` so its data status, capability wiring, action
+   queue, and final update stamp match that checkpoint;
+3. update `ALIGNMENT.md` whenever the project direction, active port, design
+   boundary, or non-negotiable scope changes;
+4. close or update the relevant Active Agent Ownership and Cross-Agent Defect
+   Registry rows.
 
-Missing any required handoff artifact means the work is not complete. Do not
-substitute a chat summary for these repository records.
+No task is accepted without its user-appointed acceptor. No integrated Stage is
+complete without the integrator's fresh-tree verification and governance
+checkpoint. Do not substitute a chat summary or Agent self-report for these
+records.
 
 ## Fail Fast
 
