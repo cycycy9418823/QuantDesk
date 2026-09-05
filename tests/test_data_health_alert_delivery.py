@@ -174,6 +174,7 @@ def test_missing_opt_in_network_push_or_key_never_calls_sender(tmp_path: Path, m
     )
 
     assert blocked_env["reason_code"] == "data_health_alert_push_not_explicitly_enabled"
+    assert blocked_env["status"] == "preview_generated"
     assert blocked_network["reason_code"] == "network_not_authorized"
     assert blocked_key["reason_code"] == "sendkey_missing"
     assert calls == ["key"]

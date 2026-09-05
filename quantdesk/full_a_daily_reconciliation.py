@@ -18,12 +18,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from quantdesk.data_health_alert_delivery import dispatch_data_health_alerts
 from quantdesk.daily_price_update_engine import update_daily_prices
+from quantdesk.data_health_alert_delivery import dispatch_data_health_alerts
 from quantdesk.full_a_daily_coverage import build_full_a_daily_coverage
 from quantdesk.interprocess_lock import interprocess_file_lock
+from quantdesk.suspension_aware_completeness import classify_universe_completeness
 from quantdesk.utils import atomic_write_json
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 UNIVERSE_RELATIVE = Path("data/universe/a_share_symbols.csv")
@@ -105,6 +105,23 @@ def build_reconciliation_partition(
             accepted.append(symbol)
         else:
             pending.append(symbol)
+    completeness = classify_universe_completeness(
+        target, project_root=root, universe_symbols=universe
+    )
+    verified = [
+        symbol
+        for symbol in (completeness.get("verified_excluded_symbols") or [])
+        if symbol in universe
+    ]
+    flagged = [
+        symbol
+        for symbol in (completeness.get("flagged_for_review_symbols") or [])
+        if symbol in universe
+    ]
+    verified_set = set(verified)
+    accepted_set = set(accepted) | verified_set
+    accepted = [symbol for symbol in universe if symbol in accepted_set]
+    pending = [symbol for symbol in universe if symbol not in accepted_set]
     classes = [research, residual, missing]
     flattened = [symbol for group in classes for symbol in group]
     overlap = sorted({symbol for symbol in flattened if flattened.count(symbol) > 1})
@@ -117,6 +134,10 @@ def build_reconciliation_partition(
         "missing_canonical_symbols": missing,
         "accepted_symbols": accepted,
         "pending_symbols": pending,
+        "verified_excluded_symbols": verified,
+        "flagged_for_review_symbols": flagged,
+        "gap_symbols": list(completeness.get("gap_symbols") or []),
+        "completeness": completeness,
         "latest_by_symbol": latest_by_symbol,
         "partition_overlap": overlap,
         "partition_complete": not overlap and set(flattened) == set(universe),
@@ -174,6 +195,44 @@ def _default_health_refresh(*, root: Path, manifest: Mapping[str, Any]) -> dict[
 def _default_lock(path: Path, *, timeout_seconds: float) -> Iterator[Path]:
     with interprocess_file_lock(path, timeout_seconds=timeout_seconds) as locked:
         yield locked
+
+
+def _effective_coverage_from_partition(
+    raw: Mapping[str, Any],
+    partition: Mapping[str, Any],
+    *,
+    target_date: str,
+) -> dict[str, Any]:
+    """Formal coverage deducts verified suspensions; raw keeps physical gaps."""
+
+    target = _date_text(target_date)
+    verified = set(partition.get("verified_excluded_symbols") or [])
+    latest = dict(partition.get("latest_by_symbol") or {})
+    universe = list(partition.get("universe_symbols") or [])
+    physical_missing = [symbol for symbol in universe if not latest.get(symbol)]
+    physical_stale = [
+        symbol
+        for symbol in universe
+        if latest.get(symbol) and target and str(latest.get(symbol)) < target
+    ]
+    effective_missing = [symbol for symbol in physical_missing if symbol not in verified]
+    effective_stale = [symbol for symbol in physical_stale if symbol not in verified]
+    effective = dict(raw)
+    effective["missing_count"] = len(effective_missing)
+    effective["stale_count"] = len(effective_stale)
+    effective["missing_symbols_sample"] = effective_missing[:50]
+    effective["stale_symbols_sample"] = effective_stale[:50]
+    effective["verified_excluded_count"] = len(verified)
+    covered = [
+        symbol
+        for symbol in universe
+        if symbol not in set(effective_missing) and symbol not in set(effective_stale)
+    ]
+    effective["at_target_date_count"] = len(covered)
+    if universe:
+        effective["at_target_date_text"] = f"{len(covered)}/{len(universe)}"
+        effective["coverage_text"] = f"{len(covered)}/{len(universe)}"
+    return effective
 
 
 def _manifest(
@@ -301,16 +360,17 @@ def run_full_a_daily_reconciliation(
                     daily_dir=root / DAILY_RELATIVE,
                     metadata_dir=root / "data/metadata",
                 )
-            coverage = build_full_a_daily_coverage(
+            raw_coverage = build_full_a_daily_coverage(
                 target_date=target,
                 universe_path=root / UNIVERSE_RELATIVE,
                 daily_dir=root / DAILY_RELATIVE,
             )
-            complete = not any(
-                int(coverage.get(key) or 0)
-                for key in ("missing_count", "stale_count", "invalid_count")
+            partition = build_reconciliation_partition(root, target_date=target)
+            retry_symbols = list(partition["pending_symbols"])
+            status = "completed" if not retry_symbols else "partial"
+            effective_coverage = _effective_coverage_from_partition(
+                raw_coverage, partition, target_date=target
             )
-            status = "completed" if complete else "partial"
             payload = _manifest(
                 run_id=current_run_id,
                 target=target,
@@ -318,20 +378,18 @@ def run_full_a_daily_reconciliation(
                 status=status,
                 resumed_from_run_id=resumed_from_run_id,
                 update=update,
-                coverage=coverage,
+                coverage=effective_coverage,
                 canonical_write=bool(pending),
             )
             payload["network"] = True
             payload["apply"] = True
-            payload["accepted_symbols"] = [
-                symbol
-                for symbol in partition["universe_symbols"]
-                if symbol not in set(coverage.get("missing_symbols_sample") or [])
-            ]
-            payload["retry_symbols"] = sorted(
-                set(coverage.get("missing_symbols_sample") or [])
-                | set(coverage.get("stale_symbols_sample") or [])
-            )
+            payload["accepted_symbols"] = list(partition["accepted_symbols"])
+            payload["retry_symbols"] = retry_symbols
+            payload["raw_coverage"] = raw_coverage
+            payload["effective_coverage"] = effective_coverage
+            payload["reason_codes"] = []
+            if partition.get("verified_excluded_symbols"):
+                payload["reason_codes"].append("verified_suspension_excluded_from_retry")
             manifest_path, _run_dir = _write_manifest(root, payload)
             health = health_refresher(root=root, manifest=payload)
             delivery = alert_dispatcher(

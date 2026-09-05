@@ -45,6 +45,16 @@ CANONICAL_DAILY_DIR = PROJECT_ROOT / "data" / "daily"
 
 RISK_DISCLAIMER = "本系统仅用于本地学习与纸面模拟，不接券商、不真实下单、不构成投资建议。"
 
+
+def _relpath_for_payload(path: Path | str) -> str:
+    """Display path relative to the project when possible; keep tmp/out-of-tree paths intact."""
+
+    target = Path(path)
+    try:
+        return str(target.relative_to(PROJECT_ROOT)).replace("\\", "/")
+    except ValueError:
+        return str(target).replace("\\", "/")
+
 _CHAIN_FAILED_STATUSES = frozenset({"abandoned", "blocked", "failed", "superseded_contract"})
 _SCHEDULER_BROKEN_STATUSES = frozenset({"missing", "unmanaged", "disabled", "misconfigured"})
 _SCHEDULER_DEGRADED_STATUSES = frozenset({"unavailable", "last_run_failed", "last_run_unknown", "not_supported"})
@@ -1236,7 +1246,7 @@ def build_data_health_dashboard(
     if write:
         target = output_path or DATA_HEALTH_DASHBOARD_LATEST_JSON
         write_json(target, payload)
-        payload["path"] = str(Path(target).relative_to(PROJECT_ROOT))
+        payload["path"] = _relpath_for_payload(target)
     return payload
 
 
@@ -1372,11 +1382,11 @@ def latest_data_health_dashboard(path: Path | None = None) -> dict[str, Any]:
         return {
             "ok": True,
             "exists": False,
-            "path": str(Path(target).relative_to(PROJECT_ROOT)),
+            "path": _relpath_for_payload(target),
             "message": "尚未生成数据健康快照。GET 仅叠加实时每日数据链；请运行 qd.py data-health 刷新完整快照。",
             "risk_disclaimer": RISK_DISCLAIMER,
         }
     payload["exists"] = True
-    payload.setdefault("path", str(Path(target).relative_to(PROJECT_ROOT)))
+    payload.setdefault("path", _relpath_for_payload(target))
     payload.setdefault("risk_disclaimer", RISK_DISCLAIMER)
     return payload

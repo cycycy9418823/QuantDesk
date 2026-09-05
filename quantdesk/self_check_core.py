@@ -240,6 +240,7 @@ def find_hardcoded_project_paths(
         "dist",
         "build",
         "test_runtime",
+        ".worktrees",
     ),
     allowed_suffixes: Iterable[str] = (
         ".py",
@@ -258,6 +259,18 @@ def find_hardcoded_project_paths(
         "CODEX_TASK*.md",
         "REFACTOR*.md",
         "round12_rectification_appendix2_errata_20260801.md",
+        # Self-referencing files: the checker itself must define forbidden
+        # fragments, and its test file must exercise them. They are not
+        # offenders.
+        "self_check_core.py",
+        "test_v263_codebase_slimming.py",
+    ),
+    excluded_fragments: Iterable[str] = (
+        # The canonical tree path fragment is allowed: only the OLD repo path
+        # is forbidden. Without this, "E:/codex/quant_new" (canonical) matches
+        # the forbidden "E:/codex/quant" (old repo) as a substring.
+        "E:" + "/" + "codex" + "/" + "quant_new",
+        "E:" + "\\" + "codex" + "\\" + "quant_new",
     ),
 ) -> list[str]:
     """Walk ``root`` and return relative paths that contain any forbidden fragment."""
@@ -284,6 +297,12 @@ def find_hardcoded_project_paths(
                 text = path.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
+            # Strip allowed fragments (e.g., the canonical quant_new path) before
+            # checking forbidden ones (the old quant path). Without this,
+            # "E:/codex/quant_new" is a substring match for forbidden
+            # "E:/codex/quant".
+            for allowed_fragment in excluded_fragments:
+                text = text.replace(allowed_fragment, "")
             if any(fragment in text for fragment in forbidden_fragments):
                 offenders.append(str(relative))
     return offenders

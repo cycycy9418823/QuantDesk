@@ -50,6 +50,7 @@ from quantdesk.paper.conditional_trade_plan import (
     conditional_trade_plan_latest,
 )
 from quantdesk.paper.delist_liquidation import apply_delisting_liquidation
+from quantdesk.paper.matching import POLICY_DAILY_APPROX, ensure_declared_fill_policy
 from quantdesk.paper.market_rules import lot_size_for_symbol, round_down_to_lot
 from quantdesk.paper.portfolio_contracts import (
     ACCEPTANCE_CAPITAL,
@@ -342,6 +343,7 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _write_auto_paper_state(state: dict[str, Any]) -> dict[str, Any]:
+    ensure_declared_fill_policy(state, policy_id=POLICY_DAILY_APPROX)
     return _auto_paper_state_store().write(reconcile_paper_account(state))
 
 
@@ -707,7 +709,7 @@ def _empty_state(initial_cash: float) -> dict[str, Any]:
         scenario_id=scenario_id,
         requested_initial_capital=float(initial_cash),
     )
-    return {
+    payload = {
         "schema_version": API_SCHEMA_VERSION,
         "app_version": APP_VERSION,
         "created_at": now_text(),
@@ -728,6 +730,7 @@ def _empty_state(initial_cash: float) -> dict[str, Any]:
         "disclaimer": DISCLAIMER,
         "broker_boundary": BROKER_BOUNDARY,
     }
+    return ensure_declared_fill_policy(payload, policy_id=POLICY_DAILY_APPROX)
 
 
 def _load_state(initial_cash: float) -> dict[str, Any]:
@@ -760,6 +763,7 @@ def _load_state(initial_cash: float) -> dict[str, Any]:
     data.setdefault("credit_limit", profile.credit_limit)
     data.setdefault("credit_used", 0.0)
     data.setdefault("simulated_interest", 0.0)
+    ensure_declared_fill_policy(data, policy_id=POLICY_DAILY_APPROX)
     return reconcile_paper_account(data)
 
 

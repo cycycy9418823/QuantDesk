@@ -1201,6 +1201,74 @@ def test_chain_bound_resolver_uses_exact_run_scoped_conflict_recovery(
     assert dated_path.read_bytes() == dated_before
 
 
+def test_pipeline_replace_same_date_overwrites_dated_candidate_snapshot(
+    tmp_path: Path,
+) -> None:
+    first_manifest = _passed_manifest()
+    first_batch = build_formal_candidate_batch(
+        data_chain_manifest=first_manifest,
+        strategy_payload=_strategy_payload(),
+        captured_at="2026-08-03T18:02:03+08:00",
+    )
+    published = publish_formal_candidate_batch(tmp_path, first_batch)
+    dated_path = tmp_path / published["dated_path"]
+    latest_path = tmp_path / published["latest_path"]
+    old_hash = json.loads(dated_path.read_text(encoding="utf-8"))["provenance"]["hash"]
+
+    retry_manifest = _passed_manifest()
+    retry_manifest["run_id"] = "daily-data-chain-20260803T103000Z-pipeline"
+    retry = run_formal_candidate_refresh(
+        project_root=tmp_path,
+        data_chain_manifest=retry_manifest,
+        strategy_payload=_strategy_payload(),
+        captured_at="2026-08-03T18:30:00+08:00",
+        apply=True,
+        replace_same_date=True,
+    )
+
+    assert retry["status"] == "completed"
+    assert retry["applied"] is True
+    new_dated = json.loads(dated_path.read_text(encoding="utf-8"))
+    new_latest = json.loads(latest_path.read_text(encoding="utf-8"))
+    assert new_dated["provenance"]["source_run_id"] == retry_manifest["run_id"]
+    assert new_dated["provenance"]["hash"] != old_hash
+    assert new_latest["provenance"]["hash"] == new_dated["provenance"]["hash"]
+
+
+def test_pipeline_replace_same_date_overwrites_conditional_plan_latest(
+    tmp_path: Path,
+) -> None:
+    first = _formal_plan(
+        plan_id="old-plan",
+        plan_date="2026-09-03",
+        trade_date="2026-09-04",
+    )
+    second = _formal_plan(
+        plan_id="pipeline-plan",
+        plan_date="2026-09-03",
+        trade_date="2026-09-04",
+    )
+    latest = tmp_path / "results" / "conditional_trade_plans_latest.json"
+    first_pub = publish_archived_conditional_plan(tmp_path, first)
+    assert first_pub["status"] == "completed"
+
+    blocked = publish_archived_conditional_plan(tmp_path, second)
+    assert blocked["status"] == "blocked"
+    assert blocked["reason_codes"] == ["conditional_plan_latest_same_date_conflict"]
+    assert json.loads(latest.read_text(encoding="utf-8"))["plan_id"] == "old-plan"
+
+    replaced = publish_archived_conditional_plan(
+        tmp_path, second, replace_same_date=True
+    )
+    assert replaced["status"] == "completed"
+    assert replaced["published_latest"] is True
+    assert json.loads(latest.read_text(encoding="utf-8"))["plan_id"] == "pipeline-plan"
+    archive = (
+        tmp_path / "results" / "conditional_trade_plans_daily" / "2026-09-04.json"
+    )
+    assert json.loads(archive.read_text(encoding="utf-8"))["plan_id"] == "pipeline-plan"
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     [

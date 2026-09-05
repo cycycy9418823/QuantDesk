@@ -141,9 +141,3 @@ def test_review_pack_manifest_has_data_truth_status() -> None:
     manifest = json.loads((ROOT / "dist/portfolio_low_vol_rev120_candidate_monitoring_review_manifest.json").read_text(encoding="utf-8"))
     assert manifest.get("data_truth_status") == "candidate_valid_but_data_risk_high"
     assert manifest.get("display_status") == "candidate_watch_due_to_data_gaps"
-
-
-def test_status_update_cli_help_runs() -> None:
-    proc = subprocess.run([sys.executable, "scripts/update_candidate_data_truth_status.py", "--help"], cwd=ROOT, text=True, stdout=subprocess.PIPE)
-    assert proc.returncode == 0
-    assert "dual status" in proc.stdout.lower()

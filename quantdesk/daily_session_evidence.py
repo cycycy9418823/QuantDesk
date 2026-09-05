@@ -706,20 +706,85 @@ def load_verified_no_session_dates(
             metadata_dir=metadata_dir,
         )
         if loaded["status"] == "missing":
-            continue
-        if not loaded["valid"]:
+            loaded = None
+        elif not loaded["valid"]:
             warnings.append(
                 "invalid_baostock_session_evidence:"
                 + symbol
                 + ":"
                 + ",".join(loaded["reason_codes"])
             )
-            continue
-        suspended = set(loaded["suspended_dates"])
-        if suspended:
-            dates_by_symbol[symbol] = suspended
-        evidence_by_symbol[symbol] = dict(loaded["evidence"])
+            loaded = None
+        if loaded is not None:
+            suspended = set(loaded["suspended_dates"])
+            if suspended:
+                dates_by_symbol.setdefault(symbol, set()).update(suspended)
+            evidence_by_symbol[symbol] = dict(loaded["evidence"])
+
+    # Sina-snapshot suspension evidence produced by the daily refresh fast
+    # path (data/metadata/suspension_evidence/<YYYYMMDD>.json). This is the
+    # bridge that stops the chain from reporting a suspended symbol as a
+    # failed update: the date is a verified no-session date, not a gap.
+    snapshot_evidence = _load_sina_suspension_dates(normalized_symbols, metadata_dir=metadata_dir)
+    for symbol, dates in snapshot_evidence.items():
+        if dates:
+            dates_by_symbol.setdefault(symbol, set()).update(dates)
+            evidence_by_symbol.setdefault(
+                symbol,
+                {"source": "sina_snapshot_suspension_evidence", "dates": sorted(dates)},
+            )
     return dates_by_symbol, evidence_by_symbol, warnings
+
+
+def _load_sina_suspension_dates(
+    symbols: list[str],
+    *,
+    metadata_dir: str | Path | None = None,
+) -> dict[str, set[str]]:
+    """Read sina-snapshot suspension evidence files for the given symbols.
+
+    Scans ``data/metadata/suspension_evidence/*.json`` (one file per trade
+    date) and returns ``{symbol: {verified dates}}``. Malformed files are
+    skipped with no exception - the caller's warnings already cover the
+    producer side, and a broken evidence file must not break the chain.
+    """
+
+    import json as _json
+
+    base = Path(metadata_dir) if metadata_dir is not None else DEFAULT_METADATA_DIR
+    evidence_dir = base / "suspension_evidence"
+    if not evidence_dir.is_dir():
+        return {}
+    wanted = set(symbols)
+    out: dict[str, set[str]] = {}
+    for path in sorted(evidence_dir.glob("*.json")):
+        try:
+            payload = _json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, _json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        target_date = str(payload.get("target_date") or "").strip()
+        digits = "".join(ch for ch in str(path.stem) if ch.isdigit())
+        if len(digits) == 8:
+            declared = f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
+            if target_date and target_date != declared:
+                continue
+        if not target_date or len(target_date) != 10:
+            continue
+        verified = payload.get("verified_exclusions")
+        if not isinstance(verified, dict):
+            continue
+        for symbol, meta in verified.items():
+            normalized = normalize_symbol(symbol)
+            if normalized in wanted and isinstance(meta, dict):
+                signature = str(meta.get("signature") or "")
+                if signature in {
+                    "zero_trade_with_estimates",
+                    "zero_volume_with_last_close",
+                }:
+                    out.setdefault(normalized, set()).add(target_date)
+    return out
 
 
 __all__ = [

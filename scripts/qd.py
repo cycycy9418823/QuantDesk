@@ -33,6 +33,8 @@ from quantdesk.shared import now_text, read_json, truthy  # noqa: E402
 IN_PROCESS_DISABLED_COMMANDS = {"app", "live"}
 
 COMMANDS: dict[str, tuple[str, list[str], str]] = {
+    "pause": ("run_desk_control.py", ["pause"], "Stop the close pipeline and 20:20 AI writer; leave readers on."),
+    "resume": ("run_desk_control.py", ["resume"], "Restore writers last stopped by pause. Does not re-enable old disabled tasks."),
     "doctor": ("self_check.py", [], "Run project self-checks; recommended first in a clean zip."),
     "env-doctor": ("check_python_env.py", [], "Diagnose the active Python runtime and Windows launcher choices."),
     "status": ("show_quantdesk_status.py", [], "Read local status and next actions; no network by default."),
@@ -562,6 +564,8 @@ def print_help() -> None:
         (
             "\u63a8\u8350\u65b0\u624b\u547d\u4ee4 / Beginner commands",
             [
+                ("pause", "Stop the close pipeline and 20:20 AI. Readers stay on."),
+                ("resume", "Restore only what pause stopped."),
                 ("status --json true", "Return local status as JSON."),
                 ("fix-plan --json true", "Return local repair plan as JSON."),
                 ("env-doctor --json true", "Check Python executable, PATH python, py launcher, and encodings."),

@@ -331,12 +331,24 @@ def _default_member_fetcher(provider: str, board: str) -> Any:
 
         return fetch_industry_board_members(board)
 
-    import akshare as ak  # type: ignore
-
     function_name = {
         "ths": "stock_board_industry_cons_ths",
     }.get(key, "")
-    function = getattr(ak, function_name, None) if function_name else None
+    if not function_name:
+        # An unroutable provider must degrade with its own reason code. Importing
+        # akshare before this check masked that with ModuleNotFoundError wherever
+        # the optional dependency is absent, losing the very reason code this
+        # branch exists to produce.
+        raise RuntimeError(f"membership_provider_unavailable:{provider}")
+
+    try:
+        import akshare as ak  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            f"membership_provider_unavailable:{provider}:akshare_not_installed"
+        ) from exc
+
+    function = getattr(ak, function_name, None)
     if not callable(function):
         raise RuntimeError(f"membership_provider_unavailable:{provider}")
     try:

@@ -1792,6 +1792,30 @@ def test_daily_coverage_rejects_partial_and_invalid_basis_even_when_fresh() -> N
     assert "daily_price_basis_not_raw" in gate["reason_codes"]
 
 
+def test_daily_coverage_accepts_verified_upstream_reuse_as_completed() -> None:
+    from quantdesk.daily_data_chain import _daily_coverage
+
+    payload = {
+        "status": "reused_verified_upstream",
+        "upstream_reuse": True,
+        "total_symbols": 914,
+        "stale_count_after": 0,
+        "missing_count_after": 0,
+        "stale_symbol_list_after": [],
+        "missing_symbol_list_after": [],
+        "failed_symbols": 0,
+        "failed_symbol_list": [],
+        "invalid_price_basis_symbols": [],
+        "require_raw_price_basis": True,
+    }
+
+    gate = _daily_coverage(payload, 914)
+
+    assert gate["status"] == "passed"
+    assert gate["fresh_count"] == 914
+    assert "daily_component_not_completed" not in gate["reason_codes"]
+
+
 def test_daily_update_subset_keeps_critical_symbols_out_of_analysis_coverage() -> None:
     from quantdesk.daily_data_chain import _subset_daily_update_payload
 

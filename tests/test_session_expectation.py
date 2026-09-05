@@ -128,6 +128,68 @@ def test_exact_local_metadata_classifies_suspension_and_lifecycle(tmp_path: Path
         assert {"exists", "read_ok", "as_of", "sha256", "count", "error"} <= set(evidence)
 
 
+def test_refresh_suspension_json_classifies_halt_without_network(tmp_path: Path) -> None:
+    _daily_dir, metadata_dir = _prepare_root(tmp_path)
+    evidence_dir = metadata_dir / "suspension_evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "20260715.json").write_text(
+        json.dumps(
+            {
+                "target_date": TARGET_DATE,
+                "source": "sina.Market_Center.getHQNodeData",
+                "verified_exclusions": {
+                    "600929": {
+                        "signature": "zero_volume_with_last_close",
+                        "open": "0.000",
+                        "close": "6.040",
+                        "volume": "",
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    payload = build_session_expectation(
+        ["600929", "000001"],
+        TARGET_DATE,
+        project_root=tmp_path,
+        network=False,
+    )
+
+    assert payload["per_symbol"]["600929"]["classification"] == "verified_full_day_suspension"
+    assert payload["per_symbol"]["600929"]["reason"]
+    assert "600929" in payload["legitimate_no_session_symbols"]
+    assert payload["unknown_symbols"] == ["000001"]
+    assert payload["source_evidence"]["refresh_suspension_evidence"]["matched_count"] == 1
+
+
+def test_null_refresh_exclusion_is_not_verified(tmp_path: Path) -> None:
+    _daily_dir, metadata_dir = _prepare_root(tmp_path)
+    evidence_dir = metadata_dir / "suspension_evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "20260715.json").write_text(
+        json.dumps(
+            {
+                "target_date": TARGET_DATE,
+                "source": "test",
+                "verified_exclusions": {"600929": None},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    payload = build_session_expectation(
+        ["600929"],
+        TARGET_DATE,
+        project_root=tmp_path,
+        network=False,
+    )
+    assert payload["per_symbol"]["600929"]["classification"] != "verified_full_day_suspension"
+    assert payload["source_evidence"]["refresh_suspension_evidence"]["verified_count"] == 0
+
+
 def test_local_suspension_metadata_requires_explicit_unconflicted_full_day_proof(
     tmp_path: Path,
 ) -> None:

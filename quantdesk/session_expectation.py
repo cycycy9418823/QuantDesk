@@ -338,6 +338,80 @@ def _load_suspension(
         )
     return result, evidence
 
+
+def _load_refresh_suspension_exclusions(
+    metadata_dir: Path,
+    target: str,
+    symbols: set[str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Use same-day refresh JSON so a halt is not 'unknown' when network is off."""
+
+    stamp = target.replace("-", "")
+    path = Path(metadata_dir) / "suspension_evidence" / f"{stamp}.json"
+    evidence: dict[str, Any] = {
+        "source": "refresh_suspension_evidence_json",
+        "path": str(path),
+        "exists": path.is_file(),
+        "read_ok": False,
+        "as_of": target,
+        "sha256": "",
+        "count": 0,
+        "matched_count": 0,
+        "verified_count": 0,
+        "error": "",
+    }
+    if not path.is_file():
+        return {}, evidence
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        evidence["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        evidence["error"] = f"unreadable:{exc.__class__.__name__}"
+        return {}, evidence
+    if not isinstance(payload, dict):
+        evidence["error"] = "invalid_payload"
+        return {}, evidence
+    file_date = _date_text(payload.get("target_date"))
+    if file_date and file_date != target:
+        evidence["error"] = f"target_date_mismatch:{file_date}"
+        return {}, evidence
+    exclusions = payload.get("verified_exclusions")
+    if not isinstance(exclusions, dict):
+        evidence["error"] = "missing_verified_exclusions"
+        return {}, evidence
+    result: dict[str, dict[str, Any]] = {}
+    for raw_symbol, row in exclusions.items():
+        symbol = normalize_symbol(raw_symbol)
+        if not symbol or symbol not in symbols:
+            continue
+        if not isinstance(row, Mapping) or not row:
+            continue
+        evidence_bits = [
+            row.get("signature"),
+            row.get("source"),
+            row.get("reason"),
+            row.get("from"),
+            row.get("start"),
+            row.get("start_date"),
+            row.get("provider"),
+        ]
+        if not any(str(item or "").strip() for item in evidence_bits):
+            continue
+        signature = str(row.get("signature") or "verified_exclusion")
+        result[symbol] = {
+            "source": str(payload.get("source") or row.get("source") or "refresh_suspension_evidence"),
+            "symbol": symbol,
+            "target_date": target,
+            "status": True,
+            "reason": f"refresh_verified_exclusion:{signature}",
+        }
+    evidence["read_ok"] = True
+    evidence["count"] = len(exclusions)
+    evidence["matched_count"] = len(result)
+    evidence["verified_count"] = len(result)
+    return result, evidence
+
+
 def _resolve_dirs(
     project_root: str | Path | None,
     data_root: str | Path | None,
@@ -638,6 +712,12 @@ def build_session_expectation(
     )
     local_suspensions = dict(history)
     local_suspensions.update(status)
+    refresh_exclusions, source_evidence["refresh_suspension_evidence"] = (
+        _load_refresh_suspension_exclusions(
+            resolved_metadata, target, symbol_set
+        )
+    )
+    local_suspensions.update(refresh_exclusions)
     (
         baostock_no_session_dates,
         baostock_evidence_by_symbol,

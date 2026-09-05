@@ -1,0 +1,17 @@
+{
+  "id": "evening_data_menu",
+  "version": "v1.0.0",
+  "note": "Frozen snapshot of the 20:20 user-message slots at charter commit 53fa41c. Do not add or remove slots without §4.",
+  "slots": [
+    {"id": "decision_date", "source": "as_of"},
+    {"id": "trade_date", "source": "trade_date"},
+    {"id": "account", "fields": ["equity", "cash", "holdings_count", "mandate_note"]},
+    {"id": "stance", "optional": true},
+    {"id": "style_scoreboard", "optional": true},
+    {"id": "holdings", "optional": true},
+    {"id": "recommendations", "optional": true, "c_line": "advisory copy only; C-line never verifies this slot"},
+    {"id": "method_results", "optional": true},
+    {"id": "evidence_notes", "optional": true},
+    {"id": "candidates", "source": "data/daily closes, N-day change"}
+  ]
+}

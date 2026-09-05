@@ -6,7 +6,7 @@ from typing import Any
 
 from ai_trader.ledger import mark_to_market, position_map, session_days_held
 from ai_trader.mandate import DEFAULT_MANDATE, TraderMandate
-from quantdesk.board_rules import classify_board
+from quantdesk.paper.matching import next_open_limit_blocked
 from quantdesk.paper.market_rules import lot_size_for_symbol, round_notional_down_to_lot_quantity
 from quantdesk.paper.trade_costs import TradeCostConfig, buy_cash_outflow, sell_cash_inflow
 
@@ -14,19 +14,7 @@ COST_CONFIG = TradeCostConfig.cn_current()
 
 
 def _limit_blocked(symbol: str, pct_chg: float | None, side: str) -> str | None:
-    if pct_chg is None or not pd_finite(pct_chg):
-        return None
-    try:
-        rules = classify_board(symbol)
-        up = float(rules.limit_up_pct) - 0.3
-        down = float(rules.limit_down_pct) + 0.3
-    except Exception:
-        up, down = 9.7, -9.7
-    if side == "buy" and pct_chg >= up:
-        return f"limit_up:{symbol}:{pct_chg:.2f}%"
-    if side == "sell" and pct_chg <= down:
-        return f"limit_down:{symbol}:{pct_chg:.2f}%"
-    return None
+    return next_open_limit_blocked(symbol, pct_chg, side)
 
 
 def pd_finite(value: float) -> bool:

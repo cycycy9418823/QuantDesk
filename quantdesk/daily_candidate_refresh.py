@@ -1882,9 +1882,17 @@ def _write_run_candidate_batch_once(
 
 
 def publish_formal_candidate_batch(
-    project_root: Path, payload: Mapping[str, Any]
+    project_root: Path,
+    payload: Mapping[str, Any],
+    *,
+    replace_same_date: bool = False,
 ) -> dict[str, Any]:
-    """Publish one verified batch to an append-only date and atomic latest."""
+    """Publish one verified batch to an append-only date and atomic latest.
+
+    ``replace_same_date`` is Pipeline-only: a verified upstream-reuse run may
+    take over the same target date that a previous writer already sealed.
+    Scheduled same-day retries keep the default append-only conflict.
+    """
 
     root = Path(project_root).resolve()
     batch = copy.deepcopy(dict(payload))
@@ -1924,12 +1932,24 @@ def publish_formal_candidate_batch(
                     existing_hash != batch_hash
                     or verify_formal_candidate_batch(dated_existing)
                 ):
-                    return {
-                        "status": "blocked",
-                        "applied": False,
-                        "reason_codes": ["candidate_dated_snapshot_conflict"],
-                        "dated_path": dated_rel,
-                    }
+                    if not replace_same_date:
+                        return {
+                            "status": "blocked",
+                            "applied": False,
+                            "reason_codes": ["candidate_dated_snapshot_conflict"],
+                            "dated_path": dated_rel,
+                        }
+                    try:
+                        atomic_write_json(dated, batch)
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        return {
+                            "status": "blocked",
+                            "applied": False,
+                            "reason_codes": ["candidate_dated_snapshot_write_failed"],
+                            "error": f"{type(exc).__name__}:{exc}"[:1000],
+                            "dated_path": dated_rel,
+                        }
+                    dated_existing = None
             else:
                 try:
                     _exclusive_write_json(dated, batch)
@@ -1945,13 +1965,28 @@ def publish_formal_candidate_batch(
                         or raced_hash != batch_hash
                         or verify_formal_candidate_batch(raced)
                     ):
-                        return {
-                            "status": "blocked",
-                            "applied": False,
-                            "reason_codes": ["candidate_dated_snapshot_conflict"],
-                            "dated_path": dated_rel,
-                        }
-                    dated_existing = raced
+                        if not replace_same_date:
+                            return {
+                                "status": "blocked",
+                                "applied": False,
+                                "reason_codes": ["candidate_dated_snapshot_conflict"],
+                                "dated_path": dated_rel,
+                            }
+                        try:
+                            atomic_write_json(dated, batch)
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            return {
+                                "status": "blocked",
+                                "applied": False,
+                                "reason_codes": [
+                                    "candidate_dated_snapshot_write_failed"
+                                ],
+                                "error": f"{type(exc).__name__}:{exc}"[:1000],
+                                "dated_path": dated_rel,
+                            }
+                        dated_existing = None
+                    else:
+                        dated_existing = raced
                 except (OSError, RuntimeError, ValueError) as exc:
                     return {
                         "status": "blocked",
@@ -1986,11 +2021,12 @@ def publish_formal_candidate_batch(
                         "reason_codes": ["candidate_latest_regression"],
                     }
                 if latest_date == target_date and latest_hash != batch_hash:
-                    return {
-                        "status": "blocked",
-                        "applied": False,
-                        "reason_codes": ["candidate_latest_same_date_conflict"],
-                    }
+                    if not replace_same_date:
+                        return {
+                            "status": "blocked",
+                            "applied": False,
+                            "reason_codes": ["candidate_latest_same_date_conflict"],
+                        }
 
             latest_same = bool(
                 latest_existing
@@ -2037,6 +2073,7 @@ def run_formal_candidate_refresh(
     strategy_runner: StrategyRunner | None = None,
     captured_at: str,
     apply: bool = False,
+    replace_same_date: bool = False,
 ) -> dict[str, Any]:
     """Stage a candidate batch, then optionally publish its dated/latest pair."""
 
@@ -2158,7 +2195,9 @@ def run_formal_candidate_refresh(
                 else ""
             ),
         }
-    published = publish_formal_candidate_batch(root, batch)
+    published = publish_formal_candidate_batch(
+        root, batch, replace_same_date=replace_same_date
+    )
     return {
         **published,
         "staging_path": staging_rel,
@@ -2234,7 +2273,7 @@ def _conditional_plan_archive_reasons(plan: Mapping[str, Any]) -> list[str]:
 
 
 def _archive_conditional_plan_locked(
-    root: Path, plan: Mapping[str, Any]
+    root: Path, plan: Mapping[str, Any], *, replace_same_date: bool = False
 ) -> dict[str, Any]:
     plan_payload = copy.deepcopy(dict(plan))
     reasons = _conditional_plan_archive_reasons(plan_payload)
@@ -2273,11 +2312,31 @@ def _archive_conditional_plan_locked(
             existing_hash = ""
             existing_reasons.append("conditional_plan_archive_hash_failed")
         if existing_reasons or existing_hash != plan_hash:
+            if not replace_same_date:
+                return {
+                    "status": "blocked",
+                    "archived": False,
+                    "reason_codes": ["conditional_plan_archive_conflict"],
+                    "archive_path": archive_rel,
+                }
+            try:
+                atomic_write_json(archive_path, plan_payload)
+            except (OSError, RuntimeError, ValueError) as exc:
+                return {
+                    "status": "blocked",
+                    "archived": False,
+                    "reason_codes": ["conditional_plan_archive_write_failed"],
+                    "error": f"{type(exc).__name__}:{exc}"[:1000],
+                    "archive_path": archive_rel,
+                }
             return {
-                "status": "blocked",
-                "archived": False,
-                "reason_codes": ["conditional_plan_archive_conflict"],
+                "status": "replaced",
+                "archived": True,
+                "reason_codes": [],
                 "archive_path": archive_rel,
+                "plan_id": str(plan_payload.get("plan_id") or ""),
+                "trade_date": trade_date,
+                "plan_hash": plan_hash,
             }
         return {
             "status": "idempotent",
@@ -2417,7 +2476,10 @@ def load_archived_conditional_plan(
 
 
 def publish_archived_conditional_plan(
-    project_root: Path, plan: Mapping[str, Any]
+    project_root: Path,
+    plan: Mapping[str, Any],
+    *,
+    replace_same_date: bool = False,
 ) -> dict[str, Any]:
     """Archive the previous latest and new plan before replacing latest."""
 
@@ -2439,7 +2501,9 @@ def publish_archived_conditional_plan(
 
             previous_archived = False
             if latest is not None:
-                previous = _archive_conditional_plan_locked(root, latest)
+                previous = _archive_conditional_plan_locked(
+                    root, latest, replace_same_date=replace_same_date
+                )
                 if previous.get("archived") is not True:
                     return {
                         "status": "blocked",
@@ -2464,7 +2528,7 @@ def publish_archived_conditional_plan(
                         ) == _conditional_plan_hash(new_plan)
                     except (TypeError, ValueError):
                         same_latest = False
-                    if not same_latest:
+                    if not same_latest and not replace_same_date:
                         return {
                             "status": "blocked",
                             "published_latest": False,
@@ -2472,7 +2536,9 @@ def publish_archived_conditional_plan(
                             "reason_codes": ["conditional_plan_latest_same_date_conflict"],
                         }
 
-            archived = _archive_conditional_plan_locked(root, new_plan)
+            archived = _archive_conditional_plan_locked(
+                root, new_plan, replace_same_date=replace_same_date
+            )
             if archived.get("archived") is not True:
                 return {
                     "status": "blocked",

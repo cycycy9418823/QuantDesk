@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 from pathlib import Path
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -15,7 +15,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from quantdesk.data_health_alert_delivery import dispatch_data_health_alerts  # noqa: E402
 from quantdesk.shared import truthy  # noqa: E402
-
 
 HEALTH_PATH = PROJECT_ROOT / "results" / "data_health" / "data_health_dashboard_latest.json"
 SENDKEY_ENV = "QUANTDESK_SERVERCHAN_SENDKEY"
@@ -46,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", default="")
     parser.add_argument("--json", default="true")
     parser.add_argument("--summary", default="false")
+    parser.add_argument("--pipeline-run-id", default="")
+    parser.add_argument("--target-date", default="")
     return parser
 
 
@@ -82,6 +83,17 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=dry_run,
             _sendkey_loader=_load_sendkey,
         )
+    pipeline_run_id = str(args.pipeline_run_id or "").strip()
+    if pipeline_run_id:
+        payload["pipeline_run_id"] = pipeline_run_id
+        payload["target_date"] = str(
+            args.target_date or payload.get("target_date") or health.get("target_date") or ""
+        )
+        dest = PROJECT_ROOT / "results" / "data_health" / "data_health_alert_delivery_latest.json"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload["artifact_path"] = "results/data_health/data_health_alert_delivery_latest.json"
+        payload["artifact_sha256"] = "sha256:" + hashlib.sha256(dest.read_bytes()).hexdigest()
     if truthy(args.json):
         print(json.dumps(payload, ensure_ascii=False, indent=None if truthy(args.summary) else 2))
     else:

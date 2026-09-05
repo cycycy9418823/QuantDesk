@@ -23,12 +23,18 @@ LEDGER_PATH = STATE_DIR / "ledger.json"
 HYPOTHESES_PATH = STATE_DIR / "hypotheses.json"
 JOURNAL_PATH = STATE_DIR / "journal.jsonl"
 JOURNAL_LATEST_PATH = STATE_DIR / "journal_latest.json"
+DAYTIME_NOTES_PATH = STATE_DIR / "daytime_notes.jsonl"
+DAYTIME_SESSION_PATH = STATE_DIR / "daytime_session.json"
 PLAN_LATEST_PATH = STATE_DIR / "plan_latest.json"
 REVIEW_LATEST_PATH = STATE_DIR / "review_latest.json"
 WATCHLIST_PATH = STATE_DIR / "watchlist.json"
 PHILOSOPHY_PATH = STATE_DIR / "philosophy.json"
 CYCLE_LATEST_PATH = RESULTS_DIR / "cycle_latest.json"
 SNAPSHOT_PATH = RESULTS_DIR / "snapshot_latest.json"
+DECISION_LOG_PATH = STATE_DIR / "decision_log.jsonl"
+DECISION_LATEST_PATH = STATE_DIR / "decision_latest.json"
+DECISION_PAGE_PATH = RESULTS_DIR / "decision_page.html"
+DECISION_PAGE_MD_PATH = RESULTS_DIR / "decision_page.md"
 
 
 @dataclass(frozen=True)
@@ -39,12 +45,18 @@ class CyclePaths:
     hypotheses: Path = HYPOTHESES_PATH
     journal_latest: Path = JOURNAL_LATEST_PATH
     journal_log: Path = JOURNAL_PATH
+    daytime_notes: Path = DAYTIME_NOTES_PATH
+    daytime_session: Path = DAYTIME_SESSION_PATH
     plan_latest: Path = PLAN_LATEST_PATH
     review_latest: Path = REVIEW_LATEST_PATH
     watchlist: Path = WATCHLIST_PATH
     philosophy: Path = PHILOSOPHY_PATH
     cycle_latest: Path = CYCLE_LATEST_PATH
     snapshot: Path = SNAPSHOT_PATH
+    decision_log: Path = DECISION_LOG_PATH
+    decision_latest: Path = DECISION_LATEST_PATH
+    decision_page: Path = DECISION_PAGE_PATH
+    decision_page_md: Path = DECISION_PAGE_MD_PATH
 
 
 def ensure_runtime_dirs() -> None:

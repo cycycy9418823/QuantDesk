@@ -858,6 +858,16 @@ def _fetch_merge_write_symbol_unlocked(
             network=network,
         )
         warnings.extend(fetch_warnings)
+        # Shared validity gate (quantdesk.data_truth.daily_bar_validity):
+        # the fast snapshot path and this slow path must reject the same rows.
+        # Vendors encode "suspended today" as zero-volume flat rows; those must
+        # never be written as normal bars (repo convention: no bar on a
+        # suspended day). Existing local history is never rewritten here.
+        from quantdesk.data_truth.daily_bar_validity import filter_invalid_daily_bars
+
+        fresh, invalid_reasons = filter_invalid_daily_bars(fresh, symbol=symbol)
+        if invalid_reasons:
+            warnings.extend(invalid_reasons)
         persisted_no_session, _persisted_evidence, persisted_warnings = (
             load_verified_no_session_dates([symbol], metadata_dir=metadata_dir)
         )

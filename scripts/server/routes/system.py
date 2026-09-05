@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
-from flask import Blueprint, Flask, Response, jsonify, make_response, render_template
+from flask import Blueprint, Flask, Response, current_app, jsonify, make_response, render_template
+
+from quantdesk.project_status import read_project_status
 
 
 def create_system_blueprint(*, build_id: str, asset_versions_func: Callable[[], dict[str, str]]) -> Blueprint:
@@ -32,6 +35,22 @@ def create_system_blueprint(*, build_id: str, asset_versions_func: Callable[[], 
     @bp.route("/api/launcher/build-id", methods=["GET"])
     def get_launcher_build_id() -> Any:
         return jsonify({"build_id": build_id})
+
+    @bp.route("/api/project-status", methods=["GET"])
+    def get_project_status() -> Any:
+        """Read-only STATUS.md. Query path arguments are ignored."""
+
+        configured = current_app.config.get("QUANTDESK_PROJECT_ROOT")
+        if configured:
+            root = Path(configured)
+        else:
+            from scripts.server.app_factory import project_root as default_root
+
+            root = Path(default_root)
+        payload = read_project_status(root)
+        response = jsonify(payload)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @bp.route("/favicon.ico")
     def favicon() -> Response:

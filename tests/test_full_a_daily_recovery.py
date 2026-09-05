@@ -285,7 +285,7 @@ def test_daily_chain_manifest_declares_data_and_research_scopes_separately() -> 
     source = inspect.getsource(_run_daily_data_chain_impl)
 
     assert '"market_data_scope": "all_a"' in source
-    assert '"research_scope": "current_analysis_pool"' in source
+    assert '"research_scope": "all_a"' in source
     assert '"full_a_research_scan": False' in source
-    # The bounded research selector must remain the declared research scope.
-    assert "resolve_symbols(only_low_price=True)" in source
+    assert "宇宙=全A" in source
+    assert "本链默认不跑该过滤器" in source

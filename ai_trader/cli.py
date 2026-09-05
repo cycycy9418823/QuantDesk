@@ -6,10 +6,20 @@ import argparse
 import json
 import sys
 
+from pathlib import Path
+
 from ai_trader.app import main as run_app
 from ai_trader.cycle import run_cycle
+from ai_trader.decision_log import ingest_state
 from ai_trader.ledger import init_ledger, load_ledger
-from ai_trader.paths import FORBIDDEN_QUANTDESK_LEDGER, LEDGER_PATH, SNAPSHOT_PATH
+from ai_trader.paths import (
+    DEFAULT_DAILY_DIR,
+    FORBIDDEN_QUANTDESK_LEDGER,
+    LEDGER_PATH,
+    RESULTS_DIR,
+    SNAPSHOT_PATH,
+    STATE_DIR,
+)
 
 
 def _print(payload: object) -> None:
@@ -32,6 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
     app = sub.add_parser("app", help="打开8001教室页")
     app.add_argument("--host", default="127.0.0.1")
     app.add_argument("--port", type=int, default=8001)
+    decisions = sub.add_parser(
+        "decisions",
+        help="C线：把已有20:20日记核成可对账记录并刷新对照页，不调模型、不改菜单、不跑周期",
+    )
+    decisions.add_argument("--daily-dir", default=str(DEFAULT_DAILY_DIR))
+    decisions.add_argument("--state-dir", default=str(STATE_DIR))
+    decisions.add_argument("--plan", default="")
+    decisions.add_argument("--journal", default="")
+    decisions.add_argument("--out-dir", default=str(RESULTS_DIR))
+    decisions.add_argument("--as-of", default="")
     return parser
 
 
@@ -66,6 +86,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "app":
         run_app(host=args.host, port=args.port)
+        return 0
+    if args.command == "decisions":
+        payload = ingest_state(
+            daily_dir=Path(args.daily_dir),
+            state_dir=Path(args.state_dir),
+            plan_path=Path(args.plan) if args.plan else None,
+            journal_path=Path(args.journal) if args.journal else None,
+            out_dir=Path(args.out_dir),
+            as_of=args.as_of or None,
+        )
+        summary = {
+            "ok": payload.get("ok"),
+            "as_of": payload.get("as_of"),
+            "disclaimer": "纸面 · 未验证",
+            "counts": (payload.get("manifest") or {}).get("counts"),
+            "page_html": (payload.get("paths") or {}).get("html"),
+            "page_md": (payload.get("paths") or {}).get("md"),
+            "log": (payload.get("paths") or {}).get("log"),
+            "git_head": (payload.get("manifest") or {}).get("git_head"),
+            "dirty_file_count": (payload.get("manifest") or {}).get("dirty_file_count"),
+            "rejection_count": payload.get("rejection_count"),
+        }
+        _print(summary)
         return 0
     raise SystemExit(f"unknown command {args.command}")
 

@@ -73,6 +73,8 @@ document.addEventListener("DOMContentLoaded", () => {
     loadHomeEquity();
     loadNewsStatus();
     loadMarketBrainHome();
+    setupProjectStatus();
+    loadProjectStatus();
     window.setInterval(() => loadRealtimeMarket(false), 300000);
     startStartupStatusPolling();
     triggerStartupRefresh();
@@ -107,6 +109,159 @@ function escapeHtml(value) {
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
+}
+
+let projectStatusLastOk = null;
+let projectStatusFullOpen = false;
+
+function setupProjectStatus() {
+    const refresh = document.getElementById("projectStatusRefreshButton");
+    const openFull = document.getElementById("projectStatusOpenFullButton");
+    if (refresh) {
+        refresh.addEventListener("click", () => {
+            loadProjectStatus();
+        });
+    }
+    if (openFull) {
+        openFull.addEventListener("click", () => {
+            const panel = document.getElementById("projectStatusFull");
+            if (!panel) return;
+            projectStatusFullOpen = !projectStatusFullOpen;
+            panel.hidden = !projectStatusFullOpen;
+            openFull.textContent = projectStatusFullOpen ? "收起完整状态" : "查看完整状态";
+        });
+    }
+}
+
+function setText(id, value) {
+    const node = document.getElementById(id);
+    if (node) node.textContent = value == null || value === "" ? "未提供" : String(value);
+}
+
+function renderProjectStatusFailure(message, keepPrevious) {
+    const banner = document.getElementById("projectStatusBanner");
+    if (banner) {
+        banner.hidden = false;
+        banner.textContent = keepPrevious
+            ? `上次读取；本次失败。${message} 这是状态文件问题，不是账本清空，也不是行情全部坏掉。`
+            : `${message} 这是状态文件问题，不是账本清空，也不是行情全部坏掉。`;
+    }
+    if (!keepPrevious) {
+        setText("projectStatusHealth", "无法读取 STATUS.md");
+        setText("projectStatusExplain", "红格解释：本次没有可用记录");
+        setText("projectStatusPhase", "当前阶段：未提供");
+        const health = document.getElementById("projectStatusHealth");
+        if (health) health.classList.remove("has-red");
+    }
+}
+
+function renderProjectStatusPayload(data, { stale = false } = {}) {
+    const banner = document.getElementById("projectStatusBanner");
+    const health = document.getElementById("projectStatusHealth");
+    const sectionsHost = document.getElementById("projectStatusSections");
+    const raw = document.getElementById("projectStatusRaw");
+    const kicker = document.getElementById("projectStatusKicker");
+    if (kicker) {
+        const scope = data.page_scope_note ? ` · ${data.page_scope_note}` : "";
+        kicker.textContent = `${data.source_label || "项目记录 · 非实时核验"} · ${data.disclaimer || "纸面 · 未验证"}${scope}`;
+    }
+    if (banner) {
+        if (stale) {
+            banner.hidden = false;
+        } else if (data.page_scope_note) {
+            banner.hidden = false;
+            banner.textContent = data.page_scope_note;
+        } else if (Array.isArray(data.parse_warnings) && data.parse_warnings.length) {
+            banner.hidden = false;
+            banner.textContent = `解析降级：${data.parse_warnings.join("；")}。下方仍提供原文。`;
+        } else {
+            banner.hidden = true;
+            banner.textContent = "";
+        }
+    }
+    setText("projectStatusDocTime", data.document_updated_at_display || "未提供");
+    setText("projectStatusFileTime", data.file_modified_at || "未提供");
+    setText("projectStatusReadTime", data.read_at || "未提供");
+    setText(
+        "projectStatusMeta",
+        `更新者：${data.document_updater || "未提供"} · 来源：${data.source_kind || "STATUS.md"} · 可读≠系统健康`
+    );
+    const healthLine = data.health_line || "未提供";
+    setText("projectStatusHealth", healthLine);
+    if (health) {
+        health.classList.toggle("has-red", /✗|红/.test(healthLine));
+    }
+    setText("projectStatusExplain", `红格解释：${data.health_explanation || "未提供"}`);
+    const phase = data.phase || {};
+    setText(
+        "projectStatusPhase",
+        `当前阶段：${phase.raw || "未提供"} · 检查点 ${phase.checkpoint || "未提供"} · 剩余交易日 ${phase.remaining_trading_days || "未提供"}`
+    );
+    setText("projectStatusTradeDate", `健康行对应交易日：${data.health_trade_date_label || "记录未明确标注"}`);
+    if (raw) raw.textContent = data.raw_text || "";
+    if (sectionsHost) {
+        sectionsHost.replaceChildren();
+        const progress = data.line_progress || {};
+        ["B", "C", "A0"].forEach((key) => {
+            const item = progress[key] || {};
+            const block = document.createElement("section");
+            const title = document.createElement("h3");
+            title.textContent = `${key} 线`;
+            const next = document.createElement("p");
+            next.textContent = `下一步：${item.next || "未提供"}`;
+            const stuck = document.createElement("p");
+            stuck.textContent = `卡住：${item.stuck || "未提供"}`;
+            const recent = document.createElement("pre");
+            recent.className = "project-status-pre";
+            recent.textContent = item.recent || "未提供";
+            block.append(title, next, stuck, recent);
+            sectionsHost.append(block);
+        });
+        const extra = Array.isArray(data.sections) ? data.sections : [];
+        extra.forEach((section) => {
+            const titleText = section.title || "未命名段落";
+            if (titleText === "B 线" || titleText === "C 线" || titleText === "A0 线") return;
+            if (titleText === "今日健康行" || titleText === "当前阶段") return;
+            const block = document.createElement("section");
+            const title = document.createElement("h3");
+            title.textContent = titleText;
+            const body = document.createElement("pre");
+            body.className = "project-status-pre";
+            body.textContent = section.body || "";
+            block.append(title, body);
+            sectionsHost.append(block);
+        });
+    }
+}
+
+async function loadProjectStatus() {
+    const refresh = document.getElementById("projectStatusRefreshButton");
+    if (refresh) refresh.disabled = true;
+    try {
+        const data = await requestJson("/api/project-status");
+        if (!data || data.readable !== true) {
+            const message = `本次读取失败：${(data && data.error) || "unknown"}`;
+            if (projectStatusLastOk) {
+                renderProjectStatusPayload(projectStatusLastOk, { stale: true });
+                renderProjectStatusFailure(message, true);
+            } else {
+                renderProjectStatusFailure(message, false);
+            }
+            return;
+        }
+        projectStatusLastOk = data;
+        renderProjectStatusPayload(data, { stale: false });
+    } catch (error) {
+        const message = `本次读取失败：${errorText(error)}`;
+        if (projectStatusLastOk) {
+            renderProjectStatusPayload(projectStatusLastOk, { stale: true });
+            renderProjectStatusFailure(message, true);
+        } else {
+            renderProjectStatusFailure(message, false);
+        }
+    } finally {
+        if (refresh) refresh.disabled = false;
+    }
 }
 
 function errorText(error) {

@@ -32,6 +32,14 @@ DISCLAIMER = (
 AUDITED_UNREFERENCED_SERVER_ROUTES: dict[tuple[str, str], tuple[str, str, str]] = {
     (
         "GET",
+        "/api/ai-trader/boundary",
+    ): (
+        "ai_trader_boundary_read_endpoint",
+        "keep_as_test_and_diagnostic_consumed",
+        "The AI trader boundary endpoint is consumed by the server test suite (tests/test_ai_trader_server_8000.py) and direct API diagnostics; the active UI reads boundary fields from the consolidated /api/ai-trader/dashboard payload instead.",
+    ),
+    (
+        "GET",
         "/api/launcher/build-id",
     ): (
         "launcher_build_probe",

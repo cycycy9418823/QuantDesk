@@ -10,6 +10,7 @@ from typing import Any
 
 from ai_trader.mandate import BOUNDARY, DEFAULT_MANDATE, TraderMandate
 from ai_trader.paths import LEDGER_PATH, assert_not_quantdesk_ledger, ensure_runtime_dirs
+from quantdesk.paper.matching import POLICY_NEXT_OPEN, ensure_declared_fill_policy
 from quantdesk.utils import atomic_write_json
 
 LEDGER_SCHEMA = "ai_trader_ledger_v1"
@@ -41,7 +42,7 @@ def _now() -> str:
 
 def empty_ledger(mandate: TraderMandate = DEFAULT_MANDATE, *, created_at: str | None = None) -> dict[str, Any]:
     stamp = created_at or _now()
-    return {
+    ledger = {
         "schema_version": LEDGER_SCHEMA,
         "ledger_id": mandate.ledger_id,
         "mandate": mandate.to_dict(),
@@ -59,6 +60,7 @@ def empty_ledger(mandate: TraderMandate = DEFAULT_MANDATE, *, created_at: str | 
         "warnings": [],
         "boundary": dict(BOUNDARY),
     }
+    return ensure_declared_fill_policy(ledger, policy_id=POLICY_NEXT_OPEN)
 
 
 def load_ledger(path: Path | None = None) -> dict[str, Any]:
@@ -70,7 +72,7 @@ def load_ledger(path: Path | None = None) -> dict[str, Any]:
         raise ValueError("ai_trader ledger is not an object")
     if str(payload.get("ledger_id") or "") != DEFAULT_MANDATE.ledger_id:
         raise ValueError("ai_trader ledger_id mismatch; refusing to load foreign book")
-    return payload
+    return ensure_declared_fill_policy(payload, policy_id=POLICY_NEXT_OPEN)
 
 
 def save_ledger(ledger: dict[str, Any], path: Path | None = None) -> Path:
@@ -79,6 +81,7 @@ def save_ledger(ledger: dict[str, Any], path: Path | None = None) -> Path:
     payload = deepcopy(ledger)
     payload["updated_at"] = _now()
     payload["boundary"] = dict(BOUNDARY)
+    ensure_declared_fill_policy(payload, policy_id=POLICY_NEXT_OPEN)
     atomic_write_json(target, payload)
     return target
 

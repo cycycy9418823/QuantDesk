@@ -31,9 +31,9 @@ def preflight(root: Path) -> dict[str, Any]:
         "data/universe/stock_theme_map.csv",
         "quantdesk/data_update_orchestrator.py",
         "scripts/run_data_update.py",
-        "scripts/run_v421_daily_open_workflow.py",
-        "scripts/show_v421_daily_result_page.py",
-        "scripts/run_v422_daily_research_long_loop.py",
+    # v421 workflow entrypoint retired (dead legacy shim, 2026-08-31);
+    # show/result/long-loop v42x entries are also legacy paths that no longer
+    # exist in the current product closure.
     ]
     file_checks = [{"path": rel, "exists": (root / rel).exists()} for rel in checks]
     candidate = _read_json(root / "results/candidate_status_reconciliation_latest.json")

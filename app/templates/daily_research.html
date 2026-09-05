@@ -3213,6 +3213,112 @@
             .home-dash-grid {
                 grid-template-columns: 1fr;
             }
+            .project-status-meta,
+            .project-status-actions {
+                flex-wrap: wrap;
+            }
+        }
+
+        .project-status-card {
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            background: var(--bg-secondary);
+            box-shadow: var(--shadow-md);
+            padding: var(--panel-padding);
+            min-width: 0;
+            overflow-wrap: anywhere;
+        }
+        .project-status-kicker {
+            margin: 0 0 6px;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            letter-spacing: .04em;
+            text-transform: uppercase;
+        }
+        .project-status-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px 16px;
+            margin: 0 0 10px;
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+        }
+        .project-status-health {
+            margin: 0 0 8px;
+            font-family: var(--font-mono);
+            font-size: var(--font-size-lg);
+            line-height: 1.4;
+        }
+        .project-status-health.has-red {
+            color: var(--color-status-bad);
+        }
+        .project-status-explain,
+        .project-status-phase,
+        .project-status-note {
+            margin: 0 0 8px;
+            color: var(--text-secondary);
+            font-size: var(--font-size-sm);
+            line-height: 1.5;
+        }
+        .project-status-banner {
+            margin: 0 0 10px;
+            padding: 8px 10px;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--color-warn);
+            background: var(--color-warn-soft);
+            color: var(--text-primary);
+            font-size: var(--font-size-sm);
+        }
+        .project-status-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 10px 0;
+        }
+        .project-status-full h3 {
+            margin: 16px 0 6px;
+            font-size: var(--font-size-base);
+        }
+        .project-status-pre {
+            margin: 0;
+            padding: 10px;
+            max-height: 360px;
+            overflow: auto;
+            background: var(--bg-sunken);
+            border-radius: var(--radius-sm);
+            font-family: var(--font-mono);
+            font-size: var(--font-size-xs);
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+        .project-status-times {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 8px;
+            margin: 8px 0 12px;
+        }
+        .project-status-times div {
+            min-width: 0;
+            padding: 8px;
+            background: var(--bg-tertiary);
+            border-radius: var(--radius-sm);
+        }
+        .project-status-times span {
+            display: block;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+        }
+        .project-status-times strong {
+            display: block;
+            margin-top: 4px;
+            font-size: var(--font-size-sm);
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }
+        @media (max-width: 720px) {
+            .project-status-times {
+                grid-template-columns: minmax(0, 1fr);
+            }
         }
 
         @media (max-width: 900px) {
@@ -3474,6 +3580,41 @@
         <div id="newsStatusBanner" class="news-status-banner" aria-live="polite" hidden>
             <span id="newsStatus" class="badge">新闻状态加载中…</span>
         </div>
+
+        <section id="projectStatusSection" class="section project-status" aria-labelledby="projectStatusTitle" data-home-section>
+            <div class="section-head">
+                <div>
+                    <h2 id="projectStatusTitle">项目状态</h2>
+                    <p class="section-note">来自 STATUS.md 的项目记录摘要，不是实时核验，纸面 · 未验证。完整段落在下方展开，摘要不代替红格解释。</p>
+                </div>
+            </div>
+            <article class="project-status-card" aria-live="polite">
+                <p class="project-status-kicker" id="projectStatusKicker">项目记录 · 非实时核验 · 纸面 · 未验证</p>
+                <p class="project-status-banner" id="projectStatusBanner" hidden></p>
+                <div class="project-status-meta" id="projectStatusMeta">正在读取 STATUS.md…</div>
+                <div class="project-status-times" aria-label="三个时间">
+                    <div><span>文档声明更新</span><strong id="projectStatusDocTime">未提供</strong></div>
+                    <div><span>文件修改时间</span><strong id="projectStatusFileTime">未提供</strong></div>
+                    <div><span>本次读取时间</span><strong id="projectStatusReadTime">未提供</strong></div>
+                </div>
+                <p class="project-status-health" id="projectStatusHealth">—</p>
+                <p class="project-status-explain" id="projectStatusExplain">红格解释：读取中</p>
+                <p class="project-status-phase" id="projectStatusPhase">当前阶段：读取中</p>
+                <p class="project-status-note" id="projectStatusTradeDate">健康行对应交易日：记录未明确标注</p>
+                <div class="project-status-actions">
+                    <button id="projectStatusOpenFullButton" class="action-button" type="button">查看完整状态</button>
+                    <button id="projectStatusRefreshButton" class="action-button secondary-action" type="button">重新读取状态</button>
+                </div>
+                <div id="projectStatusFull" class="project-status-full" hidden>
+                    <p class="section-note">以下为同一份 STATUS 的分段原文。未 commit / 未合入 / 工作树中 等措辞保持原样，不表示主程序已生效。</p>
+                    <div id="projectStatusSections"></div>
+                    <details id="projectStatusRawDetails">
+                        <summary>查看原文</summary>
+                        <pre id="projectStatusRaw" class="project-status-pre"></pre>
+                    </details>
+                </div>
+            </article>
+        </section>
 
         <section id="homeDashboardSection" class="section home-dashboard" aria-labelledby="homeDashboardTitle" data-home-section>
             <div class="section-head">

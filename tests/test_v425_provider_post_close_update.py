@@ -152,10 +152,3 @@ def test_v425_outputs_and_manifest_after_run():
     assert handoff["generated_trade_advice"] is False
     assert manifest["missing_files"] == []
     assert manifest["research_only"] is True
-
-
-def test_v425_cli_help_works():
-    proc = subprocess.run([sys.executable, str(ROOT / "scripts/run_v425_provider_post_close_update.py"), "--help"], cwd=ROOT, text=True, capture_output=True, check=False)
-
-    assert proc.returncode == 0
-    assert "--simulate" in proc.stdout

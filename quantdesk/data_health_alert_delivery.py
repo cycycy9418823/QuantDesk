@@ -219,7 +219,13 @@ def dispatch_data_health_alerts(
             if dry_run:
                 return _result(status="preview_generated", reason_code="dry_run", target_date=target, events=events)
             if not _truthy(os.environ.get(PUSH_ENV)):
-                return _result(status="blocked", reason_code="data_health_alert_push_not_explicitly_enabled", target_date=target, events=events)
+                # Owner 2026-09-05: missing push switch must not fail the data package.
+                return _result(
+                    status="preview_generated",
+                    reason_code="data_health_alert_push_not_explicitly_enabled",
+                    target_date=target,
+                    events=events,
+                )
             if not network:
                 return _result(status="blocked", reason_code="network_not_authorized", target_date=target, events=events)
             if not push:

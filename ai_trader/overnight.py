@@ -22,7 +22,9 @@ from ai_trader.ledger import (
     save_ledger,
 )
 from ai_trader.ledger import session_days_held as _session_days_held
+from ai_trader.decision_log import apply_gate_to_plan, record_evening_and_refresh_page
 from ai_trader.llm import propose_picks
+from ai_trader.prompt_pack import load_prompt_pack
 from ai_trader.mandate import BOUNDARY, DEFAULT_MANDATE, max_open_gap_for_style
 from ai_trader.market import (
     focus_universe,
@@ -873,6 +875,11 @@ def run_evening(
         # fallback to the rule engine is never mistaken for the AI's own decision.
         "unavailable_reason": "" if llm_used else str(llm_diag.get("reason") or ""),
     }
+    pack = load_prompt_pack()
+    plan["prompt_version"] = pack.prompt_version
+    plan["menu_version"] = pack.menu_version
+    plan["llm"]["prompt_version"] = pack.prompt_version
+    plan["llm"]["menu_version"] = pack.menu_version
     if not llm_used and llm_diag.get("reason"):
         warnings.append(f"llm_unavailable:{llm_diag['reason']}")
     warnings.extend(list(plan.get("warnings") or []))
@@ -907,6 +914,12 @@ def run_evening(
         "advisory_only": True,
     }
     warnings.extend(list(recommendations.get("warnings") or []))
+    statement_gate = apply_gate_to_plan(plan, daily_dir=runtime.daily_dir)
+    if statement_gate.rejections:
+        rejected_names = [
+            str(row.get("symbol") or "HOLD") for row in statement_gate.rejections
+        ]
+        warnings.append("statement_mismatch:" + ",".join(rejected_names[:12]))
     touched = [str(row.get("symbol")) for row in (plan.get("intents") or []) if row.get("symbol")]
     watch = touch_watchlist(
         watch,
@@ -1004,7 +1017,28 @@ def run_evening(
         "score_summary": review.get("score_summary"),
         "scorecard": review.get("scorecard"),
     }
+    note["prompt_version"] = plan.get("prompt_version")
+    note["menu_version"] = plan.get("menu_version")
+    from ai_trader.daytime import load_daytime_notes_for
+
+    daytime_notes = load_daytime_notes_for(as_of, notes_path=runtime.daytime_notes)
+    note["daytime_observations"] = [
+        {"at": item.get("at"), "symbol": item.get("symbol"), "kind": item.get("kind"), "text": item.get("text")}
+        for item in daytime_notes
+    ]
+    if daytime_notes:
+        digest = "；".join(str(item.get("text") or "") for item in daytime_notes[-8:] if item.get("text"))
+        if digest:
+            thought = f"白天盘中记录：{digest} {thought}"
+            note["thought"] = thought
     append_journal(note, latest_path=runtime.journal_latest, log_path=runtime.journal_log)
+    record_evening_and_refresh_page(
+        plan,
+        daily_dir=runtime.daily_dir,
+        runtime=runtime,
+        as_of=as_of,
+        rejections=statement_gate.rejections,
+    )
     snapshot = {
         "ok": True,
         "as_of": as_of,

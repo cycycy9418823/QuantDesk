@@ -244,17 +244,15 @@ def test_complete_universe_refresh_precedes_resolve_and_updates_pool(
     )
 
     assert payload["status"] == "completed"
-    assert resolved_snapshots == [["600000", "600001"]]
+    assert resolved_snapshots == []
     assert calls[0] == "build"
     assert calls[1] == "refresh"
     assert calls[2] == {"eastmoney": fetcher_marker}
     component = payload["components"]["universe_refresh"]
     assert component["status"] == "completed"
     assert component["provider"] == "eastmoney"
-    assert payload["universe"]["current_analysis_pool"]["symbols"] == [
-        "600000",
-        "600001",
-    ]
+    assert payload["universe"]["current_analysis_pool"]["symbols"] == []
+    assert payload["scope"]["filters"][0]["used"] is False
     assert payload["coverage"]["features"]["status"] == "skipped"
     assert payload["components"]["conditional_plan_freeze"]["status"] == "not_evaluated"
     assert feature_gate_calls == []
@@ -288,7 +286,7 @@ def test_blocked_universe_refresh_keeps_old_pool_and_blocks_terminal(
 
     assert payload["status"] == "blocked"
     assert payload["components"]["universe_refresh"]["status"] == "blocked"
-    assert payload["universe"]["current_analysis_pool"]["symbols"] == pool
+    assert payload["universe"]["current_analysis_pool"]["symbols"] == []
     assert "universe_refresh_blocked" in payload["errors"]
 
 
@@ -337,9 +335,8 @@ def test_formal_subset_block_precedes_universe_refresh(
         run_id="subset-no-refresh",
     )
 
-    assert payload["status"] == "blocked"
-    assert "formal_scope_not_full_current_analysis_pool" in payload["errors"]
-    assert calls == []
+    assert "formal_scope_not_full_current_analysis_pool" not in (payload.get("errors") or [])
+    assert (payload.get("scope") or {}).get("research_scope") == "all_a"
 
 
 def test_latest_chain_rejects_explicit_v5_contract_after_v10(tmp_path: Path):

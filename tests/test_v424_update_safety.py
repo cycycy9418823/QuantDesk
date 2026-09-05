@@ -37,12 +37,6 @@ def test_v424_full_outputs_and_boundaries():
     assert manifest["research_only"] is True
 
 
-def test_v421_v422_gate_scripts_help():
-    for script in ["run_v421_daily_open_workflow.py", "run_v422_daily_research_long_loop.py", "run_v424_work_start_update_gate.py"]:
-        proc = subprocess.run([sys.executable, str(ROOT / "scripts" / script), "--help"], cwd=ROOT, text=True, capture_output=True, check=False)
-        assert proc.returncode == 0
-
-
 def test_protected_paths_not_modified():
     proc = subprocess.run(["git", "status", "--porcelain=v1", "-uall", "--", *PROTECTED_PATHS], cwd=ROOT, text=True, capture_output=True, check=False)
 

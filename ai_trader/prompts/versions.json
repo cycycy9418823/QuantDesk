@@ -1,0 +1,8 @@
+{
+  "prompt_id": "evening_system",
+  "prompt_version": "v1.0.0",
+  "prompt_file": "evening_system_v1.txt",
+  "menu_id": "evening_data_menu",
+  "menu_version": "v1.0.0",
+  "menu_file": "evening_menu_v1.json"
+}

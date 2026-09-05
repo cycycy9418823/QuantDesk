@@ -14,6 +14,7 @@ Exit codes are distinct so a scheduled task log tells you which state it hit:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -56,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-alert-network", action="store_true")
     parser.add_argument("--alert-push", nargs="?", const="true", default="")
     parser.add_argument("--alert-dry-run", default="")
+    parser.add_argument("--pipeline-run-id", default="")
     return parser
 
 
@@ -101,8 +103,32 @@ def main(argv: list[str] | None = None) -> int:
         alert_dry_run=alert_dry_run,
     )
 
+    pipeline_run_id = str(args.pipeline_run_id or "").strip()
+    latest = PROJECT_ROOT / "results" / "data_chain" / "full_a_daily_reconciliation_latest.json"
+    if pipeline_run_id:
+        payload["pipeline_run_id"] = pipeline_run_id
+        if latest.is_file():
+            try:
+                disk = json.loads(latest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                disk = None
+            if isinstance(disk, dict):
+                disk["pipeline_run_id"] = pipeline_run_id
+                latest.write_text(json.dumps(disk, ensure_ascii=False, indent=2), encoding="utf-8")
+            dated = payload.get("manifest_path")
+            if dated:
+                dated_path = PROJECT_ROOT / str(dated)
+                if dated_path.is_file():
+                    dated_path.write_text(
+                        json.dumps(disk if isinstance(disk, dict) else payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
     if truthy(args.json):
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        printed = dict(payload)
+        if latest.is_file():
+            printed["artifact_path"] = "results/data_chain/full_a_daily_reconciliation_latest.json"
+            printed["artifact_sha256"] = "sha256:" + hashlib.sha256(latest.read_bytes()).hexdigest()
+        print(json.dumps(printed, ensure_ascii=False, indent=2))
     else:
         coverage = payload.get("coverage") or {}
         delivery = payload.get("data_health_alert_delivery") or {}

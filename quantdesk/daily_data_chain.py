@@ -22,43 +22,45 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from quantdesk.daily_candidate_refresh import (
+    candidate_refresh_gate,
+    publish_archived_conditional_plan,
+    run_formal_candidate_refresh,
+)
 from quantdesk.daily_feature_engine import build_daily_features
+from quantdesk.daily_plan_freeze import (
+    REQUIRED_DATA_CHAIN_CONTRACT_VERSION,
+    freeze_t_plus_one_plan,
+)
+from quantdesk.daily_price_update_engine import (
+    DEFAULT_PROVIDERS,
+    infer_target_date,
+    local_daily_status_for_symbols,
+    resolve_symbols,
+    update_daily_prices,
+)
+from quantdesk.data_close_upstream_contract import validate_upstream_reuse_manifest
 from quantdesk.data_truth.benchmark_incremental_update import update_benchmark_files
 from quantdesk.data_truth.sector_history_archive import (
     archive_forward_sector_snapshot,
     capture_current_sector_membership,
     verify_snapshot_self_hash,
 )
-from quantdesk.daily_plan_freeze import (
-    REQUIRED_DATA_CHAIN_CONTRACT_VERSION,
-    freeze_t_plus_one_plan,
-)
-from quantdesk.session_expectation import build_session_expectation
-from quantdesk.universe_refresh import (
-    build_default_fetchers,
-    refresh_universe_snapshot,
-)
-from quantdesk.daily_candidate_refresh import (
-    candidate_refresh_gate,
-    publish_archived_conditional_plan,
-    run_formal_candidate_refresh,
-)
-from quantdesk.daily_price_update_engine import (
-    DEFAULT_PROVIDERS,
-    infer_target_date,
-    resolve_symbols,
-    update_daily_prices,
-)
 from quantdesk.intraday.intraday_gap_checker import collect_intraday_required_symbols
 from quantdesk.intraday.intraday_providers import DEFAULT_INTRADAY_PROVIDER_ORDER
 from quantdesk.intraday.intraday_quality_audit import audit_intraday_batch
+from quantdesk.intraday.intraday_update_engine import update_intraday_1m_for_symbols
 from quantdesk.intraday.stage6_append_only_import import apply_audited_intraday_batch
 from quantdesk.intraday.stage6_conflict_resolution import (
     resolve_stage6_intraday_conflicts,
 )
-from quantdesk.intraday.intraday_update_engine import update_intraday_1m_for_symbols
+from quantdesk.session_expectation import build_session_expectation
 from quantdesk.shared import normalize_symbol, now_text, read_json
 from quantdesk.trading_calendar import trade_days_between
+from quantdesk.universe_refresh import (
+    build_default_fetchers,
+    refresh_universe_snapshot,
+)
 from quantdesk.utils import atomic_write_json
 from quantdesk.version import API_SCHEMA_VERSION, APP_VERSION, PACKAGE_VERSION
 
@@ -112,6 +114,98 @@ def _daily_update_rate_contract(
     if bool(network) and not bool(dry_run):
         return DAILY_NETWORK_WORKERS, DAILY_NETWORK_SLEEP_SECONDS
     return bounded_workers, 0.0
+
+
+def _reused_daily_payload(
+    root: Path, *, target_date: str, symbols: Sequence[str], source_run_id: str
+) -> dict[str, Any]:
+    rows = [{"symbol": symbol} for symbol in _normalized_symbols(symbols)]
+    status = local_daily_status_for_symbols(
+        rows,
+        target_date=target_date,
+        daily_dir=root / "data/daily",
+        metadata_dir=root / "data/metadata",
+    )
+    fresh = list(status.get("fresh_symbols") or [])
+    stale = list(status.get("stale_symbols") or [])
+    missing = list(status.get("missing_symbols") or [])
+    latest = dict(status.get("latest_by_symbol") or {})
+    return {
+        "ok": not stale and not missing,
+        "status": "reused_verified_upstream",
+        "upstream_reuse": True,
+        "source_run_id": source_run_id,
+        "provider_calls": 0,
+        "network": False,
+        "dry_run": False,
+        "target_date": target_date,
+        "total_symbols": len(rows),
+        "symbols_checked": len(rows),
+        "processed_symbols": [row["symbol"] for row in rows],
+        "fresh_symbol_list_after": fresh,
+        "stale_symbol_list_after": stale,
+        "missing_symbol_list_after": missing,
+        "failed_symbol_list": [],
+        "invalid_price_basis_symbols": [],
+        "stale_count_after": len(stale),
+        "missing_count_after": len(missing),
+        "latest_by_symbol_after": latest,
+        "raw_positive_volume_target_symbols": len(fresh),
+        "raw_positive_volume_target_symbol_list": fresh,
+        "raw_zero_volume_target_symbols": 0,
+        "raw_zero_volume_target_symbol_list": [],
+        "warnings": list(status.get("warnings") or []),
+        "errors": [],
+    }
+
+
+def resolve_upstream_reuse_steps(
+    *,
+    project_root: str | Path,
+    target_date: str,
+    upstream_reuse: Mapping[str, Any] | None,
+    daily_symbols: Sequence[str],
+    universe_writer: Callable[[], Mapping[str, Any]],
+    daily_writer: Callable[[], Mapping[str, Any]],
+) -> dict[str, Any]:
+    root = Path(project_root).resolve()
+    if upstream_reuse is None:
+        return {
+            "reused": False,
+            "universe": dict(universe_writer()),
+            "daily": dict(daily_writer()),
+            "reason_codes": [],
+        }
+    ok, reasons, normalized = validate_upstream_reuse_manifest(
+        upstream_reuse, target_date=target_date, project_root=root
+    )
+    if not ok:
+        return {
+            "reused": False,
+            "blocked": True,
+            "universe": {},
+            "daily": {},
+            "reason_codes": list(reasons),
+        }
+    return {
+        "reused": True,
+        "universe": {
+            "ok": True,
+            "status": "skipped",
+            "formal_eligible": True,
+            "reason": "verified_upstream_reuse",
+            "target_date": target_date,
+            "source_run_id": normalized["run_id"],
+        },
+        "daily": _reused_daily_payload(
+            root,
+            target_date=target_date,
+            symbols=daily_symbols,
+            source_run_id=normalized["run_id"],
+        ),
+        "reason_codes": [],
+        "normalized": normalized,
+    }
 
 
 def new_run_id() -> str:
@@ -403,6 +497,27 @@ def _daily_chain_lock(
 
 
 
+def _low_price_filter_inventory(root: Path) -> dict[str, Any]:
+    """914 is a leftover filter output, not the universe, not a chain prerequisite."""
+
+    path = root / "data" / "universe" / "low_price_learning_symbols.csv"
+    fingerprint = _file_fingerprint(path)
+    symbols: list[str] = []
+    if fingerprint.get("exists"):
+        symbols = _normalized_symbols(resolve_symbols(only_low_price=True))
+    return {
+        "id": "low_price_learning",
+        "role": "filter_output_not_universe",
+        "used": False,
+        "reason": "low_price_strategy_abandoned_filter_not_run",
+        "path": _display_path(path, root),
+        "exists": bool(fingerprint.get("exists")),
+        "symbol_count": len(symbols),
+        "sha256": str(fingerprint.get("sha256") or ""),
+        "size": int(fingerprint.get("size") or 0),
+    }
+
+
 def _file_fingerprint(path: Path) -> dict[str, Any]:
     if not path.exists() or not path.is_file():
         return {"path": str(path), "exists": False, "size": 0, "sha256": ""}
@@ -566,7 +681,15 @@ def _daily_coverage(
         list(payload.get("invalid_price_basis_symbols") or [])
     )
     component_status = str(payload.get("status") or "")
-    component_acceptable = component_status in {"completed", "passed"} or (
+    # Pipeline Stage 3 reuses Stage 2 bars as reused_verified_upstream.
+    # That is a successful daily component, not an incomplete writer.
+    component_acceptable = component_status in {
+        "completed",
+        "passed",
+        "reused_verified_upstream",
+        "skipped_network_false",
+        "skipped",
+    } or (
         component_status in {"partial", "failed"}
         and bool(legitimate)
         and not stale
@@ -575,7 +698,28 @@ def _daily_coverage(
         and not invalid_basis_symbols
     )
     reason_codes: list[str] = []
-    if reported_total != expected or expected == 0:
+    if expected == 0:
+        return {
+            "requested_count": 0,
+            "reported_count": reported_total,
+            "fresh_count": 0,
+            "stale_count": 0,
+            "stale_symbols": [],
+            "missing_count": 0,
+            "missing_symbols": [],
+            "failed_count": 0,
+            "failed_symbols": [],
+            "invalid_price_basis_count": 0,
+            "invalid_price_basis_symbols": [],
+            "legitimate_no_data_count": len(legitimate),
+            "legitimate_no_data_symbols": sorted(legitimate),
+            "coverage_ratio": None,
+            "component_status": component_status,
+            "reason_codes": [],
+            "status": "passed",
+            "note": "daily_update_not_required_universe_is_all_a",
+        }
+    if reported_total != expected:
         reason_codes.append("daily_universe_count_mismatch")
     if legitimate and not (
         stale_lists_available
@@ -1387,11 +1531,14 @@ def _run_candidate_refresh_step(
         }
     else:
         try:
+            reuse = components.get("upstream_reuse")
+            reuse = reuse if isinstance(reuse, Mapping) else {}
             result = run_formal_candidate_refresh(
                 project_root=Path(root).resolve(),
                 data_chain_manifest=manifest,
                 captured_at=captured_at,
                 apply=True,
+                replace_same_date=bool(reuse.get("reused")),
             )
         except Exception as exc:  # noqa: BLE001 - observation is failure-isolated
             result = {
@@ -2250,6 +2397,7 @@ def _run_daily_data_chain_impl(
     skip_analysis_pool_minute: bool = False,
     refresh_universe: bool = True,
     trigger: str = "manual",
+    upstream_reuse: Mapping[str, Any] | None = None,
     _failure_context: dict[str, Any] | None = None,
     _lock_already_held: bool = False,
     _force_busy: bool = False,
@@ -2337,25 +2485,120 @@ def _run_daily_data_chain_impl(
     # only unlocks *verified reuse* of already-sealed same-day artifacts;
     # ``abandoned_source_run_id`` stays restricted to the abandoned-lock case
     # because mid-flight batch checkpoints exist only there.
-    recovery_source_run_id, recovery_source_selection = _resolve_same_day_recovery_source(
-        root,
-        target_date=resolved_target,
-        current_run_id=current_run_id,
-        abandoned_lock_run_id=abandoned_lock_run_id,
-        retry_from_latest=bool(retry_from_latest),
-    )
+    # Pipeline upstream-reuse override: when the Pipeline passes a verified
+    # upstream manifest, it manages its own lifecycle. The legacy
+    # "same-day already completed" skip must not preempt it — the Pipeline
+    # Stage 3 needs to actually run its universe/daily steps (which will
+    # reuse upstream artifacts instead of writing fresh ones).
+    if upstream_reuse is not None:
+        recovery_source_run_id, recovery_source_selection = "", {
+            "schema_version": RECOVERY_SOURCE_SELECTION_SCHEMA_VERSION,
+            "action": "run",
+            "status": "upstream_reuse_provided",
+            "target_date": resolved_target,
+            "current_run_id": current_run_id,
+            "reason_codes": ["upstream_reuse_provided"],
+            "completed_run_ids": [],
+            "recovery_source_run_id": "",
+            "read_only": True,
+        }
+    else:
+        recovery_source_run_id, recovery_source_selection = _resolve_same_day_recovery_source(
+            root,
+            target_date=resolved_target,
+            current_run_id=current_run_id,
+            abandoned_lock_run_id=abandoned_lock_run_id,
+            retry_from_latest=bool(retry_from_latest),
+        )
     abandoned_source_run_id = (
         recovery_source_run_id
         if str(recovery_source_selection.get("recovery_kind") or "") == "abandoned_lock"
         else ""
     )
 
+    upstream_reuse_normalized: dict[str, Any] | None = None
+    if upstream_reuse is not None:
+        reuse_ok, reuse_reasons, reuse_normalized = validate_upstream_reuse_manifest(
+            upstream_reuse,
+            target_date=resolved_target,
+            project_root=root,
+        )
+        if not reuse_ok:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            blocked_at = now_text()
+            return _publish_manifest(
+                {
+                    "ok": False,
+                    "schema_version": API_SCHEMA_VERSION,
+                    "app_version": APP_VERSION,
+                    "package_version": PACKAGE_VERSION,
+                    "task_type": "daily_data_chain",
+                    "daily_data_chain_contract_version": DAILY_DATA_CHAIN_CONTRACT_VERSION,
+                    "authoritative": False,
+                    "run_id": current_run_id,
+                    "trigger": str(trigger or "manual"),
+                    "status": "blocked",
+                    "started_at": started_at,
+                    "completed_at": blocked_at,
+                    "generated_at": blocked_at,
+                    "target_date": resolved_target,
+                    "target_date_note": target_note,
+                    "network": bool(network),
+                    "dry_run": bool(dry_run),
+                    "refresh_universe": bool(refresh_universe),
+                    "universe": {},
+                    "components": {
+                        "upstream_reuse": {
+                            "reused": False,
+                            "blocked": True,
+                            "reason_codes": list(reuse_reasons),
+                        }
+                    },
+                    "coverage": {},
+                    "warnings": [],
+                    "errors": list(reuse_reasons),
+                    "reason_codes": list(reuse_reasons),
+                    "retry_symbols": [],
+                    "published_latest": False,
+                    "next_action": (
+                        "upstream reuse contract rejected; "
+                        "universe and daily writers were not started."
+                    ),
+                    "boundaries": {
+                        "research_only": True,
+                        "paper_account_only": True,
+                        "broker_route": False,
+                        "live_execution": False,
+                        "paper_ledger_mutated": False,
+                    },
+                    "disclaimer": DISCLAIMER,
+                },
+                root=root,
+                manifest_path=manifest_path,
+                latest_path=latest_path,
+                publish_latest=False,
+            )
+        upstream_reuse_normalized = reuse_normalized
+
     # Refresh the derivative low-price pool only for a full, explicitly
     # network-authorized run.  Offline/dry-run/subset paths must not construct
     # providers or touch canonical bytes; they continue with the previous pool.
     universe_refresh_payload: dict[str, Any]
     universe_refresh_blocked = False
-    if symbols is not None:
+    if upstream_reuse_normalized is not None:
+        universe_refresh_payload = {
+            "ok": True,
+            "status": "skipped",
+            "formal_eligible": True,
+            "reason": "verified_upstream_reuse",
+            "network_authorized": bool(network),
+            "target_date": resolved_target,
+            "preserved_previous": True,
+            "source_run_id": str(upstream_reuse_normalized.get("run_id") or ""),
+            "quote_date": resolved_target,
+            "provider": "verified_upstream_reuse",
+        }
+    elif symbols is not None:
         universe_refresh_payload = {
             "ok": True,
             "status": "skipped",
@@ -2488,16 +2731,11 @@ def _run_daily_data_chain_impl(
         and str(sector_refresh_payload.get("status") or "") != "completed"
     )
 
-    canonical_analysis_rows = resolve_symbols(only_low_price=True)
-    canonical_analysis_contract = build_universe_contract(
-        canonical_analysis_rows,
-        target_date=resolved_target,
-        name="current_analysis_pool",
-    )
+    low_price_filter = _low_price_filter_inventory(root)
     analysis_rows = (
         [{"symbol": item} for item in _normalized_symbols(list(symbols))]
         if symbols is not None
-        else canonical_analysis_rows
+        else []
     )
     analysis_contract = build_universe_contract(
         analysis_rows,
@@ -2505,63 +2743,6 @@ def _run_daily_data_chain_impl(
         name="current_analysis_pool",
     )
     analysis_symbols = list(analysis_contract["symbols"])
-    canonical_analysis_symbols = list(canonical_analysis_contract["symbols"])
-    formal_subset_blocked = bool(
-        network
-        and not dry_run
-        and symbols is not None
-        and analysis_symbols != canonical_analysis_symbols
-    )
-    if formal_subset_blocked:
-        run_dir.mkdir(parents=True, exist_ok=True)
-        return _publish_manifest(
-            {
-                "ok": False,
-                "schema_version": API_SCHEMA_VERSION,
-                "app_version": APP_VERSION,
-                "package_version": PACKAGE_VERSION,
-                "task_type": "daily_data_chain",
-                "daily_data_chain_contract_version": DAILY_DATA_CHAIN_CONTRACT_VERSION,
-                "authoritative": False,
-                "run_id": current_run_id,
-                "trigger": str(trigger or "manual"),
-                "status": "blocked",
-                "started_at": started_at,
-                "completed_at": now_text(),
-                "generated_at": now_text(),
-                "target_date": resolved_target,
-                "target_date_note": target_note,
-                "network": bool(network),
-                "dry_run": bool(dry_run),
-                "refresh_universe": bool(refresh_universe),
-                "universe": {
-                    "requested": analysis_contract,
-                    "current_analysis_pool": canonical_analysis_contract,
-                },
-                "components": {},
-                "coverage": {},
-                "warnings": [],
-                "errors": ["formal_scope_not_full_current_analysis_pool"],
-                "retry_symbols": [],
-                "published_latest": False,
-                "next_action": (
-                    "A formal network run must use the complete current analysis pool. "
-                    "Use dry-run for bounded symbol probes."
-                ),
-                "boundaries": {
-                    "research_only": True,
-                    "paper_account_only": True,
-                    "broker_route": False,
-                    "live_execution": False,
-                    "paper_ledger_mutated": False,
-                },
-                "disclaimer": DISCLAIMER,
-            },
-            root=root,
-            manifest_path=manifest_path,
-            latest_path=latest_path,
-            publish_latest=False,
-        )
     critical_payload = collect_intraday_required_symbols(
         source="preplan",
         target_trade_date=resolved_target,
@@ -2632,12 +2813,13 @@ def _run_daily_data_chain_impl(
         # validation in the UI, reports, or acceptance artifacts.
         "scope": {
             "market_data_scope": "all_a",
-            "research_scope": "current_analysis_pool",
-            "research_scope_selector": "resolve_symbols(only_low_price=True)",
+            "research_scope": "all_a",
+            "research_scope_selector": "universe_all_a",
             "full_a_research_scan": False,
+            "filters": [low_price_filter],
             "note": (
-                "全 A 日线数据覆盖 != 全 A 策略研究。研究仍在 current_analysis_pool 内，"
-                "全 A 研究扫描需显式 opt-in，默认策略行为不变。"
+                "宇宙=全A。914低价名单是过滤器输出，不是宇宙，不是下游前提。"
+                "本链默认不跑该过滤器。"
             ),
         },
         "universe": {
@@ -2652,6 +2834,16 @@ def _run_daily_data_chain_impl(
             "critical_sources": critical_source_manifest,
             "universe_refresh": universe_refresh_payload,
             "sector_refresh": sector_refresh_payload,
+            "upstream_reuse": (
+                {
+                    "reused": True,
+                    "blocked": False,
+                    "run_id": str(upstream_reuse_normalized.get("run_id") or ""),
+                    "reason_codes": [],
+                }
+                if upstream_reuse_normalized is not None
+                else {"reused": False, "blocked": False, "reason_codes": []}
+            ),
         },
         "coverage": {},
         "warnings": [],
@@ -2754,31 +2946,44 @@ def _run_daily_data_chain_impl(
             dry_run=dry_run,
             requested_workers=batch_workers,
         )
-        daily_payload = update_daily_prices(
-            only_low_price=True,
-            target_date=resolved_target,
-            providers=list(DAILY_PROVIDER_ORDER),
-            workers=daily_workers,
-            sleep_seconds=daily_sleep_seconds,
-            network=bool(network),
-            dry_run=bool(dry_run),
-            rebuild_features=False,
-            symbols=daily_update_symbols,
-            output_path=run_dir / "daily_update.json",
-            write_result=not dry_run,
-            run_id=current_run_id,
-            require_raw_price_basis=True,
-            project_root=root,
-            daily_dir=root / "data" / "daily",
-            metadata_dir=root / "data" / "metadata",
-            provider_timeout_seconds=DAILY_PROVIDER_GLOBAL_TIMEOUT_SECONDS,
-            provider_timeout_overrides=dict(DAILY_PROVIDER_TIMEOUT_OVERRIDES),
-        )
-        daily_payload["scheduler_rate_limit"] = {
-            "workers": daily_workers,
-            "sleep_seconds": daily_sleep_seconds,
-            "network_enforced": bool(network and not dry_run),
-        }
+        if upstream_reuse_normalized is not None:
+            daily_payload = _reused_daily_payload(
+                root,
+                target_date=resolved_target,
+                symbols=daily_update_symbols,
+                source_run_id=str(upstream_reuse_normalized.get("run_id") or ""),
+            )
+            daily_payload["scheduler_rate_limit"] = {
+                "workers": 0,
+                "sleep_seconds": 0.0,
+                "network_enforced": False,
+            }
+        else:
+            daily_payload = update_daily_prices(
+                only_low_price=False,
+                target_date=resolved_target,
+                providers=list(DAILY_PROVIDER_ORDER),
+                workers=daily_workers,
+                sleep_seconds=daily_sleep_seconds,
+                network=bool(network),
+                dry_run=bool(dry_run),
+                rebuild_features=False,
+                symbols=daily_update_symbols,
+                output_path=run_dir / "daily_update.json",
+                write_result=not dry_run,
+                run_id=current_run_id,
+                require_raw_price_basis=True,
+                project_root=root,
+                daily_dir=root / "data" / "daily",
+                metadata_dir=root / "data" / "metadata",
+                provider_timeout_seconds=DAILY_PROVIDER_GLOBAL_TIMEOUT_SECONDS,
+                provider_timeout_overrides=dict(DAILY_PROVIDER_TIMEOUT_OVERRIDES),
+            )
+            daily_payload["scheduler_rate_limit"] = {
+                "workers": daily_workers,
+                "sleep_seconds": daily_sleep_seconds,
+                "network_enforced": bool(network and not dry_run),
+            }
         session_symbols = _normalized_symbols(
             list(analysis_symbols) + list(critical_symbols)
         )
@@ -3332,9 +3537,9 @@ def _run_daily_data_chain_impl(
         base_manifest["coverage"]["critical"] = critical_coverage
         base_manifest["coverage"]["current_analysis_pool"] = analysis_coverage
 
-        if rebuild_features and not dry_run:
+        if rebuild_features and not dry_run and analysis_symbols:
             feature_payload = build_daily_features(
-                only_low_price=True,
+                only_low_price=bool(low_price_filter.get("used")),
                 symbols=analysis_symbols,
                 daily_dir=root / "data" / "daily",
                 low_price_universe_path=(
@@ -3347,7 +3552,13 @@ def _run_daily_data_chain_impl(
             feature_payload = {
                 "ok": True,
                 "status": "skipped",
-                "reason": "dry_run" if dry_run else "disabled_by_config",
+                "reason": (
+                    "dry_run"
+                    if dry_run
+                    else "disabled_by_config"
+                    if not rebuild_features
+                    else "research_pool_empty_filter_not_selected"
+                ),
             }
         base_manifest["components"]["features"] = feature_payload
         if dry_run:
@@ -3355,10 +3566,14 @@ def _run_daily_data_chain_impl(
                 "status": "not_evaluated",
                 "reason_codes": ["dry_run"],
             }
-        elif not rebuild_features:
+        elif not rebuild_features or not analysis_symbols:
             feature_gate = {
                 "status": "skipped",
-                "reason_codes": ["disabled_by_config"],
+                "reason_codes": [
+                    "disabled_by_config"
+                    if not rebuild_features
+                    else "research_pool_empty_filter_not_selected"
+                ],
                 "missing_symbols": [],
                 "invalid_symbols": [],
                 "stale_symbols": [],
@@ -3415,41 +3630,82 @@ def _run_daily_data_chain_impl(
             base_manifest["warnings"].append(
                 "critical_append_conflict_isolated_from_global_fetch"
             )
+        daily_hole_codes = {
+            "daily_symbols_stale",
+            "daily_symbols_missing",
+            "daily_symbols_failed",
+        }
+        feature_hole_codes = {
+            "feature_target_date_mismatch",
+            "feature_symbols_skipped",
+        }
+        daily_hard_codes = [
+            code
+            for code in (daily_gate.get("reason_codes") or [])
+            if code not in daily_hole_codes
+        ]
+        feature_hard_codes = [
+            code
+            for code in (feature_gate.get("reason_codes") or [])
+            if code not in feature_hole_codes
+        ]
+        labeled_daily_holes = _normalized_symbols(
+            list(session_unknown)
+            + list(daily_gate.get("stale_symbols") or [])
+            + list(daily_gate.get("missing_symbols") or [])
+            + list(feature_gate.get("stale_symbols") or [])
+            + list(feature_gate.get("missing_symbols") or [])
+        )
+        if session_unknown:
+            base_manifest["warnings"].append("session_unknown_labeled_not_blocking")
+        if labeled_daily_holes:
+            base_manifest["warnings"].append("daily_holes_labeled_not_fillable_tonight")
+
         if dry_run:
             status = "dry_run"
         elif universe_refresh_blocked:
             status = "blocked"
         elif critical_source_blocked:
             status = "blocked"
-        elif session_unknown:
-            status = "blocked"
-        elif daily_gate["status"] != "passed":
+        elif daily_hard_codes:
             status = "blocked"
         elif critical_daily_gate["status"] != "passed":
             status = "blocked"
-        elif (
-            critical_coverage["status"] == "blocked"
-            and critical_conflict_isolation["status"] != "isolated"
-        ):
-            status = "blocked"
-        elif rebuild_features and feature_gate["status"] != "passed":
+        elif rebuild_features and analysis_symbols and feature_hard_codes:
             status = "blocked"
         elif not base_manifest.get("protected_state_unchanged"):
             status = "blocked"
-        elif analysis_coverage["status"] == "passed":
-            status = "completed"
-        elif analysis_coverage["status"] == "partial":
-            status = "partial"
         else:
-            status = "blocked"
+            status = "completed"
+
+        not_fillable_tonight = _normalized_symbols(
+            list(analysis_coverage.get("failed_symbols") or [])
+            + list(critical_coverage.get("failed_symbols") or [])
+            + labeled_daily_holes
+        )
+        base_manifest["fill_labels"] = {
+            "not_fillable_tonight": not_fillable_tonight,
+            "reason": "missing_or_incomplete_minute_or_daily_session",
+            "blocks_chain": False,
+            "daily_holes": labeled_daily_holes,
+        }
+        if not_fillable_tonight:
+            base_manifest["warnings"].append("minute_gaps_labeled_not_fillable_tonight")
 
         if status == "completed" and sector_refresh_blocked:
-            status = "partial"
+            base_manifest["warnings"].append("sector_refresh_blocked")
         if status == "completed" and critical_conflict_isolation["status"] == "isolated":
-            status = "partial"
+            base_manifest["warnings"].append(
+                "critical_append_conflict_isolated_from_global_fetch"
+            )
 
         if status == "completed":
-            next_action = "数据链已通过；下游只能消费本 run_id 和 target_date 的产物。"
+            if not_fillable_tonight:
+                next_action = (
+                    "日线与特征已通过；缺分钟或停牌/缺口的票已标「今晚不可成交」，不拦链。"
+                )
+            else:
+                next_action = "数据链已通过；下游只能消费本 run_id 和 target_date 的产物。"
         elif status == "partial":
             if critical_conflict_isolation["status"] == "isolated":
                 next_action = (
@@ -3480,7 +3736,8 @@ def _run_daily_data_chain_impl(
                 captured_at=now_text(),
             )
 
-        if network and not dry_run and rebuild_features:
+        features_ran = str(feature_payload.get("status") or "") not in {"skipped", "not_evaluated", ""}
+        if network and not dry_run and rebuild_features and features_ran:
             plan_freeze = freeze_t_plus_one_plan(
                 project_root=root,
                 data_chain_manifest=base_manifest,
@@ -3496,6 +3753,8 @@ def _run_daily_data_chain_impl(
                     if dry_run
                     else "feature_rebuild_disabled"
                     if network and not dry_run and not rebuild_features
+                    else "research_pool_empty_filter_not_selected"
+                    if network and not dry_run and rebuild_features and not features_ran
                     else "authoritative_network_run_required"
                 ],
                 "data_chain_run_id": current_run_id,
@@ -3524,7 +3783,8 @@ def _run_daily_data_chain_impl(
         if (
             status == "completed"
             and rebuild_features
-            and plan_freeze_status not in {"prepared", "completed"}
+            and features_ran
+            and plan_freeze_status not in {"prepared", "completed", "not_evaluated"}
         ):
             status = "blocked"
             base_manifest["errors"].append("conditional_plan_freeze_blocked")
@@ -3617,8 +3877,12 @@ def _run_daily_data_chain_impl(
                 # failure leaves the prior latest untouched, matching the
                 # "retain prior plan on failure" contract below.
                 try:
+                    reuse = base_manifest.get("components", {}).get("upstream_reuse")
+                    reuse = reuse if isinstance(reuse, Mapping) else {}
                     published_plan = publish_archived_conditional_plan(
-                        root, prepared_plan
+                        root,
+                        prepared_plan,
+                        replace_same_date=bool(reuse.get("reused")),
                     )
                 except Exception as exc:  # noqa: BLE001 - retain prior plan on failure
                     published_plan = {
@@ -3718,15 +3982,21 @@ def run_daily_data_chain(
     skip_analysis_pool_minute: bool = False,
     refresh_universe: bool = True,
     trigger: str = "manual",
+    upstream_reuse: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the chain and always leave an auditable terminal result."""
 
     root = Path(project_root).resolve()
     current_run_id = str(run_id or new_run_id())
+    # Scheduled 18:30 retry must no-op when the day already has an
+    # authoritative completed chain. Pipeline Stage 3 passes upstream_reuse
+    # and must reach _run_daily_data_chain_impl, which already refuses to
+    # let that skip preempt verified reuse.
     if (
         retry_from_latest
         and symbols is None
         and not dry_run
+        and upstream_reuse is None
     ):
         preflight = preflight_daily_data_chain(
             root,
@@ -3800,6 +4070,7 @@ def run_daily_data_chain(
                 skip_analysis_pool_minute=skip_analysis_pool_minute,
                 refresh_universe=refresh_universe,
                 trigger=trigger,
+                upstream_reuse=upstream_reuse,
                 _lock_already_held=bool(outer_lock.get("acquired")),
                 _force_busy=not bool(outer_lock.get("acquired")),
                 _prelock_metadata=prelock_metadata,

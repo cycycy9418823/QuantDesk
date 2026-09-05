@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_trader.paths import STATE_DIR
+from ai_trader.prompt_pack import load_prompt_pack
 
 DEFAULT_MODEL = "claude-opus-5"
 # Wire-protocol identifiers. ``anthropic`` = /v1/messages dialect (local
@@ -406,31 +407,8 @@ def _call(
 
 def _build_prompt(context: dict[str, Any]) -> tuple[str, str]:
     persona = str(context.get("persona_zh") or "一个自己拿主意的 A 股散户")
-    system = (
-        f"你是一名 A 股纸面交易员，人格：{persona}。"
-        "你在收盘后复盘、为次日开盘布置纸面计划。这是纯纸面模拟、不接券商、不是投资建议。"
-        "\n\n"
-        "**做什么风格由你自己决定，没人规定你必须做短线。** 你可以选："
-        "打板(追涨停,持1-3天,最激进)、短线(几天)、波段(一到几周)、"
-        "中线(一到几个月)、长期(半年以上,看公司不看盘)。"
-        "你可以对不同的票用不同的做法；也可以今天想通了就改主意，改了就说为什么。"
-        "如果你想买一只票放一年，那就把 hold_days 写成 250，这是允许的。"
-        "如果今天什么都看不上，buys 就留空——空仓也是一种决定。"
-        "\n\n"
-        "唯一的硬约束是账户安全(不是风格)：持仓数上限、单票占比上限、现金下限、"
-        "每天最多开几只。成交按次日开盘价、一字涨停买不进、一字跌停卖不出，"
-        "这些由系统铁面执行，你不用管。"
-        "\n\n"
-        "只在给你的候选清单里选，不许编造代码。"
-        "只输出一个 JSON 对象，不要多余文字，格式："
-        '{"stance":{"summary":"你现在想怎么投资,一两句","preferred_styles":["长期","波段"],'
-        '"reasoning":"为什么这么想,尤其是如果你改主意了"},'
-        '"buys":[{"symbol":"6位代码","reason":"一句中文理由","style":"长期",'
-        '"hold_days":整数,"conviction":"live或probation"}],'
-        '"sells":[{"symbol":"6位代码","reason":"为什么现在卖"}],'
-        '"avoid":["代码"],"lesson":"今天复盘学到的一句话(可留空)",'
-        '"market_note":"一句中文对今天盘面的看法"}'
-    )
+    pack = load_prompt_pack()
+    system = pack.render_system(persona)
     lines = [
         f"今天(决策日)：{context.get('as_of')}，为次日 {context.get('trade_date')} 开盘布置。",
         f"账户：权益 {context.get('equity')}，现金 {context.get('cash')}，"
@@ -547,6 +525,7 @@ def propose_picks(
             ] if isinstance(styles, list) else [],
             "reasoning": str(stance_raw.get("reasoning") or "").strip(),
         }
+    pack = load_prompt_pack()
     return {
         "model": cfg["model"],
         "buys": buys,
@@ -555,6 +534,8 @@ def propose_picks(
         "lesson": str(parsed.get("lesson") or "").strip(),
         "avoid": [str(x) for x in (parsed.get("avoid") or []) if x],
         "market_note": str(parsed.get("market_note") or "").strip(),
+        "prompt_version": pack.prompt_version,
+        "menu_version": pack.menu_version,
     }
 
 
