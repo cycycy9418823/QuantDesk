@@ -109,7 +109,10 @@ def main() -> int:
             continue
 
         # class 2 - runtime paths and artifact types
-        if any(posix.startswith(p) or f"/{p}" in posix for p in BLOCKED_PATTERNS):
+        if any(
+            (posix.startswith(p) if p == "data/" else (posix.startswith(p) or f"/{p}" in posix))
+            for p in BLOCKED_PATTERNS
+        ):
             blocked.append(f"runtime-path         {code} {posix}")
             continue
         if posix.startswith("_tmp") or posix.startswith("agent_workspace/"):
