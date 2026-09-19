@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 
 _SOURCE_DIRECTORIES = (
     "quantdesk",
+    "ai_trader",
     "scripts",
     "config",
     "app",
@@ -82,10 +84,27 @@ class IsolatedProject:
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONPYCACHEPREFIX": str(pycache),
-                "PYTHONPATH": str(self.root),
+                "PYTHONPATH": os.pathsep.join([
+                    str(self.root),
+                    *[entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+                      if entry and Path(entry).resolve() != self.source_root],
+                ]),
             }
         )
         return env
+
+    def install_startup_fixture(self, fixture: Path) -> None:
+        """Load the fixture after any inherited process-isolation hooks."""
+        if self.root is None:
+            raise RuntimeError("isolated project has not been started")
+        copied = self.root / "_quantdesk_startup_fixture.py"
+        shutil.copyfile(fixture, copied)
+        inherited = getattr(sys.modules.get("sitecustomize"), "__file__", None)
+        lines = ["import runpy"]
+        if inherited:
+            lines.append(f"runpy.run_path({str(Path(inherited).resolve())!r})")
+        lines.append(f"runpy.run_path({str(copied)!r})")
+        (self.root / "sitecustomize.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def __enter__(self) -> "IsolatedProject":
         return self.start()

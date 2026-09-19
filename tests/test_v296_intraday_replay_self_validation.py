@@ -111,8 +111,15 @@ class IntradayReplaySelfValidationTests(unittest.TestCase):
 
     def test_cli_success_returns_zero(self) -> None:
         from scripts.run_intraday_replay_self_validation import main
+        from quantdesk.intraday import intraday_replay_self_validation as replay
 
-        self.assertEqual(main(["--keep-artifacts", "false"]), 0)
+        with mock.patch.multiple(
+            replay,
+            TEST_RUNTIME_DIR=self.tmp_root / "cli_runtime",
+            SELF_VALIDATION_LATEST_JSON=self.tmp_root / "cli_latest.json",
+            SELF_VALIDATION_EXECUTION_JSON=self.tmp_root / "cli_execution.json",
+        ):
+            self.assertEqual(main(["--keep-artifacts", "false"]), 0)
 
     def test_cli_failure_returns_non_zero(self) -> None:
         from scripts import run_intraday_replay_self_validation as cli

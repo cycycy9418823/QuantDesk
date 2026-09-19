@@ -65,25 +65,9 @@ def create_daily_generation_blueprint(deps: DailyGenerationRouteDeps) -> Bluepri
                 max_symbols = 40
             max_symbols = max(1, min(max_symbols, 80))
             try:
-                visible_rows = deps.candidate_rows(min(max_symbols, 18))
-                visible_symbols = [row["symbol"] for row in visible_rows if row.get("symbol")]
-                payload = deps.update_daily_prices(
-                    only_low_price=True,
-                    providers=None,
-                    workers=4,
-                    network=network_allowed,
-                    dry_run=False,
-                    limit=0,
-                    rebuild_features=True,
-                    symbols=visible_symbols,
-                )
-                payload["scope"] = "visible_daily_research_candidates"
-                payload["requested_symbols"] = visible_symbols
-                payload["message_for_ui"] = (
-                    f"已联网更新当前候选池：更新 {payload.get('updated_symbols', 0)} 只，"
-                    f"失败 {payload.get('failed_symbols', 0)} 只，目标日期 {payload.get('target_date', '数据缺失')}。"
-                )
-                status = 200
+                payload = deps.update_daily_prices(network=network_allowed)
+                payload["message_for_ui"] = payload.get("message") or "收盘更新已返回，请查看运行状态。"
+                status = 409 if payload.get("status") in {"blocked", "busy"} else 500 if payload.get("status") == "failed" else 200
             except Exception as exc:  # noqa: BLE001
                 payload = {
                     "ok": False,

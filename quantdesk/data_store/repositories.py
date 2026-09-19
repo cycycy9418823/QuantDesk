@@ -27,10 +27,29 @@ def json_safe(value: Any) -> Any:
 
 
 def normalize_symbol(symbol: Any) -> str:
+    """Canonicalize an A-share symbol to a plain six-digit local store key.
+
+    ``600000``, ``600000.SH``, ``600000.sh`` and ``sh600000`` all resolve to
+    ``600000``; ``920010``/``bj920010``/``920010.BJ`` resolve to ``920010``.
+    Rows are keyed on this canonical form so an equivalent alias hits the same
+    stored row instead of creating a divergent duplicate.
+    """
+
     text = str(symbol or "").strip()
-    if "." in text:
-        left, right = text.split(".", 1)
-        return f"{left.zfill(6) if left.isdigit() else left}.{right}"
+    if not text:
+        return ""
+    lowered = text.lower().replace(" ", "")
+    for prefix in ("sh", "sz", "bj"):
+        if lowered.startswith(prefix):
+            text = text[len(prefix):]
+            lowered = lowered[len(prefix):]
+            break
+    if "." in lowered:
+        head, tail = lowered.split(".", 1)
+        if tail in {"sh", "sz", "bj", "ss"}:
+            text = head
+            lowered = head
+    text = text.strip()
     return text.zfill(6) if text.isdigit() and len(text) <= 6 else text
 
 
@@ -73,6 +92,72 @@ def daily_table_for_adjustment(adjustment: str) -> str:
     return table
 
 
+class SymbolIdentityConflict(ValueError):
+    """Raised when plain/legacy/suffixed keys for one symbol disagree."""
+
+
+def symbol_identity_aliases(symbol: Any) -> list[str]:
+    """Every equivalent on-disk key for *symbol* (canonical + legacy forms).
+
+    Old rows were written under ``600000``, ``600000.SH``, ``600000.sh`` or
+    ``sh600000``/``SH600000`` before the canonical key was introduced. Reads must
+    match all of them so existing data stays visible without migrating the real
+    database.
+    """
+
+    canonical = normalize_symbol(symbol)
+    if not canonical:
+        return []
+    aliases = {canonical}
+    if canonical.isdigit() and len(canonical) == 6:
+        for prefix in ("sh", "sz", "bj"):
+            aliases.add(f"{prefix}{canonical}")
+            aliases.add(f"{prefix.upper()}{canonical}")
+        for suffix in ("SH", "SZ", "BJ", "sh", "sz", "bj", "SS", "ss"):
+            aliases.add(f"{canonical}.{suffix}")
+    return sorted(aliases)
+
+
+# Business content that must agree for two equivalent keys to be one row.
+# ``symbol``/``row_hash``/``updated_at``/``source`` are provenance, not content:
+# old hashes include the stored symbol, so comparing them directly would falsely
+# reject an identical plain/suffixed pair.
+_BUSINESS_FIELDS = ("open", "high", "low", "close", "volume", "amount", "pct_chg", "change", "turnover")
+
+
+def _business_signature(row: dict) -> tuple[str | None, ...]:
+    return tuple(None if row.get(field) is None else str(row.get(field)) for field in _BUSINESS_FIELDS)
+
+
+def reconcile_identity_rows(rows: list[dict]) -> list[dict]:
+    """Reconcile equivalent rows by canonical identity+date and business content.
+
+    Equivalent keys that agree on the business fields collapse to one row even
+    when their legacy ``row_hash`` differs or is ``NULL``. Any disagreement for
+    the same identity/date is a visible conflict: returning one silently is
+    exactly the bug this guards.
+    """
+
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        identity = normalize_symbol(row.get("symbol"))
+        key = (identity, str(row.get("date") or ""))
+        groups.setdefault(key, []).append(row)
+    conflicts: list[str] = []
+    deduped: list[dict] = []
+    for (identity, day), group in groups.items():
+        if len({_business_signature(item) for item in group}) > 1:
+            identities = sorted({str(item.get("symbol")) for item in group})
+            conflicts.append(f"{identity}@{day}:[{','.join(identities)}]")
+            continue
+        chosen = next((item for item in group if str(item.get("symbol")) == identity), group[0])
+        deduped.append(chosen)
+    if conflicts:
+        raise SymbolIdentityConflict("daily_symbol_identity_conflict:" + ";".join(conflicts))
+    deduped.sort(key=lambda item: (str(item.get("date") or ""), str(item.get("symbol") or "")))
+    return deduped
+
+
 class DailyBarRepository:
     def __init__(self, db: QuantDeskDB):
         self.db = db
@@ -109,28 +194,37 @@ class DailyBarRepository:
 
     def query_daily_bars(self, symbol: str, start_date: str | None = None, end_date: str | None = None, adjustment: str = "forward") -> list[dict]:
         table = daily_table_for_adjustment(adjustment)
-        params: list[Any] = [normalize_symbol(symbol)]
-        where = ["symbol = ?"]
+        aliases = symbol_identity_aliases(symbol)
+        if not aliases:
+            return []
+        placeholders = ",".join("?" for _ in aliases)
+        params: list[Any] = list(aliases)
+        where = [f"symbol IN ({placeholders})"]
         if start_date:
             where.append("date >= ?")
             params.append(normalize_date(start_date))
         if end_date:
             where.append("date <= ?")
             params.append(normalize_date(end_date))
-        return self.db.execute(f"SELECT * FROM {table} WHERE {' AND '.join(where)} ORDER BY date", params)
+        rows = self.db.execute(f"SELECT * FROM {table} WHERE {' AND '.join(where)} ORDER BY date, symbol", params)
+        return reconcile_identity_rows(rows)
 
     def query_cross_section(self, date: str, adjustment: str = "forward", limit: int | None = None) -> list[dict]:
         table = daily_table_for_adjustment(adjustment)
-        sql = f"SELECT * FROM {table} WHERE date = ? ORDER BY symbol"
+        rows = self.db.execute(f"SELECT * FROM {table} WHERE date = ? ORDER BY symbol", [normalize_date(date)])
+        rows = reconcile_identity_rows(rows)
         if limit:
-            sql += " LIMIT ?"
-            return self.db.execute(sql, [normalize_date(date), int(limit)])
-        return self.db.execute(sql, [normalize_date(date)])
+            return rows[: int(limit)]
+        return rows
 
     def latest_date(self, symbol: str | None = None, adjustment: str = "forward") -> str | None:
         table = daily_table_for_adjustment(adjustment)
         if symbol:
-            row = self.db.execute_one(f"SELECT MAX(date) AS date FROM {table} WHERE symbol = ?", [normalize_symbol(symbol)])
+            aliases = symbol_identity_aliases(symbol)
+            if not aliases:
+                return None
+            placeholders = ",".join("?" for _ in aliases)
+            row = self.db.execute_one(f"SELECT MAX(date) AS date FROM {table} WHERE symbol IN ({placeholders})", list(aliases))
         else:
             row = self.db.execute_one(f"SELECT MAX(date) AS date FROM {table}")
         return row.get("date") if row else None

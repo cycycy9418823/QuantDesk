@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -112,6 +113,109 @@ def test_missing_empty_bad_encoding_too_large_do_not_create_file(tmp_path: Path)
     assert large["ok"] is False
 
 
+def test_filesystem_error_is_structured_when_status_disappears_during_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write(tmp_path, SAMPLE_A)
+    original_exists = Path.exists
+
+    def fail_exists(self: Path) -> bool:
+        if self == path:
+            raise PermissionError("status probe denied")
+        return original_exists(self)
+
+    monkeypatch.setattr(Path, "exists", fail_exists)
+    payload = read_project_status(tmp_path)
+
+    assert payload["ok"] is False
+    assert payload["readable"] is False
+    assert payload["error"] == "read_failed:PermissionError"
+    assert payload["read_at"]
+    assert payload["source_kind"] == "STATUS.md"
+
+
+def test_status_resolve_error_returns_structured_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write(tmp_path, SAMPLE_A)
+    original_resolve = Path.resolve
+
+    def fail_resolve(self: Path, *args, **kwargs) -> Path:
+        if self == path:
+            raise PermissionError("status resolve denied")
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    payload = read_project_status(tmp_path)
+
+    assert payload["readable"] is False
+    assert payload["error"] == "read_failed:PermissionError"
+    assert payload["raw_text"] == ""
+    assert payload["read_at"]
+
+
+def test_status_changed_during_read_does_not_mix_text_and_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write(tmp_path, SAMPLE_A)
+    before = path.stat()
+    changed = SimpleNamespace(
+        st_size=before.st_size,
+        st_mtime=before.st_mtime + 1,
+        st_mtime_ns=before.st_mtime_ns + 1_000_000_000,
+        st_ctime_ns=before.st_ctime_ns + 1_000_000_000,
+        st_ino=before.st_ino,
+        st_dev=before.st_dev,
+    )
+    calls: list[int] = []
+
+    def changing_fstat(fd: int):
+        calls.append(fd)
+        return before if len(calls) == 1 else changed
+
+    monkeypatch.setattr("quantdesk.project_status.os.fstat", changing_fstat)
+    payload = read_project_status(tmp_path)
+
+    assert payload["readable"] is False
+    assert payload["error"] == "changed_during_read"
+    assert payload["raw_text"] == ""
+    assert payload["sha256"] == ""
+
+
+def test_oversized_status_uses_bounded_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "STATUS.md"
+    path.write_bytes(b"A" * (MAX_STATUS_BYTES + 1))
+    original_open = Path.open
+    requested: list[int] = []
+
+    class _Reader:
+        def __enter__(self):
+            self.handle = original_open(path, "rb")
+            return self
+
+        def __exit__(self, *args):
+            self.handle.close()
+            return False
+
+        def read(self, size: int = -1) -> bytes:
+            requested.append(size)
+            return self.handle.read(size)
+
+        def fileno(self) -> int:
+            return self.handle.fileno()
+
+    def bounded_open(self, *args, **kwargs):
+        if self == path:
+            return _Reader()
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", bounded_open)
+    payload = read_project_status(tmp_path)
+
+    assert payload["error"] == "too_large"
+    assert requested == [MAX_STATUS_BYTES + 1]
+
+
 def test_missing_health_heading_keeps_raw_and_does_not_turn_green(tmp_path: Path) -> None:
     _write(
         tmp_path,
@@ -124,6 +228,24 @@ def test_missing_health_heading_keeps_raw_and_does_not_turn_green(tmp_path: Path
     assert payload["health_line"] == "未提供"
     assert "没有健康行标题" in payload["raw_text"]
     assert payload["health_trade_date_label"] == "记录未明确标注"
+
+
+def test_phase_summary_does_not_repeat_checkpoint_metadata(tmp_path: Path) -> None:
+    _write(tmp_path, SAMPLE_A)
+    payload = read_project_status(tmp_path)
+    assert payload["phase"]["summary"] == "B + C + A0 并行"
+
+
+def test_line_progress_stops_at_nested_heading(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        SAMPLE_A.replace(
+            "卡住：未授权 commit / 合入。",
+            "卡住：未授权 commit / 合入。\n\n### 证据细节\n不应出现在卡住摘要。",
+        ),
+    )
+    payload = read_project_status(tmp_path)
+    assert payload["line_progress"]["B"]["stuck"] == "未授权 commit / 合入。"
 
 
 def test_script_and_dangerous_links_stay_in_text(tmp_path: Path) -> None:

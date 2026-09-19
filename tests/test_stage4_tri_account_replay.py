@@ -424,8 +424,8 @@ def _tiny_fill_world(tmp_path: Path) -> dict[str, Any]:
 
     minute = pd.DataFrame(
         [
-            {"symbol": symbol, "datetime": f"{exec_day} 09:30:00", "open": 10.2, "high": 10.3, "low": 10.1, "close": 10.25, "volume": 1000, "amount": 10250},
-            {"symbol": symbol, "datetime": f"{exec_day} 09:31:00", "open": 10.25, "high": 10.35, "low": 10.2, "close": 10.3, "volume": 1200, "amount": 12360},
+            {"symbol": symbol, "datetime": f"{exec_day} 09:30:00", "open": 10.2, "high": 10.3, "low": 10.1, "close": 10.25, "volume": 1000, "amount": 10250, "adjust": "raw"},
+            {"symbol": symbol, "datetime": f"{exec_day} 09:31:00", "open": 10.25, "high": 10.35, "low": 10.2, "close": 10.3, "volume": 1200, "amount": 12360, "adjust": "raw"},
         ]
     )
     minute.to_csv(intraday_dir / "1m" / f"{symbol}.csv", index=False, encoding="utf-8")

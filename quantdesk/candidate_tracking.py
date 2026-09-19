@@ -34,6 +34,9 @@ LEDGER_COLUMNS = [
     "source_mode",
     "source_run_id",
     "source_hash",
+    "entry_price_status",
+    "entry_price_reason",
+    "data_quality_warnings",
 ]
 PERFORMANCE_COLUMNS = LEDGER_COLUMNS + [
     "hold_1d_ret",
@@ -143,37 +146,380 @@ def infer_data_source(row: dict[str, str]) -> str:
     return "formal"
 
 
+def _daily_field_value(
+    row: dict[str, str],
+    field: str,
+    *,
+    path: Path,
+    symbol: str,
+    warn: bool = True,
+) -> tuple[float | None, str | None]:
+    """Parse a daily field without manufacturing prices from another field."""
+
+    raw = row.get(field)
+    value = safe_float(raw)
+    if value is not None:
+        return value, None
+    if raw is None or str(raw).strip() == "":
+        reason = f"missing_daily_field:{field}"
+    else:
+        reason = f"invalid_daily_field:{field}"
+    if warn:
+        LOG.warning(
+            "candidate_tracking_daily_field_unavailable path=%s symbol=%s field=%s "
+            "reason=%s value=%r",
+            path,
+            symbol,
+            field,
+            reason,
+            raw,
+        )
+    return None, reason
+
+
+_USABLE_PRICE_BASES = {"raw", "forward_adjusted", "back_adjusted"}
+
+
+def _classify_daily_basis(
+    rows: list[dict[str, Any]], field_bases: list[str]
+) -> tuple[str, str, bool]:
+    """Classify a daily file's price basis with the project's own classifier.
+
+    ``quantdesk.price_basis.classify_frame_price_basis`` is the single standard
+    for this question and it preserves ``mixed_or_unknown`` instead of guessing.
+    The complete original frame is always handed to that classifier: a file whose
+    ``adjust`` column is missing, blank or partly ``unknown`` carries no basis
+    evidence, and neither the close field it came from nor any caller-supplied
+    payload may be used to manufacture ``raw``.
+    """
+
+    try:
+        import pandas as pd
+
+        from quantdesk.price_basis import classify_frame_price_basis
+    except Exception as exc:  # noqa: BLE001 - never guess a basis
+        return "mixed_or_unknown", f"classifier_unavailable:{type(exc).__name__}", False
+    frame = pd.DataFrame(rows) if rows else pd.DataFrame({"adjust": []})
+    basis, reason = classify_frame_price_basis(frame)
+    if basis not in _USABLE_PRICE_BASES:
+        # ``unknown_price_basis`` also covers a missing or blank ``adjust``
+        # column; keep the classifier's own reason so the refusal is explainable.
+        return basis, str(reason or "unknown_price_basis"), False
+    # The adjust column cannot see a file that mixes ``adj_close`` and raw
+    # ``close`` values, so that check still runs on top of the strict result.
+    distinct = {value for value in field_bases if value and value != "unknown"}
+    if len(distinct) > 1:
+        return "mixed_or_unknown", "mixed_price_basis", False
+    return basis, str(reason or ""), True
+
+
 def read_daily_history(root: Path, symbol: str) -> list[dict[str, Any]]:
     path = root / "data/daily" / f"{to_plain_symbol(symbol)}.csv"
     rows = read_csv_rows(path)
+    # Classify the raw file before any filtering: the row carrying the
+    # conflicting label must not be dropped before classification.
+    field_bases: list[str] = []
+    for row in rows:
+        if safe_float(row.get("adj_close")) is not None:
+            field_bases.append("adjusted")
+        elif safe_float(row.get("close")) is not None:
+            field_bases.append("raw")
+        else:
+            field_bases.append("unknown")
+    frame_basis, frame_basis_reason, basis_usable = _classify_daily_basis(rows, field_bases)
+    explicit_convention = basis_usable and any(str(row.get("adjust") or "").strip() for row in rows)
     out: list[dict[str, Any]] = []
     for row in rows:
         close_text = row.get("adj_close") or row.get("close") or ""
-        try:
-            close = float(close_text)
-        except (TypeError, ValueError) as exc:
-            LOG.warning("candidate_tracking_daily_close_parse_failed path=%s symbol=%s value=%r error=%s", path, symbol, close_text, exc)
+        close = safe_float(close_text)
+        if close is None:
+            LOG.warning(
+                "candidate_tracking_daily_close_unavailable path=%s symbol=%s value=%r",
+                path,
+                symbol,
+                close_text,
+            )
             continue
-        item = {"date": str(row.get("date") or "")[:10], "close": close}
+        # ``adj_close`` is preferred but ``close`` is the fallback, so one file
+        # can mix an adjusted close with a raw one row by row.  Record which
+        # field supplied the value; the price itself is never rewritten.
+        if safe_float(row.get("adj_close")) is not None:
+            basis = "adjusted"
+        elif safe_float(row.get("close")) is not None:
+            basis = "raw"
+        else:
+            basis = "unknown"
+        # The execution open comes from the raw ``open`` column unless an
+        # explicit adjust convention governs the whole file.
+        open_basis = frame_basis if explicit_convention else "raw"
+        item: dict[str, Any] = {
+            "date": str(row.get("date") or "")[:10],
+            "close": close,
+            "price_basis": basis,
+            "open_basis": open_basis,
+            "frame_price_basis": frame_basis,
+            "price_basis_usable": basis_usable,
+            "warnings": [],
+            "reason_codes": [],
+        }
+        if not basis_usable:
+            basis_reason = f"price_basis_unusable:{frame_basis_reason or frame_basis}"
+            item["warnings"].append(basis_reason)
+            item["reason_codes"].append(basis_reason)
         for key in ["open", "high", "low", "volume", "amount"]:
-            try:
-                item[key] = float(row.get(key) or close)
-            except (TypeError, ValueError) as exc:
-                LOG.warning("candidate_tracking_daily_field_parse_failed path=%s symbol=%s field=%s value=%r fallback_used=true error=%s", path, symbol, key, row.get(key), exc)
-                item[key] = close if key in {"open", "high", "low"} else 0.0
+            is_ohlc_field = key in {"open", "high", "low"}
+            value, reason = _daily_field_value(
+                row,
+                key,
+                path=path,
+                symbol=symbol,
+                warn=is_ohlc_field,
+            )
+            item[key] = value
+            if reason and is_ohlc_field:
+                item["warnings"].append(reason)
+                item["reason_codes"].append(reason)
+        item["ohlc_complete"] = not any(
+            item[field] is None for field in ("open", "high", "low", "close")
+        )
         out.append(item)
+    bases = {item["price_basis"] for item in out}
+    if len(bases - {"unknown"}) > 1:
+        # A series that mixes adjusted and raw closes cannot be used for price
+        # math without a decision; say so instead of silently averaging them.
+        warning = "close_basis_mixed:" + "+".join(sorted(bases - {"unknown"}))
+        for item in out:
+            item["warnings"].append(warning)
+            item["reason_codes"].append(warning)
     return [row for row in out if row["date"]]
 
 
-def price_on_or_after(root: Path, symbol: str, entry_date: str) -> tuple[str, float] | None:
+def _verified_next_session(root: Path, entry_date: str) -> tuple[str, str]:
+    """Return the next session only when the local calendar is authoritative.
+
+    A ``weekend_only`` fallback is not evidence - it does not cover A-share
+    holidays - so it is reported as unverified instead of being asserted as the
+    next trading session. The session that is finally named must itself be
+    present in the calendar: ``next_trade_day`` falls back to a weekday guess for
+    dates outside coverage, and that guess is not verification.
+    """
+
+    try:
+        from quantdesk.trading_calendar import (
+            calendar_info,
+            load_a_share_trading_calendar,
+            next_trade_day,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return "", f"calendar_unavailable:{type(exc).__name__}"
+    calendar_path = root / "data" / "calendar" / "a_share_trading_calendar.csv"
+    try:
+        info = calendar_info(calendar_path, target_date=entry_date)
+    except Exception as exc:  # noqa: BLE001
+        return "", f"calendar_unreadable:{type(exc).__name__}"
+    if info.get("weekend_only") or not info.get("loaded_dates"):
+        return "", "calendar_quality_weekend_only"
+    if info.get("coverage_warning"):
+        return "", f"calendar_coverage:{str(info['coverage_warning'])[:120]}"
+    try:
+        expected = str(next_trade_day(entry_date, calendar_path=calendar_path))
+    except Exception as exc:  # noqa: BLE001
+        return "", f"calendar_lookup_failed:{type(exc).__name__}"
+    # The signal day being covered is not enough: the named next session needs
+    # its own evidence in the calendar file.
+    try:
+        session_info = calendar_info(calendar_path, target_date=expected)
+    except Exception as exc:  # noqa: BLE001
+        return "", f"calendar_unreadable:{type(exc).__name__}"
+    if session_info.get("coverage_warning"):
+        return "", (
+            "calendar_coverage_for_next_session:"
+            f"{str(session_info['coverage_warning'])[:120]}"
+        )
+    try:
+        lookup = load_a_share_trading_calendar(calendar_path)
+    except Exception as exc:  # noqa: BLE001
+        return "", f"calendar_unreadable:{type(exc).__name__}"
+    is_open_by_date = lookup.get("is_open_by_date") or {}
+    if is_open_by_date.get(expected) is not True:
+        return "", f"next_session_not_in_calendar:{expected}"
+    # DSR-13: the interval actually consulted to find the next session must be
+    # verified, not just the named session. A provisional row on any consulted
+    # day (open or skipped-closed) means "the next trading day" has not been
+    # authoritatively settled. Provisional rows outside the consulted interval
+    # must NOT invalidate an otherwise verified historical window.
+    rows_by_date = lookup.get("rows_by_date") or {}
+    try:
+        entry_day = datetime.strptime(entry_date[:10], "%Y-%m-%d").date()
+        expected_day = datetime.strptime(expected[:10], "%Y-%m-%d").date()
+        from datetime import timedelta
+
+        cursor = entry_day + timedelta(days=1)
+        provisional_consulted: list[str] = []
+        while cursor <= expected_day:
+            day_text = cursor.isoformat()
+            row = rows_by_date.get(day_text) if isinstance(rows_by_date, dict) else None
+            if not isinstance(row, dict):
+                return "", f"calendar_interval_row_missing:{day_text}"
+            if row.get("row_count") != "1":
+                return "", f"calendar_interval_row_ambiguous:{day_text}"
+            # Read the original cell retained by the parser, not its permissive
+            # boolean normalization used by legacy observational consumers.
+            flag = row.get("is_open_raw")
+            text_flag = str(flag).strip().lower() if flag is not None else ""
+            true_flags = {"1", "true", "t", "yes", "y", "是"}
+            false_flags = {"0", "false", "f", "no", "n", "否"}
+            if text_flag not in true_flags | false_flags:
+                return "", f"calendar_interval_open_flag_unknown:{day_text}"
+            if (text_flag in true_flags) != bool(is_open_by_date.get(day_text)):
+                return "", f"calendar_interval_open_flag_conflict:{day_text}"
+            if isinstance(row, dict):
+                marker = (
+                    str(row.get("source") or "") + " " + str(row.get("note") or "")
+                ).lower()
+                if "provisional" in marker:
+                    provisional_consulted.append(day_text)
+            cursor += timedelta(days=1)
+    except (ValueError, TypeError):
+        return "", f"calendar_lookup_failed:invalid_interval:{expected}"
+    if provisional_consulted:
+        return "", (
+            "calendar_provisional_in_next_session_interval:"
+            + ",".join(provisional_consulted)
+        )
+    return expected, ""
+
+
+def _execution_price_refusal(
+    root: Path, entry_date: str, row: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Refuse a price that is not usable T+1 execution evidence."""
+
+    reason_codes: list[str] = []
+    warnings: list[str] = []
+    if not row.get("price_basis_usable", True):
+        reason_codes.append(
+            "execution_price_unavailable:price_basis_unusable:" + str(row.get("frame_price_basis"))
+        )
+    if str(row.get("open_basis") or "raw") != str(row.get("price_basis") or "raw"):
+        # Open and closes sit on different conventions, so their ratio carries
+        # no meaning and must not become an entry price.
+        reason_codes.append(
+            "execution_price_unavailable:basis_mismatch:"
+            f"close={row.get('price_basis')}:open={row.get('open_basis')}"
+        )
+    verified = True
+    expected_session, calendar_note = _verified_next_session(root, entry_date)
+    if expected_session:
+        if str(row["date"]) != expected_session:
+            reason_codes.append(
+                "execution_price_unavailable:not_next_session:"
+                f"expected={expected_session}:used={row['date']}"
+            )
+    else:
+        # The calendar cannot settle which session this is, so the check must
+        # not assert anything either way: keep the real price and record that
+        # the T+1 session is unverified rather than pretending it is verified.
+        verified = False
+        warnings.append(f"execution_price_provenance:next_session_unverified:{calendar_note}")
+    if not reason_codes:
+        return {"warnings": warnings, "reason_codes": [], "next_session_verified": verified}
+    return {
+        "warnings": [*warnings, *reason_codes],
+        "reason_codes": reason_codes,
+        "next_session_verified": verified,
+    }
+
+
+def _next_open_evidence(root: Path, symbol: str, entry_date: str) -> dict[str, Any]:
+    """Return next-session open evidence, failing closed when it is unavailable."""
+
     for row in read_daily_history(root, symbol):
         if row["date"] > entry_date:
-            price = row.get("open")
-            price_value = safe_float(price)
-            if price_value is None or price_value <= 0:
-                price_value = safe_float(row.get("close"))
-            if price_value is not None and price_value > 0:
-                return row["date"], float(price_value)
+            price_value = safe_float(row.get("open"))
+            if price_value is None:
+                reason = "execution_price_unavailable:next_open_missing"
+                warnings = list(row.get("warnings") or [])
+                reason_codes = list(row.get("reason_codes") or [])
+                warnings.append(reason)
+                reason_codes.append(reason)
+                LOG.warning(
+                    "candidate_tracking_execution_price_unavailable symbol=%s "
+                    "entry_date=%s execution_date=%s reason=%s",
+                    symbol,
+                    entry_date,
+                    row["date"],
+                    reason,
+                )
+                return {
+                    "date": row["date"],
+                    "price": None,
+                    "warnings": list(dict.fromkeys(warnings)),
+                    "reason_codes": list(dict.fromkeys(reason_codes)),
+                }
+            if price_value <= 0:
+                reason = "execution_price_unavailable:next_open_invalid"
+                LOG.warning(
+                    "candidate_tracking_execution_price_unavailable symbol=%s "
+                    "entry_date=%s execution_date=%s reason=%s value=%r",
+                    symbol,
+                    entry_date,
+                    row["date"],
+                    reason,
+                    row.get("open"),
+                )
+                return {
+                    "date": row["date"],
+                    "price": None,
+                    "warnings": [reason],
+                    "reason_codes": [reason],
+                }
+            warnings = list(row.get("warnings") or [])
+            reason_codes = list(row.get("reason_codes") or [])
+            refusal = _execution_price_refusal(root, entry_date, row)
+            if refusal and refusal.get("reason_codes"):
+                warnings.extend(refusal["warnings"])
+                reason_codes.extend(refusal["reason_codes"])
+                for reason in refusal["reason_codes"]:
+                    LOG.warning(
+                        "candidate_tracking_execution_price_refused symbol=%s "
+                        "entry_date=%s execution_date=%s reason=%s",
+                        symbol,
+                        entry_date,
+                        row["date"],
+                        reason,
+                    )
+                # The later price is kept for diagnosis only; it is not T+1
+                # execution evidence and must not reach performance.
+                return {
+                    "date": row["date"],
+                    "price": None,
+                    "diagnostic_price": float(price_value),
+                    "warnings": list(dict.fromkeys(warnings)),
+                    "reason_codes": list(dict.fromkeys(reason_codes)),
+                }
+            return {
+                "date": row["date"],
+                "price": float(price_value),
+                "diagnostic_price": float(price_value),
+                "next_session_verified": bool((refusal or {}).get("next_session_verified", True)),
+                "warnings": list(dict.fromkeys([*warnings, *((refusal or {}).get("warnings") or [])])),
+                "reason_codes": list(dict.fromkeys(reason_codes)),
+            }
+    reason = "execution_price_unavailable:no_next_trading_day"
+    LOG.warning(
+        "candidate_tracking_execution_price_unavailable symbol=%s entry_date=%s reason=%s",
+        symbol,
+        entry_date,
+        reason,
+    )
+    return {"date": None, "price": None, "warnings": [reason], "reason_codes": [reason]}
+
+
+def price_on_or_after(root: Path, symbol: str, entry_date: str) -> tuple[str, float] | None:
+    evidence = _next_open_evidence(root, symbol, entry_date)
+    if evidence.get("date") and evidence.get("price") is not None:
+        return str(evidence["date"]), float(evidence["price"])
     return None
 
 
@@ -222,9 +568,19 @@ def append_candidate_ledger(root: Path, candidate_csv: Path | None = None) -> di
         key = (entry_date, ts_code, strategy_type)
         if key in existing_keys:
             continue
-        price_info = price_on_or_after(root, symbol, entry_date)
-        close_from_source = safe_float(row.get("close"))
-        entry_price = price_info[1] if price_info else (close_from_source if close_from_source is not None else "")
+        price_evidence = _next_open_evidence(root, symbol, entry_date)
+        price_info = (
+            (str(price_evidence["date"]), float(price_evidence["price"]))
+            if price_evidence.get("date") is not None
+            and price_evidence.get("price") is not None
+            else None
+        )
+        # A candidate's signal close is not a substitute for the T+1
+        # execution open.  Keep the entry price blank when that evidence is
+        # unavailable so downstream performance cannot silently use a proxy.
+        entry_price = price_info[1] if price_info else ""
+        entry_price_status = "available" if price_info else "unavailable"
+        entry_price_reason = "" if price_info else ";".join(price_evidence.get("reason_codes") or [])
         stock_name = str(row.get("name") or names.get(symbol) or symbol).strip()
         item = {
             "entry_date": entry_date,
@@ -241,6 +597,9 @@ def append_candidate_ledger(root: Path, candidate_csv: Path | None = None) -> di
             "strategy_id": str(row.get("strategy_id") or ""),
             "research_score": row.get("research_score", ""),
             "source_file": str(row.get("_source_file") or row.get("source_file") or ""),
+            "entry_price_status": entry_price_status,
+            "entry_price_reason": entry_price_reason,
+            "data_quality_warnings": ";".join(price_evidence.get("warnings") or []),
         }
         appended.append(item)
         existing_keys.add(key)
@@ -272,13 +631,18 @@ def _formal_tracking_row(
     source_hash: str,
 ) -> dict[str, Any]:
     symbol = to_plain_symbol(candidate.get("symbol", ""))
-    close = safe_float(candidate.get("close"))
+    # A candidate signal close is NOT execution evidence.  Writing it here made
+    # the ledger carry an entry price that no fill ever produced, and the
+    # performance path then treated it as available.  Leave it blank and say why.
     return {
         "entry_date": target_date,
         "ts_code": to_ts_code(symbol),
         "stock_name": str(candidate.get("name") or symbol),
         "strategy_type": str(candidate.get("strategy_type") or "formal_research"),
-        "entry_price": f"{close:.4f}" if close is not None and close > 0 else "",
+        "entry_price": "",
+        "entry_price_status": "unavailable",
+        "entry_price_reason": "entry_price_unavailable:no_execution_evidence",
+        "data_quality_warnings": "entry_price_unavailable:no_execution_evidence",
         "entry_signal": str(candidate.get("reason") or "正式候选研究信号"),
         "data_source": "formal_candidate_batch",
         "signal_date": target_date,
@@ -300,14 +664,14 @@ def materialize_formal_candidate_tracking(
     target_date: str,
     authoritative_chain_run_id: str,
 ) -> dict[str, Any]:
-    """Project one verified dated formal batch into the legacy tracking view.
+    """Project one verified chain-bound batch into the legacy tracking view.
 
     This is an explicit compatibility adapter. It never reads the mutable latest
     pointer or legacy candidate CSVs, and it does not mutate the paper account.
     """
 
-    from quantdesk.daily_candidate_refresh import load_formal_candidate_batch
     from quantdesk.formal_candidate_tracking import (
+        load_tracking_formal_candidate_batch,
         materialize_formal_candidate_tracking as materialize_formal_evidence,
     )
 
@@ -328,9 +692,11 @@ def materialize_formal_candidate_tracking(
             "reason_codes": list(formal_evidence.get("reason_codes") or [])
             or ["formal_candidate_tracking_evidence_blocked"],
         }
-    loaded = load_formal_candidate_batch(root, target_date=target_date)
-    batch = loaded.get("batch")
-    if loaded.get("status") != "passed" or not isinstance(batch, dict):
+    batch, loaded = load_tracking_formal_candidate_batch(
+        root, target_date=target_date,
+        authoritative_chain_run_id=authoritative_chain_run_id,
+    )
+    if batch is None:
         return {
             "status": "blocked",
             "applied": False,
@@ -341,7 +707,7 @@ def materialize_formal_candidate_tracking(
     provenance = batch.get("provenance")
     provenance = provenance if isinstance(provenance, dict) else {}
     source_run_id = str(provenance.get("source_run_id") or "")
-    source_hash = str(provenance.get("hash") or "")
+    source_hash = str(provenance.get("hash") or "").lower()
     if source_run_id != str(authoritative_chain_run_id or ""):
         return {
             "status": "blocked",
@@ -349,9 +715,13 @@ def materialize_formal_candidate_tracking(
             "target_date": target_date,
             "reason_codes": ["formal_candidate_tracking_source_run_mismatch"],
         }
-    source_path = str(Path(str(loaded.get("path") or "")).relative_to(root)).replace(
-        "\\", "/"
-    )
+    if source_hash != str(formal_evidence.get("batch_provenance_hash") or "").lower():
+        return {
+            "status": "blocked", "applied": False, "target_date": target_date,
+            "reason_codes": ["formal_candidate_tracking_batch_changed"],
+        }
+    source_path = loaded["source_path"]
+    source_mode = loaded["source_mode"]
     candidates = [row for row in batch.get("candidates") or [] if isinstance(row, dict)]
     projected = [
         _formal_tracking_row(
@@ -363,16 +733,18 @@ def materialize_formal_candidate_tracking(
         )
         for row in candidates
     ]
+    for row in projected:
+        row["source_mode"] = source_mode
     ledger_path = root / TRACKING_DIR / "candidate_ledger.csv"
     existing = read_csv_rows(ledger_path)
     same_date = [row for row in existing if row.get("entry_date") == target_date]
     foreign = [
         row
         for row in same_date
-        if row.get("source_mode") == "dated_verified_formal_batch"
+        if row.get("source_mode") in {"dated_verified_formal_batch", "run_scoped_conflict_recovery"}
         and (
             row.get("source_run_id") != source_run_id
-            or row.get("source_hash") != source_hash
+            or str(row.get("source_hash") or "").lower() != source_hash
         )
     ]
     if foreign:
@@ -387,7 +759,7 @@ def materialize_formal_candidate_tracking(
         for row in existing
         if not (
             row.get("entry_date") == target_date
-            and row.get("source_mode") == "dated_verified_formal_batch"
+            and row.get("source_mode") in {"dated_verified_formal_batch", "run_scoped_conflict_recovery"}
         )
     ]
     rows = retained + projected
@@ -400,7 +772,7 @@ def materialize_formal_candidate_tracking(
         **formal_evidence,
         "target_date": target_date,
         "candidate_count": len(projected),
-        "source_mode": "dated_verified_formal_batch",
+        "source_mode": source_mode,
         "source_path": source_path,
         "source_run_id": source_run_id,
         "source_hash": source_hash,
@@ -414,6 +786,48 @@ def nan_text(value: float | None) -> str:
     if value is None or not math.isfinite(value):
         return "NaN"
     return f"{value:.6f}"
+
+
+def _history_basis_usable(history: list[dict[str, Any]]) -> tuple[bool, str]:
+    """Return whether a series may feed price math, with an explainable reason."""
+
+    if not history:
+        return False, "empty_history"
+    unusable = [
+        str(row.get("frame_price_basis") or "mixed_or_unknown")
+        for row in history
+        if not row.get("price_basis_usable", True)
+    ]
+    if unusable:
+        return False, f"price_basis_unusable:{unusable[0]}"
+    return True, ""
+
+
+def _execution_evidence_accepted(
+    price_evidence: dict[str, Any], price_info: tuple[str, float] | None
+) -> tuple[bool, str]:
+    """Whether an entry price may feed formal returns, drawdown and hit statistics.
+
+    A stored ledger value may stay in the row for diagnosis, but the consumer
+    gate is the accepted execution evidence: the next-session open must exist,
+    its price basis must be compatible with the close series, and the calendar
+    must have confirmed the session the price came from. A positive number or a
+    ``legacy_unverified`` warning must never substitute for that evidence.
+    """
+
+    if price_info is None:
+        reasons = [
+            str(value) for value in (price_evidence.get("reason_codes") or []) if value
+        ]
+        return False, (reasons[0] if reasons else "execution_evidence_unavailable")
+    if not bool(price_evidence.get("next_session_verified", True)):
+        warnings = [
+            str(value)
+            for value in (price_evidence.get("warnings") or [])
+            if str(value).startswith("execution_price_provenance:")
+        ]
+        return False, (warnings[0] if warnings else "execution_evidence_unverified")
+    return True, ""
 
 
 def build_candidate_performance(
@@ -430,23 +844,126 @@ def build_candidate_performance(
     for item in ledger:
         symbol = to_plain_symbol(item.get("ts_code", ""))
         signal_date = str(item.get("entry_date", ""))
-        price_info = price_on_or_after(root, symbol, signal_date)
+        price_evidence = _next_open_evidence(root, symbol, signal_date)
+        price_info = (
+            (str(price_evidence["date"]), float(price_evidence["price"]))
+            if price_evidence.get("date") is not None
+            and price_evidence.get("price") is not None
+            else None
+        )
+        evidence_accepted, evidence_reason = _execution_evidence_accepted(
+            price_evidence, price_info
+        )
         performance_start = price_info[0] if price_info else signal_date
         history = [row for row in read_daily_history(root, symbol) if row["date"] >= performance_start]
         out = dict(item)
+        row_warnings = [
+            str(value)
+            for value in (price_evidence.get("warnings") or [])
+            if value
+        ]
+        row_reasons = [
+            str(value)
+            for value in (price_evidence.get("reason_codes") or [])
+            if value
+        ]
+        raw_entry_price = item.get("entry_price")
+        # The formal return denominator is the independently verified next-session
+        # open, never a stored legacy value. A stored price may stay as
+        # diagnostic/source evidence, but a mismatched legacy entry must not flip
+        # the sign of a real sample (DSR-03).
+        stored_price_value = safe_float(raw_entry_price)
         try:
-            entry_price = float(item.get("entry_price") or (price_info[1] if price_info else history[0]["close"] if history else "nan"))
+            entry_price = float(price_info[1]) if price_info else math.nan
         except (TypeError, ValueError, IndexError) as exc:
-            LOG.warning("candidate_tracking_entry_price_parse_failed symbol=%s entry_date=%s value=%r error=%s", symbol, item.get("entry_date"), item.get("entry_price"), exc)
+            LOG.warning("candidate_tracking_entry_price_parse_failed symbol=%s entry_date=%s value=%r error=%s", symbol, item.get("entry_date"), raw_entry_price, exc)
             entry_price = math.nan
+            row_warnings.append("entry_price_unavailable:invalid_verified_open")
+            row_reasons.append("entry_price_unavailable:invalid_verified_open")
+        if stored_price_value is not None and math.isfinite(stored_price_value):
+            if math.isfinite(entry_price) and entry_price > 0 and not math.isclose(stored_price_value, entry_price, rel_tol=1e-9, abs_tol=1e-9):
+                row_warnings.append(
+                    f"entry_price_provenance:stored_price_diagnostic_only:"
+                    f"stored={stored_price_value:.6f}:verified={entry_price:.6f}"
+                )
+                row_reasons.append(
+                    f"entry_price_provenance:stored_price_diagnostic_only:"
+                    f"stored={stored_price_value:.6f}:verified={entry_price:.6f}"
+                )
+            elif not math.isfinite(entry_price):
+                # No verified open: the stored value is diagnosis only and must
+                # never become a formal denominator.
+                row_warnings.append("entry_price_provenance:stored_price_diagnostic_only_no_verified_open")
+                row_reasons.append("entry_price_provenance:stored_price_diagnostic_only_no_verified_open")
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            entry_price = math.nan
+            if "entry_price_unavailable:next_open_missing" in row_reasons or "execution_price_unavailable:next_open_missing" in row_reasons:
+                row_warnings.append("entry_price_unavailable:next_open_missing")
+                row_reasons.append("entry_price_unavailable:next_open_missing")
+            elif not price_info:
+                row_warnings.append("entry_price_unavailable:no_valid_execution_evidence")
+                row_reasons.append("entry_price_unavailable:no_valid_execution_evidence")
+        # A legacy ledger row that carries a price but no evidence status may
+        # keep its value for source tracing, but the verified-open denominator
+        # above is what formal returns actually use.
+        if math.isfinite(entry_price) and entry_price > 0 and not item.get("entry_price_status"):
+            row_warnings.append("entry_price_provenance:legacy_unverified")
+            row_reasons.append("entry_price_provenance:legacy_unverified")
+        # An entry price whose T+1 session the calendar could not confirm keeps
+        # its value but is never reported as a plain available price.
+        if (
+            math.isfinite(entry_price)
+            and entry_price > 0
+            and not bool(price_evidence.get("next_session_verified", True))
+        ):
+            row_warnings.append("entry_price_provenance:next_session_unverified")
+            row_reasons.append("entry_price_provenance:next_session_unverified")
+        if math.isfinite(entry_price) and entry_price > 0:
+            if not evidence_accepted:
+                # The number is kept for diagnosis only: without accepted
+                # execution evidence it must not read as an available price.
+                out["entry_price_status"] = "available_rejected_evidence"
+                row_warnings.append(
+                    f"entry_price_provenance:rejected_execution_evidence:{evidence_reason}"
+                )
+                row_reasons.append(
+                    f"entry_price_provenance:rejected_execution_evidence:{evidence_reason}"
+                )
+            elif bool(price_evidence.get("next_session_verified", True)):
+                out["entry_price_status"] = "available"
+            else:
+                out["entry_price_status"] = "available_unverified"
+        else:
+            out["entry_price_status"] = "unavailable"
+        basis_usable, basis_reason = _history_basis_usable(history)
+        if not basis_usable:
+            row_reasons.append(f"returns_unavailable:{basis_reason}")
+            row_warnings.append(f"returns_unavailable:{basis_reason}")
+        if not evidence_accepted:
+            row_reasons.append(f"returns_unavailable:{evidence_reason}")
+            row_warnings.append(f"returns_unavailable:{evidence_reason}")
+        out["entry_price_reason"] = ";".join(dict.fromkeys(row_reasons))
+        out["data_quality_warnings"] = ";".join(dict.fromkeys(row_warnings))
         for horizon in horizons:
             key = f"hold_{horizon}d_ret"
-            if len(history) > horizon and math.isfinite(entry_price) and entry_price != 0:
+            if (
+                evidence_accepted
+                and basis_usable
+                and len(history) > horizon
+                and math.isfinite(entry_price)
+                and entry_price != 0
+            ):
                 ret = (float(history[horizon]["close"]) - entry_price) / entry_price
                 out[key] = nan_text(ret)
             else:
                 out[key] = "NaN"
-        if history and math.isfinite(entry_price) and entry_price != 0:
+        if (
+            evidence_accepted
+            and history
+            and basis_usable
+            and math.isfinite(entry_price)
+            and entry_price != 0
+        ):
             window = history[: min(len(history), 21)]
             peak = entry_price
             max_dd = 0.0
@@ -475,6 +992,11 @@ def build_candidate_performance(
         "output": str(perf_path.relative_to(root)).replace("\\", "/"),
         "return_definition": "(close_after_n_trading_days_after_t_plus_1_entry - entry_price) / entry_price",
         "short_history_fields": "NaN",
+        "warning_count": sum(
+            1
+            for row in rows
+            if str(row.get("data_quality_warnings") or "").strip()
+        ),
     }
     if provenance:
         payload["provenance"] = dict(provenance)
@@ -588,8 +1110,8 @@ def ema_nullable_with_sma_warmup(values: list[float | None], n: int) -> list[flo
 
 def compute_indicators(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     closes = [float(row["close"]) for row in history]
-    highs = [float(row.get("high") or row["close"]) for row in history]
-    lows = [float(row.get("low") or row["close"]) for row in history]
+    highs = [safe_float(row.get("high")) for row in history]
+    lows = [safe_float(row.get("low")) for row in history]
     ema12 = ema_with_sma_warmup(closes, 12)
     ema26 = ema_with_sma_warmup(closes, 26)
     diff: list[float | None] = []
@@ -624,9 +1146,11 @@ def compute_indicators(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     k_prev = 50.0
     d_prev = 50.0
     for idx in range(len(closes)):
-        if idx >= 8:
-            low_n = min(lows[idx - 8 : idx + 1])
-            high_n = max(highs[idx - 8 : idx + 1])
+        window_highs = highs[idx - 8 : idx + 1] if idx >= 8 else []
+        window_lows = lows[idx - 8 : idx + 1] if idx >= 8 else []
+        if idx >= 8 and all(value is not None for value in [*window_highs, *window_lows]):
+            low_n = min(float(value) for value in window_lows if value is not None)
+            high_n = max(float(value) for value in window_highs if value is not None)
             rsv = 50.0 if high_n == low_n else (closes[idx] - low_n) / (high_n - low_n) * 100
             k_prev = (2 / 3) * k_prev + (1 / 3) * rsv
             d_prev = (2 / 3) * d_prev + (1 / 3) * k_prev
@@ -634,6 +1158,28 @@ def compute_indicators(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
             d_values[idx] = d_prev
     for idx, row in enumerate(history):
         item = dict(row)
+        warnings = list(item.get("warnings") or [])
+        reason_codes = list(item.get("reason_codes") or [])
+        missing_ohlc = [
+            field
+            for field, values in (("high", highs), ("low", lows))
+            if values[idx] is None
+        ]
+        for field in missing_ohlc:
+            reason = f"missing_daily_field:{field}"
+            if reason not in warnings:
+                warnings.append(reason)
+            if reason not in reason_codes:
+                reason_codes.append(reason)
+        if idx >= 8 and (
+            any(value is None for value in highs[idx - 8 : idx + 1])
+            or any(value is None for value in lows[idx - 8 : idx + 1])
+        ):
+            reason = "indicator_unavailable:kdj_missing_high_low"
+            warnings.append(reason)
+            reason_codes.append(reason)
+        item["warnings"] = list(dict.fromkeys(str(value) for value in warnings if value))
+        item["reason_codes"] = list(dict.fromkeys(str(value) for value in reason_codes if value))
         for n in [5, 10, 20, 60]:
             item[f"ma{n}"] = mean(closes[idx - n + 1 : idx + 1]) if idx + 1 >= n else None
         if idx + 1 >= 20:
@@ -722,7 +1268,11 @@ def build_ui_payload(root: Path, limit: int = 12) -> dict[str, Any]:
         symbol = to_plain_symbol(row.get("ts_code", ""))
         history = compute_indicators(read_daily_history(root, symbol))
         series = []
+        item_warnings: list[str] = []
+        item_reasons: list[str] = []
         for item in history:
+            item_warnings.extend(str(value) for value in item.get("warnings") or [] if value)
+            item_reasons.extend(str(value) for value in item.get("reason_codes") or [] if value)
             series.append(
                 {
                     "date": item["date"],
@@ -744,11 +1294,28 @@ def build_ui_payload(root: Path, limit: int = 12) -> dict[str, Any]:
                     "boll_upper": None if item.get("boll_upper") is None else round(float(item["boll_upper"]), 3),
                     "boll_mid": None if item.get("boll_mid") is None else round(float(item["boll_mid"]), 3),
                     "boll_lower": None if item.get("boll_lower") is None else round(float(item["boll_lower"]), 3),
+                    "warnings": list(dict.fromkeys(str(value) for value in item.get("warnings") or [] if value)),
+                    "reason_codes": list(dict.fromkeys(str(value) for value in item.get("reason_codes") or [] if value)),
                 }
             )
         perf = perf_by_key.get((row.get("entry_date", ""), row.get("ts_code", ""), row.get("strategy_type", "")), {})
+        item_warnings.extend(
+            str(value) for value in str(perf.get("data_quality_warnings") or "").split(";") if value
+        )
+        item_reasons.extend(
+            str(value) for value in str(perf.get("entry_price_reason") or "").split(";") if value
+        )
         latest_close = series[-1]["close"] if series else safe_float(row.get("entry_price"))
-        items.append({"ledger": row, "performance": perf, "series": series, "latest_close": latest_close})
+        items.append(
+            {
+                "ledger": row,
+                "performance": perf,
+                "series": series,
+                "latest_close": latest_close,
+                "warnings": list(dict.fromkeys(item_warnings)),
+                "reason_codes": list(dict.fromkeys(item_reasons)),
+            }
+        )
     return {"status": latest_market_status(root), "items": items, "summary": summary}
 
 

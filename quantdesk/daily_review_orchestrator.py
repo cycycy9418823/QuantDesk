@@ -41,7 +41,7 @@ DISCLAIMER = (
 )
 
 CommandRunner = Callable[[], int]
-CandidateTrackingRunner = Callable[[], int]
+CandidateTrackingRunner = Callable[[], int | dict[str, Any]]
 Stage4Readiness = Callable[[Path, str], bool]
 Stage4Satisfied = Callable[[Path, str], bool]
 Clock = Callable[[], datetime]
@@ -840,7 +840,7 @@ def run_evening_review(
     authoritative_chain_run_id: str,
     daily_runner: CommandRunner,
     candidate_tracking_runner: CandidateTrackingRunner | None = None,
-    stage4_runner: CommandRunner,
+    stage4_runner: CommandRunner | None = None,
     stage4_ready: Stage4Readiness = stage4_t0_plus_8_ready,
     stage4_satisfied: Stage4Satisfied = stage4_evidence_satisfied,
     trigger: str = "manual",
@@ -931,7 +931,7 @@ def run_evening_review(
                     "updated_at": clock().isoformat(),
                 }
                 _write_receipt(path, receipt)
-            
+
             daily_done = bool(receipt.get("daily_completed_at"))
             daily_executed = False
             claim_id = uuid4().hex
@@ -1023,9 +1023,18 @@ def run_evening_review(
                     "updated_at": tracking_claimed_at.isoformat(),
                 }
                 _write_receipt(path, tracking_running)
-                tracking_returncode, tracking_error = _safe_run(
-                    candidate_tracking_runner
-                )
+                tracking_outcome: dict[str, Any] = {}
+
+                def run_tracking() -> int:
+                    outcome = candidate_tracking_runner()
+                    if isinstance(outcome, dict):
+                        tracking_outcome.update(outcome)
+                        if outcome.get("status") == "skipped" and outcome.get("reason_codes"):
+                            return 0
+                        return int(outcome.get("returncode", 79))
+                    return int(outcome)
+
+                tracking_returncode, tracking_error = _safe_run(run_tracking)
                 finished_at = clock()
                 if tracking_returncode != 0:
                     failed = {
@@ -1051,13 +1060,32 @@ def run_evening_review(
                     **tracking_running,
                     "state": "daily_completed",
                     "active_step": None,
-                    "candidate_tracking_completed_at": finished_at.isoformat(),
-                    "candidate_tracking_returncode": 0,
+                    "candidate_tracking_completed_at": None if tracking_outcome.get("status") == "skipped" else finished_at.isoformat(),
+                    "candidate_tracking_returncode": None if tracking_outcome.get("status") == "skipped" else 0,
+                    "candidate_tracking_result": tracking_outcome or {"status": "completed"},
                     "returncode": 0,
                     "lease_expires_at": None,
                     "updated_at": finished_at.isoformat(),
                 }
                 _write_receipt(path, receipt)
+
+            if stage4_runner is None:
+                receipt = {
+                    **receipt,
+                    "stage4_enabled": False,
+                    "stage4_skipped_reason": "not_requested",
+                    "status": "completed_with_skips",
+                    "skipped_steps": [
+                        *([{"step": "candidate_tracking", **dict(receipt["candidate_tracking_result"])}]
+                          if (receipt.get("candidate_tracking_result") or {}).get("status") == "skipped" else []),
+                        {"step": "stage4", "status": "skipped", "reason_codes": ["not_requested"]},
+                    ],
+                }
+                _write_receipt(path, receipt)
+                return _result(
+                    receipt, receipt_path=path, daily_executed=daily_executed,
+                    stage4_executed=False, reason_code="daily_completed_stage4_not_requested",
+                )
 
             if stage4_satisfied(root, target_date):
                 milestones = _stage4_milestone_dates(root)

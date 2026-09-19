@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from flask import Blueprint, Flask, jsonify, request
 
+from quantdesk.market_clock import CN_TIMEZONE
 from scripts.server.helpers.util import clean_payload
 
 LOG = logging.getLogger("quant_api")
@@ -46,7 +47,7 @@ def create_news_blueprint(deps: NewsRouteDeps) -> Blueprint:
         age_days = None
         if stats.get("latest_date") and len(stats["latest_date"]) == 8:
             try:
-                age_days = (datetime.now() - datetime.strptime(stats["latest_date"], "%Y%m%d")).days
+                age_days = (datetime.now(CN_TIMEZONE) - datetime.strptime(stats["latest_date"], "%Y%m%d").replace(tzinfo=CN_TIMEZONE)).days
             except Exception as exc:  # noqa: BLE001 - invalid cache metadata should be visible
                 LOG.warning("news_status_latest_date_parse_failed: latest_date=%r error=%s", stats.get("latest_date"), exc)
         stats["age_days"] = age_days
@@ -57,9 +58,9 @@ def create_news_blueprint(deps: NewsRouteDeps) -> Blueprint:
     @bp.route("/api/stock/<symbol>/news", methods=["GET"])
     def get_stock_news(symbol: str) -> Any:
         clean_symbol = deps.normalize_symbol(symbol)
-        network_allowed = deps.request_truthy(request.args.get("network")) or deps.request_truthy(
-            request.args.get("enable_network")
-        )
+        # GET is a read-only cache view (B6): a query string must never trigger
+        # a provider fetch.  News refresh is the explicit POST /api/news/refresh.
+        network_allowed = False
         result = deps.fetch_news(clean_symbol, 8, network_allowed)
         return jsonify(clean_payload(result))
 

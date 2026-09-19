@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pandas as pd
 
@@ -15,8 +16,10 @@ from quantdesk.operation_log import load_operation_log
 from quantdesk.trading_calendar import resolve_target_complete_trade_date
 
 try:
+    from tests._isolated_project import IsolatedProject
     from tests._operation_log_isolation import isolate_operation_log_dir
 except ModuleNotFoundError:  # pragma: no cover - unittest discovery adds tests/ directly
+    from _isolated_project import IsolatedProject
     from _operation_log_isolation import isolate_operation_log_dir
 
 isolate_operation_log_dir()
@@ -25,10 +28,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = sys.executable
 
 
-def run_qd(*args: str) -> subprocess.CompletedProcess[str]:
+def run_qd(
+    *args: str,
+    root: Path | None = None,
+    env: dict | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [PYTHON, "scripts/qd.py", *args],
-        cwd=PROJECT_ROOT,
+        cwd=root or PROJECT_ROOT,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -145,7 +153,16 @@ class V3423CliContractFirstRunQuantLoopTests(unittest.TestCase):
         self.assertEqual(resolved["target_complete_trade_date"], "2026-05-22")
 
     def test_data_bootstrap_offline_payload_marks_universe_only(self) -> None:
-        payload = build_data_bootstrap(symbols="600000", network=False, write=False)
+        # The builder writes the demo universe even when the report write is off,
+        # so redirect the universe path into a temp root: the test must never
+        # touch the real data/universe sink.
+        with tempfile.TemporaryDirectory() as tmp:
+            isolated_universe = Path(tmp) / "data" / "universe" / "low_price_learning_symbols.csv"
+            with mock.patch(
+                "quantdesk.data_bootstrap.low_price_universe_path",
+                return_value=isolated_universe,
+            ):
+                payload = build_data_bootstrap(symbols="600000", network=False, write=False)
         self.assertFalse(payload.get("daily_ready"))
         self.assertEqual(payload.get("bootstrap_mode"), "offline_universe_only")
         self.assertEqual(payload.get("next_required_step"), "network_data_update_or_manual_import")
@@ -156,8 +173,19 @@ class V3423CliContractFirstRunQuantLoopTests(unittest.TestCase):
 
         timeline = operation_log_timeline_path()
         before = len(load_operation_log(timeline))
-        first = run_qd("data-bootstrap", "--preset", "low_price_demo", "--network", "false", "--json", "true")
-        second = run_qd("data-health", "--symbols", "600000", "--network", "false", "--json", "true", "--max-symbols", "1")
+        # Run the qd.py subprocesses in a disposable source clone with empty
+        # runtime dirs so data-bootstrap writes its demo universe inside the
+        # clone, never into the real project tree.
+        with IsolatedProject(PROJECT_ROOT, temp_parent=Path(tempfile.gettempdir())) as project:
+            env = project.subprocess_env()
+            first = run_qd(
+                "data-bootstrap", "--preset", "low_price_demo", "--network", "false", "--json", "true",
+                root=project.root, env=env,
+            )
+            second = run_qd(
+                "data-health", "--symbols", "600000", "--network", "false", "--json", "true", "--max-symbols", "1",
+                root=project.root, env=env,
+            )
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
         after = load_operation_log(timeline)

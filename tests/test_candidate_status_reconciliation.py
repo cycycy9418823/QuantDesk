@@ -136,8 +136,37 @@ def test_candidate_status_and_dashboard_data_risk_fields(tmp_path: Path) -> None
     assert card["candidate_upgrade_blocked_by_data_gaps"] is True
 
 
-def test_review_pack_manifest_has_data_truth_status() -> None:
-    ensure_candidate_review_pack()
-    manifest = json.loads((ROOT / "dist/portfolio_low_vol_rev120_candidate_monitoring_review_manifest.json").read_text(encoding="utf-8"))
+def test_review_pack_manifest_has_data_truth_status(tmp_path: Path) -> None:
+    # Run the maintenance CLI in a disposable source clone seeded with the same
+    # deterministic fixture, so the assertion never depends on stale dist/
+    # artifacts or whatever happens to be in the real project tree.
+    from tests._isolated_project import IsolatedProject
+
+    source = Path(__file__).resolve().parents[1]
+    with IsolatedProject(source, temp_parent=tmp_path) as project:
+        root = project.root
+        assert root is not None
+        write_candidate_status_fixture(root)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(root / "scripts" / "run_research_candidate_daily_maintenance.py"),
+                "--refresh-review-pack",
+                "true",
+                "--stop-on-human-review",
+                "false",
+            ],
+            cwd=root,
+            env=project.subprocess_env(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.returncode == 0, proc.stderr + proc.stdout[-2000:]
+        manifest = json.loads(
+            (root / "dist/portfolio_low_vol_rev120_candidate_monitoring_review_manifest.json").read_text(encoding="utf-8")
+        )
+
     assert manifest.get("data_truth_status") == "candidate_valid_but_data_risk_high"
     assert manifest.get("display_status") == "candidate_watch_due_to_data_gaps"

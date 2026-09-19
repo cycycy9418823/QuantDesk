@@ -7,6 +7,7 @@ portfolio.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -22,6 +23,9 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+import pandas as pd
+
+from quantdesk.csv_io import read_csv_frame
 from quantdesk.daily_candidate_refresh import (
     candidate_refresh_gate,
     publish_archived_conditional_plan,
@@ -39,6 +43,7 @@ from quantdesk.daily_price_update_engine import (
     resolve_symbols,
     update_daily_prices,
 )
+from quantdesk.price_basis import classify_frame_price_basis
 from quantdesk.data_close_upstream_contract import validate_upstream_reuse_manifest
 from quantdesk.data_truth.benchmark_incremental_update import update_benchmark_files
 from quantdesk.data_truth.sector_history_archive import (
@@ -130,9 +135,47 @@ def _reused_daily_payload(
     stale = list(status.get("stale_symbols") or [])
     missing = list(status.get("missing_symbols") or [])
     latest = dict(status.get("latest_by_symbol") or {})
+    invalid: dict[str, str] = {}
+    raw_positive: list[str] = []
+    raw_zero: list[str] = []
+    # The freshness reader normalizes dates; classify original rows separately
+    # before passing bounded session evidence to the downstream fast reader.
+    for row in rows:
+        symbol = row["symbol"]
+        path = root / "data/daily" / f"{symbol}.csv"
+        if not path.is_file():
+            continue
+        frame = read_csv_frame(path, dtype=str)
+        basis, reason = classify_frame_price_basis(frame)
+        if frame.attrs.get("warnings"):
+            invalid[symbol] = "original_csv_read_failed"
+            continue
+        if reason or basis != "raw":
+            invalid[symbol] = reason or "consumer_price_basis_not_allowed"
+            continue
+        if "date" not in frame.columns or "volume" not in frame.columns:
+            continue
+        dates = pd.to_datetime(frame["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        target_rows = frame.loc[dates.eq(target_date)]
+        if target_rows.empty:
+            continue
+        if "symbol" in target_rows.columns and not target_rows["symbol"].map(normalize_symbol).eq(symbol).all():
+            invalid[symbol] = "target_symbol_mismatch"
+            continue
+        volumes = pd.to_numeric(target_rows["volume"], errors="coerce")
+        if volumes.isna().any() or not volumes.ge(0).all() or not volumes.lt(float("inf")).all():
+            continue
+        if volumes.gt(0).any():
+            raw_positive.append(symbol)
+        else:
+            raw_zero.append(symbol)
+    fresh = sorted(set(fresh) - set(invalid))
+    stale = sorted(set(stale) | set(invalid))
     return {
         "ok": not stale and not missing,
-        "status": "reused_verified_upstream",
+        "status": "partial" if stale or missing else "completed",
+        "source_status": "reused_verified_upstream",
+        "operation": "local_input_audit",
         "upstream_reuse": True,
         "source_run_id": source_run_id,
         "provider_calls": 0,
@@ -145,15 +188,18 @@ def _reused_daily_payload(
         "fresh_symbol_list_after": fresh,
         "stale_symbol_list_after": stale,
         "missing_symbol_list_after": missing,
-        "failed_symbol_list": [],
-        "invalid_price_basis_symbols": [],
+        "require_raw_price_basis": True,
+        "failed_symbol_list": sorted(invalid),
+        "failed_symbols": len(invalid),
+        "invalid_price_basis_symbols": sorted(invalid),
+        "invalid_price_basis_reasons": invalid,
         "stale_count_after": len(stale),
         "missing_count_after": len(missing),
         "latest_by_symbol_after": latest,
-        "raw_positive_volume_target_symbols": len(fresh),
-        "raw_positive_volume_target_symbol_list": fresh,
-        "raw_zero_volume_target_symbols": 0,
-        "raw_zero_volume_target_symbol_list": [],
+        "raw_positive_volume_target_symbols": len(raw_positive),
+        "raw_positive_volume_target_symbol_list": raw_positive,
+        "raw_zero_volume_target_symbols": len(raw_zero),
+        "raw_zero_volume_target_symbol_list": raw_zero,
         "warnings": list(status.get("warnings") or []),
         "errors": [],
     }
@@ -502,19 +548,100 @@ def _low_price_filter_inventory(root: Path) -> dict[str, Any]:
 
     path = root / "data" / "universe" / "low_price_learning_symbols.csv"
     fingerprint = _file_fingerprint(path)
-    symbols: list[str] = []
-    if fingerprint.get("exists"):
-        symbols = _normalized_symbols(resolve_symbols(only_low_price=True))
+    symbols = _csv_symbol_rows(path, included_only=True)
     return {
         "id": "low_price_learning",
         "role": "filter_output_not_universe",
         "used": False,
-        "reason": "low_price_strategy_abandoned_filter_not_run",
+        "reason": "optional_filter_not_selected",
         "path": _display_path(path, root),
         "exists": bool(fingerprint.get("exists")),
         "symbol_count": len(symbols),
         "sha256": str(fingerprint.get("sha256") or ""),
         "size": int(fingerprint.get("size") or 0),
+    }
+
+
+def _csv_symbol_rows(path: Path, *, included_only: bool = False) -> list[str]:
+    """Read canonical symbol rows without consulting the low-price resolver.
+
+    The resolver's historical default is the 914-row learning filter.  The
+    research chain must be able to read the all-A baseline independently, so
+    this small parser is deliberately local to the chain and accepts the
+    common symbol/code aliases used by the baseline exports.
+    """
+
+    if not path.exists() or not path.is_file():
+        return []
+    symbols: list[str] = []
+    seen: set[str] = set()
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if not isinstance(row, Mapping):
+                    continue
+                if included_only and str(row.get("included") or "").strip().lower() not in {
+                    "1", "true", "yes", "y", "on", "included",
+                }:
+                    continue
+                value = next(
+                    (
+                        row.get(key)
+                        for key in ("symbol", "code", "ts_code", "证券代码", "代码")
+                        if row.get(key) not in (None, "")
+                    ),
+                    "",
+                )
+                symbol = normalize_symbol(value)
+                if len(symbol) == 6 and symbol.isdigit() and symbol not in seen:
+                    symbols.append(symbol)
+                    seen.add(symbol)
+    except (OSError, csv.Error, UnicodeError):
+        return []
+    return sorted(symbols)
+
+
+def _full_a_research_universe(root: Path) -> dict[str, Any]:
+    """Return the default full-A research input and its source evidence.
+
+    ``a_share_symbols.csv`` is the authoritative current-universe source.  A
+    missing baseline is visible and may fall back to symbols represented by
+    local daily bars; the 914 low-price file is never used as this fallback.
+    """
+
+    baseline = root / "data" / "universe" / "a_share_symbols.csv"
+    fingerprint = _file_fingerprint(baseline)
+    symbols = _csv_symbol_rows(baseline)
+    source = "a_share_symbols.csv"
+    source_path = baseline
+    reason_codes: list[str] = []
+    if not symbols:
+        daily_dir = root / "data" / "daily"
+        daily_symbols = sorted(
+            {
+                normalize_symbol(path.stem)
+                for path in daily_dir.glob("*.csv")
+                if len(normalize_symbol(path.stem)) == 6
+                and normalize_symbol(path.stem).isdigit()
+            }
+        ) if daily_dir.exists() else []
+        if daily_symbols:
+            symbols = daily_symbols
+            source = "local_daily_cache_fallback"
+            source_path = daily_dir
+            reason_codes.append("all_a_baseline_missing_or_empty")
+        else:
+            source = "all_a_baseline_missing"
+            reason_codes.append("all_a_universe_source_missing")
+    return {
+        "source": source,
+        "path": _display_path(source_path, root),
+        "source_sha256": str(fingerprint.get("sha256") or ""),
+        "source_size": int(fingerprint.get("size") or 0),
+        "symbols": symbols,
+        "symbol_count": len(symbols),
+        "reason_codes": reason_codes,
     }
 
 
@@ -566,7 +693,7 @@ def _coverage_from_audit(
         status = "passed"
     elif tier == "critical":
         status = "blocked"
-    elif ratio is not None and ratio >= 0.95:
+    elif tier == "current_analysis_pool":
         status = "partial"
     else:
         status = "blocked"
@@ -687,6 +814,7 @@ def _daily_coverage(
         "completed",
         "passed",
         "reused_verified_upstream",
+        "partial",
         "skipped_network_false",
         "skipped",
     } or (
@@ -1436,7 +1564,15 @@ def _update_current_state(root: Path, manifest: Mapping[str, Any]) -> dict[str, 
         "boundaries": dict(manifest.get("boundaries") or {}),
         "governance_docs_mutated": False,
     }
-    atomic_write_json(path, runtime_status)
+    try:
+        atomic_write_json(path, runtime_status)
+    except Exception as exc:  # noqa: BLE001 - this derived status must not suppress the run manifest
+        return {
+            "ok": False, "status": "failed", "path": str(path),
+            "reason_codes": ["runtime_status_write_failed"],
+            "error": f"{type(exc).__name__}:{exc}"[:1000],
+            "governance_docs_mutated": False,
+        }
     return {
         "ok": True,
         "status": "updated",
@@ -1539,6 +1675,14 @@ def _run_candidate_refresh_step(
                 captured_at=captured_at,
                 apply=True,
                 replace_same_date=bool(reuse.get("reused")),
+                use_low_price_filter=any(
+                    isinstance(item, Mapping) and item.get("used") is True
+                    for item in (
+                        (manifest.get("scope") or {}).get("filters", [])
+                        if isinstance(manifest.get("scope"), Mapping)
+                        else []
+                    )
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - observation is failure-isolated
             result = {
@@ -1562,6 +1706,8 @@ def _feature_coverage(
     expected_symbols: Sequence[str],
     target_date: str,
     legitimate_no_data_symbols: Sequence[str] = (),
+    *,
+    output_path: Path | None = None,
 ) -> dict[str, Any]:
     expected = _normalized_symbols(expected_symbols)
     legitimate = set(_normalized_symbols(legitimate_no_data_symbols))
@@ -1579,14 +1725,52 @@ def _feature_coverage(
         if normalize_symbol(symbol)
     }
     observed_set = set(per_symbol)
-    missing_symbols = sorted(expected_set - observed_set)
+    declared_exclusions = {
+        symbol for symbol in expected_set & observed_set
+        if per_symbol[symbol].get("eligible") is False
+        and str(per_symbol[symbol].get("reason_code") or "")
+    }
+    excluded_symbols: set[str] = set()
+    output_integrity_failed = False
+    # Exclusion is safe only when the actual published CSV contains precisely
+    # the accepted symbols. A summary alone cannot prove contaminated rows left.
+    if declared_exclusions and output_path is not None:
+        output_integrity_failed = True
+        try:
+            raw_output = output_path.read_bytes()
+            output_rows = list(csv.DictReader(raw_output.decode("utf-8-sig").splitlines()))
+            output_symbols = [normalize_symbol(row.get("symbol")) for row in output_rows]
+            accepted_symbols = {
+                symbol for symbol in expected_set & observed_set
+                if per_symbol[symbol].get("eligible") is True
+            }
+            if (
+                hashlib.sha256(raw_output).hexdigest() == payload.get("output_sha256")
+                and set(output_symbols) == accepted_symbols
+                and len(output_symbols) == len(accepted_symbols) == feature_count
+                and int(payload.get("output_row_count") or 0) == feature_count
+            ):
+                excluded_symbols = declared_exclusions
+                output_integrity_failed = False
+        except (OSError, UnicodeError, csv.Error):
+            pass
+    missing_data_symbols = {
+        symbol
+        for symbol in expected_set & observed_set
+        if per_symbol[symbol].get("eligible") is False
+        and str(per_symbol[symbol].get("reason_code") or "") == "missing_or_invalid_daily"
+    }
+    missing_symbols = sorted((expected_set - observed_set) | missing_data_symbols)
     unexpected_symbols = sorted(observed_set - expected_set)
     invalid_symbols = sorted(
         symbol
         for symbol in expected_set & observed_set
         if (
+            symbol not in missing_data_symbols and symbol not in excluded_symbols
+            and (
             per_symbol[symbol].get("eligible") is not True
             or str(per_symbol[symbol].get("price_basis") or "") != "raw"
+            )
         )
     )
     target = str(target_date or "")[:10]
@@ -1596,6 +1780,7 @@ def _feature_coverage(
         if (
             str(per_symbol[symbol].get("latest_date") or "")[:10] != target
             and symbol not in legitimate
+            and symbol not in missing_data_symbols
         )
     )
     legitimate_stale_symbols = sorted(
@@ -1607,7 +1792,9 @@ def _feature_coverage(
         )
     )
     reason_codes: list[str] = []
-    if payload.get("ok") is not True or component_status != "passed":
+    if output_integrity_failed:
+        reason_codes.append("feature_output_integrity_invalid")
+    if payload.get("ok") is not True or component_status not in {"passed", "partial"}:
         reason_codes.append("feature_component_not_passed")
     if requested_count != len(expected):
         reason_codes.append("feature_requested_count_mismatch")
@@ -1625,21 +1812,50 @@ def _feature_coverage(
         reason_codes.append("feature_price_basis_not_raw")
     if not snapshot_stable:
         reason_codes.append("feature_input_snapshot_unstable")
+    policy_partial_ok = (
+        component_status == "partial"
+        and str(policy.get("status") or "") == "passed"
+        and str(policy.get("run_status") or "") in {"passed", "partial"}
+        and policy.get("eligible") is True
+        and str(policy.get("accepted_price_basis") or "") == "raw"
+        and not list(policy.get("blocked_symbols") or [])
+    )
     if (
-        str(policy.get("status") or "") != "passed"
-        or str(policy.get("run_status") or "") != "passed"
-        or policy.get("eligible") is not True
-        or str(policy.get("accepted_price_basis") or "") != "raw"
-        or list(policy.get("blocked_symbols") or [])
-        or list(policy.get("reason_codes") or [])
+        not policy_partial_ok
+        and (
+            str(policy.get("status") or "") != "passed"
+            or str(policy.get("run_status") or "") not in {"passed", "partial"}
+            or policy.get("eligible") is not True
+            or str(policy.get("accepted_price_basis") or "") != "raw"
+            or list(policy.get("blocked_symbols") or [])
+            or list(policy.get("reason_codes") or [])
+        )
     ):
         reason_codes.append("feature_price_policy_not_passed")
     if missing_symbols or unexpected_symbols:
         reason_codes.append("feature_symbol_set_mismatch")
     if invalid_symbols:
         reason_codes.append("feature_per_symbol_not_raw")
+    if excluded_symbols:
+        reason_codes.append("feature_symbols_excluded")
     if stale_symbols:
         reason_codes.append("feature_target_date_mismatch")
+    symbol_hole_codes = {
+        "feature_symbols_skipped",
+        "feature_symbol_set_mismatch",
+        "feature_requested_count_mismatch",
+        "feature_count_mismatch",
+        "feature_output_row_count_mismatch",
+        "feature_target_date_mismatch",
+        "feature_symbols_excluded",
+    }
+    status = (
+        "partial"
+        if reason_codes and set(reason_codes).issubset(symbol_hole_codes)
+        else "passed"
+        if not reason_codes
+        else "blocked"
+    )
     return {
         "requested_count": len(expected),
         "reported_requested_count": requested_count,
@@ -1651,11 +1867,16 @@ def _feature_coverage(
         "missing_symbols": missing_symbols,
         "unexpected_symbols": unexpected_symbols,
         "invalid_symbols": invalid_symbols,
+        "excluded_symbols": sorted(excluded_symbols),
+        "excluded_symbol_evidence": {
+            symbol: per_symbol[symbol] for symbol in sorted(excluded_symbols)
+        },
+        "exclusion_output_sha256": payload.get("output_sha256") if excluded_symbols else "",
         "stale_symbols": stale_symbols,
         "legitimate_stale_symbols": legitimate_stale_symbols,
         "legitimate_no_data_symbols": sorted(legitimate),
         "reason_codes": reason_codes,
-        "status": "passed" if not reason_codes else "blocked",
+        "status": status,
     }
 
 
@@ -2394,10 +2615,13 @@ def _run_daily_data_chain_impl(
     batch_workers: int = 4,
     rebuild_features: bool = True,
     retry_from_latest: bool = False,
-    skip_analysis_pool_minute: bool = False,
+    skip_analysis_pool_minute: bool = True,
+    include_critical_minute: bool = False,
     refresh_universe: bool = True,
+    use_low_price_filter: bool = False,
     trigger: str = "manual",
     upstream_reuse: Mapping[str, Any] | None = None,
+    pipeline_run_id: str = "",
     _failure_context: dict[str, Any] | None = None,
     _lock_already_held: bool = False,
     _force_busy: bool = False,
@@ -2476,6 +2700,7 @@ def _run_daily_data_chain_impl(
     latest_path = root / "results" / "data_chain" / "daily_data_chain_latest.json"
     intraday_dir = root / "data" / "intraday" / "1m"
     formal_stage6_apply = bool(network and not dry_run)
+    formal_authorized = bool(network and not dry_run and symbols is None)
     started_at = now_text()
 
     # Recovery lineage for this run.  A stale ``running`` lock still wins; when
@@ -2732,25 +2957,81 @@ def _run_daily_data_chain_impl(
     )
 
     low_price_filter = _low_price_filter_inventory(root)
+    low_price_filter["used"] = bool(use_low_price_filter and symbols is None)
+    if low_price_filter["used"]:
+        low_price_filter["reason"] = "explicit_filter_selected"
+    full_a_universe = _full_a_research_universe(root)
     analysis_rows = (
         [{"symbol": item} for item in _normalized_symbols(list(symbols))]
         if symbols is not None
-        else []
+        else (
+            [
+                {"symbol": item}
+                for item in _csv_symbol_rows(
+                    root / "data" / "universe" / "low_price_learning_symbols.csv",
+                    included_only=True,
+                )
+            ]
+            if use_low_price_filter
+            else [{"symbol": item} for item in full_a_universe["symbols"]]
+        )
     )
     analysis_contract = build_universe_contract(
         analysis_rows,
         target_date=resolved_target,
         name="current_analysis_pool",
     )
+    analysis_contract.update(
+        {
+            "source": (
+                "explicit_symbols"
+                if symbols is not None
+                else "low_price_learning_filter"
+                if use_low_price_filter
+                else full_a_universe["source"]
+            ),
+            "source_path": (
+                "explicit"
+                if symbols is not None
+                else low_price_filter.get("path")
+                if use_low_price_filter
+                else full_a_universe["path"]
+            ),
+            "source_sha256": (
+                ""
+                if symbols is not None
+                else low_price_filter.get("sha256")
+                if use_low_price_filter
+                else full_a_universe["source_sha256"]
+            ),
+            "filter_used": bool(use_low_price_filter and symbols is None),
+            "filter_id": low_price_filter.get("id"),
+            "filter_symbol_count": int(low_price_filter.get("symbol_count") or 0),
+        }
+    )
     analysis_symbols = list(analysis_contract["symbols"])
-    critical_payload = collect_intraday_required_symbols(
-        source="preplan",
-        target_trade_date=resolved_target,
-        symbols=[],
+    if universe_refresh_blocked and analysis_symbols:
+        universe_refresh_payload["research_fallback"] = {
+            "status": "degraded", "source": analysis_contract.get("source"),
+            "source_path": analysis_contract.get("source_path"),
+            "source_sha256": analysis_contract.get("source_sha256"),
+            "symbol_count": len(analysis_symbols),
+            "reason_codes": ["universe_refresh_failed_using_previous_roster"],
+        }
+        universe_refresh_blocked = False
+    critical_payload = (
+        collect_intraday_required_symbols(
+            source="preplan", target_trade_date=resolved_target, symbols=[],
+        )
+        if include_critical_minute
+        else {"items": [], "source_manifest": {
+            "status": "not_requested", "formal_eligible": False,
+            "failed_sources": [], "reason_codes": ["minute_processing_not_requested"],
+        }}
     )
     critical_source_manifest = dict(critical_payload.get("source_manifest") or {})
     critical_source_blocked = bool(
-        critical_source_manifest
+        include_critical_minute and critical_source_manifest
         and not bool(critical_source_manifest.get("formal_eligible"))
     )
     critical_symbols = _normalized_symbols(list(critical_payload.get("items") or []))
@@ -2781,8 +3062,9 @@ def _run_daily_data_chain_impl(
         "package_version": PACKAGE_VERSION,
         "task_type": "daily_data_chain",
         "daily_data_chain_contract_version": DAILY_DATA_CHAIN_CONTRACT_VERSION,
-        "authoritative": bool(network and not dry_run),
+        "authoritative": formal_authorized,
         "run_id": current_run_id,
+        "pipeline_run_id": str(pipeline_run_id),
         "trigger": str(trigger or "manual"),
         "status": "running",
         "started_at": started_at,
@@ -2806,16 +3088,40 @@ def _run_daily_data_chain_impl(
         },
         "provider_versions": _package_versions(),
         # Data coverage and research coverage are deliberately different scopes.
-        # The daily-bar layer may span the full A-share market, while the formal
-        # research/candidate path still runs on the bounded analysis pool
-        # (`resolve_symbols(only_low_price=True)`). Declaring both explicitly
-        # stops full-A *data* coverage from being read as full-A *strategy*
-        # validation in the UI, reports, or acceptance artifacts.
+        # The daily-bar layer and default research input are full A; the named
+        # 914 low-price file can be selected explicitly as a filter. Declaring
+        # both scopes stops a filter output from being mistaken for the universe.
         "scope": {
             "market_data_scope": "all_a",
-            "research_scope": "all_a",
-            "research_scope_selector": "universe_all_a",
+            "research_scope": "explicit_symbols" if symbols is not None else "all_a",
+            "research_scope_selector": (
+                "explicit_symbols" if symbols is not None else "universe_all_a"
+            ),
             "full_a_research_scan": False,
+            "full_a_local_research": symbols is None and not use_low_price_filter,
+            "formal_authoritative": formal_authorized,
+            "research_universe_source": (
+                "explicit_symbols"
+                if symbols is not None
+                else "low_price_learning_filter"
+                if use_low_price_filter
+                else full_a_universe["source"]
+            ),
+            "research_universe_source_path": (
+                "explicit"
+                if symbols is not None
+                else low_price_filter.get("path")
+                if use_low_price_filter
+                else full_a_universe["path"]
+            ),
+            "research_universe_source_sha256": (
+                ""
+                if symbols is not None
+                else low_price_filter.get("sha256")
+                if use_low_price_filter
+                else full_a_universe["source_sha256"]
+            ),
+            "research_universe_count": len(analysis_symbols),
             "filters": [low_price_filter],
             "note": (
                 "宇宙=全A。914低价名单是过滤器输出，不是宇宙，不是下游前提。"
@@ -2825,6 +3131,37 @@ def _run_daily_data_chain_impl(
         "universe": {
             "critical": critical_contract,
             "current_analysis_pool": analysis_contract,
+            "research_universe": {
+                "source": (
+                "explicit_symbols"
+                if symbols is not None
+                else "low_price_learning_filter"
+                if use_low_price_filter
+                else full_a_universe["source"]
+                ),
+                "path": (
+                    "explicit"
+                    if symbols is not None
+                    else low_price_filter.get("path")
+                    if use_low_price_filter
+                    else full_a_universe["path"]
+                ),
+                "source_sha256": (
+                    ""
+                    if symbols is not None
+                    else low_price_filter.get("sha256")
+                    if use_low_price_filter
+                    else full_a_universe["source_sha256"]
+                ),
+                "symbol_count": len(analysis_symbols),
+                "symbols": list(analysis_symbols),
+                "filter_used": bool(use_low_price_filter),
+                "filter_id": low_price_filter.get("id"),
+                "filter_symbol_count": int(low_price_filter.get("symbol_count") or 0),
+                "reason_codes": list(full_a_universe.get("reason_codes") or [])
+                if symbols is None and not use_low_price_filter
+                else [],
+            },
             "critical_daily_outside_analysis_pool": {
                 "symbol_count": len(critical_daily_symbols),
                 "symbols": critical_daily_symbols,
@@ -2938,11 +3275,14 @@ def _run_daily_data_chain_impl(
                 root=root,
                 manifest_path=manifest_path,
                 latest_path=latest_path,
-                publish_latest=True,
+                publish_latest=formal_authorized,
             )
 
+        daily_network_effective = bool(
+            network and (symbols is not None or use_low_price_filter)
+        )
         daily_workers, daily_sleep_seconds = _daily_update_rate_contract(
-            network=network,
+            network=daily_network_effective,
             dry_run=dry_run,
             requested_workers=batch_workers,
         )
@@ -2965,7 +3305,7 @@ def _run_daily_data_chain_impl(
                 providers=list(DAILY_PROVIDER_ORDER),
                 workers=daily_workers,
                 sleep_seconds=daily_sleep_seconds,
-                network=bool(network),
+                network=daily_network_effective,
                 dry_run=bool(dry_run),
                 rebuild_features=False,
                 symbols=daily_update_symbols,
@@ -2982,8 +3322,23 @@ def _run_daily_data_chain_impl(
             daily_payload["scheduler_rate_limit"] = {
                 "workers": daily_workers,
                 "sleep_seconds": daily_sleep_seconds,
-                "network_enforced": bool(network and not dry_run),
+                "network_enforced": bool(daily_network_effective and not dry_run),
             }
+        daily_payload["network_requested"] = bool(network)
+        daily_payload["network_effective"] = bool(
+            daily_network_effective and upstream_reuse_normalized is None
+        )
+        daily_payload["network_scope"] = (
+            "verified_upstream_reuse"
+            if upstream_reuse_normalized is not None
+            else "explicit_symbol_or_filter_history"
+            if daily_network_effective
+            else "local_full_a_research"
+        )
+        if network and not daily_network_effective and upstream_reuse_normalized is None:
+            base_manifest["warnings"].append(
+                "full_a_per_symbol_history_network_not_enabled"
+            )
         session_symbols = _normalized_symbols(
             list(analysis_symbols) + list(critical_symbols)
         )
@@ -3073,10 +3428,10 @@ def _run_daily_data_chain_impl(
         # benchmark_staleness_days, so the staleness was measured faithfully
         # every day and never acted on. Appending here is what keeps the
         # reference series aligned with the daily bars it is compared against.
-        benchmark_network = bool(network and not dry_run and root == PROJECT_ROOT)
+        benchmark_network = bool(formal_authorized and root == PROJECT_ROOT)
         if benchmark_network:
             try:
-                benchmark_payload = update_benchmark_files(root)
+                benchmark_payload = update_benchmark_files(root, target_date=resolved_target)
             except Exception as exc:  # noqa: BLE001 - reason must reach the manifest
                 benchmark_payload = {
                     "task_id": "benchmark_incremental_update",
@@ -3088,10 +3443,33 @@ def _run_daily_data_chain_impl(
                 "task_id": "benchmark_incremental_update",
                 "status": "skipped",
                 "reason_codes": [
-                    "network_disabled" if not network else "not_canonical_project_root",
+                    reason
+                    for blocked, reason in (
+                        (not network, "network_disabled"),
+                        (dry_run, "dry_run"),
+                        (symbols is not None, "explicit_symbol_subset"),
+                        (root != PROJECT_ROOT, "not_canonical_project_root"),
+                    )
+                    if blocked
                 ],
             }
         base_manifest["components"]["benchmark_update"] = benchmark_payload
+        benchmark_reasons = list(benchmark_payload.get("reason_codes") or [])
+        benchmark_reasons.extend(
+            str(reason) for item in benchmark_payload.get("results") or []
+            for reason in item.get("reason_codes") or []
+        )
+        if benchmark_network and benchmark_payload.get("target_covered") is not True:
+            benchmark_reasons.append("benchmark_target_not_covered")
+            base_manifest["warnings"].append("benchmark_target_not_covered")
+        base_manifest["coverage"]["benchmark"] = {
+            "target_date": benchmark_payload.get("target_date", resolved_target),
+            "target_covered": benchmark_payload.get("target_covered"),
+            "freshness_status": benchmark_payload.get("freshness_status", "not_assessed"),
+            "status": benchmark_payload.get("status"),
+            "reason_codes": sorted(set(benchmark_reasons)),
+            "indices": list(benchmark_payload.get("results") or []),
+        }
 
         retry_filter: set[str] | None = None
         previous = read_json(latest_path, {}) if retry_from_latest else {}
@@ -3119,16 +3497,19 @@ def _run_daily_data_chain_impl(
             item for item in analysis_audit_symbols
             if item not in set(critical_audit_symbols)
         ]
+        minute_not_assessed = list(analysis_to_update) if skip_analysis_pool_minute else []
+        if skip_analysis_pool_minute:
+            analysis_to_update = []
 
         recovery_payload: dict[str, Any] = {
-            "status": "not_available",
+            "status": "not_requested" if skip_analysis_pool_minute else "not_available",
             "source_run_id": abandoned_source_run_id,
             "accepted_symbols": [],
             "retry_symbols": sorted(analysis_to_update),
             "batch_evidence": [],
             "reason_codes": [],
         }
-        if retry_from_latest and abandoned_source_run_id:
+        if not skip_analysis_pool_minute and retry_from_latest and abandoned_source_run_id:
             recovery_payload = _recover_abandoned_batch_artifacts(
                 project_root=root,
                 source_run_id=abandoned_source_run_id,
@@ -3146,9 +3527,6 @@ def _run_daily_data_chain_impl(
         elif retry_filter is not None:
             analysis_to_update = [
                 item for item in analysis_to_update if item in retry_filter
-            ]
-            critical_to_update = [
-                item for item in critical_to_update if item in retry_filter
             ]
         base_manifest["components"]["analysis_intraday_recovery"] = recovery_payload
         analysis_workset_symbols = _normalized_symbols(analysis_to_update)
@@ -3278,7 +3656,7 @@ def _run_daily_data_chain_impl(
                         provider_order=list(INTRADAY_PROVIDER_ORDER),
                         source="symbols",
                         dry_run=dry_run,
-                        network=network,
+                        network=daily_network_effective,
                         execute_after_update=False,
                         update_portfolio_after_execution=False,
                         intraday_dir=batch_work_dir,
@@ -3501,16 +3879,20 @@ def _run_daily_data_chain_impl(
             if critical_symbols
             else _empty_audit(resolved_target, current_run_id)
         )
-        analysis_audit = audit_intraday_batch(
-            analysis_audit_symbols,
-            resolved_target,
-            intraday_dir=intraday_dir,
-            output_path=run_dir / "analysis_pool_intraday_quality.json",
-            write=not dry_run,
-            run_id=current_run_id,
-            price_basis_by_symbol={
-                symbol: "raw" for symbol in analysis_provenance_symbols
-            },
+        analysis_audit = (
+            _empty_audit(resolved_target, current_run_id)
+            if skip_analysis_pool_minute
+            else audit_intraday_batch(
+                analysis_audit_symbols,
+                resolved_target,
+                intraday_dir=intraday_dir,
+                output_path=run_dir / "analysis_pool_intraday_quality.json",
+                write=not dry_run,
+                run_id=current_run_id,
+                price_basis_by_symbol={
+                    symbol: "raw" for symbol in analysis_provenance_symbols
+                },
+            )
         )
         critical_coverage = _coverage_from_audit(
             critical_audit,
@@ -3518,18 +3900,33 @@ def _run_daily_data_chain_impl(
             tier="critical",
             legitimate_no_data_symbols=critical_legitimate,
         )
+        if not include_critical_minute:
+            critical_coverage.update({
+                "status": "not_requested", "reason_codes": ["minute_processing_not_requested"],
+            })
         analysis_coverage = _coverage_from_audit(
             analysis_audit,
-            requested_count=len(analysis_symbols),
+            requested_count=0 if skip_analysis_pool_minute else len(analysis_symbols),
             tier="current_analysis_pool",
-            legitimate_no_data_symbols=analysis_legitimate,
+            legitimate_no_data_symbols=() if skip_analysis_pool_minute else analysis_legitimate,
         )
+        if skip_analysis_pool_minute:
+            analysis_coverage.update({
+                "status": "not_requested",
+                "universe_count": len(analysis_symbols),
+                "not_assessed_count": len(minute_not_assessed),
+                "not_assessed_symbols": minute_not_assessed,
+                "reason_codes": ["analysis_pool_minute_on_demand"],
+            })
+            base_manifest["warnings"].append("analysis_pool_minute_not_requested")
         base_manifest["components"]["minute_quality"] = {
             "critical": {
+                "status": critical_coverage["status"],
                 "summary": critical_audit.get("summary") or {},
                 "path": critical_audit.get("path") or "",
             },
             "current_analysis_pool": {
+                "status": analysis_coverage["status"],
                 "summary": analysis_audit.get("summary") or {},
                 "path": analysis_audit.get("path") or "",
             },
@@ -3545,8 +3942,16 @@ def _run_daily_data_chain_impl(
                 low_price_universe_path=(
                     root / "data" / "universe" / "low_price_learning_symbols.csv"
                 ),
-                output_path=root / "data" / "features" / "daily_features_latest.csv",
-                summary_path=root / "data" / "features" / "daily_features_summary.json",
+                output_path=(
+                    root / "data" / "features" / "daily_features_latest.csv"
+                    if symbols is None
+                    else run_dir / "daily_features.csv"
+                ),
+                summary_path=(
+                    root / "data" / "features" / "daily_features_summary.json"
+                    if symbols is None
+                    else run_dir / "daily_features_summary.json"
+                ),
             )
         else:
             feature_payload = {
@@ -3584,6 +3989,10 @@ def _run_daily_data_chain_impl(
                 analysis_symbols,
                 resolved_target,
                 analysis_legitimate,
+                output_path=(
+                    root / "data/features/daily_features_latest.csv"
+                    if symbols is None else run_dir / "daily_features.csv"
+                ),
             )
         base_manifest["coverage"]["features"] = feature_gate
 
@@ -3599,6 +4008,7 @@ def _run_daily_data_chain_impl(
             | set(daily_payload.get("failed_symbol_list") or [])
             | set(feature_gate.get("missing_symbols") or [])
             | set(feature_gate.get("invalid_symbols") or [])
+            | set(feature_gate.get("excluded_symbols") or [])
             | set(feature_gate.get("stale_symbols") or [])
             | set(session_unknown)
         )
@@ -3624,6 +4034,8 @@ def _run_daily_data_chain_impl(
             )
         if universe_refresh_blocked:
             base_manifest["errors"].append("universe_refresh_blocked")
+        elif universe_refresh_payload.get("research_fallback"):
+            base_manifest["warnings"].append("universe_refresh_failed_using_previous_roster")
         if sector_refresh_blocked:
             base_manifest["warnings"].append("sector_refresh_blocked")
         if critical_conflict_isolation["status"] == "isolated":
@@ -3636,14 +4048,23 @@ def _run_daily_data_chain_impl(
             "daily_symbols_failed",
         }
         feature_hole_codes = {
+            "feature_component_not_passed",
+            "feature_requested_count_mismatch",
+            "feature_count_mismatch",
+            "feature_output_row_count_mismatch",
+            "feature_symbol_set_mismatch",
             "feature_target_date_mismatch",
             "feature_symbols_skipped",
+            "feature_symbols_excluded",
         }
         daily_hard_codes = [
             code
             for code in (daily_gate.get("reason_codes") or [])
             if code not in daily_hole_codes
         ]
+        isolated_daily_basis = set(daily_gate.get("invalid_price_basis_symbols") or [])
+        if isolated_daily_basis and isolated_daily_basis.issubset(set(feature_gate.get("excluded_symbols") or [])):
+            daily_hard_codes = [code for code in daily_hard_codes if code != "daily_price_basis_not_raw"]
         feature_hard_codes = [
             code
             for code in (feature_gate.get("reason_codes") or [])
@@ -3655,6 +4076,7 @@ def _run_daily_data_chain_impl(
             + list(daily_gate.get("missing_symbols") or [])
             + list(feature_gate.get("stale_symbols") or [])
             + list(feature_gate.get("missing_symbols") or [])
+            + list(feature_gate.get("excluded_symbols") or [])
         )
         if session_unknown:
             base_manifest["warnings"].append("session_unknown_labeled_not_blocking")
@@ -3682,14 +4104,16 @@ def _run_daily_data_chain_impl(
             list(analysis_coverage.get("failed_symbols") or [])
             + list(critical_coverage.get("failed_symbols") or [])
             + labeled_daily_holes
+            + minute_not_assessed
         )
         base_manifest["fill_labels"] = {
             "not_fillable_tonight": not_fillable_tonight,
-            "reason": "missing_or_incomplete_minute_or_daily_session",
+            "reason": "missing_incomplete_or_unassessed_price_evidence",
             "blocks_chain": False,
             "daily_holes": labeled_daily_holes,
+            "minute_not_assessed": minute_not_assessed,
         }
-        if not_fillable_tonight:
+        if minute_failed_symbols:
             base_manifest["warnings"].append("minute_gaps_labeled_not_fillable_tonight")
 
         if status == "completed" and sector_refresh_blocked:
@@ -3702,7 +4126,7 @@ def _run_daily_data_chain_impl(
         if status == "completed":
             if not_fillable_tonight:
                 next_action = (
-                    "日线与特征已通过；缺分钟或停牌/缺口的票已标「今晚不可成交」，不拦链。"
+                    "日线与特征已处理；缺失或尚未核验成交证据的股票不可成交，不拦研究链。"
                 )
             else:
                 next_action = "数据链已通过；下游只能消费本 run_id 和 target_date 的产物。"
@@ -3729,7 +4153,7 @@ def _run_daily_data_chain_impl(
             }
         )
 
-        if network and not dry_run:
+        if formal_authorized:
             _run_candidate_refresh_step(
                 root=root,
                 manifest=base_manifest,
@@ -3737,12 +4161,17 @@ def _run_daily_data_chain_impl(
             )
 
         features_ran = str(feature_payload.get("status") or "") not in {"skipped", "not_evaluated", ""}
-        if network and not dry_run and rebuild_features and features_ran:
-            plan_freeze = freeze_t_plus_one_plan(
-                project_root=root,
-                data_chain_manifest=base_manifest,
-                write=False,
-            )
+        if formal_authorized and rebuild_features and features_ran:
+            try:
+                plan_freeze = freeze_t_plus_one_plan(
+                    project_root=root, data_chain_manifest=base_manifest, write=False,
+                )
+            except Exception as exc:  # noqa: BLE001 - retain data results and the prior plan
+                plan_freeze = {
+                    "ok": False, "status": "blocked", "written": False,
+                    "reason_codes": ["conditional_plan_prepare_exception"],
+                    "error": f"{type(exc).__name__}:{exc}"[:1000],
+                }
         else:
             plan_freeze = {
                 "ok": True,
@@ -3752,9 +4181,9 @@ def _run_daily_data_chain_impl(
                     "dry_run"
                     if dry_run
                     else "feature_rebuild_disabled"
-                    if network and not dry_run and not rebuild_features
+                    if formal_authorized and not rebuild_features
                     else "research_pool_empty_filter_not_selected"
-                    if network and not dry_run and rebuild_features and not features_ran
+                    if formal_authorized and rebuild_features and not features_ran
                     else "authoritative_network_run_required"
                 ],
                 "data_chain_run_id": current_run_id,
@@ -3786,8 +4215,7 @@ def _run_daily_data_chain_impl(
             and features_ran
             and plan_freeze_status not in {"prepared", "completed", "not_evaluated"}
         ):
-            status = "blocked"
-            base_manifest["errors"].append("conditional_plan_freeze_blocked")
+            base_manifest["warnings"].append("conditional_plan_freeze_blocked")
             base_manifest["warnings"].extend(
                 str(item) for item in (plan_freeze.get("reason_codes") or [])
             )
@@ -3796,14 +4224,14 @@ def _run_daily_data_chain_impl(
             )
             base_manifest.update(
                 {
-                    "ok": False,
+                    "ok": True,
                     "status": status,
                     "generated_at": now_text(),
                     "next_action": next_action,
                 }
             )
 
-        publish = bool(not dry_run and network)
+        publish = formal_authorized
         base_manifest["published_latest"] = publish
         base_manifest["manifest_path"] = _display_path(manifest_path, root)
         if publish:
@@ -3812,7 +4240,13 @@ def _run_daily_data_chain_impl(
             health_snapshot = {
                 "ok": True,
                 "status": "skipped",
-                "reason": "dry_run" if dry_run else "network_not_authorized",
+                "reason": (
+                    "dry_run"
+                    if dry_run
+                    else "explicit_symbol_subset"
+                    if symbols is not None
+                    else "network_not_authorized"
+                ),
                 "path": _display_path(
                     root / "results" / "data_health" / "data_health_dashboard_latest.json",
                     root,
@@ -3830,10 +4264,8 @@ def _run_daily_data_chain_impl(
             base_manifest["warnings"].append(
                 "data_health_snapshot_refresh_failed"
             )
-            if status == "completed":
-                status = "partial"
             next_action = (
-                "Daily bars, minute bars, and features were processed, but the "
+                "Daily bars and features were processed, but the "
                 "data-health snapshot refresh failed. Keep the UI degraded."
             )
             base_manifest.update(
@@ -3864,10 +4296,11 @@ def _run_daily_data_chain_impl(
 
         if status == "completed" and plan_freeze_status == "prepared":
             if not prepared_plan:
-                status = "blocked"
-                base_manifest["ok"] = False
-                base_manifest["status"] = status
-                base_manifest["errors"].append(
+                base_manifest["components"]["conditional_plan_freeze"].update({
+                    "status": "blocked", "prepared": False, "written": False,
+                    "reason_codes": ["conditional_plan_prepared_payload_missing"],
+                })
+                base_manifest["warnings"].append(
                     "conditional_plan_prepared_payload_missing"
                 )
             else:
@@ -3909,9 +4342,6 @@ def _run_daily_data_chain_impl(
                         }
                     )
                 else:
-                    status = "blocked"
-                    base_manifest["ok"] = False
-                    base_manifest["status"] = status
                     plan_component.update(
                         {
                             "status": "blocked",
@@ -3922,9 +4352,6 @@ def _run_daily_data_chain_impl(
                             ),
                         }
                     )
-                    base_manifest["errors"].append(
-                        "conditional_plan_publish_failed"
-                    )
                     base_manifest["warnings"].append(
                         "conditional_plan_publish_failed:"
                         f"{published_plan.get('status')}"
@@ -3933,7 +4360,7 @@ def _run_daily_data_chain_impl(
                         "计划已在内存完成校验，但归档发布失败；旧计划保持不变。"
                     )
 
-        if network and not dry_run:
+        if formal_authorized:
             current_state_update = _update_current_state(root, base_manifest)
         else:
             current_state_update = {
@@ -3942,10 +4369,8 @@ def _run_daily_data_chain_impl(
                 "reason": "dry_run" if dry_run else "network_not_authorized",
             }
         base_manifest["components"]["runtime_state_update"] = current_state_update
-        if network and not dry_run and current_state_update.get("ok") is not True:
+        if formal_authorized and current_state_update.get("ok") is not True:
             base_manifest["warnings"].append("runtime_state_update_failed")
-            if status == "completed":
-                status = "partial"
 
         data_directory_fingerprints_after = _stage6_data_fingerprints(root)
         base_manifest["data_directory_fingerprints_after"] = (
@@ -3979,15 +4404,19 @@ def run_daily_data_chain(
     batch_workers: int = 4,
     rebuild_features: bool = True,
     retry_from_latest: bool = False,
-    skip_analysis_pool_minute: bool = False,
+    skip_analysis_pool_minute: bool = True,
+    include_critical_minute: bool = False,
     refresh_universe: bool = True,
+    use_low_price_filter: bool = False,
     trigger: str = "manual",
     upstream_reuse: Mapping[str, Any] | None = None,
+    pipeline_run_id: str = "",
 ) -> dict[str, Any]:
     """Run the chain and always leave an auditable terminal result."""
 
     root = Path(project_root).resolve()
     current_run_id = str(run_id or new_run_id())
+    formal_authorized = bool(network and not dry_run and symbols is None)
     # Scheduled 18:30 retry must no-op when the day already has an
     # authoritative completed chain. Pipeline Stage 3 passes upstream_reuse
     # and must reach _run_daily_data_chain_impl, which already refuses to
@@ -4068,9 +4497,12 @@ def run_daily_data_chain(
                 rebuild_features=rebuild_features,
                 retry_from_latest=retry_from_latest,
                 skip_analysis_pool_minute=skip_analysis_pool_minute,
+                include_critical_minute=include_critical_minute,
                 refresh_universe=refresh_universe,
+                use_low_price_filter=use_low_price_filter,
                 trigger=trigger,
                 upstream_reuse=upstream_reuse,
+                pipeline_run_id=pipeline_run_id,
                 _lock_already_held=bool(outer_lock.get("acquired")),
                 _force_busy=not bool(outer_lock.get("acquired")),
                 _prelock_metadata=prelock_metadata,
@@ -4102,7 +4534,7 @@ def run_daily_data_chain(
             / "daily_data_chain_latest.json"
         )
         active_lock = _lock_is_held(root / "state" / "daily_data_chain.lock")
-        publish = bool(network and not dry_run and not active_lock)
+        publish = bool(formal_authorized and not active_lock)
         protected_before = dict(
             failure_context.get("protected_fingerprints_before") or {}
         )
@@ -4144,6 +4576,7 @@ def run_daily_data_chain(
             "daily_data_chain_contract_version": DAILY_DATA_CHAIN_CONTRACT_VERSION,
             "authoritative": publish,
             "run_id": current_run_id,
+            "pipeline_run_id": str(pipeline_run_id),
             "trigger": str(trigger or "manual"),
             "status": "failed",
             "started_at": completed_at,
@@ -4199,7 +4632,13 @@ def run_daily_data_chain(
             current_state_update = {
                 "ok": True,
                 "status": "skipped",
-                "reason": "dry_run" if dry_run else "network_not_authorized",
+                "reason": (
+                    "dry_run"
+                    if dry_run
+                    else "explicit_symbol_subset"
+                    if symbols is not None
+                    else "network_not_authorized"
+                ),
             }
         failed_manifest["components"]["runtime_state_update"] = current_state_update
         if publish and current_state_update.get("ok") is not True:

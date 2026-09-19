@@ -260,6 +260,7 @@ REQUIRED_DASHBOARD_KEYS = {
 
 def _redirect_chat_log(monkeypatch, tmp_path) -> Path:
     path = tmp_path / "chat-test.log.jsonl"
+    monkeypatch.setattr(chat_mod, "STATE_DIR", tmp_path)
     monkeypatch.setattr(chat_mod, "CHAT_LOG_PATH", path)
     return path
 
@@ -793,12 +794,19 @@ class TestProposedVsCommittedCopy:
             hypotheses=out / "hypotheses.json",
             journal_latest=out / "journal_latest.json",
             journal_log=out / "journal.jsonl",
+            daytime_notes=out / "daytime_notes.jsonl",
+            daytime_session=out / "daytime_session.json",
+            daytime_intents=out / "daytime_intents.jsonl",
             plan_latest=out / "plan_latest.json",
             review_latest=out / "review_latest.json",
             watchlist=out / "watchlist.json",
             philosophy=out / "philosophy.json",
             cycle_latest=out / "cycle_latest.json",
             snapshot=out / "snapshot_latest.json",
+            decision_log=out / "decision_log.jsonl",
+            decision_latest=out / "decision_latest.json",
+            decision_page=out / "decision_page.html",
+            decision_page_md=out / "decision_page.md",
         )
 
     def _write_daily(self, root: Path, symbol: str, closes: list[float]) -> None:
@@ -827,6 +835,11 @@ class TestProposedVsCommittedCopy:
             closes = [20.0 - n * 0.05 for n in range(80)]
             self._write_daily(daily, f"60000{i}", closes)
         runtime = self._runtime(tmp_path, daily)
+        from ai_trader import paths as ai_paths
+
+        # Keep the real directory initializer active inside this test's root.
+        monkeypatch.setattr(ai_paths, "STATE_DIR", runtime.ledger.parent)
+        monkeypatch.setattr(ai_paths, "RESULTS_DIR", runtime.cycle_latest.parent)
 
         def fake_propose(context, diagnostics=None):
             return {
@@ -905,7 +918,9 @@ class TestFrontendWiring:
         assert 'id="ai-trader-section"' in template
         js = FRONTEND_JS.read_text(encoding="utf-8")
         assert '"ai-trader-section": () => loadAiTraderPanel()' in js
-        assert '"ai-trader-section": "AI 纸面交易员"' in js
+        # Label drifted to "AI脑" in the 2026-09-11 UI; the guard is that the
+        # section still has a module label, not the exact wording.
+        assert re.search(r'"ai-trader-section":\s*"[^"]+"', js)
 
     def test_all_seven_safety_badges_inside_section(self) -> None:
         template = FRONTEND_HTML.read_text(encoding="utf-8")
@@ -936,7 +951,14 @@ class TestFrontendWiring:
         forbidden = re.compile(r"(买入|卖出|下单|券商|委托|重跑|启动.*任务|停止.*任务)")
         offenders = [t for t in texts if forbidden.search(t)]
         assert offenders == [], f"order/scheduler-like buttons found: {offenders}"
-        allowed = {"返回首页", "刷新数据", "发送"}
+        # Navigation/refresh/chat only. "策略账"/"AI账" are the two-book switch and
+        # the profile buttons pick which book's data this panel reads; neither
+        # runs a cycle. Keep this list explicit so an order button can never hide.
+        allowed = {
+            "返回首页", "刷新数据", "发送",
+            "策略账", "AI账",
+            "默认 · Kimi", "GLM · glm-5.3",
+        }
         unexpected = [t for t in texts if t not in allowed]
         assert unexpected == [], f"unexpected buttons in AI trader section: {unexpected}"
 

@@ -5,6 +5,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+from tests._isolated_project import IsolatedProject
+import quantdesk.chanlun_segment_engine as engine
 from pathlib import Path
 
 from quantdesk.chanlun_segment_engine import (
@@ -39,6 +42,18 @@ def bi(direction: str, idx: int, start: float, end: float, *, confirmed: bool = 
 
 
 class ChanlunSegmentEngineTests(unittest.TestCase):
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.runtime = Path(temporary.name)
+        paths = mock.patch.multiple(
+            engine, PROJECT_ROOT=self.runtime, REPORTS_DIR=self.runtime / "reports",
+            CHANLUN_SEGMENT_RUNTIME_DIR=self.runtime / "data" / "chanlun",
+        )
+        paths.start()
+        self.addCleanup(paths.stop)
+
     def test_normalize_bi_for_segment_reads_v303_payload(self):
         payload = {"symbol": "002115", "timeframe": "daily", "bi_list": [{**bi("up", 1, 4, 8), "symbol": "002115"}]}
         result = normalize_bi_for_segment(payload)
@@ -147,7 +162,9 @@ class ChanlunSegmentEngineTests(unittest.TestCase):
             "--timeframe",
             "daily",
         ]
-        completed = subprocess.run(cmd, cwd=PROJECT_ROOT, text=True, capture_output=True, timeout=60)
+        with IsolatedProject(PROJECT_ROOT, temp_parent=self.runtime) as project:
+            cmd[1] = str(project.root / "scripts" / "run_chanlun_segment_analysis.py")
+            completed = subprocess.run(cmd, cwd=project.root, env=project.subprocess_env(), text=True, capture_output=True, timeout=60)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("chanlun_segment_analysis", completed.stdout)
 

@@ -374,6 +374,8 @@ def run_startup_update(
     command = [
         str(python),
         str(script),
+        "--root",
+        str(project_root),
         "--enable-network",
         "--max-symbols",
         str(max(0, int(max_symbols or 0))),
@@ -628,7 +630,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8000, help="Preferred HTTP port (default: 8000)")
     parser.add_argument("--allow-fallback-port", action="store_true", help="If the preferred port is busy and cannot be freed, use the next free port instead of failing. Default off, so http://127.0.0.1:8000/ stays predictable.")
     parser.add_argument("--no-browser", action="store_true", help="Do not open browser automatically")
-    parser.add_argument("--update-on-start", action="store_true", help="Run a bounded provider update before opening the app")
+    parser.add_argument("--update-on-start", action="store_true", help="Request the full-A Data Close Pipeline when a completed session is available")
     parser.add_argument("--no-update", action="store_true", help="Skip startup data update even when configured")
     parser.add_argument("--update-max-symbols", type=int, default=80, help="Maximum current-pool symbols to update at startup")
     parser.add_argument("--update-timeout", type=int, default=180, help="Startup update timeout in seconds")
@@ -646,9 +648,7 @@ def main() -> int:
     if update_enabled:
         print(
             "[QuantDesk] Startup data update enabled: the 8000 service will start first, "
-            "then run a bounded background refresh for the current analysis pool; "
-            f"max_symbols={args.update_max_symbols}; daily_candidate_generation="
-            f"{'off' if args.no_generate_candidates else 'on'}."
+            "then request the full-A Data Close Pipeline."
         )
     else:
         print("[QuantDesk] Startup data update skipped. Use --update-on-start to enable bounded provider refresh.")

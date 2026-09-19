@@ -710,27 +710,28 @@ def _backfill_target_amount_from_spot_snapshot(symbols: list[str], target_date: 
         path = DAILY_DIR / f"{symbol}.csv"
         if not path.exists():
             continue
-        frame = read_local_daily(symbol, daily_dir=DAILY_DIR)
-        if frame.empty or "date" not in frame.columns:
-            continue
-        mask = frame["date"].astype(str).str[:10] == target_date
-        if not mask.any():
-            continue
-        attempted += 1
-        latest_index = frame.loc[mask].index[-1]
-        existing_amount = safe_float(frame.at[latest_index, "amount"] if "amount" in frame.columns else None)
-        if existing_amount is not None and existing_amount > 0:
-            continue
-        frame.at[latest_index, "amount"] = amount
-        volume = spot_volume.get(symbol)
-        if volume is not None and volume > 0:
-            existing_volume = safe_float(frame.at[latest_index, "volume"] if "volume" in frame.columns else None)
-            if existing_volume is None or existing_volume <= 0 or existing_volume * 50 < volume:
-                frame.at[latest_index, "volume"] = volume
-        frame.at[latest_index, "source"] = "daily_price+spot_snapshot_amount"
-        frame.at[latest_index, "updated_at"] = now_text()
-        write_daily(symbol, frame, daily_dir=DAILY_DIR)
-        updated_symbols.append(symbol)
+        with interprocess_file_lock(DAILY_DIR / ".locks" / f"{symbol}.lock"):
+            frame = read_local_daily(symbol, daily_dir=DAILY_DIR)
+            if frame.empty or "date" not in frame.columns:
+                continue
+            mask = frame["date"].astype(str).str[:10] == target_date
+            if not mask.any():
+                continue
+            attempted += 1
+            latest_index = frame.loc[mask].index[-1]
+            existing_amount = safe_float(frame.at[latest_index, "amount"] if "amount" in frame.columns else None)
+            if existing_amount is not None and existing_amount > 0:
+                continue
+            frame.at[latest_index, "amount"] = amount
+            volume = spot_volume.get(symbol)
+            if volume is not None and volume > 0:
+                existing_volume = safe_float(frame.at[latest_index, "volume"] if "volume" in frame.columns else None)
+                if existing_volume is None or existing_volume <= 0 or existing_volume * 50 < volume:
+                    frame.at[latest_index, "volume"] = volume
+            frame.at[latest_index, "source"] = "daily_price+spot_snapshot_amount"
+            frame.at[latest_index, "updated_at"] = now_text()
+            write_daily(symbol, frame, daily_dir=DAILY_DIR)
+            updated_symbols.append(symbol)
     return {
         "provider": "spot_snapshot_amount_fill",
         "status": "ok" if updated_symbols else "skipped",

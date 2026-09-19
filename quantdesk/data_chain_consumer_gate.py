@@ -1,4 +1,4 @@
-"""Shared fail-closed consumer gate for downstream QuantDesk artifacts."""
+"""Admission for daily research readers; execution still verifies its own prices."""
 
 from __future__ import annotations
 
@@ -45,12 +45,26 @@ def evaluate_data_chain_consumer_gate(
         if actual != required_universe_sha256:
             reasons.append("daily_chain_universe_digest_mismatch")
     coverage = chain.get("coverage") if isinstance(chain.get("coverage"), Mapping) else {}
+    research_eligibility: dict[str, Any] = {}
+    if any(
+        isinstance(coverage.get(key), Mapping) and coverage[key].get("status") != "passed"
+        for key in ("daily", "features")
+    ):
+        from quantdesk.daily_candidate_refresh import candidate_refresh_gate
+
+        research_eligibility = candidate_refresh_gate(chain)
     for key in ("daily", "current_analysis_pool", "features"):
         item = coverage.get(key) if isinstance(coverage.get(key), Mapping) else {}
-        if key == "features":
-            passed = item.get("status") == "passed"
-        else:
-            passed = item.get("status") == "passed"
+        passed = item.get("status") == "passed"
+        if key in {"daily", "features"} and not passed:
+            # Published per-symbol gaps remain visible. Reuse the same structural,
+            # raw-price and provenance checks as formal research admission.
+            passed = research_eligibility.get("formal_eligible") is True
+        if key == "current_analysis_pool" and item.get("status") == "not_requested":
+            passed = (
+                set(item.get("reason_codes") or []) == {"analysis_pool_minute_on_demand"}
+                and item.get("requested_count") == 0 and item.get("audited_count") == 0
+            )
         if not passed:
             reasons.append(f"daily_chain_coverage_{key}_not_passed")
     if chain.get("protected_state_unchanged") is not True:
@@ -64,6 +78,9 @@ def evaluate_data_chain_consumer_gate(
         "target_date": str(chain.get("target_date") or "")[:10],
         "reasons": reasons,
         "chain_status": status,
+        "scope": "daily_research",
+        "execution_authorized": False,
+        "research_eligibility": research_eligibility,
         "chain": chain,
         "research_only": True,
         "paper_only": True,

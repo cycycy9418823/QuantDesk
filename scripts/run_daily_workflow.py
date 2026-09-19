@@ -24,6 +24,9 @@ from quantdesk.shared import truthy
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the local unified daily review workflow.")
     parser.add_argument("--strategy", choices=["all", "long", "board"], default="all")
+    parser.add_argument("--target-date", default="", help="Complete trading day to review.")
+    parser.add_argument("--run-brain-shadow", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--run-legacy-research", action=argparse.BooleanOptionalAction, default=False, help="Opt in to the low-price report and legacy sandbox/watchpool research.")
     parser.add_argument("--allow-auto-init", action=argparse.BooleanOptionalAction, default=False)
     # Round 21: intraday swing is a third fill path; default off. Enable explicitly
     # with --enable-intraday; ledger actions then carry fill_model=daily_approx.
@@ -57,6 +60,9 @@ def main(argv: list[str] | None = None) -> int:
         with_guardrails=truthy(args.with_guardrails),
         guardrails_mode=args.guardrails_mode,
         run_strategy_lab=args.run_strategy_lab,
+        run_legacy_research=args.run_legacy_research,
+        run_brain_shadow=args.run_brain_shadow,
+        target_date=args.target_date or None,
     )
     if truthy(args.summary):
         summary = build_cli_summary(payload, task_type="daily_workflow")

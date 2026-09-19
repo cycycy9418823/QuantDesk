@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping
 
 from quantdesk.daily_candidate_refresh import (
     build_candidate_envelope,
+    candidate_refresh_gate,
     resolve_chain_bound_formal_candidate_batch,
     verify_formal_candidate_batch,
 )
@@ -263,10 +264,40 @@ def freeze_t_plus_one_plan(
         upstream_reasons.append("data_chain_run_id_missing")
     coverage = data_chain_manifest.get("coverage")
     coverage = coverage if isinstance(coverage, Mapping) else {}
+    symbol_hole_codes = {
+        "daily_symbols_stale",
+        "daily_symbols_missing",
+        "daily_symbols_failed",
+        "feature_target_date_mismatch",
+        "feature_symbols_skipped",
+        "feature_symbol_set_mismatch",
+        "feature_requested_count_mismatch",
+        "feature_count_mismatch",
+        "feature_output_row_count_mismatch",
+        "minute_symbols_missing",
+        "minute_symbols_failed",
+    }
+    research_gate = candidate_refresh_gate(data_chain_manifest)
+    verified_research = research_gate.get("formal_eligible") is True
+    if not verified_research:
+        upstream_reasons.extend(research_gate.get("reason_codes") or ["candidate_refresh_qualification_not_passed"])
     for key in ("daily", "current_analysis_pool", "features"):
         component = coverage.get(key)
         component = component if isinstance(component, Mapping) else {}
-        if str(component.get("status") or "") != "passed":
+        status = str(component.get("status") or "")
+        reasons = {str(item) for item in (component.get("reason_codes") or []) if item}
+        degraded = bool(
+            (reasons and reasons.issubset(symbol_hole_codes))
+            or (key in {"daily", "features"} and verified_research)
+        )
+        minute_not_requested = (
+            key == "current_analysis_pool"
+            and status == "not_requested"
+            and reasons == {"analysis_pool_minute_on_demand"}
+            and component.get("requested_count") == 0
+            and component.get("audited_count") == 0
+        )
+        if status not in {"passed", "partial"} and not degraded and not minute_not_requested:
             upstream_reasons.append(f"upstream_{key}_gate_not_passed")
     universe = data_chain_manifest.get("universe")
     universe = universe if isinstance(universe, Mapping) else {}
@@ -382,6 +413,8 @@ def freeze_t_plus_one_plan(
     try:
         plan = plan_builder(
             auto_strategy_payload=dict(strategy_payload),
+            project_root=root,
+            formal_data_chain_manifest=dict(data_chain_manifest),
             strategy="all",
             quantity_per_stock=100,
             plan_date=target_date,
@@ -392,7 +425,8 @@ def freeze_t_plus_one_plan(
             state_path=root / "state" / "auto_paper_portfolio.json",
             daily_dir=root / "data" / "daily",
             daily_feature_path=root / "data" / "features" / "daily_features_latest.csv",
-            low_price_universe_path=root / "data" / "universe" / "low_price_learning_symbols.csv",
+            # The verified formal batch already owns candidate eligibility.
+            low_price_universe_path=None,
             session_evidence_metadata_dir=root / "data" / "metadata",
         )
     except Exception as exc:  # noqa: BLE001 - preserve previous plan on any failure

@@ -4,6 +4,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+from tests._isolated_project import IsolatedProject
+import quantdesk.chanlun_fractal_engine as engine
 from pathlib import Path
 
 import pandas as pd
@@ -30,6 +33,18 @@ def bars(rows: list[tuple[str, float, float, float, float]]) -> list[dict]:
 
 
 class ChanlunFractalEngineTests(unittest.TestCase):
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.runtime = Path(temporary.name)
+        paths = mock.patch.multiple(
+            engine, PROJECT_ROOT=self.runtime, REPORTS_DIR=self.runtime / "reports",
+            CHANLUN_FRACTAL_RUNTIME_DIR=self.runtime / "data" / "chanlun",
+        )
+        paths.start()
+        self.addCleanup(paths.stop)
+
     def test_normalize_english_ohlc(self) -> None:
         df = pd.DataFrame([{"symbol": "600744", "date": "2026-05-15", "open": 8, "high": 9, "low": 7, "close": 8.5}])
         out = normalize_chanlun_ohlc(df, timeframe="daily")
@@ -161,7 +176,9 @@ class ChanlunFractalEngineTests(unittest.TestCase):
             "--timeframe",
             "daily",
         ]
-        result = subprocess.run(cmd, cwd=PROJECT_ROOT, text=True, capture_output=True, timeout=60)
+        with IsolatedProject(PROJECT_ROOT, temp_parent=self.runtime) as project:
+            cmd[1] = str(project.root / "scripts" / "run_chanlun_fractal_analysis.py")
+            result = subprocess.run(cmd, cwd=project.root, env=project.subprocess_env(), text=True, capture_output=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("chanlun_fractal_analysis", result.stdout)
 

@@ -27,6 +27,7 @@ from quantdesk.intraday.intraday_schema import (
     read_intraday_csv,
     source_time_order_state,
 )
+from quantdesk.market_clock import CN_TIMEZONE
 from quantdesk.shared import normalize_symbol, short_error_text
 from quantdesk.version import PACKAGE_VERSION
 
@@ -562,7 +563,9 @@ def _http_get_text(url: str, timeout: int = 8) -> str:
 
 
 def _today_only_guard(provider: str, symbol: str, target_date: str) -> dict[str, Any] | None:
-    today = datetime.now().strftime("%Y-%m-%d")
+    # Compare against the Asia/Shanghai calendar day, not the host-local clock,
+    # so a UTC host just after Shanghai midnight does not skip today's request.
+    today = datetime.now(CN_TIMEZONE).strftime("%Y-%m-%d")
     if target_date and target_date[:10] != today:
         result = _empty_result(provider, symbol, target_date, "skipped", f"{provider} 仅支持当日分钟线，不支持历史目标日期 {target_date[:10]}")
         result["date_scope"] = "current_day_only"

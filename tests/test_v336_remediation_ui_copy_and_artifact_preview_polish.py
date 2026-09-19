@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TEST_TMP_ROOT = PROJECT_ROOT / ".quantdesk_test_tmp"
+TEST_TMP_ROOT = Path(tempfile.gettempdir()) / ".quantdesk_test_tmp"
 
 
 class V336RemediationUiCopyArtifactPreviewPolishTests(unittest.TestCase):

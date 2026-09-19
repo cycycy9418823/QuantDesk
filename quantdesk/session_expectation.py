@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping
 from datetime import date, datetime
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any
@@ -372,8 +373,10 @@ def _load_refresh_suspension_exclusions(
         evidence["error"] = "invalid_payload"
         return {}, evidence
     file_date = _date_text(payload.get("target_date"))
-    if file_date and file_date != target:
-        evidence["error"] = f"target_date_mismatch:{file_date}"
+    if file_date != target:
+        evidence["error"] = (
+            f"target_date_mismatch:{file_date}" if file_date else "missing_target_date"
+        )
         return {}, evidence
     exclusions = payload.get("verified_exclusions")
     if not isinstance(exclusions, dict):
@@ -386,18 +389,9 @@ def _load_refresh_suspension_exclusions(
             continue
         if not isinstance(row, Mapping) or not row:
             continue
-        evidence_bits = [
-            row.get("signature"),
-            row.get("source"),
-            row.get("reason"),
-            row.get("from"),
-            row.get("start"),
-            row.get("start_date"),
-            row.get("provider"),
-        ]
-        if not any(str(item or "").strip() for item in evidence_bits):
+        if not _valid_refresh_suspension_row(payload, row, target):
             continue
-        signature = str(row.get("signature") or "verified_exclusion")
+        signature = str(row.get("signature") or "").strip()
         result[symbol] = {
             "source": str(payload.get("source") or row.get("source") or "refresh_suspension_evidence"),
             "symbol": symbol,
@@ -410,6 +404,75 @@ def _load_refresh_suspension_exclusions(
     evidence["matched_count"] = len(result)
     evidence["verified_count"] = len(result)
     return result, evidence
+
+
+def _valid_refresh_suspension_row(
+    payload: Mapping[str, Any], row: Mapping[str, Any], target: str
+) -> bool:
+    """Require a same-day provider observation, not a free-form label.
+
+    Refresh exclusions are a fallback for symbols with no daily bar.  A label
+    or a single provider/close field cannot establish that the session was
+    absent, so accepted rows need a known signature plus the raw quote facts
+    used by that signature.
+    """
+
+    known_signatures = {"zero_trade_with_estimates", "zero_volume_with_last_close"}
+    signature = str(row.get("signature") or "").strip()
+    if signature not in known_signatures:
+        return False
+
+    # The current refresh producer writes this exact source at the file level.
+    # Source identity is provenance only; quote facts below establish the halt.
+    source = str(payload.get("source") or "").strip()
+    if source != "sina.Market_Center.getHQNodeData":
+        return False
+    row_source = str(row.get("source") or "").strip()
+    if row_source and row_source != source:
+        return False
+
+    # If a row carries its own date, it must agree with the file's date.
+    for key in ("target_date", "trade_date", "date", "as_of"):
+        if key in row and _date_text(row.get(key)) != target:
+            return False
+
+    # The producer derives these signatures from the Sina snapshot row.  Keep
+    # the quote fields explicit so a label or a provider name cannot certify a
+    # missing observation.
+    if "open" not in row or "close" not in row or "volume" not in row:
+        return False
+
+    def finite_number(value: Any) -> float | None:
+        if isinstance(value, bool) or value is None or str(value).strip() == "":
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    close = finite_number(row.get("close"))
+    opening = finite_number(row.get("open"))
+    if close is None or opening is None:
+        return False
+
+    volume = finite_number(row.get("volume"))
+    if volume is None or volume < 0:
+        return False
+
+    tradestatus = row.get("tradestatus")
+    if tradestatus is not None and str(tradestatus).strip() not in {"", "0"}:
+        return False
+
+    # Match the producer's invalid-row signatures.  A zero-volume halt has a
+    # positive last trade and an observed zero open; a zero-trade halt has no
+    # positive trade and likewise no activity.  Any contradictory quote is a
+    # gap, not a verified suspension.
+    if signature == "zero_volume_with_last_close":
+        return close > 0 and opening <= 0 and volume == 0
+    if signature == "zero_trade_with_estimates":
+        return close == 0 and opening <= 0 and volume == 0
+    return False
 
 
 def _resolve_dirs(
@@ -443,7 +506,11 @@ def _classify_basis(frame: pd.DataFrame) -> tuple[str, str]:
         basis, reason = classify_frame_price_basis(frame)
     except Exception as exc:  # noqa: BLE001
         return PRICE_BASIS_UNKNOWN, f"price_basis_classification_failed:{type(exc).__name__}"
-    if not reason:
+    if (
+        not reason
+        or "adjust" in frame.columns
+        or frame.attrs.get("price_basis_reason") in {"mixed_price_basis", "unknown_price_basis"}
+    ):
         return basis, reason
     markers: list[Any] = []
     marker_column = _find_column(frame, ("price_basis", "adjustment_basis"))
@@ -732,6 +799,11 @@ def build_session_expectation(
             continue
         evidence = baostock_evidence_by_symbol.get(symbol) or {}
         evidence_source = str(evidence.get("source") or BAOSTOCK_SESSION_SOURCE)
+        # The legacy Sina snapshot loader only exposed a signature and date.
+        # Refresh exclusions are validated above with the complete quote
+        # facts; do not let the legacy path bypass that contract.
+        if evidence_source == "sina_snapshot_suspension_evidence":
+            continue
         is_bse_interval = evidence_source == BSE_SOURCE
         baostock_suspensions[symbol] = {
             "source": evidence_source,
@@ -891,46 +963,12 @@ def build_session_expectation(
                     ),
                     "raw_zero_volume_verified": symbol in raw_zero_from_update,
                 }
-            elif symbol in fresh_from_update:
-                daily_info[symbol] = {
-                    "evidence": {
-                        "source": "daily_update_payload",
-                        "exists": True,
-                        "read_ok": True,
-                        "as_of": target,
-                        "sha256": update_digest,
-                        "count": 1,
-                        "error": "target_volume_classification_missing",
-                        "symbol": symbol,
-                        "target_count": 1,
-                        "price_basis": PRICE_BASIS_RAW,
-                    },
-                    "basis": PRICE_BASIS_RAW,
-                    "basis_reason": "target_volume_classification_missing",
-                    "target_count": 1,
-                    "volumes": [],
-                    "volume_valid_count": 0,
-                }
             else:
-                daily_info[symbol] = {
-                    "evidence": {
-                        "source": "daily_update_payload",
-                        "exists": False,
-                        "read_ok": True,
-                        "as_of": "",
-                        "sha256": update_digest,
-                        "count": 0,
-                        "error": "not_fresh_in_daily_update",
-                        "symbol": symbol,
-                        "target_count": 0,
-                        "price_basis": "unknown",
-                    },
-                    "basis": "unknown",
-                    "basis_reason": "not_fresh_in_daily_update",
-                    "target_count": 0,
-                    "volumes": [],
-                    "volume_valid_count": 0,
-                }
+                # History coverage does not prove file absence or a target bar.
+                # Re-read only symbols without conclusive target-volume evidence.
+                daily_info[symbol] = _daily_info(
+                    symbol, resolved_daily, daily_frames, target,
+                )
     else:
         daily_info = {
             symbol: _daily_info(symbol, resolved_daily, daily_frames, target)

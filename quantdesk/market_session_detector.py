@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from quantdesk.daily_open_workflow import md_table, write_json, write_md
+from quantdesk.market_clock import to_shanghai_datetime
 from quantdesk.trading_day_freshness import latest_expected_trade_date, trading_day_freshness
 
 
@@ -53,7 +54,10 @@ def previous_trading_day(day: date) -> date:
 
 
 def detect_market_session(root: Path, now: datetime | None = None, windows: SessionWindows | None = None) -> dict[str, Any]:
-    now = now or datetime.now().astimezone()
+    # Normalize to Asia/Shanghai: a naive value is treated as Shanghai local
+    # time and an aware value is converted, so an aware UTC instant just after
+    # Shanghai midnight is classified under the correct local day/session.
+    now = to_shanghai_datetime(now)
     windows = windows or SessionWindows()
     today = now.date()
     if not is_trading_day(today):

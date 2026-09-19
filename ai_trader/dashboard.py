@@ -32,6 +32,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ai_trader.llm import llm_runtime_descriptor
 from ai_trader.mandate import BOUNDARY
@@ -39,6 +40,21 @@ from ai_trader.paths import CYCLE_LATEST_PATH, STATE_DIR
 
 DASHBOARD_SCHEMA = "ai_trader_dashboard_view_v1"
 CHAT_BOUNDARY_NOTE = "聊天只能解释，不能下单：仓位只在每晚纸面复盘流程中变化。"
+
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _shanghai_date(value: datetime):
+    """Return the Asia/Shanghai calendar date for *value*.
+
+    Naive datetimes are treated as Shanghai local time; aware datetimes are
+    converted. This keeps journal-age comparisons correct right after Shanghai
+    midnight and avoids mixing naive and aware datetimes in a subtraction.
+    """
+
+    if value.tzinfo is None:
+        return value.date()
+    return value.astimezone(_SHANGHAI).date()
 
 # A journal/ledger older than this many days means at least one scheduled
 # evening run was missed; the UI must say so instead of looking current.
@@ -266,12 +282,13 @@ def build_dashboard_payload(
     stale = False
     if last_journal_date:
         if now is None:
-            now = datetime.now()
+            now = datetime.now(_SHANGHAI)
         try:
-            delta = now - datetime.strptime(last_journal_date[:10], "%Y-%m-%d")
+            reference = _shanghai_date(now) if isinstance(now, datetime) else now
+            delta = reference - datetime.strptime(last_journal_date[:10], "%Y-%m-%d").date()
             age_days = max(int(delta.days), 0)
             stale = age_days >= STALE_AFTER_DAYS
-        except ValueError:
+        except (ValueError, TypeError):
             warnings.append(f"unreadable_journal_date:{last_journal_date}")
 
     if stale:

@@ -42,6 +42,7 @@ from quantdesk.paper.portfolio_contracts import (
 from quantdesk.paper.state_store import PaperStateStore
 from quantdesk.paper.trade_costs import TRADE_COST_MODEL, compute_trade_costs
 from quantdesk.risk.risk_gate import RiskGateDecision, validate_risk_gate_decision_binding
+from quantdesk.price_basis import classify_frame_price_basis
 from quantdesk.shared import normalize_symbol
 from quantdesk.version import API_SCHEMA_VERSION
 
@@ -460,6 +461,13 @@ def simulate_paper_intent(
         reasons.append("execution_not_after_signal_date")
     if execution_evidence.price_basis != "raw":
         reasons.append("execution_price_basis_not_raw")
+    # Never trust the caller-supplied basis string alone: classify the original
+    # minute frame and fail closed on mixed/unknown (or non-raw) evidence.
+    frame_basis, frame_basis_reason = classify_frame_price_basis(execution_evidence.minute_frame)
+    if frame_basis_reason:
+        reasons.append(f"execution_minute_frame_basis_unverified:{frame_basis_reason}")
+    elif frame_basis != "raw":
+        reasons.append("execution_minute_frame_basis_not_raw")
     if execution_evidence.evidence_digest != compute_execution_evidence_digest(execution_evidence):
         reasons.append("execution_evidence_digest_mismatch")
     if not _strict_text(execution_evidence.minute_source_path):

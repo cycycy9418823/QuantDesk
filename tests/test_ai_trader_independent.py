@@ -165,9 +165,9 @@ def test_overnight_fill_uses_open_not_high_or_low(tmp_path: Path) -> None:
     daily = tmp_path / "daily"
     daily.mkdir()
     rows = [
-        "date,symbol,open,high,low,close,volume,amount,pct_chg,adjust",
-        "2024-01-02,600000,10.0,10.2,9.8,10.0,1000,10000,0,raw",
-        "2024-01-03,600000,10.15,12.0,9.50,11.0,1000,10000,10,raw",
+        "date,symbol,open,high,low,close,volume,amount,pct_chg,adjust,source,updated_at",
+        "2024-01-02,600000,10.0,10.2,9.8,10.0,1000,10000,0,raw,fixture,2024-01-02T15:00:00+08:00",
+        "2024-01-03,600000,10.15,12.0,9.50,11.0,1000,10000,10,raw,fixture,2024-01-03T15:00:00+08:00",
     ]
     (daily / "600000.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
     plan = {
@@ -226,9 +226,9 @@ def test_settle_fills_at_open_not_high_or_low(tmp_path: Path) -> None:
     daily = tmp_path / "daily"
     daily.mkdir()
     rows = [
-        "date,symbol,open,high,low,close,volume,amount,pct_chg,adjust",
-        "2024-01-02,600000,10.0,10.2,9.8,10.0,1000,10000,0,raw",
-        "2024-01-03,600000,10.3,12.0,9.5,11.0,1000,10000,10,raw",
+        "date,symbol,open,high,low,close,volume,amount,pct_chg,adjust,source,updated_at",
+        "2024-01-02,600000,10.0,10.2,9.8,10.0,1000,10000,0,raw,fixture,2024-01-02T15:00:00+08:00",
+        "2024-01-03,600000,10.3,12.0,9.5,11.0,1000,10000,10,raw,fixture,2024-01-03T15:00:00+08:00",
     ]
     (daily / "600000.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
     plan = {

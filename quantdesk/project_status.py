@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -136,7 +136,7 @@ def _labeled_block(text: str, label: str) -> str:
         if capture:
             if any(stripped.startswith(prefix) for prefix in stop_prefixes):
                 break
-            if stripped.startswith("## "):
+            if re.match(r"^#{1,6}\s", stripped):
                 break
             collected.append(line.rstrip())
     return "\n".join(collected).strip()
@@ -160,9 +160,11 @@ def _parse_phase(text: str) -> dict[str, str]:
     check = _CHECKPOINT_RE.search(line)
     if check:
         checkpoint = check.group("when")
+    summary = re.split(r"\s*[·|]\s*(?=(?:检查点|剩)\s*)", line, maxsplit=1)[0].strip()
     remaining_display = _display_or_missing(remaining_raw)
     return {
         "raw": line or "未提供",
+        "summary": summary or "未提供",
         "checkpoint": checkpoint or "未提供",
         "remaining_trading_days": remaining_display,
         "remaining_trading_days_note": (
@@ -281,7 +283,15 @@ def read_project_status(project_root: str | Path) -> dict[str, Any]:
         root = Path(project_root).resolve()
     except OSError as exc:
         return _empty_payload(read_at=read_at, error=f"root_unreadable:{exc.__class__.__name__}")
-    path = (root / STATUS_FILENAME).resolve()
+    extra_scope = {"page_scope_note": _page_scope_note(root)}
+    try:
+        path = (root / STATUS_FILENAME).resolve()
+    except OSError as exc:
+        return _empty_payload(
+            read_at=read_at,
+            error=f"read_failed:{exc.__class__.__name__}",
+            extra=extra_scope,
+        )
     try:
         path.relative_to(root)
     except ValueError:
@@ -289,22 +299,48 @@ def read_project_status(project_root: str | Path) -> dict[str, Any]:
     if path.name != STATUS_FILENAME:
         return _empty_payload(read_at=read_at, error="unexpected_filename")
 
-    extra_scope = {"page_scope_note": _page_scope_note(root)}
-    if not path.exists():
-        return _empty_payload(read_at=read_at, error="missing_file", extra=extra_scope)
-    if not path.is_file():
-        return _empty_payload(read_at=read_at, error="not_a_file", extra=extra_scope)
-
     try:
-        with path.open("rb") as handle:
-            raw_bytes = handle.read(MAX_STATUS_BYTES + 1)
-            stat_info = os.fstat(handle.fileno())
+        if not path.exists():
+            return _empty_payload(read_at=read_at, error="missing_file", extra=extra_scope)
+        if not path.is_file():
+            return _empty_payload(read_at=read_at, error="not_a_file", extra=extra_scope)
     except FileNotFoundError:
         return _empty_payload(read_at=read_at, error="missing_file", extra=extra_scope)
     except OSError as exc:
         return _empty_payload(
             read_at=read_at,
             error=f"read_failed:{exc.__class__.__name__}",
+            extra=extra_scope,
+        )
+
+    try:
+        with path.open("rb") as handle:
+            before_stat = os.fstat(handle.fileno())
+            raw_bytes = handle.read(MAX_STATUS_BYTES + 1)
+            stat_info = os.fstat(handle.fileno())
+    except FileNotFoundError:
+        return _empty_payload(read_at=read_at, error="missing_file", extra=extra_scope)
+    except IsADirectoryError:
+        return _empty_payload(read_at=read_at, error="not_a_file", extra=extra_scope)
+    except OSError as exc:
+        return _empty_payload(
+            read_at=read_at,
+            error=f"read_failed:{exc.__class__.__name__}",
+            extra=extra_scope,
+        )
+
+    if (
+        before_stat.st_size,
+        before_stat.st_mtime_ns,
+        before_stat.st_ctime_ns,
+    ) != (
+        stat_info.st_size,
+        stat_info.st_mtime_ns,
+        stat_info.st_ctime_ns,
+    ):
+        return _empty_payload(
+            read_at=read_at,
+            error="changed_during_read",
             extra=extra_scope,
         )
 

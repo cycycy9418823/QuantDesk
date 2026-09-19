@@ -26,7 +26,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from ai_trader.paths import STATE_DIR
+from ai_trader.paths import STATE_DIR, active_profile, profile_env_file
 from ai_trader.prompt_pack import load_prompt_pack
 
 DEFAULT_MODEL = "claude-opus-5"
@@ -49,6 +49,20 @@ DEFAULT_TIMEOUT_S = 300
 # the trader back onto the rule engine. Headroom is far cheaper than that.
 DEFAULT_MAX_TOKENS = 24000
 ENV_FILE = STATE_DIR / "llm.env"
+
+
+def _env_file() -> Path:
+    """Credentials file for the active book.
+
+    The default book keeps using the module-level ``ENV_FILE`` so existing
+    callers and tests can keep swapping that attribute; a named profile reads
+    its own ``state/ai_trader_<profile>/llm.env``.
+    """
+
+    profile = active_profile()
+    if profile and profile != "default":
+        return profile_env_file()
+    return ENV_FILE
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -123,7 +137,7 @@ def load_llm_config(
         if diagnostics is not None and not diagnostics.get("reason"):
             diagnostics["reason"] = name
 
-    parsed = _parse_env_file(ENV_FILE)
+    parsed = _parse_env_file(_env_file())
     # The opt-in gate deliberately comes from the live process only.  The file
     # may store credentials (and may contain a historical enable line), but its
     # mere presence must never turn an incidental run or a test into a network
@@ -176,7 +190,7 @@ def llm_runtime_descriptor() -> dict[str, Any]:
     hostname only.
     """
 
-    parsed = _parse_env_file(ENV_FILE)
+    parsed = _parse_env_file(_env_file())
     base = os.environ.get("ANTHROPIC_BASE_URL", "").strip() or parsed.get(
         "ANTHROPIC_BASE_URL", ""
     ).strip()
@@ -448,6 +462,10 @@ def _build_prompt(context: dict[str, Any]) -> tuple[str, str]:
     cands = context.get("candidates") or []
     lines.append(f"可选候选(只能从这里选，共{len(cands)}只，附近期涨跌)：")
     lines.append("，".join(cands) if cands else "(今天没有可用候选)")
+    facts = context.get("candidate_facts") or []
+    if facts:
+        lines.append("上述候选的周期与来源证据（研究代理或不完整区间仅作诊断，不可改述为今日原始行情）：")
+        lines.append(json.dumps(facts, ensure_ascii=False, sort_keys=True, allow_nan=False))
     lines.append(
         "请先想清楚你要做哪一类投资者，再挑你真正看得上的票(0-2 只)，"
         "说人话理由，标明做法(style)和打算拿多少天。没把握就少买或不买。"
@@ -458,21 +476,35 @@ def _build_prompt(context: dict[str, Any]) -> tuple[str, str]:
 def propose_picks(
     context: dict[str, Any],
     diagnostics: dict[str, Any] | None = None,
+    *,
+    reuse_text: str | None = None,
+    reuse_model: str = "",
 ) -> dict[str, Any] | None:
     """Ask the configured LLM for its plan. None => caller uses rules.
 
     Pass ``diagnostics`` to learn *why* None came back; silent degradation to the
     rule engine is otherwise invisible, and the user cannot tell whether they are
     watching the AI think or a hardcoded ranking.
+
+    ``reuse_text`` replays a *persisted original* response during recovery
+    (A2): the model is never called again and the saved reply is re-parsed as it
+    was.  No network, no new price, no re-decision.
     """
 
-    cfg = load_llm_config(diagnostics=diagnostics)
-    if cfg is None:
-        if diagnostics is not None and not diagnostics.get("reason"):
-            diagnostics["reason"] = "not_enabled_or_unconfigured"
-        return None
-    system, user = _build_prompt(context)
-    text = _call(system, user, cfg, diagnostics)
+    if reuse_text is not None:
+        text = reuse_text
+        model = reuse_model
+        if diagnostics is not None:
+            diagnostics["reused_persisted_response"] = True
+    else:
+        cfg = load_llm_config(diagnostics=diagnostics)
+        if cfg is None:
+            if diagnostics is not None and not diagnostics.get("reason"):
+                diagnostics["reason"] = "not_enabled_or_unconfigured"
+            return None
+        system, user = _build_prompt(context)
+        text = _call(system, user, cfg, diagnostics)
+        model = str(cfg.get("model") or "")
     if not text:
         return None
     parsed = _extract_json(text)
@@ -527,7 +559,7 @@ def propose_picks(
         }
     pack = load_prompt_pack()
     return {
-        "model": cfg["model"],
+        "model": model,
         "buys": buys,
         "sells": sells,
         "stance": stance,
@@ -536,6 +568,10 @@ def propose_picks(
         "market_note": str(parsed.get("market_note") or "").strip(),
         "prompt_version": pack.prompt_version,
         "menu_version": pack.menu_version,
+        # The unparsed model reply is persisted so an interrupted cycle can be
+        # honestly reconstructed (or reported missing) instead of re-decided.
+        "raw_response": text,
+        "reused_persisted_response": reuse_text is not None,
     }
 
 

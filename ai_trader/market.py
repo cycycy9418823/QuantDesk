@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
 
 from ai_trader.paths import DEFAULT_DAILY_DIR, DEFAULT_MINUTE_DIR
+from ai_trader.execution_evidence import fingerprint_file, source_reference
 from quantdesk.corporate_action_repair import repair_corporate_actions
 from quantdesk.csv_io import read_csv_frame
 from quantdesk.price_basis import PRICE_BASIS_UNKNOWN, classify_frame_price_basis
@@ -138,7 +140,9 @@ def load_symbol_frame(
     """
 
     path = Path(daily_dir or DEFAULT_DAILY_DIR) / f"{symbol}.csv"
+    source_before = fingerprint_file(path)
     frame = read_csv_frame(path)
+    original_basis, original_reason = classify_frame_price_basis(frame)
     warnings = list(frame.attrs.get("warnings") or [])
     if frame.empty:
         frame.attrs["warnings"] = warnings
@@ -159,6 +163,7 @@ def load_symbol_frame(
         if col in frame.columns:
             frame[col] = pd.to_numeric(frame[col], errors="coerce")
     frame = frame.dropna(subset=["close"])
+    ca_info: dict[str, Any] = {"ca_bars": 0}
     if adjust_corporate_actions and not frame.empty:
         # Repair on full history so the back-adjust factors are complete, then tail.
         frame, ca_info = repair_corporate_actions(frame)
@@ -173,13 +178,23 @@ def load_symbol_frame(
             warnings.append(f"corporate_actions_repaired:{symbol}:{ca_info['ca_bars']}")
     if lookback > 0:
         frame = frame.tail(int(lookback))
-    basis, reason = (PRICE_BASIS_UNKNOWN, "unknown_price_basis")
-    if "adjust" in frame.columns:
-        basis, reason = classify_frame_price_basis(frame)
+    basis, reason = original_basis, original_reason
+    source = source_reference(source_before, fingerprint_file(path))
+    transformed_dates: list[str] = []
+    if "raw_close" in frame.columns:
+        for _, item in frame.iterrows():
+            actual, original = _safe_float(item.get("close")), _safe_float(item.get("raw_close"))
+            if actual is not None and original is not None and not math.isclose(actual, original, rel_tol=1e-12, abs_tol=1e-12):
+                transformed_dates.append(item["date"].strftime("%Y-%m-%d"))
     frame.attrs["warnings"] = warnings
     frame.attrs["price_basis"] = basis
     frame.attrs["price_basis_reason"] = reason
     frame.attrs["symbol"] = symbol
+    frame.attrs["source_evidence"] = source
+    frame.attrs["transformed_dates"] = transformed_dates
+    frame.attrs["calculation_basis"] = (
+        "corporate_action_repaired_research_proxy" if transformed_dates else "source_prices"
+    )
     return frame.reset_index(drop=True)
 
 
@@ -200,6 +215,7 @@ def load_close_panel(
     pct: dict[str, pd.Series] = {}
     warnings: list[str] = []
     bases: set[str] = set()
+    series_evidence: dict[str, dict[str, Any]] = {}
     for symbol in symbols:
         frame = load_symbol_frame(
             symbol, daily_dir, lookback=lookback, adjust_corporate_actions=True
@@ -213,6 +229,13 @@ def load_close_panel(
         if basis == PRICE_BASIS_UNKNOWN:
             warnings.append(f"unlabeled_or_unknown_price_basis:{symbol}")
         indexed = frame.set_index(frame["date"].dt.strftime("%Y-%m-%d"))
+        series_evidence[str(symbol)] = {
+            "original_price_basis": basis,
+            "price_basis_reason": frame.attrs.get("price_basis_reason") or "",
+            "source_evidence": dict(frame.attrs.get("source_evidence") or {}),
+            "transformed_dates": list(frame.attrs.get("transformed_dates") or []),
+            "calculation_basis": frame.attrs.get("calculation_basis"),
+        }
         closes[symbol] = indexed["close"]
         if "pct_chg" in indexed.columns:
             pct[symbol] = indexed["pct_chg"]
@@ -222,6 +245,7 @@ def load_close_panel(
         warnings.append("cross_symbol_price_basis_mismatch")
     close_panel.attrs["warnings"] = warnings
     close_panel.attrs["price_bases"] = sorted(bases)
+    close_panel.attrs["series_evidence"] = series_evidence
     return close_panel, pct_panel, warnings
 
 
@@ -237,39 +261,91 @@ def latest_as_of(daily_dir: Path | None = None) -> dict[str, Any]:
     }
 
 
-def load_ohlc_row(symbol: str, as_of: str, daily_dir: Path | None = None) -> dict[str, float | None]:
-    """One bar's OHLC at the price it was actually quoted.
-
-    Deliberately NOT corporate-action adjusted: callers use this for execution
-    fills, lot sizing, mark-to-market and "does a bar exist" checks, and the
-    ledger must record real prices. (The repair is anchored to the newest bar, so
-    for today's bar it would be a no-op anyway.)
-    """
-
-    frame = load_symbol_frame(symbol, daily_dir, lookback=0)
-    if frame.empty or "date" not in frame.columns:
-        return {"open": None, "high": None, "low": None, "close": None, "pct_chg": None}
-    indexed = frame.set_index(frame["date"].dt.strftime("%Y-%m-%d"))
-    if as_of not in indexed.index:
-        return {"open": None, "high": None, "low": None, "close": None, "pct_chg": None}
-    row = indexed.loc[as_of]
-    if isinstance(row, pd.DataFrame):
-        row = row.iloc[-1]
-    def _num(name: str) -> float | None:
-        if name not in row.index:
-            return None
+def _status_from_raw(raw: Any) -> tuple[float | None, str]:
+    if raw is None:
+        return None, "missing"
+    token = str(raw).strip()
+    if token == "":
+        return None, "missing"
+    lowered = token.lower()
+    if lowered in {"nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}:
         try:
-            value = float(row[name])
+            return float(token), "nonfinite"
         except (TypeError, ValueError):
-            return None
-        return value if value == value and value > 0 else None
-    close = _num("close")
+            return float("nan"), "nonfinite"
+    try:
+        number = float(token)
+    except (TypeError, ValueError):
+        return None, "missing"
+    if not math.isfinite(number):
+        return number, "nonfinite"
+    return number, "ok"
+
+
+def load_ohlc_row(symbol: str, as_of: str, daily_dir: Path | None = None) -> dict[str, Any]:
+    """One bar's OHLC plus fill-evidence fields. Does not guess a missing basis."""
+
+    path = Path(daily_dir or DEFAULT_DAILY_DIR) / f"{symbol}.csv"
+    # Keep raw tokens and provenance together; the research loader drops rows
+    # with no close, which cannot determine whether a next-open fill existed.
+    source_before = fingerprint_file(path)
+    frame = read_csv_frame(path, dtype=str, keep_default_na=False, on_bad_lines="error")
+    basis, basis_reason = classify_frame_price_basis(frame)
+    source = source_reference(source_before, fingerprint_file(path))
+    if source.get("status") != "stable":
+        basis_reason = "daily_file_changed_or_missing_during_read"
+    frame.columns = [str(col).strip().lower() for col in frame.columns]
+    empty = {
+        "open": None,
+        "high": None,
+        "low": None,
+        "close": None,
+        "pct_chg": None,
+        "volume": None,
+        "open_status": "missing",
+        "volume_status": "missing",
+        "price_basis": basis,
+        "price_basis_reason": basis_reason,
+        "source": "",
+        "fetched_at": "",
+        "updated_at": "",
+        "is_suspended": None,
+        "is_st": None,
+        "source_evidence": source,
+    }
+    if frame.empty or "date" not in frame.columns:
+        return empty
+    dates = pd.to_datetime(frame["date"], errors="coerce")
+    session = frame.loc[dates.dt.strftime("%Y-%m-%d") == as_of]
+    if session.empty:
+        return empty
+    row = session.iloc[-1]
+    open_px, open_status = _status_from_raw(row.get("open"))
+    volume, volume_status = _status_from_raw(row.get("volume"))
+
+    def positive_price(name: str) -> float | None:
+        value, status = _status_from_raw(row.get(name))
+        return value if status == "ok" and value is not None and value > 0 else None
+
     return {
-        "open": _num("open"),
-        "high": _num("high"),
-        "low": _num("low"),
-        "close": close,
+        "open": open_px,
+        "high": positive_price("high"),
+        "low": positive_price("low"),
+        "close": positive_price("close"),
         "pct_chg": None if "pct_chg" not in row.index else _safe_float(row.get("pct_chg")),
+        "volume": volume,
+        "open_status": open_status,
+        "volume_status": volume_status,
+        "price_basis": basis,
+        "price_basis_reason": basis_reason,
+        "source": row.get("source", ""),
+        "fetched_at": row.get("fetched_at", ""),
+        "updated_at": row.get("updated_at", ""),
+        "is_suspended": row.get("is_suspended"),
+        "is_st": row.get("is_st"),
+        "date": as_of,
+        "source_evidence": source,
+        "original_row": {str(key): str(value) for key, value in row.to_dict().items()},
     }
 
 

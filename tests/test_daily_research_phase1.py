@@ -1487,7 +1487,8 @@ def test_generate_recommendations_can_skip_paper_sync(monkeypatch) -> None:
     assert payload["paper_simulation_sync"]["paper_only"] is True
 
 
-def test_backtest_run_can_use_strategy_screening_handoff(monkeypatch) -> None:
+def test_backtest_run_can_use_strategy_screening_handoff(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(backtest_routes, "project_root", tmp_path)
     dates = pd.date_range("2024-01-01", periods=190, freq="D")
     close = np.concatenate(
         [
@@ -1741,7 +1742,7 @@ def test_frontend_disclaimer_text_does_not_render_boolean_research_only() -> Non
     assert "loadPaperWatchlist(true)" in script
     assert "loadStrategyScorecard()" in script
     assert "loadDataHealth()" in script
-    assert "更新当前研究池、重新生成今日重点、同步纸面模拟池并刷新策略成绩单" in script
+    assert "查看全 A 收盘更新和当前研究结果" in script
     assert "renderQuantDailySummary" in script
     assert "renderQuantLimitReviewDigest" in script
     assert "涨停复盘摘要" in script
@@ -2677,7 +2678,7 @@ def test_theme_map_draft_skips_bad_candidate_ledger_rows_with_warning(monkeypatc
     assert any("csv_bad_lines_skipped" in item for item in caplog.messages)
 
 
-def test_startup_status_is_corrected_by_current_candidate_health(monkeypatch) -> None:
+def test_startup_status_preserves_run_warning_despite_current_candidate_health(monkeypatch) -> None:
     monkeypatch.setitem(api_server.STARTUP_REFRESH_STATE, "running", False)
     monkeypatch.setattr(
         api_server,
@@ -2710,13 +2711,11 @@ def test_startup_status_is_corrected_by_current_candidate_health(monkeypatch) ->
     payload = app.test_client().get("/api/startup/update-status").get_json()
 
     assert payload["running"] is False
-    assert payload["current_view_override"] is True
-    assert payload["status"] == "completed"
-    assert payload["current_status_label"] == "当前候选已补齐"
-    assert payload["failed_symbols"] == 0
-    assert payload["current_candidate_gap_summary"]["gap_count"] == 0
-    assert payload["startup_update_explanation"]["reason_code"] == "ready"
-    assert payload["startup_update_explanation"]["next_action"]
+    assert payload["current_view_override"] is False
+    assert payload["status"] == "completed_with_warnings"
+    assert payload["failed_symbols"] == 1
+    assert payload["latest_local_date_after"] == "2026-06-12"
+    assert payload["startup_update_explanation"]["status"] == "completed_with_warnings"
 
 
 def test_startup_update_explanation_marks_stale_generation(monkeypatch) -> None:
@@ -2745,7 +2744,8 @@ def test_startup_update_explanation_marks_stale_generation(monkeypatch) -> None:
 
     assert explanation["reason_code"] == "recommendation_stale"
     assert explanation["reason_label"] == "研究候选批次滞后"
-    assert explanation["target_date"] == "2026-06-23"
+    # The attempt keeps its target even when today's candidate view is newer.
+    assert explanation["target_date"] == "2026-06-22"
     assert explanation["recommendation_signal_date"] == "2026-06-22"
     assert "重新生成每日研究候选" in explanation["next_action"]
 
@@ -2918,7 +2918,7 @@ def test_data_gap_summary_separates_today_focus_from_observation_gaps() -> None:
     assert "今日重点价格/K线已覆盖目标日" in summary["message"]
 
 
-def test_page_open_startup_refresh_runs_in_process_without_timeout(monkeypatch) -> None:
+def test_explicit_startup_refresh_delegates_without_paper_sync(monkeypatch) -> None:
     calls: list[dict[str, object]] = []
     sync_calls: list[dict[str, object]] = []
     written: list[dict[str, object]] = []
@@ -2962,13 +2962,10 @@ def test_page_open_startup_refresh_runs_in_process_without_timeout(monkeypatch) 
     assert calls
     kwargs = calls[0]["kwargs"]
     assert kwargs["enable_network"] is True
-    assert kwargs["max_symbols"] == 80
-    assert kwargs["generate_candidates"] is True
-    assert kwargs["candidate_max_candidates"] == 18
-    assert sync_calls == [{"include_observation": False, "max_candidates": 18}]
+    assert kwargs.get("generate_candidates", False) is False
+    assert sync_calls == []
     assert written
-    assert written[-1]["paper_simulation_sync"]["status"] == "synced"
-    assert written[-1]["paper_simulation_sync"]["selected_count"] == 2
+    assert "paper_simulation_sync" not in written[-1]
     state = api_server.startup_refresh_state_payload()
     assert state["running"] is False
     assert state["status"] == "completed"
@@ -3438,13 +3435,13 @@ def test_target_amount_backfill_skips_bad_spot_snapshot_rows(monkeypatch, tmp_pa
     assert any("csv_bad_lines_skipped" in item for item in result["warnings"])
 
 
-def test_update_candidates_endpoint_uses_visible_candidate_symbols(monkeypatch) -> None:
+def test_update_candidates_endpoint_delegates_full_a(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     def fake_candidate_rows(limit: int = 10) -> list[dict[str, object]]:
         return [{"symbol": "000802"}, {"symbol": "601778"}]
 
-    def fake_update_daily_prices(**kwargs: object) -> dict[str, object]:
+    def fake_update_daily_prices(root, **kwargs: object) -> dict[str, object]:
         captured.update(kwargs)
         return {
             "ok": True,
@@ -3452,30 +3449,31 @@ def test_update_candidates_endpoint_uses_visible_candidate_symbols(monkeypatch) 
             "updated_symbols": 2,
             "failed_symbols": 0,
             "target_date": "2026-06-15",
+            "scope": "full_a",
         }
 
     monkeypatch.setattr(api_server, "candidate_rows", fake_candidate_rows)
-    monkeypatch.setattr(api_server, "update_daily_prices", fake_update_daily_prices)
+    monkeypatch.setattr(api_server, "run_startup_data_update", fake_update_daily_prices)
     monkeypatch.setitem(app.config, "REALTIME_NETWORK_ENABLED", True)
 
     response = app.test_client().post("/api/daily/update-candidates", json={"max_symbols": 40})
     payload = response.get_json()
 
     assert response.status_code == 200
-    assert captured["symbols"] == ["000802", "601778"]
-    assert payload["scope"] == "visible_daily_research_candidates"
+    assert captured == {"enable_network": True}
+    assert payload["scope"] == "full_a"
 
 
 def test_update_candidates_endpoint_requires_network_authorization(monkeypatch) -> None:
     called = False
 
-    def fake_update_daily_prices(**kwargs: object) -> dict[str, object]:
+    def fake_update_daily_prices(root, **kwargs: object) -> dict[str, object]:
         nonlocal called
         called = True
         return {"ok": True}
 
     monkeypatch.setitem(app.config, "REALTIME_NETWORK_ENABLED", False)
-    monkeypatch.setattr(api_server, "update_daily_prices", fake_update_daily_prices)
+    monkeypatch.setattr(api_server, "run_startup_data_update", fake_update_daily_prices)
 
     response = app.test_client().post("/api/daily/update-candidates", json={"max_symbols": 40})
     payload = response.get_json()

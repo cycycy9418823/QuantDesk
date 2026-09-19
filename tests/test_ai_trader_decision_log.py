@@ -149,7 +149,7 @@ def test_drop_pct_matches_computed_daily_change(tmp_path: Path) -> None:
             "symbol": "600172",
             "side": "buy",
             "ref_close": 12.72,
-            "llm_reason": "研究台推荐且近期跌6.7%，正合我超跌反转口味",
+            "llm_reason": "研究台推荐且近5个交易日跌6.7%，正合我超跌反转口味",
         },
         decision_date="2026-08-24",
         daily_dir=daily,
@@ -166,6 +166,7 @@ def test_drop_pct_matches_computed_daily_change(tmp_path: Path) -> None:
         daily_dir=daily,
     )
     assert fake
+    assert fake[0]["kind"] == "claimed_pct_ambiguous_period"
 
 
 def test_llm_reason_fake_price_is_rejected(tmp_path: Path) -> None:

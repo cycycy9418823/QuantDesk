@@ -184,8 +184,8 @@ def _risk_case(symbol: str = "600000", quantity: int = 100) -> dict[str, Any]:
 def _minute_frame(symbol: str, day: str = "2026-07-13") -> pd.DataFrame:
     return pd.DataFrame(
         [
-            {"symbol": symbol, "datetime": f"{day} 09:30:00", "open": 10.2, "high": 10.3, "low": 10.1, "close": 10.25, "volume": 1000, "amount": 10250},
-            {"symbol": symbol, "datetime": f"{day} 09:31:00", "open": 10.25, "high": 10.35, "low": 10.2, "close": 10.3, "volume": 1200, "amount": 12360},
+            {"symbol": symbol, "datetime": f"{day} 09:30:00", "open": 10.2, "high": 10.3, "low": 10.1, "close": 10.25, "volume": 1000, "amount": 10250, "adjust": "raw"},
+            {"symbol": symbol, "datetime": f"{day} 09:31:00", "open": 10.25, "high": 10.35, "low": 10.2, "close": 10.3, "volume": 1200, "amount": 12360, "adjust": "raw"},
         ]
     )
 
@@ -349,6 +349,27 @@ def test_minute_quality_reverse_schema_and_zero_volume_are_no_fill(frame_mutator
     result = _simulate(case, _execution(case, frame=frame))
     assert isinstance(result, kernel.RejectionEvent)
     assert reason in result.reason_codes
+
+
+def test_original_minute_frame_basis_cannot_be_overridden_by_evidence_string() -> None:
+    case = _risk_case()
+    frame = _minute_frame(case["intent"].symbol).copy()
+    frame["adjust"] = ["qfq", "qfq"]
+    result = _simulate(case, _execution(case, frame=frame))
+    assert isinstance(result, kernel.RejectionEvent)
+    assert "execution_minute_frame_basis_not_raw" in result.reason_codes
+
+
+def test_mixed_minute_frame_basis_is_unverified_even_with_raw_evidence_string() -> None:
+    case = _risk_case()
+    frame = _minute_frame(case["intent"].symbol).copy()
+    frame["adjust"] = ["raw", "qfq"]
+    result = _simulate(case, _execution(case, frame=frame))
+    assert isinstance(result, kernel.RejectionEvent)
+    assert any(
+        str(code).startswith("execution_minute_frame_basis_unverified")
+        for code in result.reason_codes
+    )
 
 
 def test_minute_frame_cannot_substitute_another_pool_members_symbol() -> None:

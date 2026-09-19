@@ -193,6 +193,7 @@ def candidate_refresh_gate(data_chain_manifest: Mapping[str, Any]) -> dict[str, 
     coverage = _mapping(manifest.get("coverage"))
     universe = _mapping(manifest.get("universe"))
     analysis_pool = _mapping(universe.get("current_analysis_pool"))
+    research_universe = _mapping(universe.get("research_universe"))
     critical_pool = _mapping(universe.get("critical"))
     components = _mapping(manifest.get("components"))
     features = _mapping(components.get("features"))
@@ -234,13 +235,27 @@ def candidate_refresh_gate(data_chain_manifest: Mapping[str, Any]) -> dict[str, 
         "legitimate_no_data_symbols"
     )
     daily_excluded = set(
-        daily_stale + daily_missing + daily_failed + daily_legitimate
+        daily_stale + daily_missing + daily_failed + daily_legitimate + daily_invalid_basis
     )
-    feature_component_passed = str(features.get("status") or "") == "passed"
+    # A missing symbol is a per-symbol research exclusion, not a failure of
+    # the feature stage for every other member of the all-A universe.
+    feature_component_passed = str(features.get("status") or "") in {
+        "passed",
+        "partial",
+    }
     feature_per_symbol = {
         normalize_symbol(symbol): _mapping(entry)
         for symbol, entry in _mapping(features.get("per_symbol")).items()
         if normalize_symbol(symbol)
+    }
+    verified_exclusions = _mapping(feature_gate.get("excluded_symbol_evidence"))
+    verified_exclusion_symbols = {
+        symbol for symbol, evidence in feature_per_symbol.items()
+        if evidence.get("eligible") is False
+        and str(evidence.get("reason_code") or "")
+        and dict(_mapping(verified_exclusions.get(symbol))) == dict(evidence)
+        and str(feature_gate.get("exclusion_output_sha256") or "") == feature_hash
+        and _is_sha256(feature_hash)
     }
 
     if manifest.get("authoritative") is not True:
@@ -282,7 +297,22 @@ def candidate_refresh_gate(data_chain_manifest: Mapping[str, Any]) -> dict[str, 
     coverage_unknown, coverage_unknown_valid = _strict_symbol_list(
         session_coverage.get("unknown_symbols")
     )
-    daily_session_unknown = set(daily_stale + daily_missing + daily_failed)
+    daily_session_unknown = (
+        set(daily_stale + daily_missing + daily_failed + daily_invalid_basis)
+        | verified_exclusion_symbols
+    )
+    session_per_symbol = _mapping(session_gate.get("per_symbol"))
+    witnessed_session_unknown = {
+        symbol for symbol in session_unknown
+        if (entry := _mapping(session_per_symbol.get(symbol))).get("symbol") == symbol
+        and entry.get("classification") == "unknown"
+        and entry.get("status") == "unknown"
+        and isinstance(entry.get("reason_code"), str)
+        and entry["reason_code"].strip()
+        and isinstance(entry.get("evidence"), list)
+        and bool(entry["evidence"])
+        and all(isinstance(item, Mapping) and item.get("source") for item in entry["evidence"])
+    }
     session_coverage_unknown_count = _integer_or_none(
         session_coverage.get("unknown_count")
     )
@@ -308,7 +338,9 @@ def candidate_refresh_gate(data_chain_manifest: Mapping[str, Any]) -> dict[str, 
         session_structure_valid
         and str(session_gate.get("status") or "") == "blocked"
         and session_gate.get("formal_eligible") is False
-        and sorted(session_unknown) == sorted(daily_session_unknown)
+        and bool(session_unknown)
+        and set(session_unknown).issubset(daily_session_unknown | witnessed_session_unknown)
+        and (not session_per_symbol or set(session_unknown) == witnessed_session_unknown)
         and str(session_coverage.get("status") or "") == "blocked"
         and session_coverage_unknown_count == len(session_unknown)
         and coverage_unknown_valid
@@ -321,7 +353,11 @@ def candidate_refresh_gate(data_chain_manifest: Mapping[str, Any]) -> dict[str, 
     failed_sources_valid = isinstance(failed_sources, list)
     if not critical_sources:
         reasons.append("upstream_critical_sources_missing")
-    elif (
+    elif not (
+        not critical_symbols
+        and str(critical_sources.get("status") or "") == "not_requested"
+        and critical_sources.get("reason_codes") == ["minute_processing_not_requested"]
+    ) and (
         str(critical_sources.get("status") or "") not in {"passed", "completed"}
         or critical_sources.get("formal_eligible") is not True
         or not failed_sources_valid
@@ -329,7 +365,19 @@ def candidate_refresh_gate(data_chain_manifest: Mapping[str, Any]) -> dict[str, 
     ):
         reasons.append("upstream_critical_sources_not_formal")
 
-    if str(daily_coverage.get("status") or "") != "passed" and not daily_excluded:
+    daily_hole_codes = {
+        "daily_symbols_stale",
+        "daily_symbols_missing",
+        "daily_symbols_failed",
+        "daily_price_basis_not_raw",
+    }
+    daily_status = str(daily_coverage.get("status") or "")
+    daily_reasons = {
+        str(item) for item in (daily_coverage.get("reason_codes") or []) if item
+    }
+    if daily_status not in {"passed", "partial"} and not (
+        daily_excluded and daily_reasons.issubset(daily_hole_codes)
+    ):
         reasons.append("upstream_daily_gate_not_passed_without_symbol_evidence")
     for list_name, values, values_valid in (
         ("stale", daily_stale, daily_stale_valid),
@@ -358,14 +406,29 @@ def candidate_refresh_gate(data_chain_manifest: Mapping[str, Any]) -> dict[str, 
             reasons.append("upstream_daily_invalid_price_basis_count_invalid")
         else:
             invalid_basis_count = parsed_invalid_basis_count
-    if daily_invalid_basis or invalid_basis_count:
+    if invalid_basis_count != len(daily_invalid_basis):
+        reasons.append("upstream_daily_invalid_price_basis_evidence_mismatch")
+    if (daily_invalid_basis or invalid_basis_count) and not set(daily_invalid_basis).issubset(verified_exclusion_symbols):
         reasons.append("upstream_daily_price_basis_not_raw")
 
     if not feature_component_passed:
         reasons.append("upstream_feature_component_not_passed")
-    if str(feature_gate.get("status") or "") != "passed" and not (
-        feature_component_passed and feature_per_symbol and daily_excluded
-    ):
+    if set(feature_gate.get("reason_codes") or []) & {
+        "feature_output_integrity_invalid", "feature_input_snapshot_unstable",
+        "feature_output_digest_missing", "feature_price_policy_not_passed",
+        "feature_price_basis_not_raw", "feature_per_symbol_not_raw",
+    }:
+        reasons.append("upstream_feature_output_not_verified")
+    feature_degraded = bool(
+        feature_component_passed
+        and feature_per_symbol
+        and (
+            daily_excluded
+            or len(feature_per_symbol) < len(universe_symbols)
+            or str(feature_gate.get("status") or "") == "partial"
+        )
+    )
+    if str(feature_gate.get("status") or "") not in {"passed", "partial"} and not feature_degraded:
         reasons.append("upstream_features_gate_not_passed_without_symbol_evidence")
     if _iso_day(analysis_pool.get("target_date")) != target_date:
         reasons.append("upstream_universe_target_date_mismatch")
@@ -433,9 +496,23 @@ def candidate_refresh_gate(data_chain_manifest: Mapping[str, Any]) -> dict[str, 
         exclude(symbol, "daily_failed")
     for symbol in daily_legitimate:
         exclude(symbol, "daily_no_session")
+    for symbol in daily_invalid_basis:
+        exclude(symbol, "daily_price_basis_invalid")
+    for symbol in session_unknown:
+        if symbol in universe_set:
+            exclude(symbol, "session_expectation_unknown")
     for symbol in universe_symbols:
         evidence = feature_per_symbol.get(symbol)
         if not evidence:
+            exclude(symbol, "feature_evidence_missing")
+            continue
+        if symbol in verified_exclusion_symbols:
+            exclude(symbol, str(evidence["reason_code"]))
+            continue
+        if (
+            evidence.get("eligible") is False
+            and str(evidence.get("reason_code") or "") == "missing_or_invalid_daily"
+        ):
             exclude(symbol, "feature_evidence_missing")
             continue
         feature_basis = str(evidence.get("price_basis") or "")
@@ -458,7 +535,10 @@ def candidate_refresh_gate(data_chain_manifest: Mapping[str, Any]) -> dict[str, 
     exclusions = [
         {
             "symbol": symbol,
+            "status": "unknown",
+            "tonight_unavailable": True,
             "reason_codes": list(dict.fromkeys(exclusions_by_symbol[symbol])),
+            "session_evidence": dict(_mapping(session_per_symbol.get(symbol))),
         }
         for symbol in excluded_symbols
     ]
@@ -487,6 +567,14 @@ def candidate_refresh_gate(data_chain_manifest: Mapping[str, Any]) -> dict[str, 
         "daily_missing_symbols": daily_missing,
         "daily_failed_symbols": daily_failed,
         "feature_per_symbol": feature_per_symbol,
+        "universe_source": str(
+            research_universe.get("source") or analysis_pool.get("source") or ""
+        ),
+        "universe_filter_used": bool(research_universe.get("filter_used", False)),
+        "universe_filter_id": str(research_universe.get("filter_id") or ""),
+        "universe_filter_count": _integer_or_none(
+            research_universe.get("filter_symbol_count")
+        ) or 0,
     }
 
 
@@ -499,8 +587,12 @@ def _write_candidate_eligible_universe(
     root: Path,
     run_id: str,
     eligible_symbols: Sequence[str],
+    source_path: Path | None = None,
+    require_included: bool = True,
 ) -> tuple[Path | None, list[str]]:
-    source_path = root / "data" / "universe" / "low_price_learning_symbols.csv"
+    source_path = source_path or (
+        root / "data" / "universe" / "low_price_learning_symbols.csv"
+    )
     if not source_path.is_file():
         return None, ["candidate_source_universe_file_missing"]
     try:
@@ -510,13 +602,19 @@ def _write_candidate_eligible_universe(
             rows = [dict(row) for row in reader]
     except (OSError, UnicodeError, csv.Error):
         return None, ["candidate_source_universe_file_unreadable"]
-    if not fieldnames or not ({"symbol", "code"} & set(fieldnames)):
+    if not fieldnames or not ({"symbol", "code", "ts_code", "代码", "证券代码"} & set(fieldnames)):
         return None, ["candidate_source_universe_schema_invalid"]
 
     rows_by_symbol: dict[str, dict[str, Any]] = {}
     duplicates: set[str] = set()
     for row in rows:
-        symbol = normalize_symbol(row.get("symbol") or row.get("code"))
+        symbol = normalize_symbol(
+            row.get("symbol")
+            or row.get("code")
+            or row.get("ts_code")
+            or row.get("证券代码")
+            or row.get("代码")
+        )
         if not symbol:
             continue
         if symbol in rows_by_symbol:
@@ -529,12 +627,18 @@ def _write_candidate_eligible_universe(
     if missing:
         return None, ["candidate_source_universe_eligible_rows_missing"]
     selected = [rows_by_symbol[symbol] for symbol in expected]
-    if any(
+    if require_included and any(
         str(row.get("included") or "").strip().lower()
         not in {"1", "true", "yes", "y"}
         for row in selected
     ):
         return None, ["candidate_source_universe_eligible_row_not_included"]
+
+    if "included" not in fieldnames:
+        fieldnames.append("included")
+    if not require_included:
+        for row in selected:
+            row["included"] = "true"
 
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
@@ -817,6 +921,10 @@ def build_formal_candidate_batch(
         "rejected_candidates": rejected,
         "reason_codes": visible_reasons,
         "qualification_gate": gate_payload,
+        "universe_source": gate_payload.get("universe_source") or "",
+        "universe_filter_used": bool(gate_payload.get("universe_filter_used")),
+        "universe_filter_id": gate_payload.get("universe_filter_id") or "",
+        "universe_filter_count": int(gate_payload.get("universe_filter_count") or 0),
         "provenance": {
             "source": f"daily_data_chain:{source_run_id}" if source_run_id else "",
             "captured_at": normalized_captured_at,
@@ -1049,6 +1157,99 @@ def load_formal_candidate_batch(
     }
 
 
+def load_formal_candidate_intake(
+    project_root: Path, *, target_date: str,
+    batch: Mapping[str, Any] | None = None,
+    batch_path: Path | str | None = None, status: str = "",
+    data_chain_manifest: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve and revalidate the one formal source allowed for a paper date.
+
+    An injected batch is a claim to compare with the actual immutable source,
+    never a way to bypass its verification. Completed-chain conflict recovery
+    retains the same run binding as the daily workflow.
+    """
+    root = Path(project_root).resolve()
+    target = _iso_day(target_date)
+    if status and status != "passed":
+        loaded: dict[str, Any] = {
+            "status": status if status in {"missing", "blocked"} else "blocked",
+            "batch": None, "path": str(batch_path or ""),
+            "reason_codes": [f"formal_candidate_batch_{status}"],
+        }
+    else:
+        latest, _ = _read_json_strict(root / "results/data_chain/daily_data_chain_latest.json")
+        latest = latest or {}
+        current_chain = bool(
+            latest.get("status") == "completed" and latest.get("authoritative") is True
+            and latest.get("published_latest") is True and latest.get("target_date") == target
+        )
+        if data_chain_manifest is not None:
+            loaded = resolve_chain_bound_formal_candidate_batch(root, data_chain_manifest=data_chain_manifest)
+            if data_chain_manifest.get("target_date") != target:
+                loaded = {**loaded, "status": "blocked", "batch": None,
+                          "reason_codes": [*loaded.get("reason_codes", []), "formal_candidate_chain_target_mismatch"]}
+        elif current_chain:
+            run_id = _safe_run_id(latest.get("run_id"))
+            terminal, error = _read_json_strict(root / "results/data_chain/runs" / run_id / "manifest.json") if run_id else (None, "run_id_invalid")
+            if error or terminal != latest:
+                loaded = {"status": "blocked", "batch": None, "path": "",
+                          "source_mode": "completed_chain_unverified",
+                          "reason_codes": [f"formal_candidate_data_chain_terminal_{error or 'mismatch'}"]}
+            else:
+                loaded = resolve_chain_bound_formal_candidate_batch(root, data_chain_manifest=terminal)
+        else:
+            loaded = {**load_formal_candidate_batch(root, target_date=target_date),
+                      "source_mode": "dated_observation_snapshot"}
+        reasons = list(loaded.get("reason_codes") or [])
+        if batch is not None:
+            reasons.extend(verify_formal_candidate_batch(batch))
+            if dict(batch) != loaded.get("batch"):
+                reasons.append("formal_candidate_injected_batch_mismatch")
+        if batch_path:
+            claimed = (root / str(batch_path)).resolve()
+            actual = (root / str(loaded.get("path") or "")).resolve()
+            if claimed != actual:
+                reasons.append("formal_candidate_injected_path_mismatch")
+        if reasons:
+            loaded = {**loaded, "status": "blocked" if loaded.get("status") != "missing" else "missing",
+                      "batch": None, "reason_codes": list(dict.fromkeys(reasons))}
+    accepted = loaded.get("batch") if loaded.get("status") == "passed" else None
+    accepted = accepted if isinstance(accepted, Mapping) else {}
+    provenance = _mapping(accepted.get("provenance"))
+    rows = [row for row in accepted.get("candidates", []) if isinstance(row, Mapping)]
+    return {
+        **loaded, "target_date": target, "candidate_count": len(rows),
+        "symbol_count": len({normalize_symbol(row.get("symbol")) for row in rows}),
+        "source": "formal_candidate_daily_batch", "as_of": target,
+        "provenance_hash": str(provenance.get("hash") or ""),
+        "source_run_id": str(provenance.get("source_run_id") or ""),
+        "input_source": "formal_candidate_batch" if accepted else f"formal_candidate_batch_{loaded.get('status') or 'blocked'}",
+        "legacy_fallback_used": False,
+    }
+
+
+def formal_candidate_strategy_payload(intake: Mapping[str, Any]) -> dict[str, Any]:
+    """Project verified source rows, retaining their complete batch envelopes."""
+    batch = intake.get("batch") if intake.get("status") == "passed" else None
+    batch = dict(batch) if isinstance(batch, Mapping) else None
+    rows: list[dict[str, Any]] = []
+    if batch is not None:
+        for raw in batch.get("candidates") or []:
+            row = copy.deepcopy(dict(raw))
+            row["candidate_envelope"] = build_candidate_envelope(batch, batch_path=str(intake.get("path") or ""), candidate=raw)
+            rows.append(row)
+    return {
+        "ok": batch is not None, "generated_at": str(intake.get("target_date") or ""),
+        "candidates": rows, "standard_candidates": rows,
+        "long_candidates": [row for row in rows if row.get("strategy_type") == "long"],
+        "board_candidates": [row for row in rows if row.get("strategy_type") == "board"],
+        "formal_candidate_batch": batch, "formal_candidate_batch_path": str(intake.get("path") or ""),
+        "formal_candidate_status": str(intake.get("status") or "blocked"),
+        "candidate_intake": {key: value for key, value in intake.items() if key != "batch"},
+    }
+
+
 def _chain_candidate_binding(
     batch: Mapping[str, Any],
     *,
@@ -1115,8 +1316,40 @@ def resolve_chain_bound_formal_candidate_batch(
         upstream_reasons.append("authoritative_data_chain_run_id_invalid")
     if manifest.get("protected_state_unchanged") is not True:
         upstream_reasons.append("authoritative_data_chain_protected_state_invalid")
+    # Daily/feature/minute holes are carried as per-symbol exclusions.  They do
+    # not invalidate the unaffected candidate batch; structural and price-basis
+    # failures remain hard gates.
+    symbol_hole_codes = {
+        "daily_symbols_stale",
+        "daily_symbols_missing",
+        "daily_symbols_failed",
+        "feature_target_date_mismatch",
+        "feature_symbols_skipped",
+        "feature_symbol_set_mismatch",
+        "feature_requested_count_mismatch",
+        "feature_count_mismatch",
+        "feature_output_row_count_mismatch",
+    }
+    research_gate = candidate_refresh_gate(manifest)
+    verified_research = research_gate.get("formal_eligible") is True
+    if not verified_research:
+        upstream_reasons.extend(research_gate.get("reason_codes") or ["candidate_refresh_qualification_not_passed"])
     for key in ("daily", "current_analysis_pool", "features"):
-        if str(_mapping(coverage.get(key)).get("status") or "") != "passed":
+        gate = _mapping(coverage.get(key))
+        gate_status = str(gate.get("status") or "")
+        gate_reasons = {str(item) for item in (gate.get("reason_codes") or []) if item}
+        degraded = bool(
+            (gate_reasons and gate_reasons.issubset(symbol_hole_codes))
+            or (key in {"daily", "features"} and verified_research)
+        )
+        minute_not_requested = (
+            key == "current_analysis_pool"
+            and gate_status == "not_requested"
+            and gate_reasons == {"analysis_pool_minute_on_demand"}
+            and gate.get("requested_count") == 0
+            and gate.get("audited_count") == 0
+        )
+        if gate_status not in {"passed", "partial"} and not degraded and not minute_not_requested:
             upstream_reasons.append(f"authoritative_data_chain_{key}_gate_not_passed")
     if not _is_sha256(universe.get("sha256")):
         upstream_reasons.append("authoritative_data_chain_universe_hash_invalid")
@@ -2074,6 +2307,7 @@ def run_formal_candidate_refresh(
     captured_at: str,
     apply: bool = False,
     replace_same_date: bool = False,
+    use_low_price_filter: bool = False,
 ) -> dict[str, Any]:
     """Stage a candidate batch, then optionally publish its dated/latest pair."""
 
@@ -2115,23 +2349,28 @@ def run_formal_candidate_refresh(
             from quantdesk.auto_strategy_sandbox import run_auto_strategy_cycle
 
             strategy_runner = run_auto_strategy_cycle
-        if manifest_gate.get("degraded") is True:
-            scoped_universe_path, scope_reasons = _write_candidate_eligible_universe(
-                root=root,
-                run_id=run_id,
-                eligible_symbols=list(manifest_gate.get("eligible_symbols") or []),
-            )
-            if scope_reasons:
-                return {
-                    "status": "blocked",
-                    "applied": False,
-                    "reason_codes": scope_reasons,
-                    "qualification_gate": manifest_gate,
-                }
-        else:
-            scoped_universe_path = (
-                root / "data" / "universe" / "low_price_learning_symbols.csv"
-            )
+        # The default strategy input is the all-A universe with per-symbol
+        # exclusions already applied by the gate.  The legacy 914 file is only
+        # selected when a caller explicitly opts into that named filter.
+        source_path = (
+            root / "data" / "universe" / "low_price_learning_symbols.csv"
+            if use_low_price_filter
+            else root / "data" / "universe" / "a_share_symbols.csv"
+        )
+        scoped_universe_path, scope_reasons = _write_candidate_eligible_universe(
+            root=root,
+            run_id=run_id,
+            eligible_symbols=list(manifest_gate.get("eligible_symbols") or []),
+            source_path=source_path,
+            require_included=bool(use_low_price_filter),
+        )
+        if scope_reasons:
+            return {
+                "status": "blocked",
+                "applied": False,
+                "reason_codes": scope_reasons,
+                "qualification_gate": manifest_gate,
+            }
         try:
             resolved_strategy = strategy_runner(
                 mode="live",
@@ -3181,13 +3420,22 @@ def coordinate_plan_rollover(
     }
 
 
+def _receipt_key(row: Any) -> tuple[str, str]:
+    if not isinstance(row, Mapping):
+        return ("", "")
+    return (str(row.get("plan_id") or ""), _iso_day(row.get("trade_date")))
+
+
 def scan_unreplayed_archived_plans(
     project_root: Path,
     *,
     as_of: str,
     applied_execution_ids: Sequence[str] = (),
+    review_receipts: Sequence[Mapping[str, Any]] | None = None,
+    replay_receipts: Sequence[Mapping[str, Any]] | None = None,
+    include_as_of: bool = False,
 ) -> dict[str, Any]:
-    """Report archived plans whose trade date passed without a recorded replay.
+    """Report archived plans whose trade date passed without any recorded evidence.
 
     Why this exists: exit rules are only evaluated on days the evening routine
     actually runs, and the stop-loss band is recomputed from a *rolling* support
@@ -3197,9 +3445,16 @@ def scan_unreplayed_archived_plans(
     no longer matched. The result was 26 applied executions but a single closed
     trade.
 
-    Nothing detected those skips. This scan makes them visible and countable:
-    it compares the append-only plan archive against the ledger's
-    ``applied_execution_ids`` and returns the plans that were never replayed.
+    Three different facts are kept apart (B1):
+
+    * ``applied_execution_ids`` - a fill/simulation was applied to the ledger;
+    * ``replay_receipts`` - an intraday simulation pass ran for the plan;
+    * ``review_receipts`` - a read-only expiry review was performed even when
+      no simulation ran.
+
+    Status text is not a receipt. Each v2 record is checked against the actual
+    plan and input files; an old unbound v1 receipt remains diagnostic only.
+    Applied IDs retain their existing ledger semantics, never a review claim.
 
     Read-only by construction: it opens no lock, writes nothing, and fabricates
     no replay. Recovering a missed day stays a separate, explicitly authorized
@@ -3218,11 +3473,29 @@ def scan_unreplayed_archived_plans(
             "unreplayed": [],
             "unreplayed_count": 0,
         }
+    from quantdesk.plan_review_receipts import load_plan_review_receipts, verify_plan_review_receipt
+
+    stored = load_plan_review_receipts(root) if review_receipts is None or replay_receipts is None else {}
+    review_rows = list(stored.get("review_receipts") or []) if review_receipts is None else list(review_receipts)
+    replay_rows = list(stored.get("replay_receipts") or []) if replay_receipts is None else list(replay_receipts)
+    store_reasons = list(stored.get("reason_codes") or [])
+    by_plan: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for receipt in [*review_rows, *replay_rows]:
+        key = _receipt_key(receipt)
+        if not all(key):
+            store_reasons.append("receipt_identity_missing")
+            continue
+        by_plan.setdefault(key, []).append(receipt)
     applied = {str(item) for item in applied_execution_ids if str(item)}
     archive_root = root / "results" / "conditional_trade_plans_daily"
     unreplayed: list[dict[str, Any]] = []
     unreadable: list[str] = []
     scanned = 0
+    applied_count = 0
+    simulated_count = 0
+    reviewed_count = 0
+    review_passed_count = 0
+    all_items: list[dict[str, Any]] = []
     if archive_root.is_dir():
         for path in sorted(archive_root.glob("*.json")):
             plan, error = _read_json_strict(path)
@@ -3234,43 +3507,125 @@ def scan_unreplayed_archived_plans(
             plan_id = str(plan.get("plan_id") or "")
             # Only a *passed* trade date can be missed; today's and future plans
             # are simply not due yet.
-            if not trade_date or trade_date >= normalized_as_of:
+            if not trade_date:
+                unreadable.append(path.name)
+                continue
+            if trade_date > normalized_as_of or (trade_date == normalized_as_of and not include_as_of):
+                all_items.append({"archive_file": path.name, "plan_id": plan_id, "trade_date": trade_date,
+                                  "status": "not_due", "reason_codes": ["plan_not_due"],
+                                  "evidence": {"applied_to_ledger": False, "intraday_simulation_executed": False, "expiry_reviewed": False}})
                 continue
             execution_id = f"{plan_id}:{trade_date}" if plan_id and trade_date else ""
-            if execution_id and execution_id in applied:
-                continue
-            unreplayed.append(
-                {
+            key = (plan_id, trade_date)
+            receipts = by_plan.get(key, [])
+            valid: list[Mapping[str, Any]] = []
+            rejected: list[str] = []
+            for receipt in receipts:
+                reasons = verify_plan_review_receipt(receipt, plan=plan, project_root=root, as_of=normalized_as_of)
+                if reasons:
+                    rejected.extend(reasons)
+                else:
+                    valid.append(receipt)
+            evidence = {
+                "applied_to_ledger": bool(execution_id and execution_id in applied),
+                "intraday_simulation_executed": any(row.get("kind") == "intraday_replay" and row.get("simulation_executed") is True for row in valid),
+                "expiry_reviewed": any(row.get("kind") == "expiry_review" and row.get("review_completed") is True for row in valid),
+            }
+            review_passed = any(row.get("kind") == "expiry_review" and row.get("review_passed") is True for row in valid)
+            replay_passed = any(row.get("kind") == "intraday_replay" and row.get("simulation_executed") is True and row.get("review_passed") is True for row in valid)
+            passed = review_passed or replay_passed
+            applied_count += int(evidence["applied_to_ledger"])
+            simulated_count += int(evidence["intraday_simulation_executed"])
+            reviewed_count += int(evidence["expiry_reviewed"])
+            review_passed_count += int(review_passed)
+            if passed:
+                status = "replayed" if evidence["intraday_simulation_executed"] else (
+                    "simulation_disabled" if all(row.get("simulation_enabled") is False for row in valid) else "reviewed"
+                )
+            elif valid and evidence["expiry_reviewed"]:
+                status = "evidence_insufficient"
+            elif rejected:
+                status = "legacy_unbound" if "legacy_unbound" in rejected else "receipt_invalid"
+            elif evidence["applied_to_ledger"]:
+                status = "applied_record_only"
+            else:
+                status = "unreviewed"
+            resolved = passed or (evidence["applied_to_ledger"] and not receipts)
+            missing: list[str] = []
+            if not execution_id:
+                missing.append("plan_id_or_trade_date_missing")
+            else:
+                if not evidence["applied_to_ledger"]:
+                    missing.append("no_applied_execution")
+                if not evidence["intraday_simulation_executed"]:
+                    missing.append("no_intraday_simulation")
+                if not evidence["expiry_reviewed"]:
+                    missing.append("no_expiry_review")
+            missing.extend(rejected)
+            if not passed:
+                missing.extend(str(reason) for row in valid for reason in (row.get("reason_codes") or []))
+            item = {
                     "archive_file": path.name,
                     "plan_id": plan_id,
                     "trade_date": trade_date,
                     "execution_id": execution_id,
                     "symbol_count": len(_plan_symbols(plan)),
+                    "status": status,
+                    "evidence": evidence,
+                    "review_passed": review_passed,
+                    "replay_validation_passed": replay_passed,
+                    "missing_evidence_reasons": list(dict.fromkeys(missing)),
+                    "reason_codes": list(dict.fromkeys(rejected)),
+                    "receipts": [{"kind": row.get("kind"), "checked_at": row.get("checked_at"),
+                                  "status": row.get("status"), "receipt_hash": row.get("receipt_hash"),
+                                  "plan_hash": row.get("plan_hash"), "reconstruction": row.get("reconstruction")}
+                                 for row in valid],
                     "reason_code": (
                         "plan_id_or_trade_date_missing"
                         if not execution_id
                         else "trade_date_passed_without_recorded_replay"
                     ),
                 }
-            )
+            all_items.append(item)
+            if not resolved:
+                unreplayed.append(item)
+    summary = {
+        "status": "attention" if unreplayed or unreadable or store_reasons else "passed",
+        "as_of": normalized_as_of, "book_id": "strategy_paper",
+        "plan_count": len(all_items), "due_count": sum(row["status"] != "not_due" for row in all_items),
+        "not_due_count": sum(row["status"] == "not_due" for row in all_items),
+        "reviewed_count": reviewed_count, "review_passed_count": review_passed_count,
+        "replayed_count": simulated_count, "applied_count": applied_count,
+        "unresolved_count": len(unreplayed),
+        "evidence_insufficient_count": sum(row["status"] == "evidence_insufficient" for row in all_items),
+        "legacy_unbound_count": sum(row["status"] == "legacy_unbound" for row in all_items),
+        "reason_codes": list(dict.fromkeys([*store_reasons, *(reason for row in all_items for reason in row.get("reason_codes", []))])),
+    }
     return {
         "task_type": "unreplayed_archived_plan_scan",
         "schema_version": PLAN_ROLLOVER_SCHEMA_VERSION,
-        "status": "passed" if not unreplayed and not unreadable else "attention",
+        "status": summary["status"],
         "as_of": normalized_as_of,
         "archive_scanned": scanned,
         "archive_unreadable": unreadable,
         "applied_execution_id_count": len(applied),
+        "evidence_counts": {
+            "applied_to_ledger": applied_count,
+            "intraday_simulation_executed": simulated_count,
+            "expiry_reviewed": reviewed_count,
+        },
         "unreplayed": unreplayed,
         "unreplayed_count": len(unreplayed),
+        "plan_review_summary": summary,
+        "plan_review_items": all_items,
         "recovery_authorized": False,
         "reason_codes": (
             ["unreplayed_archived_plans_present"] if unreplayed else []
         )
-        + (["archive_entries_unreadable"] if unreadable else []),
+        + (["archive_entries_unreadable"] if unreadable else []) + store_reasons,
         "note": (
-            "只读扫描：不补放、不写盘。漏放日的退出信号已不可追溯，"
-            "重放需单独授权。"
+            "只读扫描：不补放、不写盘。到期已复核、盘中已模拟、已应用到账本三者分开，"
+            "状态字样或无计划绑定的旧收据不构成核验；已应用ID不冒充到期复核。"
         ),
         "boundaries": {
             "research_only": True,

@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TEST_TMP_ROOT = PROJECT_ROOT / ".quantdesk_test_tmp"
+TEST_TMP_ROOT = Path(tempfile.gettempdir()) / ".quantdesk_test_tmp"
 
 
 def _symbols(count: int = 80) -> list[str]:
@@ -140,8 +140,8 @@ class V337DataUpdateOutputSlimMobileVisualCheckTests(unittest.TestCase):
         symbols = _symbols(12)
         with self._temp_dir() as tmp:
             root = Path(tmp)
-            output_dir = root.relative_to(PROJECT_ROOT) / "data_update"
-            report_path = root.relative_to(PROJECT_ROOT) / "data_update_report.md"
+            output_dir = root / "data_update"
+            report_path = root / "data_update_report.md"
             buf = io.StringIO()
             with redirect_stdout(buf):
                 code = main(

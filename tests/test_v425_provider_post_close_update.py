@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from tests._isolated_project import IsolatedProject
 
 from quantdesk.bounded_market_data_provider import provider_config
 import quantdesk.post_close_daily_updater as post_close_daily_updater
@@ -140,15 +141,16 @@ def test_v425_intraday_network_true_writes_snapshot_not_daily(tmp_path, monkeypa
     assert (daily / "000002.csv").read_text(encoding="utf-8").count("\n") == 2
 
 
-def test_v425_outputs_and_manifest_after_run():
-    manifest_path = ROOT / "dist/quantdesk_v4.2.5_provider_post_close_update_review_manifest.json"
-    if not manifest_path.exists():
-        run_v425_provider_workflow(ROOT, network=False, max_symbols=2)
-    handoff = json.loads((ROOT / "results/data_update/v425_provider_post_close_update_handoff_latest.json").read_text(encoding="utf-8-sig"))
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+def test_v425_outputs_and_manifest_after_run(tmp_path):
+    with IsolatedProject(ROOT, temp_parent=tmp_path) as project:
+        root = project.root
+        manifest_path = root / "dist/quantdesk_v4.2.5_provider_post_close_update_review_manifest.json"
+        run_v425_provider_workflow(root, network=False, max_symbols=2)
+        handoff = json.loads((root / "results/data_update/v425_provider_post_close_update_handoff_latest.json").read_text(encoding="utf-8-sig"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
 
-    assert handoff["candidate_upgrade_allowed"] is False
-    assert handoff["canonical_equity_overwritten"] is False
-    assert handoff["generated_trade_advice"] is False
-    assert manifest["missing_files"] == []
-    assert manifest["research_only"] is True
+        assert handoff["candidate_upgrade_allowed"] is False
+        assert handoff["canonical_equity_overwritten"] is False
+        assert handoff["generated_trade_advice"] is False
+        assert manifest["missing_files"] == []
+        assert manifest["research_only"] is True

@@ -19,6 +19,7 @@ Current live policies:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any, Mapping
 
 from quantdesk.board_rules import classify_board
@@ -140,7 +141,9 @@ def _finite(value: float | None) -> bool:
     return number == number and abs(number) != float("inf")
 
 
-def next_open_limit_blocked(symbol: str, pct_chg: float | None, side: str) -> str | None:
+def next_open_limit_blocked(
+    symbol: str, pct_chg: float | None, side: str, *, is_st: bool = False
+) -> str | None:
     """Limit-up cannot buy, limit-down cannot sell, using the open gap.
 
     Same numeric tolerance the AI trader already used: board limit minus 0.3
@@ -151,7 +154,7 @@ def next_open_limit_blocked(symbol: str, pct_chg: float | None, side: str) -> st
         return None
     change = float(pct_chg)
     try:
-        rules = classify_board(symbol)
+        rules = classify_board(symbol, is_st=is_st)
         up = float(rules.limit_up_pct) - 0.3
         down = float(rules.limit_down_pct) + 0.3
     except Exception:
@@ -161,6 +164,105 @@ def next_open_limit_blocked(symbol: str, pct_chg: float | None, side: str) -> st
     if side == "sell" and change <= down:
         return f"limit_down:{symbol}:{change:.2f}%"
     return None
+
+
+def evaluate_next_open_fill(
+    bar: Mapping[str, Any] | None,
+    *,
+    symbol: str,
+    side: str,
+    prev_close: float | None = None,
+    trade_date: str = "",
+) -> dict[str, Any]:
+    """Accept a next-open fill only with raw, dated, sourced price evidence."""
+
+    row = dict(bar or {})
+    basis_reason = str(row.get("price_basis_reason") or "")
+    basis = str(row.get("price_basis") or "")
+    if basis_reason == "mixed_price_basis":
+        return {"ok": False, "reason": "mixed_price_basis"}
+    if basis_reason == "unknown_price_basis" or basis in {"", "mixed_or_unknown"}:
+        return {"ok": False, "reason": "unknown_price_basis"}
+    if basis != "raw":
+        return {"ok": False, "reason": "consumer_price_basis_not_allowed"}
+
+    suspended = str(row.get("is_suspended") or "").strip().lower()
+    if suspended in {"1", "1.0", "true", "yes"}:
+        return {"ok": False, "reason": "suspended"}
+
+    open_status = str(row.get("open_status") or "ok")
+    open_px = row.get("open")
+    if open_status == "missing" or open_px is None:
+        return {"ok": False, "reason": "missing_open_price"}
+    if open_status == "nonfinite" or not _finite(open_px):
+        return {"ok": False, "reason": "nonfinite_open_price"}
+    if float(open_px) <= 0:
+        return {"ok": False, "reason": "invalid_open_price"}
+
+    volume_status = str(row.get("volume_status") or "ok")
+    volume = row.get("volume")
+    if volume_status == "missing" or volume is None:
+        return {"ok": False, "reason": "missing_volume"}
+    if volume_status == "nonfinite" or not _finite(volume):
+        return {"ok": False, "reason": "nonfinite_volume"}
+    if float(volume) == 0:
+        return {"ok": False, "reason": "zero_volume"}
+    if float(volume) < 0:
+        return {"ok": False, "reason": "invalid_volume"}
+
+    if not _finite(prev_close) or float(prev_close) <= 0:
+        return {"ok": False, "reason": "missing_or_invalid_previous_close"}
+    gap_pct = (float(open_px) / float(prev_close) - 1.0) * 100.0
+    is_st = str(row.get("is_st") or "").strip().lower() in {"1", "1.0", "true", "yes"}
+    blocked = next_open_limit_blocked(symbol, gap_pct, side, is_st=is_st)
+    if blocked:
+        return {"ok": False, "reason": blocked}
+
+    source = str(row.get("source") or "")
+    missing_tokens = {"", "nan", "none", "null", "<na>", "nat", "n/a", "na"}
+    if source.strip().lower() in missing_tokens:
+        return {"ok": False, "reason": "missing_evidence_source"}
+    timestamp_field = "fetched_at"
+    timestamp = str(row.get(timestamp_field) or "")
+    if timestamp.strip().lower() in missing_tokens:
+        timestamp_field = "updated_at"
+        timestamp = str(row.get(timestamp_field) or "")
+    if timestamp.strip().lower() in missing_tokens:
+        return {"ok": False, "reason": "missing_evidence_timestamp"}
+    try:
+        date.fromisoformat(trade_date)
+        if str(row.get("date") or "") != trade_date:
+            raise ValueError("bar date differs from the requested session")
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "price_evidence_date_mismatch"}
+    try:
+        if len(timestamp.strip()) <= 10:
+            raise ValueError("a date without a time is not a fetch timestamp")
+        datetime.fromisoformat(timestamp.strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "invalid_evidence_timestamp"}
+    evidence = {
+        "symbol": symbol,
+        "trade_date": trade_date,
+        "side": side,
+        "price_field": "open",
+        "price": float(open_px),
+        "price_basis": "raw",
+        "source": source,
+        "timestamp": timestamp,
+        "timestamp_field": timestamp_field,
+        timestamp_field: timestamp,
+        "volume": float(volume),
+    }
+    return {
+        "ok": True,
+        "reason": "",
+        "price": float(open_px),
+        "price_basis": "raw",
+        "evidence_source": source,
+        "evidence_timestamp": timestamp,
+        "price_evidence": evidence,
+    }
 
 
 __all__ = [
@@ -177,6 +279,7 @@ __all__ = [
     "declared_fill_policy",
     "default_policy_for_ledger",
     "ensure_declared_fill_policy",
+    "evaluate_next_open_fill",
     "get_policy",
     "next_open_limit_blocked",
     "policy_header",

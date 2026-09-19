@@ -51,8 +51,9 @@ class TestFetchNewsOffline(unittest.TestCase):
 class TestFetchNewsNetwork(unittest.TestCase):
     def test_network_fetch_success_caches(self) -> None:
         fake_items = [{"title": "Announcement A", "content": "Content A", "published": "2026-01-01", "source": "东方财富公告", "url": "http://a"}]
-        with mock.patch.object(news_provider, "_fetch_announce_eastmoney", return_value=fake_items), \
-             mock.patch.object(news_provider, "NEWS_DIR", Path("/tmp/test_news_cache_qd")):
+        with tempfile.TemporaryDirectory() as cache_dir, \
+             mock.patch.object(news_provider, "_fetch_announce_eastmoney", return_value=fake_items), \
+             mock.patch.object(news_provider, "NEWS_DIR", Path(cache_dir)):
             result = news_provider.fetch_news("000001", limit=10, network=True)
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "fetched")

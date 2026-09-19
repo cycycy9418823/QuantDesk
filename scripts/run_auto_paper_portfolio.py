@@ -29,6 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lookback-days", type=int, default=250)
     parser.add_argument("--trade-date", default="")
     parser.add_argument("--plan-date", default="")
+    parser.add_argument("--candidate-mode", choices=["formal", "legacy_diagnostic"], default="formal",
+                        help="Use target-date formal candidates; legacy_diagnostic is read-only and never applies paper actions.")
     parser.add_argument("--allow-same-day-rerun", action="store_true")
     parser.add_argument("--force-reset", action="store_true", help="Allow init to reset an existing automatic paper portfolio.")
     parser.add_argument("--dry-run", action="store_true")
@@ -54,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
         trade_date=args.trade_date,
         lookback_days=args.lookback_days,
         allow_same_day_rerun=args.allow_same_day_rerun,
+        candidate_mode=args.candidate_mode,
     )
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     return 0 if payload.get("ok") else 1

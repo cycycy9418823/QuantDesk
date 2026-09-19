@@ -55,8 +55,12 @@ def create_realtime_blueprint(deps: RealtimeRouteDeps) -> Blueprint:
     @bp.route("/api/realtime/market", methods=["GET", "POST"])
     def realtime_market() -> Any:
         body = request.get_json(silent=True) or {}
-        refresh = _truthy_text(request.args.get("refresh") or body.get("refresh"))
-        explicit_network = deps.request_truthy(request.args.get("network") or body.get("network"))
+        is_get = request.method == "GET"
+        # GET is a read-only cache view (B6): a query string must never turn a
+        # page load or a cross-site embed into a provider refresh.  Refresh
+        # intent is an explicit POST action that flows through the origin gate.
+        refresh = False if is_get else _truthy_text(body.get("refresh"))
+        explicit_network = False if is_get else deps.request_truthy(body.get("network"))
         payload = deps.realtime_market_summary(refresh=refresh, explicit_network=explicit_network)
         return jsonify(clean_payload(payload))
 
@@ -67,8 +71,8 @@ def create_realtime_blueprint(deps: RealtimeRouteDeps) -> Blueprint:
             limit = max(1, min(20, int(request.args.get("limit") or 8)))
         except (TypeError, ValueError):
             limit = 8
-        if request.args.get("refresh") in {"1", "true", "yes"}:
-            deps.refresh_spot_snapshot_cache(network=deps.realtime_network_enabled(), force=True)
+        # Search is read-only and the service switch stays separate from the
+        # query: no ``refresh`` mutation fires on a GET (B6).
         rows = deps.search_stock_rows(query, limit)
         return jsonify(
             clean_payload(
@@ -87,22 +91,17 @@ def create_realtime_blueprint(deps: RealtimeRouteDeps) -> Blueprint:
     @bp.route("/api/realtime/stock/<symbol>", methods=["GET"])
     def realtime_stock_detail(symbol: str) -> Any:
         clean_symbol = deps.normalize_symbol(symbol)
-        refresh_daily = _truthy_text(request.args.get("refresh_daily"))
-        refresh_quote = _truthy_text(request.args.get("refresh_quote") or "1")
-        explicit_network = deps.request_truthy(request.args.get("network"))
-        network_allowed = bool(deps.realtime_network_enabled() or explicit_network)
+        # GET is a read-only cache view (B6): quote/daily refresh and any
+        # network intent are explicit POST actions, never query-string side
+        # effects.  The master switch is still reported for transparency.
+        refresh_daily = False
+        refresh_quote = False
+        network_allowed = bool(deps.realtime_network_enabled())
         quote_refresh_result: dict[str, Any] = {"attempted": False}
-        if refresh_quote:
-            if network_allowed:
-                quote_refresh_result = deps.refresh_single_quote_cache(clean_symbol)
-                if not quote_refresh_result.get("ok") and deps.realtime_network_enabled():
-                    deps.maybe_start_realtime_background_refresh(force=False, reason=f"stock_detail:{clean_symbol}")
-            else:
-                quote_refresh_result = deps.refresh_spot_snapshot_cache(network=False, force=False)
         daily_refresh = deps.ensure_single_stock_daily_with_auth(
             clean_symbol,
-            refresh_daily=refresh_daily,
-            network_allowed=network_allowed,
+            refresh_daily=False,
+            network_allowed=False,
         )
         stock_df = deps.load_stock_data(clean_symbol)
         quote = deps.spot_quote_for_symbol(clean_symbol)
@@ -196,6 +195,46 @@ def create_realtime_blueprint(deps: RealtimeRouteDeps) -> Blueprint:
             "research_only": "Research Only；实时观察不覆盖正式日线，不接券商、不下单、不构成投资建议。",
         }
         return jsonify(clean_payload(payload))
+
+    @bp.route("/api/realtime/stock/<symbol>/refresh", methods=["POST"])
+    def realtime_stock_refresh(symbol: str) -> Any:
+        """Explicit single-stock refresh action (B6).
+
+        GET stock detail is cache-only; refreshing the quote and/or daily layer
+        is a deliberate POST that flows through the origin gate and the network
+        master switch plus the caller's explicit intent.
+        """
+        clean_symbol = deps.normalize_symbol(symbol)
+        body = request.get_json(silent=True) or {}
+        refresh_daily = _truthy_text(body.get("refresh_daily"))
+        refresh_quote = _truthy_text(body.get("refresh_quote", True))
+        network_allowed = bool(deps.realtime_network_enabled() or deps.request_truthy(body.get("network")))
+        quote_refresh_result: dict[str, Any] = {"attempted": False}
+        if refresh_quote:
+            if network_allowed:
+                quote_refresh_result = deps.refresh_single_quote_cache(clean_symbol)
+                if not quote_refresh_result.get("ok") and deps.realtime_network_enabled():
+                    deps.maybe_start_realtime_background_refresh(force=False, reason=f"stock_detail:{clean_symbol}")
+            else:
+                quote_refresh_result = deps.refresh_spot_snapshot_cache(network=False, force=False)
+        daily_refresh = deps.ensure_single_stock_daily_with_auth(
+            clean_symbol,
+            refresh_daily=refresh_daily,
+            network_allowed=network_allowed,
+        )
+        return jsonify(
+            clean_payload(
+                {
+                    "ok": True,
+                    "symbol": clean_symbol,
+                    "network_authorized": network_allowed,
+                    "quote_refresh": quote_refresh_result,
+                    "daily_refresh": daily_refresh,
+                    "temporary_quote_only": True,
+                    "message": "单股实时/日线刷新已按意图执行；不覆盖正式研究结论。",
+                }
+            )
+        )
 
     @bp.route("/api/realtime/watchlist", methods=["POST"])
     def realtime_add_watchlist() -> Any:

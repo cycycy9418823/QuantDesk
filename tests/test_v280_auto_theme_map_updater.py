@@ -213,6 +213,8 @@ class CLITests(unittest.TestCase):
     def test_local_source_no_network(self) -> None:
         import subprocess
 
+        from tests._isolated_project import IsolatedProject
+
         protected = tuple(
             PROJECT_ROOT / "data" / "universe" / name
             for name in (
@@ -223,33 +225,45 @@ class CLITests(unittest.TestCase):
             )
         )
         before = {path: path.read_bytes() for path in protected if path.exists()}
+        # Run the CLI inside a disposable clone seeded with a complete low-price
+        # pool, so the "local source" path is exercised without depending on the
+        # real machine's data/universe and without writing real project state.
         with tempfile.TemporaryDirectory() as tmp:
-            temp_root = Path(tmp)
-            output = temp_root / "stock_theme_map.csv"
-            pending = temp_root / "stock_theme_map_pending.csv"
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(PROJECT_ROOT / "scripts" / "update_stock_theme_map.py"),
-                    "--source",
-                    "local",
-                    "--limit",
-                    "3",
-                    "--output",
-                    str(output),
-                    "--pending-output",
-                    str(pending),
-                ],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("ok", result.stdout.lower() + result.stderr.lower())
-            self.assertTrue(output.exists())
-            self.assertTrue(pending.exists())
+            with IsolatedProject(PROJECT_ROOT, temp_parent=Path(tmp)) as project:
+                root = project.root
+                assert root is not None
+                universe = root / "data" / "universe"
+                universe.mkdir(parents=True, exist_ok=True)
+                (universe / "low_price_learning_symbols.csv").write_text(
+                    "symbol,name,included\n600000,浦发银行,true\n000001,平安银行,true\n",
+                    encoding="utf-8",
+                )
+                output = universe / "stock_theme_map.csv"
+                pending = universe / "stock_theme_map_pending.csv"
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(root / "scripts" / "update_stock_theme_map.py"),
+                        "--source",
+                        "local",
+                        "--limit",
+                        "3",
+                        "--output",
+                        str(output),
+                        "--pending-output",
+                        str(pending),
+                    ],
+                    cwd=root,
+                    env=project.subprocess_env(),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("ok", result.stdout.lower() + result.stderr.lower())
+                self.assertTrue(output.exists())
+                self.assertTrue(pending.exists())
 
         after = {path: path.read_bytes() for path in protected if path.exists()}
         self.assertEqual(before, after)

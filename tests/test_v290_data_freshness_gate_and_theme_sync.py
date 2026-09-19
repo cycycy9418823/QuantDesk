@@ -11,9 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 class TestV290DataFreshnessGateAndThemeSync(unittest.TestCase):
     def setUp(self) -> None:
-        tmp_root = PROJECT_ROOT / ".tmp"
-        tmp_root.mkdir(parents=True, exist_ok=True)
-        self.tmp_obj = tempfile.TemporaryDirectory(dir=tmp_root)
+        self.tmp_obj = tempfile.TemporaryDirectory()
         self.tmp = Path(self.tmp_obj.name)
 
     def tearDown(self) -> None:

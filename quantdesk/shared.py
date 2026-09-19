@@ -11,6 +11,7 @@ import csv
 import json
 import math
 import os
+import tempfile
 import time
 import uuid
 from datetime import date, datetime
@@ -198,7 +199,22 @@ def write_text(path: str | Path, text: str, *, trailing_newline: bool = True) ->
     content = str(text)
     if trailing_newline:
         content = content.rstrip() + "\n"
-    target.write_text(content, encoding="utf-8")
+    # Atomic replace: a partial write never truncates the previous file. Report
+    # and note writers use this helper, so an interrupted save (disk full,
+    # killed process) must leave the old bytes intact rather than half-written.
+    fd, temp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, target)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
     return target
 
 

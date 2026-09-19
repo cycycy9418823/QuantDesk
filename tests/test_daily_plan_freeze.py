@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -776,8 +778,10 @@ def test_freeze_rejects_valid_batch_bound_to_another_chain_run(tmp_path: Path) -
     assert output_path.read_bytes() == original
 
 
+@pytest.mark.parametrize("analysis_minute_requested", [False, True])
 def test_valid_post_close_run_freezes_t_plus_one_plan_with_chain_provenance(
     tmp_path: Path,
+    analysis_minute_requested: bool,
 ) -> None:
     from quantdesk.daily_plan_freeze import freeze_t_plus_one_plan
 
@@ -821,9 +825,15 @@ def test_valid_post_close_run_freezes_t_plus_one_plan_with_chain_provenance(
             "summary": {"symbol_count": 1},
         }
 
+    manifest = _completed_manifest()
+    if not analysis_minute_requested:
+        manifest["coverage"]["current_analysis_pool"] = {
+            "status": "not_requested", "requested_count": 0, "audited_count": 0,
+            "reason_codes": ["analysis_pool_minute_on_demand"],
+        }
     result = freeze_t_plus_one_plan(
         project_root=tmp_path,
-        data_chain_manifest=_completed_manifest(),
+        data_chain_manifest=manifest,
         now=datetime(2026, 7, 16, 18, 30, tzinfo=SHANGHAI),
         calendar_path=calendar_path,
         strategy_runner=strategy_runner,
@@ -1015,7 +1025,7 @@ def test_prepare_mode_returns_plan_without_overwriting_latest(tmp_path: Path) ->
     assert output_path.read_bytes() == original
 
 
-def test_authoritative_chain_is_blocked_when_plan_freeze_gate_fails(
+def test_authoritative_chain_preserves_completed_data_when_plan_freeze_gate_fails(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1161,6 +1171,9 @@ def test_authoritative_chain_is_blocked_when_plan_freeze_gate_fails(
         "_refresh_data_health_snapshot",
         lambda root, manifest: {"ok": True, "status": "refreshed"},
     )
+    universe = tmp_path / "data" / "universe" / "a_share_symbols.csv"
+    universe.parent.mkdir(parents=True, exist_ok=True)
+    universe.write_text("symbol,name\n600000,fixture\n", encoding="utf-8")
 
     payload = chain.run_daily_data_chain(
         project_root=tmp_path,
@@ -1172,9 +1185,13 @@ def test_authoritative_chain_is_blocked_when_plan_freeze_gate_fails(
     )
 
     assert len(freeze_calls) == 1
-    assert payload["status"] == "blocked"
-    assert payload["ok"] is False
+    assert payload["status"] == "completed"
+    assert payload["ok"] is True
     assert payload["components"]["conditional_plan_freeze"]["written"] is False
-    assert "conditional_plan_freeze_blocked" in payload["errors"]
+    assert payload["components"]["conditional_plan_freeze"]["reason_codes"] == [
+        "retroactive_generation_window_closed"
+    ]
+    assert "conditional_plan_freeze_blocked" in payload["warnings"]
+    assert "conditional_plan_freeze_blocked" not in payload["errors"]
     assert payload["published_latest"] is True
     assert order == ["candidate_refresh", "freeze"]

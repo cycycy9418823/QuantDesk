@@ -130,6 +130,13 @@ def to_tencent_symbol(symbol: Any) -> dict[str, Any]:
         market = "SH"
     elif normalized.startswith(("000", "001", "002", "003", "300", "301", "302")):
         market = "SZ"
+    elif normalized.startswith(("900", "200")):
+        # Shanghai/Shenzhen B-shares are not part of the Tencent A-share default
+        # route. An explicit ``.SH``/``.SZ`` suffix is handled above and still
+        # wins; a bare code must not be silently labelled BJ just because it
+        # starts with 9 or 2.
+        market = "UNSUPPORTED"
+        warnings.append("B 股代码（900/200）不在 Tencent A 股默认路由内，未发起默认请求。")
     elif normalized.startswith(("4", "8", "9")):
         market = "BJ"
         warnings.append("北交所或特殊代码，Tencent endpoint 兼容性需以实际返回为准。")
@@ -248,7 +255,11 @@ def fetch_realtime_quote(symbols: Any, *, network: bool = False, timeout: int = 
     """Fetch realtime quotes from ``qt.gtimg.cn`` when explicitly enabled."""
 
     started = time.perf_counter()
-    requested_symbols = [normalize_symbol(item) for item in ensure_list(symbols) if normalize_symbol(item)]
+    # Keep the raw inputs so an explicit market (``sh000001`` / ``900901.SH``)
+    # survives into request construction; the normalized six-digit form is only
+    # used for result keys and parsing.
+    raw_inputs = [item for item in ensure_list(symbols) if normalize_symbol(item)]
+    requested_symbols = [normalize_symbol(item) for item in raw_inputs]
     result = _base_result(QUOTE_PROVIDER, network=network)
     result["symbols"] = requested_symbols
     result["category"] = "market_quote"
@@ -260,7 +271,7 @@ def fetch_realtime_quote(symbols: Any, *, network: bool = False, timeout: int = 
             "suggested_next_action": "如需真实检查，请使用 --network true 或在 UI 中点击联网检查。",
         })
         return _finish_result(result, started)
-    converted = [to_tencent_symbol(item) for item in requested_symbols]
+    converted = [to_tencent_symbol(item) for item in raw_inputs]
     warnings = [warning for item in converted for warning in item.get("warnings", [])]
     query_symbols = [item["tencent_symbol"] for item in converted if item.get("tencent_symbol") and item.get("market") != "UNSUPPORTED"]
     if not query_symbols:
@@ -365,7 +376,7 @@ def fetch_daily_bars(
             "suggested_next_action": "如需真实检查，请使用 --network true 或在 UI 中点击联网检查。",
         })
         return _finish_result(result, started)
-    converted = to_tencent_symbol(norm)
+    converted = to_tencent_symbol(symbol)
     result["warnings"].extend(converted.get("warnings", []))
     if not converted.get("tencent_symbol") or converted.get("market") == "UNSUPPORTED":
         _set_failed(result, reason="; ".join(result["warnings"]) or "Unsupported Tencent symbol.", failed_type="unsupported_symbol")
@@ -474,7 +485,7 @@ def fetch_intraday_bars(
             "suggested_next_action": "请导入历史 1 分钟线 CSV，或在目标交易日盘后尝试当日 provider。",
         })
         return _finish_result(result, started)
-    converted = to_tencent_symbol(norm)
+    converted = to_tencent_symbol(symbol)
     result["warnings"].extend(converted.get("warnings", []))
     if not converted.get("tencent_symbol") or converted.get("market") == "UNSUPPORTED":
         _set_failed(result, reason="; ".join(result["warnings"]) or "Unsupported Tencent symbol.", failed_type="unsupported_symbol")
@@ -529,7 +540,7 @@ def fetch_valuation(symbol: str, *, network: bool = False, timeout: int = 8) -> 
     result = _base_result(VALUATION_PROVIDER, network=network)
     norm = normalize_symbol(symbol)
     result.update({"symbol": norm, "category": "valuation"})
-    quote = fetch_realtime_quote([norm], network=network, timeout=timeout)
+    quote = fetch_realtime_quote([symbol], network=network, timeout=timeout)
     result["provider_chain"] = [VALUATION_PROVIDER, *quote.get("provider_chain", [])]
     result["data_source_trace"] = result["provider_chain"]
     if not network:

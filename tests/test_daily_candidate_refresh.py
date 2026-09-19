@@ -794,7 +794,62 @@ def test_candidate_refresh_gate_rejects_noncanonical_raw_universe_symbols(
     assert "upstream_universe_symbols_invalid" in gate["reason_codes"]
 
 
-def test_candidate_refresh_gate_blocks_session_unknown_outside_daily_exclusions() -> None:
+def _current_daily_unknown_session_manifest() -> dict:
+    manifest = _passed_manifest()
+    session = manifest["components"]["session_expectation"]
+    session.update({
+        "status": "blocked", "formal_eligible": False, "unknown_symbols": ["600001"],
+        "classification_counts": {"expected_trade": 1, "unknown": 1},
+        "counts": {"expected_trade": 1, "unknown": 1},
+        "per_symbol": {"600001": {
+            "symbol": "600001", "classification": "unknown", "status": "unknown",
+            "reason_code": "zero_volume_without_verified_suspension",
+            "evidence": [{"source": "daily", "price_basis": "raw", "target_count": 1}],
+        }},
+    })
+    manifest["coverage"]["session_expectation"] = {
+        "status": "blocked", "unknown_count": 1, "unknown_symbols": ["600001"],
+    }
+    return manifest
+
+
+def test_candidate_refresh_excludes_witnessed_unknown_session_with_current_daily() -> None:
+    manifest = _current_daily_unknown_session_manifest()
+
+    gate = candidate_refresh_gate(manifest)
+
+    assert gate["status"] == "passed", gate["reason_codes"]
+    assert gate["eligible_symbols"] == ["600000"]
+    assert gate["excluded_symbols"] == ["600001"]
+    assert gate["exclusions"][0]["reason_codes"] == ["session_expectation_unknown"]
+    assert gate["exclusions"][0]["session_evidence"] == manifest["components"]["session_expectation"]["per_symbol"]["600001"]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "wrong_symbol", "wrong_class", "no_reason", "no_evidence", "bad_count"])
+def test_candidate_refresh_rejects_unproved_unknown_session(mutation: str) -> None:
+    manifest = _current_daily_unknown_session_manifest()
+    session = manifest["components"]["session_expectation"]
+    evidence = session["per_symbol"]["600001"]
+    if mutation == "missing":
+        session.pop("per_symbol")
+    elif mutation == "wrong_symbol":
+        evidence["symbol"] = "600002"
+    elif mutation == "wrong_class":
+        evidence["classification"] = "expected_trade"
+    elif mutation == "no_reason":
+        evidence["reason_code"] = ""
+    elif mutation == "no_evidence":
+        evidence["evidence"] = []
+    elif mutation == "bad_count":
+        manifest["coverage"]["session_expectation"]["unknown_count"] = 2
+
+    gate = candidate_refresh_gate(manifest)
+
+    assert gate["status"] == "blocked"
+    assert "upstream_session_expectation_not_passed" in gate["reason_codes"]
+
+
+def test_candidate_refresh_gate_blocks_session_unknown_outside_universe() -> None:
     manifest = _degraded_914_manifest()
     manifest["components"]["session_expectation"]["symbols"].append("999999")
     manifest["components"]["session_expectation"]["unknown_symbols"].append(
@@ -892,7 +947,7 @@ def test_candidate_refresh_scopes_strategy_runner_to_gate_eligible_universe(
 ) -> None:
     manifest = _degraded_914_manifest()
     universe_path = (
-        tmp_path / "data" / "universe" / "low_price_learning_symbols.csv"
+        tmp_path / "data" / "universe" / "a_share_symbols.csv"
     )
     universe_path.parent.mkdir(parents=True)
     universe_path.write_text(
@@ -1561,6 +1616,11 @@ def test_custom_root_requires_explicit_strategy_runner(tmp_path: Path) -> None:
 
 
 def test_custom_root_uses_only_the_explicit_strategy_runner(tmp_path: Path) -> None:
+    universe = tmp_path / "data" / "universe" / "a_share_symbols.csv"
+    universe.parent.mkdir(parents=True)
+    universe.write_text(
+        "symbol,name\n600000,fixture\n600001,fixture\n", encoding="utf-8"
+    )
     calls: list[dict] = []
 
     def injected_runner(**kwargs) -> dict:

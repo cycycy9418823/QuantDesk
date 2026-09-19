@@ -8,6 +8,7 @@ tasks are left disabled. Resume only re-enables what this command paused.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Callable
@@ -32,21 +33,49 @@ def _query_task(name: str, runner: Callable[..., subprocess.CompletedProcess[str
         encoding="utf-8",
         errors="replace",
     )
+    raw_error = (completed.stderr or completed.stdout or "").strip()
     if completed.returncode != 0:
-        return {"name": name, "exists": False, "state": "missing", "raw": completed.stderr.strip()}
+        lowered_error = raw_error.lower()
+        missing_markers = (
+            "not found",
+            "cannot find",
+            "does not exist",
+            "找不到",
+            "不存在",
+        )
+        missing = any(marker in lowered_error for marker in missing_markers)
+        return {
+            "name": name,
+            "exists": not missing,
+            "state": "missing" if missing else "unknown",
+            "query_failed": not missing,
+            "error": raw_error,
+            "raw": raw_error,
+        }
     state = "unknown"
-    for line in (completed.stdout or "").splitlines():
-        if "Status:" in line or "状态:" in line or "Status：" in line:
-            state = line.split(":", 1)[-1].strip() or "unknown"
+    output = completed.stdout or ""
+    for line in output.splitlines():
+        normalized = line.replace("：", ":").strip()
+        match = re.match(r"^(?:status|状态)\s*:\s*(.*?)\s*$", normalized, re.IGNORECASE)
+        if match:
+            state = match.group(1).strip() or "unknown"
             break
-    lowered = (completed.stdout or "").lower()
-    if "disabled" in lowered or "已禁用" in (completed.stdout or ""):
-        state = "Disabled"
-    elif "ready" in lowered or "就绪" in (completed.stdout or ""):
-        state = "Ready"
-    elif "running" in lowered:
-        state = "Running"
-    return {"name": name, "exists": True, "state": state, "raw": ""}
+    return {"name": name, "exists": True, "state": state, "query_failed": False, "error": "", "raw": ""}
+
+
+def _is_running_state(state: Any) -> bool:
+    text = str(state or "").strip().lower()
+    return text in {"running", "正在运行", "运行中"} or "running" in text or "正在运行" in text or "运行中" in text
+
+
+def _is_stopped_state(state: Any) -> bool:
+    text = str(state or "").strip().lower()
+    return text in {"ready", "disabled", "就绪", "准备就绪", "已禁用"}
+
+
+def _is_disabled_state(state: Any) -> bool:
+    text = str(state or "").strip().lower()
+    return text in {"disabled", "已禁用"} or "disabled" in text or "已禁用" in text
 
 
 def _set_task(name: str, enable: bool, runner: Callable[..., subprocess.CompletedProcess[str]]) -> dict[str, Any]:
@@ -127,20 +156,51 @@ def pause_writers(
             if not item["exists"]:
                 skipped.append(name)
                 continue
+            if item.get("query_failed"):
+                failed.append(name)
+                writer_stops.append(
+                    {
+                        "name": name,
+                        "stop": "failed",
+                        "detail": str(item.get("error") or "scheduler_query_failed"),
+                    }
+                )
+                continue
             state = str(item["state"] or "")
-            if state.lower() == "disabled":
+            if _is_disabled_state(state):
                 skipped.append(name)
                 continue
-            if state.lower() == "running":
+            if _is_running_state(state):
                 ended = _end_task(name, run)
                 actions.append(ended)
                 if not ended["ok"]:
                     failed.append(name)
                     writer_stops.append({"name": name, "stop": "failed", "detail": ended.get("error") or ""})
                     continue
-                writer_stops.append({"name": name, "stop": "stopped"})
-            else:
+                after_end = _query_task(name, run)
+                if after_end.get("query_failed"):
+                    failed.append(name)
+                    writer_stops.append(
+                        {
+                            "name": name,
+                            "stop": "waiting",
+                            "detail": str(after_end.get("error") or "scheduler_query_failed"),
+                        }
+                    )
+                elif _is_running_state(after_end.get("state")):
+                    failed.append(name)
+                    writer_stops.append({"name": name, "stop": "waiting", "detail": "task_still_running"})
+                elif _is_stopped_state(after_end.get("state")):
+                    writer_stops.append({"name": name, "stop": "stopped"})
+                else:
+                    failed.append(name)
+                    writer_stops.append({"name": name, "stop": "waiting", "detail": "stop_not_proven"})
+            elif _is_stopped_state(state):
                 writer_stops.append({"name": name, "stop": "not_running_schedule_disabled"})
+            else:
+                failed.append(name)
+                writer_stops.append({"name": name, "stop": "failed", "detail": "unknown_task_state"})
+                continue
             result = _set_task(name, False, run)
             actions.append(result)
             if result["ok"]:

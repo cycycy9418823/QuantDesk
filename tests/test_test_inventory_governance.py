@@ -60,7 +60,10 @@ class TestInventoryGovernanceTests(unittest.TestCase):
     def test_002b_versioned_acceptance_tests_are_legacy_tier(self) -> None:
         records = self.payload["records"]
         versioned = [record for record in records if re.match(r"test_v\d", record["name"])]
-        self.assertGreater(len(versioned), 100)
+        # R4 slim: the old tree had >100 versioned files. The new whitelist
+        # keeps a smaller but still non-trivial legacy set (currently 77).
+        self.assertGreater(len(versioned), 50)
+        self.assertLess(len(versioned), 100)
         self.assertTrue(all(record["tier"] == "legacy_versioned_acceptance" for record in versioned))
 
     def test_003_cli_summary_json(self) -> None:

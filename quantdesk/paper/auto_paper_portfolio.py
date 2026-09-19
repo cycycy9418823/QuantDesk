@@ -27,14 +27,18 @@ from quantdesk.daily_candidate_refresh import (
     build_candidate_envelope,
     build_conditional_replay_receipt,
     enrich_legacy_due_plan_candidate_envelopes,
+    formal_candidate_strategy_payload,
     load_archived_conditional_plan,
+    load_formal_candidate_intake,
     publish_archived_conditional_plan,
 )
 from quantdesk.data_freshness_gate import (
     evaluate_data_freshness,
+    evaluate_paper_review_freshness,
     waiting_decision_review,
     waiting_yesterday_holding_review,
 )
+from quantdesk.data_truth.daily_bar_validity import daily_bar_validity_from_row
 from quantdesk.intraday.intraday_gap_checker import intraday_gap_status
 from quantdesk.intraday.intraday_swing_strategy import build_swing_plan
 from quantdesk.intraday_execution import simulate_intraday_plan
@@ -64,6 +68,15 @@ from quantdesk.paper.position_management_engine import (
     simulate_conditional_plan_file,
 )
 from quantdesk.paper.state_store import PaperStateStore
+from quantdesk.price_basis import classify_frame_price_basis
+from quantdesk.plan_review_receipts import (
+    bind_plan_replay_receipt,
+    inspect_plan_minute_inputs,
+    load_plan_review_snapshot,
+    plan_review_snapshot,
+    publish_plan_review_receipt,
+)
+from quantdesk.daily_price_update_engine import infer_target_date
 from quantdesk.paper.trade_costs import buy_cash_outflow, compute_trade_costs, sell_cash_inflow
 from quantdesk.risk.risk_gate_shadow import (
     build_legacy_blocked_shadow_record,
@@ -348,9 +361,21 @@ def _write_auto_paper_state(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _write_auto_paper_latest(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Persist a canonical latest snapshot without mutating the source state."""
+    """Persist a canonical latest snapshot without mutating the source state.
 
-    normalized = reconcile_paper_account(snapshot)
+    A snapshot is assembled with its money detail under ``summary``; without
+    promoting the missing top-level fields here, ``reconcile_paper_account``
+    would read absent ``cash`` as zero and publish a cash/equity that disagrees
+    with the real ledger and the summary it carries.
+    """
+
+    prepared = dict(snapshot)
+    summary = prepared.get("summary")
+    if isinstance(summary, dict):
+        for key in ("cash", "market_value", "total_equity", "realized_pnl", "unrealized_pnl", "initial_cash"):
+            if prepared.get(key) is None and summary.get(key) is not None:
+                prepared[key] = summary[key]
+    normalized = reconcile_paper_account(prepared)
     atomic_write_json(AUTO_PAPER_PORTFOLIO_LATEST_JSON, normalized)
     return normalized
 
@@ -438,6 +463,47 @@ def _archive_project_root() -> Path:
     """
 
     return RESULTS_DIR.parent
+
+
+def _attach_bound_replay_review(
+    payload: dict[str, Any], *, source_plan: dict[str, Any] | None,
+    replay_receipt: dict[str, Any] | None, input_evidence: list[dict[str, Any]] | None,
+    applied_ids: list[str], dry_run: bool,
+) -> None:
+    """Keep the v1 rollover receipt and separately archive plan-bound evidence."""
+    if source_plan is None or replay_receipt is None:
+        return
+    root = _archive_project_root()
+    try:
+        original = load_archived_conditional_plan(root, trade_date=str(source_plan.get("trade_date") or ""))
+        if original.get("status") != "passed" or original.get("plan") != source_plan:
+            payload["plan_replay_receipt"] = {"status": "legacy_unbound", "reason_codes": ["replay_source_archive_not_proven"]}
+            return
+        checked_at = now_text()
+        bound = bind_plan_replay_receipt(
+            root, source_plan, replay_receipt, checked_at=checked_at,
+            intraday_dir=INTRADAY_DIR / "1m", input_evidence=input_evidence,
+        )
+        payload["plan_replay_receipt"] = bound
+        archive_reasons: list[str] = []
+        if not dry_run:
+            archived = publish_plan_review_receipt(root, bound, plan=source_plan)
+            payload["plan_replay_receipt_archive"] = archived
+            if archived.get("status") not in {"completed", "idempotent"}:
+                archive_reasons = list(archived.get("reason_codes") or ["plan_replay_receipt_archive_failed"])
+                payload.setdefault("warnings", []).extend(archive_reasons)
+        snapshot = plan_review_snapshot(
+            root, trade_date=str(source_plan["trade_date"]), checked_at=checked_at,
+            applied_execution_ids=applied_ids, simulation_enabled=True,
+            write=not dry_run, review_current=False,
+            extra_replay_receipts=[bound] if dry_run else [],
+            additional_reason_codes=archive_reasons,
+        )
+        payload.update(snapshot)
+    except Exception as exc:  # noqa: BLE001 - preserve a failed evidence step
+        reason = f"plan_replay_receipt_failed:{type(exc).__name__}:{exc}"
+        payload["plan_replay_receipt"] = {"status": "blocked", "reason_codes": [reason]}
+        payload.setdefault("warnings", []).append(reason)
 
 
 def _conditional_execution_path() -> Path:
@@ -549,6 +615,14 @@ def _read_daily_bars(symbol: str) -> pd.DataFrame:
         "最低": "low",
     }
     df = df.rename(columns={key: value for key, value in rename.items() if key in df.columns and value not in df.columns})
+    # Classify the original frame before any date parse/sort/dedup or numeric
+    # coercion, so a mixed/unknown basis cannot be silently treated as raw.
+    try:
+        basis, basis_reason = classify_frame_price_basis(df)
+    except Exception:  # noqa: BLE001 - classification must never break a reader
+        basis, basis_reason = "unknown", "unknown_price_basis"
+    df.attrs["price_basis"] = basis
+    df.attrs["price_basis_reason"] = basis_reason
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
@@ -557,14 +631,41 @@ def _read_daily_bars(symbol: str) -> pd.DataFrame:
     return df
 
 
-def _latest_daily_quote(symbol: str) -> dict[str, Any]:
+def _last_tradable_close(df: pd.DataFrame) -> float | None:
+    """Most recent close whose row is a genuine trading bar (not a suspension)."""
+
+    for _, row in df.iloc[::-1].iterrows():
+        ok, _reason = daily_bar_validity_from_row(row.to_dict())
+        if ok:
+            price = safe_float(row.get("close"), None)
+            if price is not None and price > 0:
+                return price
+    return None
+
+
+def _latest_daily_quote(symbol: str, *, decision_date: str | None = None) -> dict[str, Any]:
     df = _read_daily_bars(symbol)
     warnings = [str(item) for item in df.attrs.get("warnings", [])]
+    code = normalize_symbol(symbol)
     if df.empty or "close" not in df.columns:
-        return {"price": None, "date": "", "source": "missing_daily", "warnings": warnings}
+        warnings.append(f"missing_daily_quote:{code}")
+        return {
+            "price": None,
+            "date": "",
+            "source": "missing_daily",
+            "missing": True,
+            "warnings": warnings,
+        }
     valid = df.dropna(subset=["close"])
     if valid.empty:
-        return {"price": None, "date": "", "source": "missing_close", "warnings": warnings}
+        warnings.append(f"missing_close:{code}")
+        return {
+            "price": None,
+            "date": "",
+            "source": "missing_close",
+            "missing": True,
+            "warnings": warnings,
+        }
     row = valid.iloc[-1]
     date_value = row.get("date", "")
     if pd.notna(date_value):
@@ -575,12 +676,118 @@ def _latest_daily_quote(symbol: str) -> dict[str, Any]:
     else:
         date_text = ""
     price = safe_float(row.get("close"), None)
-    return {"price": price, "date": date_text, "source": "daily_cache", "warnings": warnings}
+    quote: dict[str, Any] = {
+        "price": price,
+        "date": date_text,
+        "source": "daily_cache",
+        "warnings": warnings,
+        "price_basis": str(df.attrs.get("price_basis") or ""),
+        "price_basis_reason": str(df.attrs.get("price_basis_reason") or ""),
+        # Raw bar fields let a *fill* decision distinguish a genuine tradeable
+        # session from a zero-volume suspension or a one-word limit board. They
+        # are evidence about today's bar, never a substitute for a fill.
+        "open": safe_float(row.get("open"), None),
+        "high": safe_float(row.get("high"), None),
+        "low": safe_float(row.get("low"), None),
+        "close": safe_float(row.get("close"), None),
+        "volume": safe_float(row.get("volume"), None),
+        "pct_chg": safe_float(row.get("pct_chg"), None),
+    }
+    basis_reason = str(df.attrs.get("price_basis_reason") or "")
+    if basis_reason:
+        warnings.append(
+            f"price_basis_untrusted:{code}:{quote['price_basis'] or 'unknown'}:{basis_reason}"
+        )
+        if basis_reason == "mixed_price_basis":
+            quote["price_basis_untrusted"] = True
+    # A zero-volume flat bar is how vendors encode "suspended today" (see
+    # quantdesk/data_truth/daily_bar_validity.py). Mark it so the valuation
+    # policy freezes at the last genuinely tradable price instead of treating a
+    # non-trading row as a fresh mark.
+    ok, reason = daily_bar_validity_from_row(row.to_dict())
+    if not ok and "volume_not_positive" in reason:
+        last_tradable = _last_tradable_close(df)
+        if last_tradable is not None:
+            quote["price"] = last_tradable
+            quote["last_tradable_price"] = last_tradable
+        quote.update(
+            {
+                "suspended": True,
+                "is_suspended": True,
+                "suspend_type": "zero_volume_flat",
+                "suspend_reason": reason,
+            }
+        )
+        warnings.append(f"suspended_daily_bar:{code}:{date_text}")
+    if decision_date and date_text and str(decision_date)[:10] > date_text:
+        quote["stale"] = True
+        warnings.append(f"stale_daily_quote:{code}:{date_text}->{str(decision_date)[:10]}")
+    return quote
 
 
 def _quote_warnings(symbol: Any, quote: dict[str, Any]) -> list[str]:
     code = normalize_symbol(symbol)
     return [f"{code}: {warning}" for warning in quote.get("warnings") or []]
+
+
+def _daily_price_basis(symbol: Any) -> tuple[str, str]:
+    """Price basis of the symbol's original daily frame: ``(basis, reason)``.
+
+    Mirrors the AI book's evidence requirement: a fill may not be booked when
+    the local daily frame is ``mixed``/``unknown``. A known basis (raw/qfq/hfq)
+    is returned with an empty reason.
+    """
+
+    df = _read_daily_bars(str(symbol or ""))
+    return (
+        str(df.attrs.get("price_basis") or ""),
+        str(df.attrs.get("price_basis_reason") or ""),
+    )
+
+
+def _basis_fill_rejection(symbol: Any) -> str:
+    """Human reason when the symbol's price basis must block a paper fill."""
+
+    basis, reason = _daily_price_basis(symbol)
+    if not reason:
+        return ""
+    return (
+        f"价格口径不可用于成交（{reason or 'unknown_price_basis'}"
+        f"{'; basis=' + basis if basis else ''}），拒绝模拟买入。"
+    )
+
+
+def _fill_tradability_rejection(quote: dict[str, Any], side: str, *, require_quote: bool = False) -> str:
+    """Reason this bar cannot support a real paper fill, else ``""``.
+
+    Mirrors the AI book's fill reality: a book entry needs today's *tradeable*
+    bar, not a stale carried valuation. Zero-volume suspension and a one-word
+    limit board (up for a buy, down for a sell) cannot be filled at the open.
+    A missing quote only blocks when ``require_quote`` (exits must not fall back
+    to yesterday's mark); buys may still price off the committed candidate.
+    """
+
+    label = "买入" if side == "buy" else "卖出"
+    price = safe_float(quote.get("price"), None)
+    if require_quote and (quote.get("missing") or price is None or price <= 0):
+        return f"缺少当日成交证据（{quote.get('source') or 'missing'}），拒绝模拟{label}。"
+    volume = safe_float(quote.get("volume"), None)
+    if quote.get("suspended") or quote.get("is_suspended") or (volume is not None and volume <= 0):
+        return f"当日零成交量（停牌或无成交），无法确认成交，拒绝模拟{label}。"
+    basis_reason = str(quote.get("price_basis_reason") or "")
+    if basis_reason in {"mixed_price_basis", "unknown_price_basis"} or quote.get("price_basis_untrusted"):
+        return f"价格口径不可用于成交（{basis_reason or 'unknown_price_basis'}），拒绝模拟{label}。"
+    open_px = safe_float(quote.get("open"), None)
+    high = safe_float(quote.get("high"), None)
+    low = safe_float(quote.get("low"), None)
+    close = safe_float(quote.get("close"), None)
+    pct = safe_float(quote.get("pct_chg"), None)
+    one_word = open_px is not None and open_px == high == low == close and (close or 0) > 0
+    if one_word and side == "buy" and pct is not None and pct >= 9.8:
+        return "当日一字涨停，开盘无法买入，拒绝模拟买入。"
+    if one_word and side == "sell" and pct is not None and pct <= -9.8:
+        return "当日一字跌停，无法卖出，拒绝模拟卖出。"
+    return ""
 
 
 def _read_intraday_bars(symbol: str, source: str = "1m") -> pd.DataFrame | None:
@@ -914,8 +1121,12 @@ def _mark_position(
     position["hold_reason"] = hold_reason
     position["sector"] = position.get("sector") or "未知板块"
     position["primary_theme"] = position.get("primary_theme") or "未知题材"
-    quote = quote if isinstance(quote, dict) else _latest_daily_quote(position.get("symbol"))
+    quote = quote if isinstance(quote, dict) else _latest_daily_quote(position.get("symbol"), decision_date=decision_date)
     position["latest_date"] = quote.get("date") or position.get("latest_date") or decision_date
+    quote_warnings = [str(item) for item in (quote.get("warnings") or [])]
+    if quote_warnings:
+        seen = list(position.get("valuation_warnings") or [])
+        position["valuation_warnings"] = seen + [w for w in quote_warnings if w not in seen]
     position = apply_suspension_valuation_policy(position, quote)
     adjusted_price = safe_float(position.get("latest_price"), latest_price) or latest_price
     position = apply_paper_adjustment_policy(
@@ -1559,6 +1770,7 @@ def _run_conditional_auto_paper_update(
     formal_candidate_batch_path: Path | str | None = None,
     formal_candidate_status: str = "",
     publish_next_plan: bool = True,
+    review_target_date: str = "",
 ) -> dict[str, Any]:
     state = _load_state(initial_cash)
     candidate_input_source = (
@@ -1577,7 +1789,11 @@ def _run_conditional_auto_paper_update(
     previous_positions = [dict(row) for row in state.get("positions") or []]
     previous_actions = list(state.get("daily_actions") or state.get("actions") or [])
     previous_total_equity = _total_equity_from_state(state)
-    freshness_gate = evaluate_data_freshness()
+    freshness_gate = (
+        evaluate_paper_review_freshness(state, target_date=review_target_date, daily_dir=DAILY_DIR)
+        if review_target_date else evaluate_data_freshness()
+    )
+    candidate_intake = dict((auto_strategy_payload or {}).get("candidate_intake") or {})
     if not freshness_gate.get("can_review_yesterday_positions", True):
         decision_date = str(freshness_gate.get("target_complete_trade_date") or now_text())[:10]
         actions: list[dict[str, Any]] = []
@@ -1598,6 +1814,8 @@ def _run_conditional_auto_paper_update(
             "quantity_per_stock": round_down_to_lot(quantity_per_stock),
             "source": "conditional_position_management",
             "input_source": candidate_input_source,
+            "candidate_intake": candidate_intake,
+            "warnings": list(candidate_intake.get("reason_codes") or []),
             "task_type": "conditional_position_management",
             "scope": "low_price_included_only",
             "network": False,
@@ -1703,7 +1921,8 @@ def _run_conditional_auto_paper_update(
         state_path=AUTO_PAPER_PORTFOLIO_STATE_JSON,
         daily_dir=DAILY_DIR,
         daily_feature_path=DAILY_FEATURE_LATEST_CSV,
-        low_price_universe_path=LOW_PRICE_UNIVERSE_CSV,
+        low_price_universe_path=None,
+        project_root=_archive_project_root(),
     )
     due_trade_date = str(plan_payload.get("plan_date") or "")[:10]
     archive_root = _archive_project_root()
@@ -1735,6 +1954,8 @@ def _run_conditional_auto_paper_update(
         and isinstance(due_loaded.get("plan"), dict)
         else None
     )
+    due_source_plan = copy.deepcopy(due_plan_payload)
+    replay_input_evidence = None
     due_plan_enrichment: dict[str, Any] = {
         "status": "not_applicable",
         "target_date": "",
@@ -1773,6 +1994,7 @@ def _run_conditional_auto_paper_update(
         if isinstance(enriched_plan, dict):
             due_plan_payload = enriched_plan
     if due_plan_payload is not None:
+        replay_input_evidence = inspect_plan_minute_inputs(archive_root, due_source_plan, intraday_dir=INTRADAY_DIR / "1m")
         execution_payload = simulate_conditional_plan_file(
             due_plan_payload,
             intraday_dir=INTRADAY_DIR,
@@ -1902,6 +2124,8 @@ def _run_conditional_auto_paper_update(
         "quantity_per_stock": round_down_to_lot(quantity_per_stock),
         "source": "conditional_position_management",
         "input_source": candidate_input_source,
+        "candidate_intake": candidate_intake,
+        "warnings": list(candidate_intake.get("reason_codes") or []),
         "task_type": "conditional_position_management",
         "scope": "low_price_included_only",
         "network": False,
@@ -1968,6 +2192,12 @@ def _run_conditional_auto_paper_update(
                 write_error=not dry_run,
             )
     persisted_apply_state: dict[str, Any] | None = None
+    if dry_run:
+        _attach_bound_replay_review(
+            latest, source_plan=due_source_plan, replay_receipt=replay_receipt,
+            input_evidence=replay_input_evidence,
+            applied_ids=list(latest_state.get("applied_execution_ids") or []), dry_run=True,
+        )
     if not dry_run:
         if risk_gate_shadow_summary is not None:
             try:
@@ -2006,6 +2236,11 @@ def _run_conditional_auto_paper_update(
                 captured_at=now_text(),
             )
             latest["replay_receipt"] = replay_receipt
+        _attach_bound_replay_review(
+            latest, source_plan=due_source_plan, replay_receipt=replay_receipt,
+            input_evidence=replay_input_evidence,
+            applied_ids=list((persisted_apply_state or latest_state).get("applied_execution_ids") or []), dry_run=False,
+        )
         if not apply_result.get("already_updated_today"):
             latest = _write_auto_paper_latest(latest)
             history = _append_history(latest)
@@ -2048,24 +2283,44 @@ def _run_auto_paper_portfolio_unlocked(
     formal_candidate_batch_path: Path | str | None = None,
     formal_candidate_status: str = "",
     publish_next_plan: bool = True,
+    review_target_date: str = "",
+    candidate_mode: str = "formal",
 ) -> dict[str, Any]:
     """Initialize or update the persistent automatic paper portfolio."""
 
     mode = "update" if str(mode) == "update" else "init"
     quantity = round_down_to_lot(quantity_per_stock)
-    if formal_candidate_batch is not None or formal_candidate_status:
-        auto_payload = _formal_batch_strategy_payload(
-            formal_candidate_batch,
-            formal_candidate_batch_path,
+    if candidate_mode == "legacy_diagnostic":
+        diagnostic = build_conditional_trade_plan(
+            auto_strategy_payload=auto_strategy_payload, candidate_mode=candidate_mode,
+            strategy=strategy, quantity_per_stock=quantity_per_stock,
+            plan_date=plan_date, trade_date=trade_date, lookback_days=lookback_days,
+            write=False, auto_strategy_path=auto_strategy_path or AUTO_STRATEGY_LATEST_JSON,
+            state_path=AUTO_PAPER_PORTFOLIO_STATE_JSON, daily_dir=DAILY_DIR,
+            daily_feature_path=DAILY_FEATURE_LATEST_CSV, low_price_universe_path=None,
+            project_root=_archive_project_root(),
         )
-        auto_strategy_input_source = (
-            "formal_candidate_batch"
-            if formal_candidate_status == "passed" and formal_candidate_batch is not None
-            else f"formal_candidate_batch_{formal_candidate_status or 'missing'}"
-        )
-    else:
-        auto_payload = auto_strategy_payload if isinstance(auto_strategy_payload, dict) else _load_auto_strategy(auto_strategy_path or AUTO_STRATEGY_LATEST_JSON)
-        auto_strategy_input_source = "in_memory" if isinstance(auto_strategy_payload, dict) else "latest_file_fallback"
+        diagnostic.update({"mode": "diagnostic", "dry_run": True, "input_source": "legacy_diagnostic", "ledger_write": False})
+        return diagnostic
+    if candidate_mode != "formal":
+        raise ValueError("candidate_mode must be formal or legacy_diagnostic")
+    supplied = auto_strategy_payload if isinstance(auto_strategy_payload, dict) else {}
+    formal_candidate_batch = formal_candidate_batch if formal_candidate_batch is not None else supplied.get("formal_candidate_batch")
+    formal_candidate_batch_path = formal_candidate_batch_path or supplied.get("formal_candidate_batch_path")
+    formal_candidate_status = formal_candidate_status or str(supplied.get("formal_candidate_status") or "")
+    candidate_target = str(plan_date or review_target_date or (formal_candidate_batch or {}).get("target_date") or infer_target_date()[0])[:10]
+    intake = load_formal_candidate_intake(
+        _archive_project_root(), target_date=candidate_target, batch=formal_candidate_batch,
+        batch_path=formal_candidate_batch_path, status=formal_candidate_status,
+    )
+    if supplied and "formal_candidate_batch" not in supplied:
+        intake["reason_codes"] = [*intake.get("reason_codes", []), "legacy_candidate_payload_ignored"]
+    auto_payload = formal_candidate_strategy_payload(intake)
+    auto_strategy_input_source = str(intake["input_source"])
+    formal_candidate_batch_path = intake.get("path") or None
+    formal_candidate_status = str(intake.get("status") or "blocked")
+    review_target_date = review_target_date or candidate_target
+    plan_date = plan_date or candidate_target
     candidates = candidate_rows_from_strategy_payload(auto_payload, strategy=strategy)
     decision_date = str(auto_payload.get("generated_at") or now_text())[:10]
     candidate_source_for_risk = (
@@ -2117,16 +2372,18 @@ def _run_auto_paper_portfolio_unlocked(
             state_path=AUTO_PAPER_PORTFOLIO_STATE_JSON,
             daily_dir=DAILY_DIR,
             daily_feature_path=DAILY_FEATURE_LATEST_CSV,
-            low_price_universe_path=LOW_PRICE_UNIVERSE_CSV,
+            low_price_universe_path=None,
+            project_root=_archive_project_root(),
         )
         payload.update({
             "task_type": "conditional_position_management",
-            "scope": "low_price_included_only",
+            "scope": "formal_candidates_and_positions",
             "network": False,
             "full_scan": False,
             "user_triggered": True,
             "dry_run": bool(dry_run),
             "input_source": auto_strategy_input_source,
+            "candidate_intake": {key: value for key, value in intake.items() if key != "batch"},
         })
         return payload
     if simulate_conditional_plan:
@@ -2169,6 +2426,7 @@ def _run_auto_paper_portfolio_unlocked(
             formal_candidate_batch_path=formal_candidate_batch_path,
             formal_candidate_status=formal_candidate_status,
             publish_next_plan=publish_next_plan,
+            review_target_date=review_target_date,
         )
     state = (
         _empty_state(initial_cash)
@@ -2193,7 +2451,7 @@ def _run_auto_paper_portfolio_unlocked(
     previous_actions = list(state.get("daily_actions") or state.get("actions") or [])
     actions: list[dict[str, Any]] = []
     actions.extend(delist_liquidation.get("actions") or [])
-    warnings: list[str] = [str(item) for item in state.get("warnings") or []]
+    warnings: list[str] = [str(item) for item in state.get("warnings") or []] + list(intake.get("reason_codes") or [])
     cash_value = safe_float(state.get("cash"), None)
     if cash_value is None:
         cash = 0.0
@@ -2351,6 +2609,14 @@ def _run_auto_paper_portfolio_unlocked(
                 updated_positions.append(updated)
                 continue
             if latest_price > 0 and entry_price > 0 and latest_price <= entry_price * 0.92:
+                # An exit is a real fill: it needs today's tradeable bar. A
+                # suspended / missing / limit-down / untrusted-basis day must
+                # not be booked off the carried old mark.
+                rejection = _fill_tradability_rejection(quote, "sell", require_quote=True)
+                if rejection:
+                    actions.append(_block_action(position, rejection, decision_date))
+                    updated_positions.append(dict(position))
+                    continue
                 reason = "触发自动虚拟组合风险复核：最新价较模拟买入价回撤超过 8%，执行纸面退出。"
                 actions.append(_sell_action(position, latest_price, decision_date, reason))
                 closed = _close_position(position, latest_price, decision_date, reason)
@@ -2381,6 +2647,22 @@ def _run_auto_paper_portfolio_unlocked(
     for candidate in candidates:
         key = _position_key(candidate)
         if key in existing_keys:
+            continue
+        # Evidence requirement shared with the AI book: never book a fill off a
+        # mixed/unknown price basis. A known basis (raw/qfq/hfq) proceeds.
+        basis_rejection = _basis_fill_rejection(candidate.get("symbol"))
+        if basis_rejection:
+            actions.append(_block_action(candidate, basis_rejection, decision_date))
+            record_legacy_shadow_block(candidate, basis_rejection, "auto_paper_daily_buy")
+            continue
+        # A new book entry is a real fill too: a zero-volume suspension or a
+        # one-word limit-up board cannot be bought at the open.
+        buy_quote = _latest_daily_quote(candidate.get("symbol"))
+        warnings.extend(_quote_warnings(candidate.get("symbol"), buy_quote))
+        buy_rejection = _fill_tradability_rejection(buy_quote, "buy")
+        if buy_rejection:
+            actions.append(_block_action(candidate, buy_rejection, decision_date))
+            record_legacy_shadow_block(candidate, buy_rejection, "auto_paper_daily_buy")
             continue
         if enable_intraday_swing and mode == "update" and _is_long_strategy(candidate):
             plan, execution = _simulate_swing_for_row(
@@ -2556,7 +2838,10 @@ def _run_auto_paper_portfolio_unlocked(
         })
         actions.append(action)
 
-    freshness_gate = evaluate_data_freshness()
+    freshness_gate = (
+        evaluate_paper_review_freshness(state, target_date=review_target_date, daily_dir=DAILY_DIR)
+        if review_target_date else evaluate_data_freshness()
+    )
     decision_review = build_decision_review(previous_actions, decision_date, freshness_gate)
     positions = _enrich_positions_with_theme_map(positions)
     yesterday_review = build_yesterday_holding_review(previous_positions, positions, actions, decision_review, freshness_gate)
@@ -2587,7 +2872,9 @@ def _run_auto_paper_portfolio_unlocked(
         "strategy": strategy,
         "generated_at": now_text(),
         "quantity_per_stock": quantity,
-        "source": "auto_strategy_sandbox",
+        "source": "formal_candidate_daily_batch",
+        "input_source": auto_strategy_input_source,
+        "candidate_intake": {key: value for key, value in intake.items() if key != "batch"},
         "summary": _summary(state, actions),
         "positions": positions,
         "closed_positions": closed_positions,
@@ -2698,9 +2985,14 @@ def run_auto_paper_portfolio(
     formal_candidate_batch_path: Path | str | None = None,
     formal_candidate_status: str = "",
     publish_next_plan: bool = True,
+    review_target_date: str = "",
+    candidate_mode: str = "formal",
 ) -> dict[str, Any]:
     """Run the automatic paper portfolio with a local advisory state-file lock."""
 
+    if candidate_mode not in {"formal", "legacy_diagnostic"}:
+        raise ValueError("candidate_mode must be formal or legacy_diagnostic")
+    dry_run = bool(dry_run or candidate_mode == "legacy_diagnostic")
     existing_profile_state: dict[str, Any] = {}
     if AUTO_PAPER_PORTFOLIO_STATE_JSON.exists() and not force_reset:
         existing_profile_state = _auto_paper_state_store().read(default={})
@@ -2748,6 +3040,8 @@ def run_auto_paper_portfolio(
             formal_candidate_batch_path=formal_candidate_batch_path,
             formal_candidate_status=formal_candidate_status,
             publish_next_plan=publish_next_plan,
+            review_target_date=review_target_date,
+            candidate_mode=candidate_mode,
         )
     finally:
         if lock_info is not None:
@@ -2789,13 +3083,15 @@ def auto_paper_portfolio_latest() -> dict[str, Any]:
         return {
             "ok": True,
             "exists": False,
-            "message": "尚未初始化自动虚拟组合。请先在自动策略沙盒中生成候选，再初始化组合。",
+            "message": "尚未初始化自动虚拟组合。请先确认目标日期的正式候选批次，再初始化组合。",
+            **load_plan_review_snapshot(_archive_project_root()),
             "disclaimer": DISCLAIMER,
             "broker_boundary": BROKER_BOUNDARY,
         }
     data["exists"] = True
     data.setdefault("disclaimer", DISCLAIMER)
     data.setdefault("broker_boundary", BROKER_BOUNDARY)
+    data.update(load_plan_review_snapshot(_archive_project_root()))
     return data
 
 

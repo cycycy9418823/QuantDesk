@@ -187,6 +187,7 @@ def _patch_daily_workflow(
         lambda: {"ok": True, "included_count": 1, "message": "ok"},
     )
     monkeypatch.setattr(workflow, "_latest_daily_date", lambda: TARGET_DATE)
+    monkeypatch.setattr(workflow, "infer_target_date", lambda target_date=None: (target_date or TARGET_DATE, "fixture"))
     monkeypatch.setattr(
         workflow,
         "daily_price_status",
@@ -622,8 +623,14 @@ def _write_plan_inputs(root: Path, symbol: str) -> tuple[Path, Path, Path]:
 
 
 def test_conditional_plan_preserves_bound_candidate_envelope(tmp_path: Path) -> None:
+    from tests.test_b5_formal_candidate_intake import make_formal_batch
+
     symbol = "600143"
-    envelope = _candidate_envelope(tmp_path, symbol)
+    batch = make_formal_batch(TARGET_DATE, candidate=_formal_candidate(symbol))
+    batch_path = tmp_path / "results/candidate_refresh/daily" / f"{TARGET_DATE}.json"
+    batch_path.parent.mkdir(parents=True, exist_ok=True)
+    batch_path.write_text(json.dumps(batch), encoding="utf-8")
+    envelope = candidate_refresh.build_candidate_envelope(batch, batch_path=batch_path, candidate=batch["candidates"][0])
     daily, features, universe = _write_plan_inputs(tmp_path, symbol)
     candidate = {
         **copy.deepcopy(envelope["candidate"]),
@@ -637,6 +644,8 @@ def test_conditional_plan_preserves_bound_candidate_envelope(tmp_path: Path) -> 
             "standard_candidates": [candidate],
             "long_candidates": [candidate],
             "board_candidates": [],
+            "formal_candidate_batch": batch,
+            "formal_candidate_batch_path": str(batch_path),
         },
         state={
             "initial_cash": 10_000.0,
@@ -1310,6 +1319,7 @@ def test_auto_paper_enriches_due_plan_after_archive_load_before_simulation(
         }
 
     monkeypatch.setattr(auto_portfolio, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(auto_portfolio, "INTRADAY_DIR", tmp_path / "data/intraday")
     monkeypatch.setattr(
         auto_portfolio,
         "AUTO_PAPER_PORTFOLIO_STATE_JSON",

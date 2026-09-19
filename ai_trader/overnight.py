@@ -7,11 +7,17 @@ session ends, to check whether a preset level was traded through.
 from __future__ import annotations
 
 import json
+import math
 from copy import deepcopy
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+from ai_trader.decision_log import apply_gate_to_plan, record_evening_and_refresh_page
+from ai_trader.execution_evidence import capture_execution_evidence
+from ai_trader.ledger_audit import audit_ledger
 from ai_trader.hypotheses import load_hypotheses, save_hypotheses
 from ai_trader.journal import append_journal, build_journal
 from ai_trader.ledger import (
@@ -22,9 +28,7 @@ from ai_trader.ledger import (
     save_ledger,
 )
 from ai_trader.ledger import session_days_held as _session_days_held
-from ai_trader.decision_log import apply_gate_to_plan, record_evening_and_refresh_page
 from ai_trader.llm import propose_picks
-from ai_trader.prompt_pack import load_prompt_pack
 from ai_trader.mandate import BOUNDARY, DEFAULT_MANDATE, max_open_gap_for_style
 from ai_trader.market import (
     focus_universe,
@@ -46,12 +50,19 @@ from ai_trader.philosophy import (
     save_philosophy,
     style_scoreboard,
 )
+from ai_trader.prompt_pack import load_prompt_pack
 from ai_trader.recommendations import load_recommendations, recommendation_note
+from ai_trader.recovery import (
+    MISSING_ORIGINAL_MODEL_OUTPUT,
+    REUSABLE_ORIGINAL_OUTPUT,
+    plan_cycle_recovery,
+)
 from ai_trader.researcher import rank_today, research_ideas, template_by_id
 from ai_trader.trader import execute_intents
 from ai_trader.watchlist import load_watchlist, save_watchlist, touch_watchlist, watch_names
 from quantdesk.paper.market_rules import lot_size_for_symbol, round_notional_down_to_lot_quantity
-from quantdesk.trading_calendar import next_trade_day
+from quantdesk.paper.matching import evaluate_next_open_fill
+from quantdesk.trading_calendar import next_trade_day, load_a_share_trading_calendar
 from quantdesk.utils import atomic_write_json
 
 PLAN_SCHEMA = "ai_trader_plan_v1"
@@ -80,6 +91,29 @@ def save_plan(plan: dict[str, Any], path: Any = None) -> None:
     target = assert_not_quantdesk_ledger(path or PLAN_LATEST_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(target, plan)
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _cycle_recovery_for_plan(existing: dict[str, Any] | None, as_of: str) -> dict[str, Any]:
+    """A2: classify recovery for a cycle already begun for ``as_of``.
+
+    A frozen input exists only when an earlier run already committed a plan for
+    this same ``as_of``.  The persisted model reply is whatever that plan saved;
+    if it is absent the cycle must stay interrupted (no model re-call, no new
+    price, no fabricated prediction).
+    """
+
+    is_prior_cycle = bool(
+        existing and str(existing.get("decision_date") or "")[:10] == as_of
+    )
+    raw = ((existing or {}).get("llm") or {}).get("raw_response")
+    return plan_cycle_recovery(
+        input_snapshot=({"as_of": as_of} if is_prior_cycle else None),
+        persisted_model_output=raw if isinstance(raw, dict) else None,
+    )
 
 
 def pick_operating_method(research: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
@@ -131,13 +165,19 @@ def llm_journal_headline(
     proposed: list[str],
     committed_buy_symbols: list[str],
     plan_committed: bool,
+    held_count: int = 0,
+    gate_rejected: bool = False,
+    committed_sell_symbols: list[str] | None = None,
+    statement_review: dict[str, Any] | None = None,
 ) -> str:
     """Headline that never conflates LLM proposals with committed intents.
 
     The brain may float several names; account constraints (probation open cap,
     holdings/cash limits) decide what actually lands in tomorrow's paper plan.
     Writing "看上 A、B" when only A survived made a proposal read like an
-    order, so the wording now separates 提交买入 from 仅提议·未提交.
+    order, so the wording now separates 提交买入 from 仅提议·未提交.  It also
+    separates a statement-gate rejection from the brain choosing nothing, and
+    never calls a still-invested account "空仓" (B3).
     """
 
     if not plan_committed:
@@ -146,15 +186,39 @@ def llm_journal_headline(
             f"今晚思考已记录（提议：{note}）；上一份计划还没结算，"
             f"明天（{trade_date}）不叠加新纸面委托。"
         )
-    if committed_buy_symbols:
-        headline = f"明天（{trade_date}）AI自己拿主意：提交买入 {'、'.join(committed_buy_symbols)}。"
+    planned_sells = list(dict.fromkeys(committed_sell_symbols or []))
+    review = statement_review or {}
+    diagnosis = {
+        "unverified": "证据不足，尚未核验",
+        "mismatch": "事实不符",
+        "mixed": "部分事实不符，部分证据不足",
+    }.get(str(review.get("status") or ""), "原因见核验记录")
+    if committed_buy_symbols or planned_sells:
+        parts = []
+        if committed_buy_symbols:
+            parts.append(f"提交买入 {'、'.join(committed_buy_symbols)}")
+        if planned_sells:
+            parts.append(f"提交卖出 {'、'.join(planned_sells)}")
+        headline = f"明天（{trade_date}）AI自己拿主意：{'；'.join(parts)}（计划已存档，待开盘核验，尚未成交）。"
+    elif gate_rejected:
+        if review.get("original_intent_count") == 0:
+            headline = f"明天（{trade_date}）无新增买卖计划；盘面陈述核验未通过（{diagnosis}），原本没有个股交易意图。"
+        else:
+            headline = f"明天（{trade_date}）相关意图未通过陈述核验（{diagnosis}），未提交。"
+    elif held_count > 0:
+        # The account is still invested: "空仓" would be false.
+        headline = f"明天（{trade_date}）保留现有持仓，无新增交易。"
     elif proposed:
         headline = f"明天（{trade_date}）AI看完没有提交新开仓。"
     else:
         headline = f"明天（{trade_date}）AI看完决定空仓，今晚不追高。"
     withheld = [s for s in dict.fromkeys(proposed) if s not in set(committed_buy_symbols)]
-    if withheld:
+    if withheld and not gate_rejected:
         headline += f"（曾提议 {'、'.join(withheld)}，未通过账户约束，仅作记录、未提交。）"
+    elif withheld and gate_rejected:
+        headline += f"（被驳回提议：{'、'.join(withheld)}。）"
+    if gate_rejected and (committed_buy_symbols or planned_sells):
+        headline += f"其余陈述核验存在问题（{diagnosis}），详见拒绝记录。"
     return headline
 
 
@@ -233,20 +297,110 @@ def _direction_from_score(score: float) -> str:
     return "flat"
 
 
-def _recent_change(panel: Any, symbol: str, as_of: str, days: int = 5) -> float | None:
-    """N-session close-to-close change for one symbol, or None if too short."""
+def _recent_change_fact(
+    panel: Any,
+    symbol: str,
+    as_of: str,
+    *,
+    sessions: int = 5,
+    row: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """N-session close-to-close change plus the period metadata it came from.
+
+    The trader's LLM brain must not see a bare percentage it can describe as
+    "today".  Every candidate change carries its start/end dates, the number of
+    trading sessions, the as-of, the price basis and the source, so the wording
+    can say "近5交易日" and the statement gate can verify the same window (B3).
+    """
 
     try:
         series = panel[symbol].dropna()
         series = series[series.index <= as_of]
-        if len(series) <= days:
+        if len(series) <= sessions:
             return None
-        prior = float(series.iloc[-1 - days])
-        if prior <= 0:
+        prior = float(series.iloc[-1 - sessions])
+        last = float(series.iloc[-1])
+        if prior <= 0 or not math.isfinite(prior) or not math.isfinite(last):
             return None
-        return float(series.iloc[-1] / prior - 1.0)
+        change = float(series.iloc[-1] / prior - 1.0)
     except (KeyError, IndexError, ValueError, TypeError):
         return None
+    row = row or {}
+    window_dates = [str(value)[:10] for value in series.index[-1 - sessions:]]
+    start, end = window_dates[0], window_dates[-1]
+    calendar = load_a_share_trading_calendar()
+    open_days = calendar.get("is_open_by_date") or {}
+    calendar_rows = calendar.get("rows_by_date") or {}
+    cursor, last_day = date.fromisoformat(start), date.fromisoformat(end)
+    expected: list[str] = []
+    calendar_verified = True
+    while cursor <= last_day:
+        day = cursor.isoformat()
+        calendar_row = calendar_rows.get(day) or {}
+        source_text = str(calendar_row.get("source") or "").strip()
+        quality_text = (source_text + " " + str(calendar_row.get("note") or "")).lower()
+        if day not in open_days or not source_text or any(token in quality_text for token in ("provisional", "unknown", "unverified")):
+            calendar_verified = False
+        if open_days.get(day, cursor.weekday() < 5):
+            expected.append(day)
+        cursor += timedelta(days=1)
+    missing = sorted(set(expected) - set(window_dates))
+    consecutive = expected == window_dates and end == as_of
+    metadata = (getattr(panel, "attrs", {}).get("series_evidence") or {}).get(symbol) or {}
+    source = dict(metadata.get("source_evidence") or row.get("source_evidence") or {})
+    transformed = sorted(set(metadata.get("transformed_dates") or []) & set(window_dates))
+    original_basis = str(metadata.get("original_price_basis") or row.get("price_basis") or "mixed_or_unknown")
+    basis = "mixed_or_unknown" if transformed else original_basis
+    reason = "derived_research_prices" if transformed else str(metadata.get("price_basis_reason") or row.get("price_basis_reason") or "")
+    current_source = row.get("source_evidence") or {}
+    source_changed = bool(source.get("sha256") and current_source.get("sha256") and source["sha256"] != current_source["sha256"])
+    diagnostics = []
+    if not consecutive:
+        diagnostics.append("incomplete_session_window")
+    if not calendar_verified:
+        diagnostics.append("calendar_unverified")
+    if source.get("status") != "stable" or source_changed:
+        diagnostics.append("source_version_unverified")
+    if reason or original_basis != "raw":
+        diagnostics.append(reason or "consumer_price_basis_not_allowed")
+    if not str(row.get("source") or "").strip():
+        diagnostics.append("provider_source_missing")
+    label = f"近{sessions}交易日"
+    if not consecutive:
+        label = f"区间{start}至{end}（交易日证据不完整）"
+    if transformed:
+        label = f"公司行动修复研究序列（{start}至{end}）"
+    return {
+        "symbol": symbol,
+        "change": change,
+        "start": start,
+        "end": end,
+        "sessions": max(len(expected) - 1, 0),
+        "requested_sessions": sessions,
+        "observed_intervals": sessions,
+        "as_of": as_of,
+        "period_label": label,
+        "price_basis": basis,
+        "original_price_basis": original_basis,
+        "price_basis_reason": reason,
+        "calculation_basis": "corporate_action_repaired_research_proxy" if transformed else "source_prices",
+        "transformed_dates": transformed,
+        "missing_sessions": missing,
+        "calendar_verified": calendar_verified,
+        "window_complete": consecutive,
+        "validation_status": "diagnostic_only" if diagnostics else "verified_raw_window",
+        "warnings": diagnostics,
+        "evidence_ref": source,
+        "source": str(row.get("source") or ""),
+    }
+
+
+def _recent_change(panel: Any, symbol: str, as_of: str, days: int = 5) -> float | None:
+    """N-session close-to-close change for one symbol, or None if too short."""
+
+    fact = _recent_change_fact(panel, symbol, as_of, sessions=days)
+    return None if fact is None else float(fact["change"])
+
 
 
 def _build_llm_context(
@@ -281,11 +435,19 @@ def _build_llm_context(
     ]
     columns = [str(col) for col in getattr(panel, "columns", [])]
     candidates: list[str] = []
+    candidate_facts: list[dict[str, Any]] = []
     for sym in columns:
-        if not load_ohlc_row(sym, as_of, daily_dir).get("close"):
+        row = load_ohlc_row(sym, as_of, daily_dir)
+        if not row.get("close"):
             continue
-        change = _recent_change(panel, sym, as_of)
-        candidates.append(f"{sym}({change:+.1%})" if change is not None else sym)
+        fact = _recent_change_fact(panel, sym, as_of, row=row)
+        if fact is not None:
+            # The period is written into the fact the LLM reads, so a percentage
+            # can never be narrated as "today" by accident (B3).
+            candidates.append(f"{sym}({fact['period_label']}{fact['change']:+.1%})")
+            candidate_facts.append(dict(fact))
+        else:
+            candidates.append(sym)
         if len(candidates) >= 40:
             break
     method_results = [
@@ -310,6 +472,7 @@ def _build_llm_context(
         "recommendations": list(recommended),
         "method_results": method_results,
         "candidates": candidates,
+        "candidate_facts": candidate_facts,
         "mandate_note": mandate_note,
         # Its own previously-written stance and its own realised track record per
         # style, so a change of mind is informed by evidence rather than mood.
@@ -517,7 +680,10 @@ def _score_intent(intent: dict[str, Any], session: dict[str, float | None], fill
     close_px = session.get("close")
     high = session.get("high")
     low = session.get("low")
-    ref = float(intent.get("ref_close") or 0.0)
+    try:
+        ref = float(intent.get("ref_close") or 0.0)
+    except (TypeError, ValueError):
+        ref = 0.0
     preset = float(intent.get("preset_touch_price") or 0.0)
     predicted = str(intent.get("predicted_direction") or "flat")
     actual_dir = "flat"
@@ -556,56 +722,248 @@ def _score_intent(intent: dict[str, Any], session: dict[str, float | None], fill
     }
 
 
+def _ledger_has_plan_fills(ledger: dict[str, Any], plan_id: str) -> bool:
+    """Whether the ledger already records this plan's committed fills.
+
+    New fills carry a ``plan_id`` tag written by :func:`settle_plan`; a legacy
+    trade without the tag is not evidence either way.
+    """
+
+    if not plan_id:
+        return False
+    return any(
+        isinstance(trade, dict) and str(trade.get("plan_id") or "") == plan_id
+        for trade in (ledger.get("trades") or [])
+    )
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _numbers_equal(left: Any, right: Any, *, places: int = 4) -> bool:
+    try:
+        return round(float(left), places) == round(float(right), places)
+    except (TypeError, ValueError):
+        return left == right
+
+
+def _plan_fill_mismatch(plan: dict[str, Any], ledger: dict[str, Any]) -> str | None:
+    """Describe how the ledger fails to account for a plan's frozen fills.
+
+    Returns ``None`` only when the ledger's ``plan_id``-tagged trades exactly
+    account for every ``filled`` action: identical count, and a distinct match
+    on symbol, side, trade date, quantity, price, fee and cash delta.  A partial
+    effect (fewer effects than fills), a wrong identity reusing the same
+    ``plan_id``, or an unexpected extra plan trade each return a reason instead
+    of being mistaken for a complete settlement.  This only inspects the frozen
+    plan and the current ledger; it never re-prices against today's CSV.
+    """
+
+    plan_id = str(plan.get("plan_id") or "")
+    if not plan_id:
+        return None
+    filled = [
+        row
+        for row in (plan.get("actions") or [])
+        if isinstance(row, dict) and row.get("status") == "filled"
+    ]
+    trades = [
+        row
+        for row in (ledger.get("trades") or [])
+        if isinstance(row, dict) and str(row.get("plan_id") or "") == plan_id
+    ]
+    if not filled:
+        return f"unexpected_plan_trades:{len(trades)}" if trades else None
+    if len(trades) != len(filled):
+        return f"plan_fill_count_mismatch:ledger={len(trades)}:frozen={len(filled)}"
+    expected_date = str(plan.get("trade_date") or "")
+    remaining = list(trades)
+    for action in filled:
+        symbol = str(action.get("symbol") or "")
+        side = str(action.get("side") or "")
+        match_index = next(
+            (
+                index
+                for index, trade in enumerate(remaining)
+                if str(trade.get("symbol") or "") == symbol and str(trade.get("side") or "") == side
+            ),
+            None,
+        )
+        if match_index is None:
+            return f"plan_fill_identity_missing:{symbol}:{side}"
+        trade = remaining.pop(match_index)
+        if expected_date and str(trade.get("date") or "") != expected_date:
+            return f"plan_fill_date_mismatch:{symbol}"
+        if _as_int(action.get("quantity")) != _as_int(trade.get("quantity")):
+            return f"plan_fill_quantity_mismatch:{symbol}"
+        for field in ("price", "fee", "cash_delta"):
+            if not _numbers_equal(action.get(field), trade.get(field)):
+                return f"plan_fill_{field}_mismatch:{symbol}"
+    return None
+
+
 def settle_plan(
     plan: dict[str, Any],
     ledger: dict[str, Any],
     *,
     as_of: str,
     daily_dir: Any,
+    evidence_dir: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     if str(plan.get("trade_date") or "") != as_of:
         return plan, ledger, []
     if str(plan.get("status") or "") == "settled":
-        return plan, ledger, []
+        # A settled marker alone is NOT proof the ledger effect was committed,
+        # because the writer persists the ledger before the settled plan, not
+        # the reverse.  Only an exact ledger match may no-op; a partial effect,
+        # a wrong identity reusing the plan_id, an unexpected extra trade, or an
+        # unevidenced/legacy plan is refused here.  It is never re-derived from
+        # today's mutable CSV, which could re-price a past fill.
+        mismatch = _plan_fill_mismatch(plan, ledger)
+        if mismatch is None:
+            return plan, ledger, []
+        raise RuntimeError(f"settled_plan_effect_unverified:{plan.get('plan_id')}:{mismatch}")
+    plan_id = str(plan.get("plan_id") or "")
+    if _ledger_has_plan_fills(ledger, plan_id):
+        # Reverse interruption: the ledger effect is already committed but the
+        # settled marker was not written.  Return a settled view without
+        # re-executing, so recovery never debits the same plan twice.
+        settled = deepcopy(plan)
+        settled["status"] = "settled"
+        settled.setdefault("settled_on", as_of)
+        settled.setdefault("actions", [])
+        settled["recovery_note"] = "ledger_effect_already_committed"
+        return settled, ledger, []
     intents = [dict(row) for row in (plan.get("intents") or []) if isinstance(row, dict)]
     open_prices: dict[str, float] = {}
     prev_closes: dict[str, float] = {}
-    mark_prices: dict[str, float] = {}
-    sessions: dict[str, dict[str, float | None]] = {}
+    open_marks: dict[str, float] = {}
+    close_marks: dict[str, float] = {}
+    sessions: dict[str, dict[str, Any]] = {}
+    mark_warnings: list[str] = []
+
+    def _cache_row(symbol: str) -> dict[str, Any]:
+        if symbol not in sessions:
+            sessions[symbol] = load_ohlc_row(symbol, as_of, daily_dir)
+        row = sessions[symbol]
+        if row.get("price_basis") != "raw":
+            warning = f"untrusted_mark_price_basis:{symbol}:{row.get('price_basis')}"
+            if warning not in mark_warnings:
+                mark_warnings.append(warning)
+            return row
+        open_px = row.get("open")
+        if row.get("open_status") == "ok" and open_px is not None and float(open_px) > 0:
+            open_marks[symbol] = float(open_px)
+        close_px = row.get("close")
+        if close_px is not None and float(close_px) > 0:
+            close_marks[symbol] = float(close_px)
+        elif symbol in open_marks:
+            close_marks[symbol] = open_marks[symbol]
+            warning = f"missing_close_price:{symbol}:using_open_mark"
+            if warning not in mark_warnings:
+                mark_warnings.append(warning)
+        return row
+
     for intent in intents:
         symbol = str(intent.get("symbol") or "")
-        row = load_ohlc_row(symbol, as_of, daily_dir)
-        sessions[symbol] = row
-        if row.get("open"):
-            open_prices[symbol] = float(row["open"])
-        if intent.get("ref_close"):
+        _cache_row(symbol)
+        try:
             prev_closes[symbol] = float(intent["ref_close"])
-        if row.get("close"):
-            mark_prices[symbol] = float(row["close"])
-        elif row.get("open"):
-            mark_prices[symbol] = float(row["open"])
-    # Price the WHOLE book, not just tonight's intents. execute_intents marks the
-    # entire ledger with this dict, so any holding absent from it would be valued
-    # at zero and equity (plus the cash floor derived from it) would be wrong.
+        except (KeyError, TypeError, ValueError):
+            prev_closes.pop(symbol, None)
     for symbol in position_map(ledger):
-        if symbol in mark_prices:
+        _cache_row(symbol)
+
+    try:
+        prior_marks_are_dated = date.fromisoformat(str(ledger.get("as_of") or "")) < date.fromisoformat(as_of)
+    except (TypeError, ValueError):
+        prior_marks_are_dated = False
+    missing_open_valuations: list[str] = []
+    for symbol, position in position_map(ledger).items():
+        if symbol in open_marks:
             continue
-        row = load_ohlc_row(symbol, as_of, daily_dir)
-        if row.get("close"):
-            mark_prices[symbol] = float(row["close"])
-        elif row.get("open"):
-            mark_prices[symbol] = float(row["open"])
+        try:
+            carried = float(position.get("market_price") or position.get("avg_cost") or 0.0)
+        except (TypeError, ValueError):
+            carried = 0.0
+        if not prior_marks_are_dated or not math.isfinite(carried) or carried <= 0:
+            missing_open_valuations.append(symbol)
+
     live = plan.get("live_method") if isinstance(plan.get("live_method"), dict) else {}
     live_id = str(live.get("hypothesis_id") or "") or None
+    rejected: list[dict[str, Any]] = []
+    allowed: list[dict[str, Any]] = []
+    evidence_by_side: dict[tuple[str, str], dict[str, Any]] = {}
+    for intent in intents:
+        symbol = str(intent.get("symbol") or "")
+        side = str(intent.get("side") or "buy")
+        decision = evaluate_next_open_fill(
+            sessions.get(symbol),
+            symbol=symbol,
+            side=side,
+            prev_close=prev_closes.get(symbol),
+            trade_date=as_of,
+        )
+        # Sales do not use the cash floor; only buys need the entire book's
+        # valuation to be known at this open. An undated/future saved mark is
+        # not evidence of that earlier value.
+        if decision.get("ok") and side == "buy" and missing_open_valuations:
+            decision = {"ok": False, "reason": "missing_open_valuation:" + ",".join(sorted(missing_open_valuations))}
+        if not decision.get("ok"):
+            rejected.append(
+                {
+                    "action": side,
+                    "symbol": symbol,
+                    "status": "rejected",
+                    "reason": decision.get("reason") or "missing_open",
+                    "fill_model": "next_open_only",
+                }
+            )
+            continue
+        decision = dict(decision)
+        decision["price_evidence"] = capture_execution_evidence(
+            decision.get("price_evidence") or {},
+            sessions[symbol],
+            plan_id=str(plan.get("plan_id") or ""),
+            evidence_dir=evidence_dir,
+        )
+        allowed.append(intent)
+        evidence_by_side[(symbol, side)] = decision
+        open_prices[symbol] = float(decision["price"])
+    prior_trade_count = len(ledger.get("trades") or [])
+    execution_ledger = {**ledger, "warnings": list(ledger.get("warnings") or []) + mark_warnings}
     ledger, actions = execute_intents(
-        ledger,
+        execution_ledger,
         as_of=as_of,
-        intents=intents,
+        intents=allowed,
         open_prices=open_prices,
         prev_closes=prev_closes,
-        mark_prices=mark_prices,
+        mark_prices=open_marks,
         live_id=live_id,
     )
+    actions = rejected + list(actions)
+    for row in actions:
+        extra = evidence_by_side.get((str(row.get("symbol") or ""), str(row.get("side") or "")))
+        if row.get("status") == "filled" and extra:
+            row["price_basis"] = extra.get("price_basis")
+            row["evidence_source"] = extra.get("evidence_source")
+            row["evidence_timestamp"] = extra.get("evidence_timestamp")
+            row["price_evidence"] = extra.get("price_evidence")
+    plan_id = str(plan.get("plan_id") or "")
+    for trade in (ledger.get("trades") or [])[prior_trade_count:]:
+        if isinstance(trade, dict) and plan_id:
+            # Stable settlement identity: lets a later re-entry tell whether this
+            # plan's financial effect is already committed (no double-debit).
+            trade.setdefault("plan_id", plan_id)
+        extra = evidence_by_side.get((str(trade.get("symbol") or ""), str(trade.get("side") or "")))
+        if extra:
+            trade["price_evidence"] = extra.get("price_evidence")
+    if close_marks:
+        ledger = mark_to_market(ledger, close_marks, as_of=as_of)
     fill_by_symbol = {}
     for row in actions:
         if row.get("symbol"):
@@ -617,6 +975,7 @@ def settle_plan(
     abandoned = sum(1 for row in scorecard if row.get("open_fill") == "abandoned")
     n = max(len(scorecard), 1)
     settled = deepcopy(plan)
+    settled["warnings"] = list(settled.get("warnings") or []) + mark_warnings
     settled["status"] = "settled"
     settled["settled_on"] = as_of
     settled["actions"] = actions
@@ -683,10 +1042,22 @@ def run_evening(
 
     prices = {}
     if as_of in getattr(panel, "index", []):
-        prices = {str(col): float(val) for col, val in panel.loc[as_of].dropna().items()}
-    ledger = mark_to_market(ledger, prices, as_of=as_of) if prices else ledger
-
+        for col in panel.loc[as_of].dropna().index:
+            symbol = str(col)
+            row = load_ohlc_row(symbol, as_of, runtime.daily_dir)
+            if row.get("price_basis") != "raw":
+                warnings.append(f"untrusted_mark_price_basis:{symbol}:{row.get('price_basis')}")
+                continue
+            if row.get("close") is not None:
+                prices[symbol] = float(row["close"])
     existing = load_plan(runtime.plan_latest)
+    if existing and str(existing.get("status") or "") == "settled":
+        # run_evening skips re-settling a settled plan, so an inconsistent
+        # past effect would otherwise be swallowed and a fresh plan written on
+        # top of it.  Refuse before any write (no silent no-op, no overwrite).
+        mismatch = _plan_fill_mismatch(existing, ledger)
+        if mismatch:
+            raise RuntimeError(f"settled_plan_effect_unverified:{existing.get('plan_id')}:{mismatch}")
     review: dict[str, Any] | None = None
     settle_actions: list[dict[str, Any]] = []
     deferred_plan: dict[str, Any] | None = None
@@ -709,21 +1080,22 @@ def run_evening(
         )
         if not intent_symbols or has_bar:
             review, ledger, settle_actions = settle_plan(
-                existing, ledger, as_of=plan_trade_date, daily_dir=runtime.daily_dir
+                existing, ledger, as_of=plan_trade_date, daily_dir=runtime.daily_dir,
+                evidence_dir=runtime.ledger.parent / "execution_evidence",
             )
             if plan_trade_date != as_of:
                 review["settled_late"] = True
                 review["settled_late_from"] = plan_trade_date
                 review["settled_late_observed_on"] = as_of
                 warnings.append(f"plan_settled_late:{plan_trade_date}->{as_of}")
+            # Commit the financial effect (ledger) BEFORE the settled marker and
+            # review.  A crash in between then leaves an unsettled plan whose
+            # fills are already in the ledger; the idempotent settle_plan above
+            # recognises that on re-entry instead of double-debiting.
+            save_ledger(ledger, runtime.ledger)
             save_plan(review, runtime.plan_latest)
             runtime.review_latest.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_json(assert_not_quantdesk_ledger(runtime.review_latest), review)
-            if prices and plan_trade_date != as_of:
-                # Positions opened on an older session must be re-marked to the
-                # latest close before tonight's decisions.
-                ledger = mark_to_market(ledger, prices, as_of=as_of)
-            save_ledger(ledger, runtime.ledger)
             warnings.extend(list(review.get("warnings") or []))
         else:
             # A committed plan must not be silently voided. There is only one
@@ -733,6 +1105,10 @@ def run_evening(
             # the settled_late path above then handles.
             deferred_plan = existing
             warnings.append(f"plan_settlement_deferred_missing_bars:{plan_trade_date}")
+
+    # The close is known for tonight's decisions, never for settling the
+    # earlier open, including carry-forward marks of holdings without an open.
+    ledger = mark_to_market(ledger, prices, as_of=as_of) if prices else ledger
 
     book = load_hypotheses(runtime.hypotheses)
     research = research_ideas(panel, book, as_of=as_of) if not panel.empty else {"book": book, "evaluated": [], "live": None}
@@ -779,7 +1155,24 @@ def run_evening(
         )
         philosophy_dirty = True
     llm_diag: dict[str, Any] = {}
-    if as_of in getattr(panel, "index", []) and len(getattr(panel, "columns", [])):
+    proposal: dict[str, Any] | None = None
+    cycle_recovery = _cycle_recovery_for_plan(existing, as_of)
+    llm_recovery_status = str(cycle_recovery.get("status") or "")
+    if llm_recovery_status == MISSING_ORIGINAL_MODEL_OUTPUT:
+        # A2: the cycle was interrupted after its input was frozen but before the
+        # original model reply was persisted.  Stay interrupted: never call the
+        # model again and never re-derive a "prediction" from today's prices.
+        warnings.append("llm_recovery_missing_original_model_output")
+    elif as_of in getattr(panel, "index", []) and len(getattr(panel, "columns", [])):
+        persisted_output = cycle_recovery.get("output") or {}
+        reuse_kwargs = (
+            {
+                "reuse_text": persisted_output.get("text"),
+                "reuse_model": str(persisted_output.get("model") or ""),
+            }
+            if llm_recovery_status == REUSABLE_ORIGINAL_OUTPUT
+            else {}
+        )
         proposal = propose_picks(
             _build_llm_context(
                 as_of=as_of,
@@ -792,6 +1185,7 @@ def run_evening(
                 philosophy=philosophy,
             ),
             llm_diag,
+            **reuse_kwargs,
         )
         if proposal is not None:
             llm_used = True
@@ -874,6 +1268,21 @@ def run_evening(
         # Why the brain did not engage, when it did not. Recorded so a silent
         # fallback to the rule engine is never mistaken for the AI's own decision.
         "unavailable_reason": "" if llm_used else str(llm_diag.get("reason") or ""),
+        # A2: the recovery verdict for this cycle, and the raw reply (when one
+        # was actually obtained) so an interruption is reconstructed, never
+        # re-decided.
+        "recovery_status": llm_recovery_status or None,
+        "raw_response": (
+            {
+                "text": str(proposal.get("raw_response") or ""),
+                "model": llm_model,
+                "source": "llm",
+                "created_at": _now_iso(),
+                "reused": bool(proposal.get("reused_persisted_response")),
+            }
+            if llm_used and proposal is not None and proposal.get("raw_response")
+            else None
+        ),
     }
     pack = load_prompt_pack()
     plan["prompt_version"] = pack.prompt_version
@@ -944,6 +1353,10 @@ def run_evening(
         save_plan(plan, runtime.plan_latest)
     save_ledger(ledger, runtime.ledger)
 
+    ledger_review = audit_ledger(ledger)
+    if ledger_review.get("status") != "exact":
+        warnings.append(f"ledger_audit:{ledger_review.get('status')}")
+
     if conviction == "live" and method:
         headline = f"明天（{trade_date}）按开盘预案做。"
         thought = (
@@ -959,18 +1372,30 @@ def run_evening(
             + " 这是试错，不是打板。没有当天分钟也可以看这只，分钟不决定资格。"
         )
     else:
-        headline = f"明天（{trade_date}）先空仓。今晚没看出值得试的票。"
+        held_count_now = len(position_map(ledger))
+        if held_count_now > 0:
+            headline = f"明天（{trade_date}）保留现有持仓，无新增交易。"
+        else:
+            headline = f"明天（{trade_date}）先空仓。今晚没看出值得试的票。"
         thought = "现金也是决定。编故事硬做，不像新人，像赌。"
     if llm_used:
         # The journal must say what was actually submitted. `picked` is the
         # LLM's proposal; account constraints may have kept only part of it
         # (e.g. probation allows one open per night), and history showed the
-        # headline listing both as if both were ordered.
+        # headline listing both as if both were ordered.  A gate rejection is
+        # also told apart from the brain choosing nothing (B3).
         headline = llm_journal_headline(
             trade_date,
             proposed=[str(s) for s in (plan.get("llm", {}).get("picked") or [])],
             committed_buy_symbols=committed_buy_symbols_from_plan(plan),
             plan_committed=bool(plan.get("committed", True)),
+            held_count=len(position_map(ledger)),
+            gate_rejected=bool(statement_gate.rejections),
+            committed_sell_symbols=[
+                str(item.get("symbol")) for item in (plan.get("intents") or [])
+                if item.get("side") == "sell" and item.get("symbol")
+            ],
+            statement_review=plan.get("statement_review"),
         )
         thought = (f"[AI大脑·{llm_model}] {llm_note}".strip() + " " + thought).strip()
     if review and review.get("score_summary"):
@@ -1004,6 +1429,7 @@ def run_evening(
             f"【观察仓·未验证】{method.get('title')}：{method.get('reason')}"
         ] + list(note.get("lessons") or [])
     note["headline"] = headline
+    note["ledger_audit"] = ledger_review
     note["thought"] = thought
     note["role_zh"] = plan.get("role_zh")
     note["tomorrow_plan"] = {
@@ -1031,6 +1457,29 @@ def run_evening(
         if digest:
             thought = f"白天盘中记录：{digest} {thought}"
             note["thought"] = thought
+    from ai_trader.daytime_intent import load_daytime_intents_for
+
+    daytime_intents = load_daytime_intents_for(as_of, intents_path=runtime.daytime_intents)
+    note["daytime_intents"] = [
+        {
+            "at": item.get("at"),
+            "symbol": item.get("symbol"),
+            "side": item.get("side"),
+            "precondition": item.get("precondition"),
+            "level": item.get("level"),
+            "observed_price": item.get("observed_price"),
+            "status": item.get("status"),
+            "filled": item.get("filled"),
+            "note": item.get("note"),
+        }
+        for item in daytime_intents
+    ]
+    if daytime_intents:
+        intent_digest = "；".join(
+            str(item.get("note") or "") for item in daytime_intents[-6:] if item.get("note")
+        )
+        if intent_digest:
+            note["thought"] = f"{thought} 白天盘中意图（未成交，仅记录）：{intent_digest}"
     append_journal(note, latest_path=runtime.journal_latest, log_path=runtime.journal_log)
     record_evening_and_refresh_page(
         plan,
@@ -1054,6 +1503,7 @@ def run_evening(
         "plan": plan,
         "review": review,
         "journal": note,
+        "ledger_audit": ledger_review,
         "ledger": {
             "ledger_id": ledger.get("ledger_id"),
             "cash": ledger.get("cash"),

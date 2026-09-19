@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_trader.mandate import BOUNDARY, DEFAULT_MANDATE, TraderMandate
-from ai_trader.paths import LEDGER_PATH, assert_not_quantdesk_ledger, ensure_runtime_dirs
+from ai_trader.paths import LEDGER_PATH, assert_not_quantdesk_ledger, ledger_id_for_path, ledger_id_for_profile
 from quantdesk.paper.matching import POLICY_NEXT_OPEN, ensure_declared_fill_policy
 from quantdesk.utils import atomic_write_json
 
@@ -40,11 +40,16 @@ def _now() -> str:
     return datetime.now(timezone.utc).astimezone().replace(microsecond=0).isoformat()
 
 
-def empty_ledger(mandate: TraderMandate = DEFAULT_MANDATE, *, created_at: str | None = None) -> dict[str, Any]:
+def empty_ledger(
+    mandate: TraderMandate = DEFAULT_MANDATE,
+    *,
+    created_at: str | None = None,
+    ledger_id: str | None = None,
+) -> dict[str, Any]:
     stamp = created_at or _now()
     ledger = {
         "schema_version": LEDGER_SCHEMA,
-        "ledger_id": mandate.ledger_id,
+        "ledger_id": ledger_id or ledger_id_for_profile() or mandate.ledger_id,
         "mandate": mandate.to_dict(),
         "created_at": stamp,
         "updated_at": stamp,
@@ -66,18 +71,18 @@ def empty_ledger(mandate: TraderMandate = DEFAULT_MANDATE, *, created_at: str | 
 def load_ledger(path: Path | None = None) -> dict[str, Any]:
     target = assert_not_quantdesk_ledger(path or LEDGER_PATH)
     if not target.is_file():
-        return empty_ledger()
+        return empty_ledger(ledger_id=ledger_id_for_path(target))
     payload = json.loads(target.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("ai_trader ledger is not an object")
-    if str(payload.get("ledger_id") or "") != DEFAULT_MANDATE.ledger_id:
+    if str(payload.get("ledger_id") or "") != ledger_id_for_path(target):
         raise ValueError("ai_trader ledger_id mismatch; refusing to load foreign book")
     return ensure_declared_fill_policy(payload, policy_id=POLICY_NEXT_OPEN)
 
 
 def save_ledger(ledger: dict[str, Any], path: Path | None = None) -> Path:
     target = assert_not_quantdesk_ledger(path or LEDGER_PATH)
-    ensure_runtime_dirs()
+    target.parent.mkdir(parents=True, exist_ok=True)
     payload = deepcopy(ledger)
     payload["updated_at"] = _now()
     payload["boundary"] = dict(BOUNDARY)

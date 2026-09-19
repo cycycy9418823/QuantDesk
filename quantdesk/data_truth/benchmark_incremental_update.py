@@ -41,10 +41,12 @@ Safety properties
 
 from __future__ import annotations
 
+import csv
 import math
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
+from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -102,6 +104,13 @@ class BenchmarkUpdateResult:
     status: str
     local_last_date: str = ""
     remote_last_date: str = ""
+    local_last_date_after: str = ""
+    target_date: str | None = None
+    target_covered: bool | None = None
+    freshness_status: str = "not_assessed"
+    fetch_status: str = "not_requested"
+    failure_stage: str = ""
+    planned_dates: list[str] = field(default_factory=list)
     appended_dates: list[str] = field(default_factory=list)
     overlap_rows: int = 0
     overlap_max_close_diff: float = 0.0
@@ -114,6 +123,14 @@ class BenchmarkUpdateResult:
             "status": self.status,
             "local_last_date": self.local_last_date,
             "remote_last_date": self.remote_last_date,
+            "local_last_date_after": self.local_last_date_after,
+            "target_date": self.target_date,
+            "target_covered": self.target_covered,
+            "freshness_status": self.freshness_status,
+            "fetch_status": self.fetch_status,
+            "failure_stage": self.failure_stage,
+            "planned_count": len(self.planned_dates),
+            "planned_dates": list(self.planned_dates),
             "appended_count": len(self.appended_dates),
             "appended_dates": list(self.appended_dates),
             "overlap_rows": self.overlap_rows,
@@ -145,14 +162,34 @@ def default_index_fetcher(symbol: str) -> pd.DataFrame:
     )
 
 
+def _validate_target_date(target_date: str | None) -> str | None:
+    """Accept an explicit ISO session date; never infer one from wall-clock time."""
+
+    if target_date is None:
+        return None
+    try:
+        valid = isinstance(target_date, str) and date.fromisoformat(target_date).isoformat() == target_date
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("target_date must be a valid YYYY-MM-DD date")
+    return target_date
+
+
 def _normalize_remote(frame: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(frame, pd.DataFrame):
+        raise ValueError("remote index response is not a DataFrame")
     out = frame.copy()
+    if out.empty:
+        return pd.DataFrame(columns=["date", "close"])
     if "date" not in out.columns:
         raise ValueError("remote index frame missing date column")
     if "close" not in out.columns:
         raise ValueError("remote index frame missing close column")
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    out = out.dropna(subset=["date"]).drop_duplicates("date", keep="last")
+    # Preserve duplicate rows so neither a bad target row nor an overlap
+    # disagreement can disappear through keep-last normalization.
+    out = out.dropna(subset=["date"])
     return out.sort_values("date").reset_index(drop=True)
 
 
@@ -160,9 +197,25 @@ def _read_local(path: Path) -> tuple[list[str], pd.DataFrame, str]:
     """Return (header columns, frame, line terminator) for a local benchmark CSV."""
 
     raw = path.read_bytes()
+    if b"\x00" in raw:
+        raise ValueError("local_csv_contains_nul")
     terminator = "\r\n" if b"\r\n" in raw else "\n"
-    frame = pd.read_csv(path, dtype=str, encoding="utf-8-sig", keep_default_na=False)
-    columns = [str(col) for col in frame.columns]
+    # Parse the exact bytes that were inspected; a second file read could see
+    # different content. Do not let pandas infer an index, pad short records,
+    # rename duplicate headers, or truncate NUL suffixes in damaged input.
+    reader = csv.reader(StringIO(raw.decode("utf-8-sig"), newline=""), strict=True)
+    columns = next(reader, [])
+    if not columns or any(not column.strip() for column in columns) or len(set(columns)) != len(columns):
+        raise ValueError("local_csv_header_invalid")
+    records: list[list[str]] = []
+    for row in reader:
+        if len(row) != len(columns):
+            raise ValueError(
+                f"local_csv_column_count_mismatch:line={reader.line_num}:"
+                f"expected={len(columns)}:actual={len(row)}"
+            )
+        records.append(row)
+    frame = pd.DataFrame(records, columns=columns, dtype=str)
     return columns, frame, terminator
 
 
@@ -185,6 +238,56 @@ def _format_number(value: Any) -> str:
     return repr(number)
 
 
+def _date_keys(frame: pd.DataFrame) -> pd.Series:
+    if "date" not in frame.columns:
+        return pd.Series(index=frame.index, dtype=object)
+    return pd.to_datetime(frame["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+
+def _usable_price_row(row: pd.Series, columns: Sequence[str]) -> bool:
+    prices = {
+        column: _as_float(row.get(column))
+        for column in ("open", "high", "low", "close")
+        if column in columns
+    }
+    if "close" not in prices or any(value is None or value <= 0 for value in prices.values()):
+        return False
+    if "high" in prices and prices["high"] < max(prices.values()):
+        return False
+    if "low" in prices and prices["low"] > min(prices.values()):
+        return False
+    return True
+
+
+def _frame_freshness(frame: pd.DataFrame, target_date: str | None) -> tuple[str, str, bool | None]:
+    dates = _date_keys(frame)
+    last_date = max(dates.dropna(), default="")
+    if target_date is None:
+        return last_date, "target_not_supplied", None
+    if "date" not in frame.columns or "close" not in frame.columns:
+        return last_date, "not_assessed", None
+    target_rows = frame.loc[dates == target_date]
+    if not target_rows.empty:
+        usable = len(target_rows) == 1 and _usable_price_row(target_rows.iloc[0], frame.columns)
+        return last_date, "current" if usable else "target_unusable", usable
+    return last_date, "target_missing" if last_date > target_date else "behind_target", False
+
+
+def _record_local_evidence(result: BenchmarkUpdateResult, frame: pd.DataFrame, *, initial: bool = False) -> None:
+    last_date, freshness, covered = _frame_freshness(frame, result.target_date)
+    if initial:
+        result.local_last_date = last_date
+    result.local_last_date_after = last_date
+    result.freshness_status = freshness
+    result.target_covered = covered
+
+
+def _record_failure(result: BenchmarkUpdateResult, stage: str, exc: Exception) -> None:
+    result.status = "failed"
+    result.failure_stage = result.failure_stage or stage
+    result.reason_codes.append(f"{stage}:{type(exc).__name__}:{exc}")
+
+
 def plan_benchmark_appends(
     spec: BenchmarkSpec,
     local_columns: Sequence[str],
@@ -192,19 +295,43 @@ def plan_benchmark_appends(
     remote_frame: pd.DataFrame,
     *,
     fetched_at: str,
+    target_date: str | None = None,
 ) -> tuple[list[list[str]], BenchmarkUpdateResult]:
     """Build the exact rows to append, or a fail-closed result explaining why not.
 
-    Pure function: reads frames, writes nothing.
+    Pure function: reads frames, writes nothing. ``remote_frame`` uses the
+    normalized date column supplied by the updater. Planned rows never count
+    as appended rows or improve the local target-day coverage.
     """
 
-    result = BenchmarkUpdateResult(label=spec.label, path=spec.filename, status="pending")
+    target_date = _validate_target_date(target_date)
+    result = BenchmarkUpdateResult(
+        label=spec.label, path=spec.filename, status="pending", target_date=target_date
+    )
+    _record_local_evidence(result, local_frame, initial=True)
     if "date" not in local_columns or "close" not in local_columns:
         result.status = "skipped"
         result.reason_codes.append("local_schema_missing_date_or_close")
         return [], result
 
-    local_dates = [str(value).strip() for value in local_frame["date"].tolist()]
+    local_dates = _date_keys(local_frame)
+    result.remote_last_date, remote_freshness, _ = _frame_freshness(remote_frame, target_date)
+    if remote_freshness in {"behind_target", "target_missing", "target_unusable"}:
+        result.reason_codes.append(f"remote_{remote_freshness}")
+    if local_dates.isna().any() or local_dates.duplicated().any():
+        result.status = "blocked"
+        result.reason_codes.append("local_dates_unusable_or_duplicated")
+        return [], result
+    if remote_frame.empty:
+        # An empty successful fetch adds nothing. Local verified target-day
+        # coverage still stands; a T-1 file remains explicitly incomplete.
+        result.status = "up_to_date" if result.target_covered is True else "no_usable_rows"
+        result.reason_codes.append("remote_no_rows")
+        return [], result
+    if remote_frame["date"].duplicated().any():
+        result.status = "blocked"
+        result.reason_codes.append("remote_duplicate_dates")
+        return [], result
     local_close = {
         date: _as_float(value)
         for date, value in zip(local_dates, local_frame["close"].tolist())
@@ -213,9 +340,6 @@ def plan_benchmark_appends(
         str(row["date"]): _as_float(row["close"])
         for _, row in remote_frame.iterrows()
     }
-
-    result.local_last_date = local_dates[-1] if local_dates else ""
-    result.remote_last_date = str(remote_frame["date"].iloc[-1]) if len(remote_frame) else ""
 
     # Fail closed on any historical disagreement: a silently substituted series
     # would otherwise be stitched onto a different index's history.
@@ -243,7 +367,7 @@ def plan_benchmark_appends(
 
     new_dates = [date for date in remote_close if date > result.local_last_date]
     if not new_dates:
-        result.status = "up_to_date"
+        result.status = "up_to_date" if result.target_covered is True else "unchanged"
         return [], result
 
     remote_by_date = {str(row["date"]): row for _, row in remote_frame.iterrows()}
@@ -260,8 +384,13 @@ def plan_benchmark_appends(
     for date in sorted(new_dates):
         remote_row = remote_by_date[date]
         close_value = _as_float(remote_row.get("close"))
-        if close_value is None:
+        if close_value is None or close_value <= 0:
             result.reason_codes.append(f"remote_close_unusable:{date}")
+            continue
+        # A narrow local schema must not hide invalid OHLC supplied remotely;
+        # locally required price columns must also exist in the source row.
+        if not _usable_price_row(remote_row, (*local_columns, *remote_frame.columns)):
+            result.reason_codes.append(f"remote_ohlc_unusable:{date}")
             continue
         cells: list[str] = []
         for column in local_columns:
@@ -285,8 +414,8 @@ def plan_benchmark_appends(
         rows.append(cells)
         previous_close = close_value
 
-    result.appended_dates = [row[local_columns.index("date")] for row in rows]
-    result.status = "appended" if rows else "no_usable_rows"
+    result.planned_dates = [row[local_columns.index("date")] for row in rows]
+    result.status = "planned" if rows else "no_usable_rows"
     return rows, result
 
 
@@ -302,6 +431,71 @@ def _append_rows(path: Path, rows: Iterable[Sequence[str]], terminator: str) -> 
         handle.write(prefix + payload.encode("utf-8"))
 
 
+def _append_and_verify(
+    path: Path,
+    columns: Sequence[str],
+    rows: list[list[str]],
+    terminator: str,
+    result: BenchmarkUpdateResult,
+) -> None:
+    try:
+        _append_rows(path, rows, terminator)
+    except Exception as exc:  # noqa: BLE001 - an interrupted append may have written some rows
+        _record_failure(result, "append", exc)
+    try:
+        actual_columns, actual_frame, _ = _read_local(path)
+        _record_local_evidence(result, actual_frame)
+        if list(columns) != actual_columns:
+            raise ValueError("local_schema_changed_during_append")
+        date_index = columns.index("date")
+        for row in rows:
+            matches = actual_frame.loc[actual_frame["date"] == row[date_index]]
+            if len(matches) == 1 and matches.iloc[0].tolist() == row:
+                result.appended_dates.append(row[date_index])
+        if result.appended_dates != result.planned_dates:
+            _record_failure(result, "verify", ValueError("appended_rows_not_fully_persisted"))
+    except Exception as exc:  # noqa: BLE001 - post-write evidence is unknown, not successful
+        result.local_last_date_after = ""
+        result.target_covered = None
+        result.freshness_status = "not_assessed" if result.target_date else "target_not_supplied"
+        _record_failure(result, "verify", exc)
+    if result.status != "failed":
+        result.status = "appended"
+
+
+def _summarize_results(
+    results: Sequence[dict[str, Any]], target_date: str | None, dry_run: bool
+) -> tuple[str, str, bool | None]:
+    statuses = {item["status"] for item in results}
+    coverage = [item["target_covered"] for item in results]
+    if target_date is None:
+        freshness, covered = "target_not_supplied", None
+    elif not coverage or all(value is None for value in coverage):
+        freshness, covered = "not_assessed", None
+    elif all(value is True for value in coverage):
+        freshness, covered = "current", True
+    else:
+        freshness_values = {item["freshness_status"] for item in results}
+        freshness = next(iter(freshness_values)) if len(freshness_values) == 1 else "incomplete"
+        covered = False if False in coverage else None
+
+    if statuses & {"blocked", "failed", "no_usable_rows"}:
+        overall = "degraded"
+    elif not results or statuses == {"skipped"}:
+        overall = "skipped"
+    elif dry_run:
+        overall = "dry_run"
+    elif "skipped" in statuses or (target_date is not None and covered is not True):
+        overall = "partial"
+    elif "appended" in statuses:
+        overall = "updated"
+    elif covered is True:
+        overall = "up_to_date"
+    else:
+        overall = "unchanged"
+    return overall, freshness, covered
+
+
 def update_benchmark_files(
     project_root: str | Path,
     *,
@@ -309,12 +503,17 @@ def update_benchmark_files(
     fetcher: Callable[[str], pd.DataFrame] = default_index_fetcher,
     dry_run: bool = False,
     fetched_at: str | None = None,
+    target_date: str | None = None,
 ) -> dict[str, Any]:
     """Append missing sessions to each local benchmark file.
 
     Returns a JSON-safe payload describing what was verified and what changed.
+    ``target_date`` is supplied by the caller's calendar decision. Without it,
+    an unchanged file is not evidence of freshness. ``appended`` still denotes
+    actual writes even when the requested target remains missing.
     """
 
+    target_date = _validate_target_date(target_date)
     root = Path(project_root).resolve()
     benchmark_dir = root / "data" / "benchmark"
     stamp = fetched_at or datetime.now().astimezone().isoformat(timespec="seconds")
@@ -322,50 +521,64 @@ def update_benchmark_files(
 
     for spec in specs:
         path = benchmark_dir / spec.filename
+        result = BenchmarkUpdateResult(
+            label=spec.label, path=spec.filename, status="pending", target_date=target_date,
+            freshness_status="not_assessed" if target_date else "target_not_supplied",
+        )
         if not path.exists():
-            results.append(
-                BenchmarkUpdateResult(
-                    label=spec.label,
-                    path=spec.filename,
-                    status="skipped",
-                    reason_codes=["local_file_missing"],
-                ).as_dict()
-            )
+            result.status = "skipped"
+            result.reason_codes.append("local_file_missing")
+            results.append(result.as_dict())
             continue
         try:
             columns, local_frame, terminator = _read_local(path)
-            remote_frame = _normalize_remote(fetcher(spec.remote_symbol))
+            _record_local_evidence(result, local_frame, initial=True)
         except Exception as exc:  # noqa: BLE001 - reason must reach the payload
-            results.append(
-                BenchmarkUpdateResult(
-                    label=spec.label,
-                    path=spec.filename,
-                    status="failed",
-                    reason_codes=[f"{type(exc).__name__}:{exc}"],
-                ).as_dict()
-            )
+            _record_failure(result, "local_read", exc)
+            results.append(result.as_dict())
             continue
-
-        rows, result = plan_benchmark_appends(
-            spec, columns, local_frame, remote_frame, fetched_at=stamp
-        )
+        if "date" not in columns or "close" not in columns:
+            result.status = "skipped"
+            result.reason_codes.append("local_schema_missing_date_or_close")
+            results.append(result.as_dict())
+            continue
+        try:
+            raw_remote = fetcher(spec.remote_symbol)
+            result.fetch_status = "succeeded"
+        except Exception as exc:  # noqa: BLE001 - keep the already-read local evidence
+            result.fetch_status = "failed"
+            _record_failure(result, "fetch", exc)
+            results.append(result.as_dict())
+            continue
+        try:
+            remote_frame = _normalize_remote(raw_remote)
+        except Exception as exc:  # noqa: BLE001 - response quality is distinct from request failure
+            _record_failure(result, "remote_validation", exc)
+            results.append(result.as_dict())
+            continue
+        try:
+            rows, result = plan_benchmark_appends(
+                spec, columns, local_frame, remote_frame, fetched_at=stamp, target_date=target_date
+            )
+            result.fetch_status = "succeeded"
+        except Exception as exc:  # noqa: BLE001 - one file must not abort the remaining indices
+            _record_failure(result, "plan", exc)
+            results.append(result.as_dict())
+            continue
         if rows and not dry_run:
-            _append_rows(path, rows, terminator)
+            _append_and_verify(path, columns, rows, terminator, result)
         elif rows and dry_run:
             result.status = "dry_run"
         results.append(result.as_dict())
 
-    statuses = {str(item["status"]) for item in results}
-    if statuses & {"blocked", "failed"}:
-        overall = "degraded"
-    elif statuses & {"appended", "dry_run"}:
-        overall = "updated"
-    else:
-        overall = "up_to_date"
+    overall, freshness, covered = _summarize_results(results, target_date, dry_run)
 
     return {
         "task_id": "benchmark_incremental_update",
         "status": overall,
+        "target_date": target_date,
+        "target_covered": covered,
+        "freshness_status": freshness,
         "research_only": True,
         "dry_run": bool(dry_run),
         "fetched_at": stamp,

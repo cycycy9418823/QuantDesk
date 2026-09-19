@@ -22,6 +22,12 @@ from quantdesk.candidate_contract import (
     summarize_candidates_by_strategy,
 )
 from quantdesk.csv_io import read_csv_frame
+from quantdesk.daily_candidate_refresh import (
+    formal_candidate_strategy_payload,
+    load_formal_candidate_intake,
+    verify_candidate_envelope,
+)
+from quantdesk.daily_price_update_engine import infer_target_date
 from quantdesk.daily_session_evidence import load_verified_no_session_dates
 from quantdesk.market_clock import next_cn_a_share_trading_day
 from quantdesk.paper.market_rules import lot_size_for_symbol, paper_only_boundary, round_down_to_lot
@@ -103,8 +109,8 @@ def _read_csv_rows(path: Path) -> list[dict[str, str]]:
         return []
 
 
-def _read_low_price_allowed_symbols(path: Path = LOW_PRICE_UNIVERSE_CSV) -> set[str] | None:
-    if not path.exists():
+def _read_low_price_allowed_symbols(path: Path | None = LOW_PRICE_UNIVERSE_CSV) -> set[str] | None:
+    if path is None or not path.exists():
         return None
     allowed: set[str] = set()
     for row in _read_csv_rows(path):
@@ -613,6 +619,7 @@ def _build_item(
     daily_df: pd.DataFrame,
     feature: dict[str, Any],
     price_data_evidence: dict[str, Any],
+    diagnostic_only: bool = False,
 ) -> dict[str, Any]:
     reference_close = None
     if not daily_df.empty:
@@ -639,10 +646,18 @@ def _build_item(
     board_lot = lot_size_for_symbol(symbol) or 100
     entry_below_board_lot = (not holding) and quantity < board_lot
     risk_guards = _risk_guards(feature, context, holding=holding)
-    formal_execution_eligible = bool(
-        price_data_evidence.get("formal_execution_eligible")
-    )
-    if not formal_execution_eligible:
+    candidate_envelope = candidate.get("candidate_envelope") if isinstance(candidate, dict) else None
+    qualification_reasons = verify_candidate_envelope(candidate_envelope) if candidate else ["not_a_current_candidate"]
+    if isinstance(candidate_envelope, dict):
+        original = candidate_envelope.get("candidate") or {}
+        if (candidate_envelope.get("target_date") != plan_date
+                or normalize_symbol(original.get("symbol")) != symbol
+                or normalize_strategy_type(original.get("strategy_type")) != normalize_strategy_type(strategy_type)):
+            qualification_reasons.append("candidate_envelope_plan_binding_mismatch")
+    candidate_eligible = bool(candidate and not qualification_reasons and not diagnostic_only)
+    price_eligible = price_data_evidence.get("formal_execution_eligible") is True
+    formal_execution_eligible = bool(price_eligible and (holding or candidate_eligible) and not diagnostic_only)
+    if not price_eligible:
         risk_guards = [
             *risk_guards,
             {
@@ -654,6 +669,9 @@ def _build_item(
                 ),
             },
         ]
+    if candidate and not candidate_eligible:
+        risk_guards.append({"guard": "formal_candidate_qualification", "effect": "block_new_buy",
+                            "reason": "候选缺少目标日期的正式来源证据；仅供诊断。"})
     if entry_below_board_lot:
         risk_guards = [
             *risk_guards,
@@ -682,6 +700,8 @@ def _build_item(
         "source_data_cutoff": source_data_cutoff,
         "formal_execution_eligible": formal_execution_eligible,
         "price_data_evidence": dict(price_data_evidence),
+        "candidate_qualification": {"status": "passed" if candidate_eligible else "diagnostic_only" if diagnostic_only else "not_eligible",
+                                    "formal_eligible": candidate_eligible, "reason_codes": qualification_reasons},
         "current_quantity": current_quantity,
         "sellable_quantity": sellable_quantity or 0,
         "frozen_quantity": frozen_quantity,
@@ -694,7 +714,7 @@ def _build_item(
         "rules": {
             "risk_guards": risk_guards,
             "entry_rules": entry_rules,
-            "add_rules": _add_rules(context, quantity) if holding and still_candidate and formal_execution_eligible else [],
+            "add_rules": _add_rules(context, quantity) if holding and candidate_eligible and formal_execution_eligible else [],
             "exit_rules": _exit_rules(context) if holding and formal_execution_eligible else [],
         },
         "warnings": context.get("warnings", []),
@@ -733,12 +753,40 @@ def build_conditional_trade_plan(
     daily_dir: Path = DAILY_DIR,
     daily_cache: dict[str, pd.DataFrame] | None = None,
     daily_feature_path: Path = DAILY_FEATURE_LATEST_CSV,
-    low_price_universe_path: Path = LOW_PRICE_UNIVERSE_CSV,
+    low_price_universe_path: Path | None = LOW_PRICE_UNIVERSE_CSV,
     session_evidence_metadata_dir: Path | None = None,
+    project_root: Path | None = None,
+    formal_candidate_batch: dict[str, Any] | None = None,
+    formal_candidate_batch_path: Path | str | None = None,
+    formal_candidate_status: str = "",
+    formal_data_chain_manifest: dict[str, Any] | None = None,
+    candidate_mode: str = "formal",
 ) -> dict[str, Any]:
-    auto_payload = auto_strategy_payload if isinstance(auto_strategy_payload, dict) else read_json_safe(auto_strategy_path, {})
-    if not isinstance(auto_payload, dict):
-        auto_payload = {}
+    if candidate_mode not in {"formal", "legacy_diagnostic"}:
+        raise ValueError("candidate_mode must be formal or legacy_diagnostic")
+    diagnostic_only = candidate_mode == "legacy_diagnostic"
+    root = Path(project_root).resolve() if project_root is not None else (
+        Path(daily_dir).parent.parent.resolve() if Path(daily_dir).parent.name == "data" else PROJECT_ROOT
+    )
+    supplied = auto_strategy_payload if isinstance(auto_strategy_payload, dict) else {}
+    formal_candidate_batch = formal_candidate_batch if formal_candidate_batch is not None else supplied.get("formal_candidate_batch")
+    formal_candidate_batch_path = formal_candidate_batch_path or supplied.get("formal_candidate_batch_path")
+    formal_candidate_status = formal_candidate_status or str(supplied.get("formal_candidate_status") or "")
+    formal_target = str(plan_date or source_data_cutoff or (formal_candidate_batch or {}).get("target_date") or infer_target_date()[0])[:10]
+    if diagnostic_only:
+        auto_payload = supplied or read_json_safe(auto_strategy_path, {})
+        auto_payload = auto_payload if isinstance(auto_payload, dict) else {}
+        intake = {"status": "legacy_diagnostic", "target_date": formal_target,
+                  "reason_codes": ["legacy_candidates_diagnostic_only"], "legacy_fallback_used": False,
+                  "source": "explicit_legacy_diagnostic", "input_source": "legacy_diagnostic"}
+    else:
+        intake = load_formal_candidate_intake(root, target_date=formal_target, batch=formal_candidate_batch,
+                                            batch_path=formal_candidate_batch_path, status=formal_candidate_status,
+                                            data_chain_manifest=formal_data_chain_manifest)
+        if source_data_cutoff and source_data_cutoff[:10] != formal_target:
+            intake = {**intake, "status": "blocked", "batch": None,
+                      "reason_codes": [*intake.get("reason_codes", []), "formal_candidate_cutoff_mismatch"]}
+        auto_payload = formal_candidate_strategy_payload(intake)
     state_recovered_from_backup = False
     state_recovery_source = ""
     state_recovery_warning = ""
@@ -758,13 +806,13 @@ def build_conditional_trade_plan(
     if not isinstance(portfolio_state, dict):
         portfolio_state = {}
     feature_map_initial = _read_daily_feature_map(daily_feature_path, cutoff="")
-    plan_date_value = _infer_plan_date(auto_payload, feature_map_initial, portfolio_state, plan_date)
+    plan_date_value = _infer_plan_date(auto_payload, feature_map_initial, portfolio_state, plan_date) if diagnostic_only else formal_target
     cutoff = (source_data_cutoff or plan_date_value)[:10]
     feature_map = _read_daily_feature_map(daily_feature_path, cutoff=cutoff)
     trade_date_value = _infer_trade_date(plan_date_value, trade_date)
     plan_id = f"plan_{plan_date_value.replace('-', '')}_for_{trade_date_value.replace('-', '')}"
     quantity = round_down_to_lot(quantity_per_stock)
-    allowed_symbols = _read_low_price_allowed_symbols(low_price_universe_path)
+    allowed_symbols = _read_low_price_allowed_symbols(low_price_universe_path) if diagnostic_only else None
     candidates = []
     for row in candidate_rows_from_strategy_payload(auto_payload, strategy=strategy):
         symbol = normalize_symbol(row.get("symbol"))
@@ -817,7 +865,9 @@ def build_conditional_trade_plan(
             session_evidence=dict(session_evidence_by_symbol.get(symbol) or {}),
         )
     symbols: list[dict[str, Any]] = []
-    warnings: list[str] = list(session_warnings)
+    warnings: list[str] = [*session_warnings, *intake.get("reason_codes", [])]
+    if supplied and "formal_candidate_batch" not in supplied and not diagnostic_only:
+        warnings.append("legacy_candidate_payload_ignored")
     if state_recovered_from_backup:
         warnings.append(
             "state_recovered_from_backup: 当前纸面持仓 state JSON 已损坏，已从最近的有效备份"
@@ -845,6 +895,7 @@ def build_conditional_trade_plan(
             daily_df=daily_df,
             feature=feature,
             price_data_evidence=price_evidence_by_symbol[symbol],
+            diagnostic_only=diagnostic_only,
         )
         symbols.append(item)
         warnings.extend(f"{symbol}: {warning}" for warning in item.get("warnings") or [])
@@ -868,6 +919,7 @@ def build_conditional_trade_plan(
             daily_df=daily_df,
             feature=feature,
             price_data_evidence=price_evidence_by_symbol[symbol],
+            diagnostic_only=diagnostic_only,
         )
         symbols.append(item)
         warnings.extend(f"{symbol}: {warning}" for warning in item.get("warnings") or [])
@@ -901,12 +953,15 @@ def build_conditional_trade_plan(
         "plan_date": plan_date_value,
         "trade_date": trade_date_value,
         "source_data_cutoff": cutoff,
-        "scope": SCOPE,
+        "scope": "legacy_diagnostic" if diagnostic_only else "formal_candidates_and_positions",
         "network": False,
         "is_real_order": False,
         "generated_at": now_text(),
         "state_recovered_from_backup": bool(state_recovered_from_backup),
-        "formal_execution_eligible": not blocked_price_symbols,
+        "formal_execution_eligible": bool(symbols) and all(row.get("formal_execution_eligible") is True for row in symbols),
+        "candidate_mode": candidate_mode,
+        "candidate_intake": {key: value for key, value in intake.items() if key != "batch"},
+        "observation_only": diagnostic_only,
         "price_data_validation": price_data_validation,
         "symbols": symbols,
         "summary": {
@@ -920,7 +975,13 @@ def build_conditional_trade_plan(
         "disclaimer": DISCLAIMER,
         **paper_only_boundary(),
     }
-    if write:
+    if intake.get("status") == "passed":
+        payload.update({
+            "formal_candidate_batch_path": str(intake.get("path") or ""),
+            "formal_candidate_batch_provenance_hash": str(intake.get("provenance_hash") or ""),
+            "formal_candidate_batch_source_mode": str(intake.get("source_mode") or "dated_observation_snapshot"),
+        })
+    if write and not diagnostic_only:
         atomic_write_json(output_path, payload)
         payload["path"] = _display_path(output_path)
     return payload

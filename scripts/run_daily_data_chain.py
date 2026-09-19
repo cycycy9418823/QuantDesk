@@ -14,50 +14,6 @@ from quantdesk.daily_data_chain import run_daily_data_chain  # noqa: E402
 from quantdesk.shared import truthy  # noqa: E402
 
 
-def stamp_pipeline_run_id(
-    root: Path,
-    payload: dict,
-    pipeline_run_id: str,
-) -> None:
-    """Write pipeline_run_id onto latest AND the run archive so they stay equal."""
-
-    stamp = str(pipeline_run_id or "").strip()
-    if not stamp:
-        return
-    payload["pipeline_run_id"] = stamp
-    run_id = str(payload.get("run_id") or "").strip()
-    targets = [root / "results" / "data_chain" / "daily_data_chain_latest.json"]
-    if run_id:
-        targets.append(root / "results" / "data_chain" / "runs" / run_id / "manifest.json")
-    manifest_rel = str(payload.get("manifest_path") or "").strip()
-    if manifest_rel:
-        extra = Path(manifest_rel)
-        if not extra.is_absolute():
-            extra = root / extra
-        if extra not in targets:
-            targets.append(extra)
-    seen: set[Path] = set()
-    for path in targets:
-        try:
-            resolved = path.resolve()
-        except OSError:
-            continue
-        if resolved in seen or not path.is_file():
-            continue
-        seen.add(resolved)
-        try:
-            disk = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(disk, dict):
-            continue
-        disk["pipeline_run_id"] = stamp
-        path.write_text(
-            json.dumps(disk, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the authoritative QuantDesk daily data chain."
@@ -69,8 +25,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--batch-workers", type=int, default=4)
     parser.add_argument("--retry-from-latest", default="true")
-    parser.add_argument("--skip-analysis-pool-minute", default="false")
+    parser.add_argument(
+        "--skip-analysis-pool-minute", default="true",
+        help="Skip broad minute processing; pass false only for an explicit research run.",
+    )
     parser.add_argument("--rebuild-features", default="true")
+    parser.add_argument("--include-critical-minute", default="false")
     parser.add_argument("--refresh-universe", default="true")
     parser.add_argument("--trigger", default="manual")
     parser.add_argument("--reuse-upstream-manifest", default="")
@@ -106,17 +66,16 @@ def main(argv: list[str] | None = None) -> int:
         rebuild_features=truthy(args.rebuild_features),
         retry_from_latest=truthy(args.retry_from_latest),
         skip_analysis_pool_minute=truthy(args.skip_analysis_pool_minute),
+        include_critical_minute=truthy(args.include_critical_minute),
         refresh_universe=truthy(args.refresh_universe),
         trigger=args.trigger,
         upstream_reuse=upstream_reuse,
+        pipeline_run_id=str(args.pipeline_run_id or "").strip(),
     )
-    pipeline_run_id = str(args.pipeline_run_id or "").strip()
-    if pipeline_run_id:
-        stamp_pipeline_run_id(PROJECT_ROOT, payload, pipeline_run_id)
     if truthy(args.json):
         latest = PROJECT_ROOT / "results" / "data_chain" / "daily_data_chain_latest.json"
         printed = dict(payload)
-        if latest.is_file():
+        if payload.get("published_latest") is True and latest.is_file():
             printed["artifact_path"] = "results/data_chain/daily_data_chain_latest.json"
             printed["artifact_sha256"] = "sha256:" + hashlib.sha256(latest.read_bytes()).hexdigest()
         print(json.dumps(printed, ensure_ascii=False, indent=None if truthy(args.summary) else 2))

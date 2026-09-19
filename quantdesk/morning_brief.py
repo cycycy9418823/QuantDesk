@@ -136,6 +136,8 @@ def _valid_chain_manifest(payload: Mapping[str, Any], *, run_dir: Path | None = 
         not _RUN_ID_RE.fullmatch(run_id)
         or not _DATE_RE.fullmatch(target_date)
         or status not in TERMINAL_CHAIN_STATUSES
+        or payload.get("dry_run") is True
+        or payload.get("authoritative") is False
     ):
         return False
     return run_dir is None or run_dir.name == run_id
@@ -209,17 +211,24 @@ def load_morning_brief_snapshot(
         return _blocked_snapshot("chain_lock_invalid")
 
     lock_status = str(lock_before.get("status") or "")
-    if lock_status == "running" or not lock_before:
+    lock_snapshot = {
+        key: lock_before.get(key)
+        for key in ("run_id", "pid", "status", "acquired_at", "released_at", "abandoned_reason")
+        if key in lock_before
+    }
+    if lock_status != "released":
         chain, chain_provenance = _latest_terminal_archive(paths)
         if not chain:
-            return _blocked_snapshot("terminal_chain_archive_missing")
+            return {**_blocked_snapshot("terminal_chain_archive_missing"), "lock_snapshot": lock_snapshot}
         reasons = [
-            "chain_running" if lock_status == "running" else "chain_lock_missing",
+            "chain_running" if lock_status == "running" else
+            f"chain_lock_{lock_status}" if lock_status else "chain_lock_missing",
             "mutable_latest_not_read",
         ]
         return {
             "status": "degraded",
             "source_mode": "archived_terminal_run",
+            "lock_snapshot": lock_snapshot,
             "reason_codes": reasons,
             "chain": chain,
             "workflow": {},
@@ -230,9 +239,6 @@ def load_morning_brief_snapshot(
             "stage4_maintenance": {},
             "source_provenance": {"chain": chain_provenance},
         }
-
-    if lock_status != "released":
-        return _blocked_snapshot("chain_lock_not_released")
 
     source_paths = {
         "chain": paths.chain_latest,
@@ -280,6 +286,7 @@ def load_morning_brief_snapshot(
     return {
         "status": "ready" if not reasons else "degraded",
         "source_mode": "stable_latest",
+        "lock_snapshot": lock_snapshot,
         "reason_codes": _unique(reasons),
         **values,
         "source_provenance": provenance,
@@ -323,7 +330,7 @@ def _finite_number(value: object) -> float | None:
     return number
 
 
-def _candidate_rows(workflow: Mapping[str, Any]) -> tuple[list[dict[str, str]], int]:
+def _candidate_rows(workflow: Mapping[str, Any]) -> tuple[list[dict[str, str]], int | None]:
     """Return (bounded detail rows, full unique count).
 
     The brief reports the full count but only expands a bounded detail list,
@@ -331,9 +338,22 @@ def _candidate_rows(workflow: Mapping[str, Any]) -> tuple[list[dict[str, str]], 
     detail rows are truncated.
     """
 
+    formal = workflow.get("formal_candidate_intake")
+    if isinstance(formal, Mapping):
+        source = formal.get("candidates")
+        if formal.get("status") != "passed" or not isinstance(source, list):
+            return [], None
+        if type(formal.get("candidate_count")) is not int or formal["candidate_count"] != len(source):
+            return [], None
+        rows = [
+            {name: _safe_text(raw.get(name), limit=80)
+             for name in ("symbol", "name", "strategy_type", "sector", "reason", "risk_notes")}
+            for raw in source if isinstance(raw, Mapping) and raw.get("symbol")
+        ]
+        return (rows[:3], len(rows)) if len(rows) == len(source) else ([], None)
     strategy = workflow.get("auto_strategy")
     if not isinstance(strategy, Mapping):
-        return [], 0
+        return [], None
     rows: list[dict[str, str]] = []
     for key in ("long_candidates", "board_candidates", "standard_candidates"):
         source = strategy.get(key)
@@ -657,10 +677,11 @@ def build_morning_brief(
         "as_of": as_of,
         "run_id": run_id,
         "source_mode": str(snapshot.get("source_mode") or "none"),
+        "lock_snapshot": dict(snapshot.get("lock_snapshot") or {}),
         "reason_codes": reasons,
         "data_health": {},
         "candidates": [],
-        "candidate_count": 0,
+        "candidate_count": None,
         "shadow_gate": {},
         "wide_pool": {},
         "candidate_review_url": "http://127.0.0.1:8000/#daily-focus-section",
@@ -723,7 +744,7 @@ def build_morning_brief(
         else {}
     )
     dates = workflow.get("dates") if isinstance(workflow.get("dates"), Mapping) else {}
-    workflow_day = _artifact_day(dates.get("local_complete_daily_date"))
+    workflow_day = _artifact_day(workflow.get("target_date") or dates.get("local_complete_daily_date"))
     workflow_scope_ok = bool(workflow and workflow_day == as_of)
     # Every optional section records the day it actually observed, so a reader can
     # tell *which* artifact is stale instead of only that something was.
@@ -731,6 +752,15 @@ def build_morning_brief(
     scope_mismatch = False
     if workflow_scope_ok:
         raw_candidates, candidate_total = _candidate_rows(workflow)
+        formal = workflow.get("formal_candidate_intake")
+        if isinstance(formal, Mapping) and (
+            _artifact_day(formal.get("target_date")) != as_of
+            or str(formal.get("source_run_id") or "") != run_id
+        ):
+            raw_candidates, candidate_total = [], None
+            reasons.append("formal_candidate_source_mismatch")
+        if candidate_total is None:
+            reasons.append("candidate_review_unavailable")
         payload["candidate_count"] = candidate_total
         # The brief reports the total but only expands a bounded detail list:
         # the preview is a digest for a phone screen, not a data dump.
@@ -932,7 +962,7 @@ def render_morning_brief_markdown(payload: Mapping[str, Any]) -> str:
     candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
     candidate_total = payload.get("candidate_count")
     if not isinstance(candidate_total, int) or isinstance(candidate_total, bool):
-        candidate_total = len(candidates)
+        candidate_total = len(candidates) if "candidate_count" not in payload else None
     account = payload.get("paper_account") if isinstance(payload.get("paper_account"), Mapping) else {}
     risk_items = payload.get("risk_items") if isinstance(payload.get("risk_items"), list) else []
     milestone = payload.get("milestone") if isinstance(payload.get("milestone"), Mapping) else {}
@@ -1356,6 +1386,9 @@ def run_morning_brief(
                 "reason_code": str(delivery.get("reason_code") or "provider_failure"),
                 "http_status": delivery.get("http_status"),
                 "provider_code": delivery.get("provider_code"),
+                "transport_error_type": delivery.get("transport_error_type"),
+                "transport_error_category": delivery.get("transport_error_category"),
+                "transport_error_errno": delivery.get("transport_error_errno"),
                 "summary_sha256": content_sha256,
                 "research_only": True,
                 "paper_only": True,

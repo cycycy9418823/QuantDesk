@@ -336,7 +336,9 @@ def test_formal_subset_block_precedes_universe_refresh(
     )
 
     assert "formal_scope_not_full_current_analysis_pool" not in (payload.get("errors") or [])
-    assert (payload.get("scope") or {}).get("research_scope") == "all_a"
+    assert (payload.get("scope") or {}).get("research_scope") == "explicit_symbols"
+    assert (payload.get("scope") or {}).get("formal_authoritative") is False
+    assert payload.get("published_latest") is False
 
 
 def test_latest_chain_rejects_explicit_v5_contract_after_v10(tmp_path: Path):

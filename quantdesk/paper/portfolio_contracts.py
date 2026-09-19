@@ -480,6 +480,8 @@ def build_portfolio_snapshot(
     positions = [dict(row) for row in positions_raw if isinstance(row, Mapping)] if isinstance(positions_raw, list) else []
     market_value = 0.0
     funded_count = 0
+    carried_forward_count = 0
+    unknown_count = 0
     for row in positions:
         state = str(row.get("effective_state") or row.get("lifecycle_state") or "").strip()
         if row.get("funded") is False or state in {
@@ -496,14 +498,32 @@ def build_portfolio_snapshot(
             price = _optional_finite(row.get("latest_price") or row.get("mark_price"))
             value = quantity * price if quantity is not None and price is not None else None
         if value is None or value < 0:
-            reasons.append("position_market_value_missing")
-            continue
+            # No fresh mark: carry the last trustworthy frozen valuation forward
+            # (explicitly marked) instead of under-counting equity; if none is
+            # trustworthy, record the position as unknown and mark the snapshot
+            # incomplete rather than dropping it silently.
+            quantity = _optional_finite(row.get("quantity") or row.get("shares"))
+            prior = _optional_finite(
+                row.get("last_tradable_price") or row.get("settled_price")
+            )
+            if quantity is not None and prior is not None and prior > 0:
+                value = quantity * prior
+                reasons.append("position_market_value_carried_forward")
+                carried_forward_count += 1
+            else:
+                reasons.append("position_market_value_missing")
+                unknown_count += 1
+                continue
         row_basis = str(row.get("price_basis") or row.get("valuation_price_basis") or "").strip().lower()
         if row_basis != "raw":
             reasons.append("position_price_basis_not_raw")
         market_value += value
         funded_count += 1
 
+    if unknown_count:
+        # A position with no trustworthy valuation must never be silently dropped
+        # while a seemingly complete equity is still reported.
+        reasons.append("equity_incomplete_unknown_positions")
     basis_text = str(valuation_price_basis or "").strip().lower()
     if funded_count:
         if basis_text != "raw":
@@ -591,6 +611,9 @@ def build_portfolio_snapshot(
             "kind": "funded_ledger_positions",
             "position_count": funded_count,
             "row_count": len(positions),
+            "carried_forward_position_count": carried_forward_count,
+            "unknown_position_count": unknown_count,
+            "valuation_complete": unknown_count == 0,
         },
         evidence_eligible=evidence_eligible,
         degraded_codes=reason_tuple,

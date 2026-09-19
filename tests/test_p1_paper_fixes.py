@@ -4,9 +4,22 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from quantdesk.data_truth.pit_st_delist_loader import DelistRecord, StDelistData
 from quantdesk.paper import auto_paper_portfolio, delist_liquidation, paper_trading, position_management_engine
+
+
+@pytest.fixture(autouse=True)
+def isolated_paper_paths_and_clock(tmp_path: Path, monkeypatch):
+    source_root = Path(__file__).resolve().parents[1]
+    for name, value in list(vars(auto_paper_portfolio).items()):
+        if isinstance(value, Path) and value.is_relative_to(source_root):
+            monkeypatch.setattr(auto_paper_portfolio, name, tmp_path / value.relative_to(source_root))
+    monkeypatch.setattr(auto_paper_portfolio, "infer_target_date", lambda target_date=None: (target_date or "2026-06-18", "fixture"))
+    # These accounting/lot/T+1 cases keep their existing freshness fixture at
+    # the position-specific adapter introduced by the formal intake change.
+    monkeypatch.setattr(auto_paper_portfolio, "evaluate_paper_review_freshness", lambda _state, **_kwargs: auto_paper_portfolio.evaluate_data_freshness())
 
 
 def test_paper_trading_blocks_limit_and_suspended_metadata(tmp_path: Path) -> None:
@@ -441,12 +454,20 @@ def test_auto_portfolio_blocks_star_candidate_when_default_quantity_is_below_boa
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    from tests.test_b5_formal_candidate_intake import dump, make_formal_batch
+    from tests.test_daily_candidate_refresh import _strategy_payload
+
+    candidate = _strategy_payload("2026-06-18")["standard_candidates"][0]
+    candidate.update(symbol="688001", name="sample", close=10.0)
+    batch = make_formal_batch("2026-06-18", candidate=candidate)
+    batch_path = tmp_path / "results/candidate_refresh/daily/2026-06-18.json"
     state_dir = tmp_path / "state"
     results_dir = tmp_path / "results"
     daily_dir = tmp_path / "data" / "daily"
     state_dir.mkdir(parents=True)
     results_dir.mkdir(parents=True)
     daily_dir.mkdir(parents=True)
+    dump(batch_path, batch)
     monkeypatch.setattr(auto_paper_portfolio, "STATE_DIR", state_dir)
     monkeypatch.setattr(auto_paper_portfolio, "RESULTS_DIR", results_dir)
     monkeypatch.setattr(auto_paper_portfolio, "DAILY_DIR", daily_dir)
@@ -470,6 +491,9 @@ def test_auto_portfolio_blocks_star_candidate_when_default_quantity_is_below_boa
         force_reset=True,
         enable_intraday_swing=False,
         quantity_per_stock=100,
+        formal_candidate_batch=batch,
+        formal_candidate_batch_path=batch_path,
+        formal_candidate_status="passed",
         auto_strategy_payload={
             "generated_at": "2026-06-18T15:30:00",
             "long_candidates": [

@@ -1069,7 +1069,7 @@ def _amount_to_yi(value: Any) -> float | None:
 def realtime_market_summary(*, refresh: bool = False, explicit_network: bool = False) -> dict[str, Any]:
     background_refresh: dict[str, Any] = {}
     network_allowed = bool(realtime_network_enabled() or explicit_network)
-    if realtime_network_enabled():
+    if realtime_network_enabled() and refresh:
         age = cache_age_seconds(SPOT_SNAPSHOT_CACHE)
         stale = age is None or age > REALTIME_CACHE_MAX_AGE_SECONDS
         current_background = realtime_background_snapshot()
@@ -1112,7 +1112,11 @@ def realtime_market_summary(*, refresh: bool = False, explicit_network: bool = F
             "message_for_ui": "本次由页面按钮显式联网刷新实时快照。",
         }
     else:
-        refresh_result = refresh_spot_snapshot_cache(network=False, force=refresh)
+        background_refresh = realtime_background_snapshot()
+        refresh_result = _cached_spot_refresh_payload(
+            network=False, status="cache_only",
+            message="当前显示已保存的快照；需要新报价时使用刷新按钮。",
+        )
     sector_stats = calculate_sector_stats()
     sector_cache_usable = sector_cache_has_usable_rows(sector_stats)
     frame = load_spot_snapshot_frame()

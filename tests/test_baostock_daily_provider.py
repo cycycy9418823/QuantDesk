@@ -15,6 +15,10 @@ from quantdesk import daily_price_providers as providers
 from quantdesk.daily_price_update_engine import DEFAULT_PROVIDERS
 from quantdesk.daily_session_evidence import validate_baostock_session_evidence
 
+@pytest.fixture(autouse=True)
+def isolated_baostock_session_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(providers, "_BAOSTOCK_SESSION_LOCK_PATH", tmp_path / "baostock_session.lock")
+
 
 class _Reply:
     error_code = "0"

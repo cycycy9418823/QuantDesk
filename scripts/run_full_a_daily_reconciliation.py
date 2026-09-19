@@ -46,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--network", default="false")
     parser.add_argument("--enable-network", action="store_true")
     parser.add_argument("--apply", nargs="?", const="true", default="")
+    parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--lock-timeout-seconds", type=float, default=0.0)
     parser.add_argument("--json", default="true")
@@ -63,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 _EXIT_BY_STATUS = {
     "completed": 0,
+    "completed_with_warnings": 0,
     "planned_offline": 0,
     "skipped_existing_run": 0,
     "deferred_upstream_busy": 3,
@@ -96,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         target_date=target,
         network=network,
         apply=apply_writes,
+        audit_only=args.audit_only,
         run_id=args.run_id.strip() or None,
         lock_timeout_seconds=args.lock_timeout_seconds,
         alert_network=alert_network,

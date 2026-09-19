@@ -145,6 +145,50 @@ def test_resume_without_pause_record_does_not_enable_writers(tmp_path: Path) -> 
     assert runner.states["QuantDesk AI Trader Evening"] == "Disabled"
 
 
+class _AlwaysRunningRunner(_FakeRunner):
+    def __call__(self, argv, **kwargs):
+        self.commands.append(list(argv))
+        if argv[1] == "/Query":
+            name = argv[3]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"TaskName: {name}\nStatus: Running\n",
+                stderr="",
+            )
+        if argv[1] == "/End":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if argv[1] == "/Change":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(argv)
+
+
+class _AccessDeniedRunner:
+    def __init__(self) -> None:
+        self.commands: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.commands.append(list(argv))
+        return SimpleNamespace(returncode=1, stdout="", stderr="Access is denied.")
+
+
+def test_pause_does_not_claim_stop_when_end_leaves_task_running(tmp_path: Path) -> None:
+    runner = _AlwaysRunningRunner()
+    payload = pause_writers(tmp_path, apply=True, runner=runner)
+    assert payload["ok"] is False
+    stops = {row["name"]: row["stop"] for row in payload["writer_stops"]}
+    assert stops["QuantDesk Data Close Pipeline"] == "waiting"
+    queries = [cmd for cmd in runner.commands if cmd[1] == "/Query"]
+    assert len(queries) >= 4
+
+
+def test_pause_query_access_denied_is_failure(tmp_path: Path) -> None:
+    runner = _AccessDeniedRunner()
+    payload = pause_writers(tmp_path, apply=True, runner=runner)
+    assert payload["ok"] is False
+    assert payload["failed_tasks"]
+    assert "QuantDesk Data Close Pipeline" in payload["failed_tasks"]
+
+
 def test_empty_pipeline_is_not_completed() -> None:
     empty = classify_pipeline_status({})
     assert empty["status"] == "failed"

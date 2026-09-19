@@ -11,11 +11,15 @@ import html
 import json
 import re
 import subprocess
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha1
+from math import isfinite
 from pathlib import Path
 from typing import Any, Iterable
+
+import pandas as pd
 
 from ai_trader.paths import (
     CYCLE_LATEST_PATH,
@@ -26,7 +30,8 @@ from ai_trader.paths import (
     CyclePaths,
 )
 from ai_trader.prompt_pack import load_prompt_pack
-from quantdesk.trading_calendar import is_trade_day
+from quantdesk.price_basis import PRICE_BASIS_RAW, validate_price_frame_set
+from quantdesk.trading_calendar import is_trade_day, load_a_share_trading_calendar
 from quantdesk.utils import atomic_write_json
 
 SCHEMA = "ai_trader_decision_v1"
@@ -57,12 +62,26 @@ _SYMBOL_PCT = re.compile(r"(?<!\d)(\d{6})\s*(?:\()?\s*([+-]?\d+(?:\.\d+)?)\s*%")
 _CLOSE_PRICE = re.compile(r"(?:收盘价?|现价)\s*[为是:]?\s*(\d+(?:\.\d+)?)(?:\s*元)?")
 _OPEN_PRICE = re.compile(r"开盘价?\s*[为是:]?\s*(\d+(?:\.\d+)?)(?:\s*元)?")
 _UNTAGGED_PCT = re.compile(
-    r"(?:近期|今天|今日|当日)?(涨(?:幅)?|跌(?:幅)?|回调|[+＋\-－])\s*约?\s*([+-]?\d+(?:\.\d+)?)\s*%"
+    r"(?P<verb>涨(?:幅)?|跌(?:幅)?|回调|[+＋\-－])\s*约?\s*(?P<pct>[+-]?\d+(?:\.\d+)?)\s*%"
 )
-_PREDICTION_CONTEXT = re.compile(r"(预计|预判|预期|目标价?|明天|次日|往后|未来|将会?|有望|看涨|看跌)")
+_N_SESSIONS = re.compile(r"近\s*(\d+)\s*个?交易日|近\s*(\d+)\s*日")
+_CLAIM_TIME = re.compile(
+    r"\d{4}-\d{2}-\d{2}|近\s*\d+\s*个?交易日|近\s*\d+\s*日|"
+    r"今天|今日|当日|昨天|昨日|前天|近期|最近|明天|明日|后天|次日|往后|未来"
+)
+_CLAUSE_BOUNDARY = re.compile(r"[，,；;。！？!?\n]|但是|但|然而|不过")
+_FUTURE_TIME = {"明天", "明日", "后天", "次日", "往后", "未来"}
+_PREDICTION_CONTEXT = re.compile(r"预计|预判|预期|目标价?|将会?|有望|看涨|看跌")
 _INTENT_FACT_FIELDS = ("llm_reason", "reason", "thesis", "recommendation_note")
 TZ_SHANGHAI = timezone(timedelta(hours=8))
-_DAILY_ROWS_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
+_DAILY_PRICE_CONSUMER = "paper_execution"
+@dataclass(frozen=True)
+class _DailyRowsCacheEntry:
+    signature: tuple[int, int, int, int, int]
+    rows: list[dict[str, Any]]
+
+
+_DAILY_ROWS_CACHE: dict[tuple[str, str], _DailyRowsCacheEntry] = {}
 
 
 @dataclass
@@ -70,6 +89,29 @@ class StatementGateResult:
     accepted_intents: list[dict[str, Any]]
     rejections: list[dict[str, Any]] = field(default_factory=list)
     market_note_ok: bool = True
+    original_intents: list[dict[str, Any]] = field(default_factory=list)
+    market_note_rejections: list[dict[str, Any]] = field(default_factory=list)
+
+
+def statement_gate_summary(gate: StatementGateResult) -> dict[str, Any]:
+    """Describe what was proposed and why evidence was refused, without guessing."""
+    hits = [hit for row in gate.rejections for hit in (row.get("statement_rejections") or [])]
+    unverified = any(hit.get("evidence_status") == "unverified" for hit in hits)
+    mismatch = any(hit.get("evidence_status") != "unverified" for hit in hits)
+    status = "mixed" if unverified and mismatch else (
+        "unverified" if unverified else ("mismatch" if mismatch else "accepted")
+    )
+    return {
+        "status": status,
+        "original_intent_count": len(gate.original_intents),
+        "original_buy_count": sum(row.get("side") == "buy" for row in gate.original_intents),
+        "original_sell_count": sum(row.get("side") == "sell" for row in gate.original_intents),
+        "accepted_intent_count": len(gate.accepted_intents),
+        "rejected_intent_count": sum(row.get("side") in {"buy", "sell"} for row in gate.rejections),
+        "market_note_ok": gate.market_note_ok,
+        "market_note_rejections": deepcopy(gate.market_note_rejections),
+        "original_intents": deepcopy(gate.original_intents),
+    }
 
 
 def _now_iso() -> str:
@@ -85,13 +127,17 @@ def _f(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if number != number:
+    if not isfinite(number):
         return None
     return number
 
 
 def _price_close_enough(claimed: float, actual: float) -> bool:
-    return abs(claimed - actual) <= max(0.02, abs(actual) * 0.005)
+    return (
+        isfinite(claimed)
+        and isfinite(actual)
+        and abs(claimed - actual) <= max(0.02, abs(actual) * 0.005)
+    )
 
 
 def _pct_close_enough(claimed: float, actual: float | None) -> bool:
@@ -102,9 +148,60 @@ def _pct_close_enough(claimed: float, actual: float | None) -> bool:
     return abs(claimed - actual) <= 1.0
 
 
-def _is_prediction_context(text: str, start: int) -> bool:
-    window = str(text or "")[max(0, start - 16) : start]
-    return bool(_PREDICTION_CONTEXT.search(window))
+@dataclass(frozen=True)
+class _ClaimScope:
+    evidence_date: str
+    period: str = ""
+    sessions: int | None = None
+    forecast: bool = False
+    ambiguous: bool = False
+
+
+def _scope_period_unspecified(scope: _ClaimScope) -> bool:
+    """True when a claim states no period at all.
+
+    Such a claim must be reported as unverified rather than guessed as "today"
+    or auto-widened to five sessions (B3).  It is distinct from ``ambiguous``
+    tokens such as 近期, and from the recursion inside a numbered-period scope
+    (whose returned scope carries a non-empty ``period``).
+    """
+
+    return not scope.forecast and not scope.period and not scope.ambiguous
+
+
+def _claim_scope(text: str, start: int, decision_date: str) -> _ClaimScope:
+    # Time belongs to the current clause, including intervening subject words.
+    prefix = _CLAUSE_BOUNDARY.split(text[:start])[-1]
+    times = list(_CLAIM_TIME.finditer(prefix))
+    if not times:
+        return _ClaimScope(decision_date, forecast=bool(_PREDICTION_CONTEXT.search(prefix)))
+    token = re.sub(r"\s+", "", times[-1].group())
+    if token in _FUTURE_TIME:
+        return _ClaimScope(decision_date, period=token, forecast=True)
+    if token in {"近期", "最近"}:
+        return _ClaimScope(decision_date, period=token, ambiguous=True)
+    numbered = _N_SESSIONS.fullmatch(token)
+    if numbered:
+        sessions = int(numbered.group(1) or numbered.group(2))
+        endpoint = _claim_scope(prefix, times[-1].start(), decision_date)
+        return _ClaimScope(
+            endpoint.evidence_date,
+            period=token,
+            sessions=sessions,
+            forecast=endpoint.forecast,
+            ambiguous=sessions < 1 or endpoint.ambiguous,
+        )
+    if token in {"今天", "今日", "当日"}:
+        return _ClaimScope(decision_date, period=token)
+    if token in {"昨天", "昨日", "前天"}:
+        offset = 2 if token == "前天" else 1
+        day = (date.fromisoformat(decision_date) - timedelta(days=offset)).isoformat()
+        return _ClaimScope(day, period=token)
+    try:
+        day = date.fromisoformat(token).isoformat()
+    except ValueError:
+        return _ClaimScope(token, period=token, ambiguous=True)
+    return _ClaimScope(day, period=token, forecast=day > decision_date)
 
 
 def _intent_fact_texts(intent: dict[str, Any]) -> list[str]:
@@ -121,43 +218,97 @@ def _row_date(row: dict[str, str]) -> str:
     return raw[:10].replace("/", "-")
 
 
+def _calendar_is_open(day: date, open_by_date: dict[str, bool]) -> bool:
+    return bool(open_by_date.get(day.isoformat(), day.weekday() < 5))
+
+
+def _previous_session(day: str, open_by_date: dict[str, bool]) -> str:
+    cursor = date.fromisoformat(day) - timedelta(days=1)
+    for _ in range(371):
+        if _calendar_is_open(cursor, open_by_date):
+            return cursor.isoformat()
+        cursor -= timedelta(days=1)
+    raise RuntimeError("trading calendar lookup exceeded 370 days")
+
+
+def _daily_file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+
 def iter_daily_rows(symbol: str, daily_dir: Path) -> list[dict[str, Any]]:
     key = (str(symbol), str(Path(daily_dir)))
-    cached = _DAILY_ROWS_CACHE.get(key)
-    if cached is not None:
-        return cached
     path = Path(daily_dir) / f"{symbol}.csv"
-    if not path.is_file():
-        _DAILY_ROWS_CACHE[key] = []
+    signature = _daily_file_signature(path)
+    if signature is None or not path.is_file():
+        _DAILY_ROWS_CACHE.pop(key, None)
         return []
+    cached = _DAILY_ROWS_CACHE.get(key)
+    if cached is not None and cached.signature == signature:
+        return [dict(row) for row in cached.rows]
+    _DAILY_ROWS_CACHE.pop(key, None)
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            raw_rows = list(csv.DictReader(handle))
+    except FileNotFoundError:
+        return []
+    # Classify the entire original frame, including malformed-date rows and
+    # every original column, before aliases, filtering, sorting or arithmetic.
+    validation = validate_price_frame_set(
+        {str(symbol): pd.DataFrame(raw_rows)}, consumer=_DAILY_PRICE_CONSUMER
+    )
+    evidence = validation["per_symbol"][str(symbol)]
+    basis = evidence["price_basis"]
+    basis_reason = evidence["reason_code"]
+    if _daily_file_signature(path) != signature:
+        # A concurrent update cannot supply one stable version of the evidence.
+        basis_reason = "daily_file_changed_during_read"
     rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for raw in reader:
-            day = _row_date(raw)
-            if len(day) != 10:
-                continue
-            close = _f(raw.get("close") or raw.get("收盘"))
-            pct = _f(raw.get("pct_chg") or raw.get("涨跌幅"))
-            rows.append(
-                {
-                    "date": day,
-                    "open": _f(raw.get("open") or raw.get("开盘")),
-                    "high": _f(raw.get("high") or raw.get("最高")),
-                    "low": _f(raw.get("low") or raw.get("最低")),
-                    "close": close,
-                    "pct_chg": pct,
-                }
-            )
+    for raw in raw_rows:
+        day = _row_date(raw)
+        try:
+            day = date.fromisoformat(day).isoformat()
+        except ValueError:
+            continue
+        rows.append(
+            {
+                "date": day,
+                "open": _f(raw.get("open") or raw.get("开盘")),
+                "high": _f(raw.get("high") or raw.get("最高")),
+                "low": _f(raw.get("low") or raw.get("最低")),
+                "close": _f(raw.get("close") or raw.get("收盘")),
+                "pct_chg": _f(raw.get("pct_chg") or raw.get("涨跌幅")),
+                "adjust": raw.get("adjust") or "",
+                "price_basis": basis,
+                "price_basis_reason": basis_reason,
+            }
+        )
     rows.sort(key=lambda item: item["date"])
+    if basis_reason:
+        if basis_reason != "daily_file_changed_during_read":
+            _DAILY_ROWS_CACHE[key] = _DailyRowsCacheEntry(signature, rows)
+        return [dict(row) for row in rows]
+    # Reuse one parsed lookup so each historical row does not resolve a path.
+    open_by_date = load_a_share_trading_calendar().get("is_open_by_date") or {}
     prev_close: float | None = None
+    prev_date = ""
     for row in rows:
-        if row.get("pct_chg") is None and row.get("close") is not None and prev_close:
+        if (
+            row.get("pct_chg") is None
+            and row.get("close") is not None
+            and prev_close
+            and prev_date == _previous_session(row["date"], open_by_date)
+        ):
             row["pct_chg"] = (float(row["close"]) / prev_close - 1.0) * 100.0
         if row.get("close") is not None:
             prev_close = float(row["close"])
-    _DAILY_ROWS_CACHE[key] = rows
-    return rows
+            prev_date = row["date"]
+    _DAILY_ROWS_CACHE[key] = _DailyRowsCacheEntry(signature, rows)
+    return [dict(row) for row in rows]
 
 
 def load_daily_bar(symbol: str, as_of: str, daily_dir: Path) -> dict[str, Any] | None:
@@ -170,7 +321,10 @@ def load_daily_bar(symbol: str, as_of: str, daily_dir: Path) -> dict[str, Any] |
 
 def _closes_from(symbol: str, start: str, daily_dir: Path, count: int) -> list[tuple[str, float]]:
     out: list[tuple[str, float]] = []
-    for row in iter_daily_rows(symbol, daily_dir):
+    rows = iter_daily_rows(symbol, daily_dir)
+    if any(_basis_untrusted(row) for row in rows):
+        return out
+    for row in rows:
         if row["date"] < start:
             continue
         close = row.get("close")
@@ -183,11 +337,23 @@ def _closes_from(symbol: str, start: str, daily_dir: Path, count: int) -> list[t
 
 
 def _change_n(rows: list[dict[str, Any]], as_of: str, days: int = 5) -> float | None:
-    upto = [row for row in rows if row["date"] <= as_of and row.get("close")]
-    if len(upto) <= days:
+    if days < 1 or any(_basis_untrusted(row) for row in rows):
         return None
-    prior = float(upto[-1 - days]["close"])
-    last = float(upto[-1]["close"])
+    upto = [row for row in rows if row["date"] <= as_of and row.get("close")]
+    if len(upto) <= days or upto[-1]["date"] != as_of:
+        return None
+    window = upto[-1 - days :]
+    cursor = date.fromisoformat(window[0]["date"])
+    open_by_date = load_a_share_trading_calendar().get("is_open_by_date") or {}
+    expected_dates: list[str] = []
+    while cursor.isoformat() <= as_of:
+        if _calendar_is_open(cursor, open_by_date):
+            expected_dates.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    if expected_dates != [row["date"] for row in window]:
+        return None
+    prior = float(window[0]["close"])
+    last = float(window[-1]["close"])
     if prior <= 0:
         return None
     return (last / prior - 1.0) * 100.0
@@ -224,70 +390,120 @@ def _mismatch(kind: str, detail: str, **extra: Any) -> dict[str, Any]:
     return payload
 
 
-def _check_price_claims(text: str, bar: dict[str, Any]) -> list[dict[str, Any]]:
+def _check_price_claims(
+    text: str, bar: dict[str, Any], *, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     hits: list[dict[str, Any]] = []
-    close = bar.get("close")
-    open_px = bar.get("open")
-    for match in _CLOSE_PRICE.finditer(text or ""):
-        if _is_prediction_context(text, match.start()):
-            continue
-        claimed = float(match.group(1))
-        if close is None or not _price_close_enough(claimed, float(close)):
-            hits.append(
-                _mismatch(
-                    "claimed_close",
-                    f"陈述收盘{claimed}，日线收盘{close}",
-                    claimed=claimed,
-                    actual=close,
+    for pattern, field_name, label in (
+        (_CLOSE_PRICE, "close", "收盘"),
+        (_OPEN_PRICE, "open", "开盘"),
+    ):
+        for match in pattern.finditer(text or ""):
+            scope = _claim_scope(text, match.start(), str(bar.get("date") or ""))
+            if scope.forecast:
+                continue
+            claimed = float(match.group(1))
+            if scope.ambiguous or _scope_period_unspecified(scope):
+                hits.append(
+                    _mismatch(
+                        f"claimed_{field_name}_ambiguous_period",
+                        f"{label}价对应的时段不明确，不能核对。",
+                        claimed=claimed,
+                        evidence_status="unverified",
+                        evidence_date=scope.evidence_date,
+                    )
                 )
-            )
-    for match in _OPEN_PRICE.finditer(text or ""):
-        if _is_prediction_context(text, match.start()):
-            continue
-        claimed = float(match.group(1))
-        if open_px is None or not _price_close_enough(claimed, float(open_px)):
-            hits.append(
-                _mismatch(
-                    "claimed_open",
-                    f"陈述开盘{claimed}，日线开盘{open_px}",
-                    claimed=claimed,
-                    actual=open_px,
+                continue
+            dated = next((row for row in rows if row["date"] == scope.evidence_date), None)
+            actual = None if dated is None else dated.get(field_name)
+            if actual is None or not _price_close_enough(claimed, float(actual)):
+                hits.append(
+                    _mismatch(
+                        f"claimed_{field_name}",
+                        f"陈述{scope.evidence_date}{label}{claimed}，日线{label}{actual}",
+                        claimed=claimed,
+                        actual=actual,
+                        evidence_date=scope.evidence_date,
+                        **({"evidence_status": "unverified"} if actual is None else {}),
+                    )
                 )
-            )
     return hits
+
+
+def _pct_claim_hits(
+    claimed: float,
+    scope: _ClaimScope,
+    rows: list[dict[str, Any]],
+    *,
+    kind: str,
+    symbol: str = "",
+) -> list[dict[str, Any]]:
+    if scope.forecast:
+        return []
+    evidence: dict[str, Any] = {"claimed": claimed, "evidence_date": scope.evidence_date}
+    if symbol:
+        evidence["symbol"] = symbol
+    if scope.ambiguous or _scope_period_unspecified(scope):
+        return [
+            _mismatch(
+                "claimed_pct_ambiguous_period",
+                "陈述的涨跌时段不明确，不能核对。",
+                evidence_status="unverified",
+                **evidence,
+            )
+        ]
+    blocked = _basis_untrusted(rows[0]) if rows else ""
+    if blocked:
+        return [
+            _mismatch(
+                "claimed_price_basis_untrusted",
+                f"{symbol} 日线价格口径不可用作原始核对（{blocked}）",
+                actual=None,
+                evidence_status="unverified",
+                price_basis=rows[0].get("price_basis"),
+                reason_code=blocked,
+                **evidence,
+            )
+        ]
+    bar = next((row for row in rows if row["date"] == scope.evidence_date), None)
+    if scope.sessions is not None:
+        actual = _change_n(rows, scope.evidence_date, scope.sessions)
+    else:
+        actual = None if bar is None else bar.get("pct_chg")
+    if actual is None:
+        return [
+            _mismatch(
+                "claimed_pct_no_bar" if bar is None and symbol else "claimed_pct_missing_evidence",
+                f"陈述{scope.evidence_date}时段涨跌，证据不足。",
+                actual=None,
+                evidence_status="unverified",
+                **evidence,
+            )
+        ]
+    if _pct_close_enough(claimed, actual):
+        return []
+    return [
+        _mismatch(
+            kind,
+            f"陈述{claimed}%，该票对应时段日线涨跌{actual}",
+            actual=actual,
+            **evidence,
+        )
+    ]
 
 
 def _check_symbol_pct_claims(text: str, decision_date: str, daily_dir: Path) -> list[dict[str, Any]]:
     hits: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
     for match in _SYMBOL_PCT.finditer(text or ""):
-        if _is_prediction_context(text, match.start()):
-            continue
+        scope = _claim_scope(text, match.start(), decision_date)
         symbol, raw = match.group(1), match.group(2)
-        key = (symbol, raw)
-        if key in seen:
-            continue
-        seen.add(key)
-        claimed = float(raw)
-        bar = load_daily_bar(symbol, decision_date, daily_dir)
-        if bar is None:
-            hits.append(_mismatch("claimed_pct_no_bar", f"{symbol} 陈述{claimed}%，日线无{decision_date}", symbol=symbol))
-            continue
-        actual = bar.get("pct_chg")
-        if actual is None and bar.get("close") is not None:
-            rows = iter_daily_rows(symbol, daily_dir)
-            change = _change_n(rows, decision_date, 1)
-            actual = change
-        n_day = _change_n(iter_daily_rows(symbol, daily_dir), decision_date, 5)
-        if _pct_close_enough(claimed, actual) or _pct_close_enough(claimed, n_day):
-            continue
-        hits.append(
-            _mismatch(
-                "claimed_pct",
-                f"{symbol} 陈述{claimed}%，日线涨跌{actual}",
+        hits.extend(
+            _pct_claim_hits(
+                float(raw),
+                scope,
+                iter_daily_rows(symbol, daily_dir),
+                kind="claimed_pct",
                 symbol=symbol,
-                claimed=claimed,
-                actual=actual,
             )
         )
     return hits
@@ -307,25 +523,32 @@ def _check_untagged_pct(text: str, bar: dict[str, Any] | None, rows: list[dict[s
     if not text or bar is None:
         return []
     hits: list[dict[str, Any]] = []
+    symbol_spans = [match.span() for match in _SYMBOL_PCT.finditer(text)]
     for match in _UNTAGGED_PCT.finditer(text):
-        if _is_prediction_context(text, match.start()):
+        if any(start <= match.start() < end for start, end in symbol_spans):
             continue
-        claimed = _signed_pct_claim(match.group(1), match.group(2))
-        if _pct_close_enough(claimed, bar.get("pct_chg")):
-            continue
-        day1 = _change_n(rows, as_of, 1)
-        n_day = _change_n(rows, as_of, 5)
-        if _pct_close_enough(claimed, day1) or _pct_close_enough(claimed, n_day):
-            continue
-        hits.append(
-            _mismatch(
-                "claimed_pct_untagged",
-                f"陈述{claimed}%，该票日线涨跌{bar.get('pct_chg')}",
-                claimed=claimed,
-                actual=bar.get("pct_chg"),
+        scope = _claim_scope(text, match.start(), as_of)
+        hits.extend(
+            _pct_claim_hits(
+                _signed_pct_claim(match.group("verb"), match.group("pct")),
+                scope,
+                rows,
+                kind="claimed_pct_untagged",
             )
         )
     return hits
+
+
+def _basis_untrusted(row: dict[str, Any] | None) -> str:
+    if not row:
+        return "unknown_price_basis"
+    reason = str(row.get("price_basis_reason") or "")
+    basis = str(row.get("price_basis") or "")
+    if reason in {"mixed_price_basis", "unknown_price_basis"}:
+        return reason
+    if basis != PRICE_BASIS_RAW:
+        return reason or "consumer_price_basis_not_allowed"
+    return ""
 
 
 def verify_intent_against_daily(
@@ -338,13 +561,36 @@ def verify_intent_against_daily(
     symbol = str(intent.get("symbol") or "").strip()
     if not symbol:
         return [_mismatch("missing_symbol", "决策没有代码")]
-    bar = load_daily_bar(symbol, decision_date, daily_dir)
+    rows = iter_daily_rows(symbol, daily_dir)
+    bar = next((row for row in rows if row["date"] == _as_day(decision_date)), None)
     if bar is None:
-        return [_mismatch("daily_bar_missing", f"{symbol} 在 {decision_date} 没有日线", symbol=symbol)]
+        return [
+            _mismatch(
+                "daily_bar_missing",
+                f"{symbol} 在 {decision_date} 没有日线",
+                symbol=symbol,
+                evidence_date=decision_date,
+                evidence_status="unverified",
+            )
+        ]
     hits: list[dict[str, Any]] = []
+    blocked = _basis_untrusted(bar)
+    if blocked:
+        return [
+            _mismatch(
+                "claimed_price_basis_untrusted",
+                f"{symbol} 日线价格口径不可用作原始核对（{blocked}）",
+                symbol=symbol,
+                actual=None,
+                evidence_date=decision_date,
+                evidence_status="unverified",
+                price_basis=bar.get("price_basis"),
+                reason_code=blocked,
+            )
+        ]
     ref = _f(intent.get("ref_close"))
     close = bar.get("close")
-    if ref is not None and close is not None and not _price_close_enough(ref, float(close)):
+    if ref is not None and (close is None or not _price_close_enough(ref, float(close))):
         hits.append(
             _mismatch(
                 "ref_close",
@@ -352,21 +598,26 @@ def verify_intent_against_daily(
                 symbol=symbol,
                 claimed=ref,
                 actual=close,
+                evidence_date=decision_date,
+                **({"evidence_status": "unverified"} if close is None else {}),
             )
         )
     session = intent.get("session") if isinstance(intent.get("session"), dict) else {}
     session_close = _f(session.get("daily_close"))
-    if session_close is not None and close is not None and not _price_close_enough(session_close, float(close)):
+    if session_close is not None and (close is None or not _price_close_enough(session_close, float(close))):
         hits.append(
             _mismatch(
                 "session_daily_close",
                 f"{symbol} 会话记录收盘{session_close}，日线收盘{close}",
                 symbol=symbol,
+                claimed=session_close,
+                actual=close,
+                evidence_date=decision_date,
+                **({"evidence_status": "unverified"} if close is None else {}),
             )
         )
-    rows = iter_daily_rows(symbol, daily_dir)
     for fact in _intent_fact_texts(intent):
-        hits.extend(_check_price_claims(fact, bar))
+        hits.extend(_check_price_claims(fact, bar, rows=rows))
         hits.extend(_check_untagged_pct(fact, bar, rows, decision_date))
         hits.extend(_check_symbol_pct_claims(fact, decision_date, daily_dir))
     hits.extend(_check_symbol_pct_claims(market_note, decision_date, daily_dir))
@@ -414,6 +665,8 @@ def gate_plan_statements(plan: dict[str, Any], *, daily_dir: Path) -> StatementG
         accepted_intents=accepted,
         rejections=rejections,
         market_note_ok=not note_hits,
+        original_intents=deepcopy([row for row in (plan.get("intents") or []) if isinstance(row, dict)]),
+        market_note_rejections=deepcopy(note_hits),
     )
 
 
@@ -642,6 +895,21 @@ def score_decision(record: dict[str, Any], *, daily_dir: Path, as_of: str) -> di
         return updated
     window = trade_days_from(start, n_days)
     due = str(verification.get("due_date") or (window[-1] if window else ""))
+    rows = iter_daily_rows(symbol, daily_dir)
+    blocked = _basis_untrusted(rows[0]) if rows else ""
+    if blocked:
+        updated["result"] = RESULT_EXPIRED_NO_EVIDENCE if due and as_of >= due else RESULT_PENDING
+        updated["result_as_of"] = as_of
+        updated["result_evidence"] = [{
+            "kind": "price_basis_untrusted",
+            "evidence_status": "unverified",
+            "symbol": symbol,
+            "price_basis": rows[0].get("price_basis"),
+            "reason_code": blocked,
+            "consumer": _DAILY_PRICE_CONSUMER,
+            "due_date": due,
+        }]
+        return updated
     closes = dict(_closes_from(symbol, start, daily_dir, n_days + 5))
     observed: list[tuple[str, float]] = []
     for day in window:
@@ -722,7 +990,13 @@ def _result_names() -> tuple[str, ...]:
     )
 
 
-def render_owner_page(records: list[dict[str, Any]], *, html_path: Path, md_path: Path) -> None:
+def render_owner_page(
+    records: list[dict[str, Any]],
+    *,
+    html_path: Path,
+    md_path: Path,
+    intents: list[dict[str, Any]] | None = None,
+) -> None:
     ordered = _sort_for_page(records)
     live = [row for row in ordered if not _is_backfill(row)]
     review = [row for row in ordered if _is_backfill(row)]
@@ -781,6 +1055,30 @@ def render_owner_page(records: list[dict[str, Any]], *, html_path: Path, md_path
             f"<td>{html.escape(recorded)}</td>"
             "</tr>"
         )
+    intent_rows = list(intents or [])
+    if intent_rows:
+        lines += [
+            "",
+            f"## 白天盘中意图（未成交，仅记录）· {len(intent_rows)} 条",
+            "",
+            "对照的是 AI 自己当晚计划的点位；价格来自 `data/snapshots/` 的 5 分钟槽与实时快照。"
+            "**没有成交，未改账本。**",
+            "",
+            "| 时刻 | 代码 | 方向 | 触发条件 | 计划点位 | 现价 | 当日低/高 | 备注 |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for item in intent_rows:
+            low = item.get("observed_low")
+            high = item.get("observed_high")
+            band = f"{low if low is not None else '-'} / {high if high is not None else '-'}"
+            note = str(item.get("note") or "").replace("|", "\\|").replace("\n", " ")
+            lines.append(
+                f"| {item.get('at') or ''} | {item.get('symbol') or ''} | {item.get('side') or ''} | "
+                f"{item.get('precondition') or ''} | "
+                f"{item.get('level') if item.get('level') is not None else '-'} | "
+                f"{item.get('observed_price') if item.get('observed_price') is not None else '-'} | "
+                f"{band} | {note} |"
+            )
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     html_doc = (
@@ -804,7 +1102,33 @@ def render_owner_page(records: list[dict[str, Any]], *, html_path: Path, md_path
         "<th>判断</th><th>验证条件</th><th>提示词/菜单</th><th>落盘时刻</th>"
         "</tr></thead><tbody>"
         + "".join(html_rows)
-        + "</tbody></table></body></html>"
+        + "</tbody></table>"
+        + (
+            "<h2>白天盘中意图（未成交，仅记录）· "
+            + str(len(intent_rows))
+            + " 条</h2><p>对照的是 AI 自己当晚计划的点位；价格来自 "
+            "<code>data/snapshots/</code> 的 5 分钟槽与实时快照。<strong>没有成交，未改账本。</strong></p>"
+            "<table><thead><tr><th>时刻</th><th>代码</th><th>方向</th><th>触发条件</th>"
+            "<th>计划点位</th><th>现价</th><th>当日低/高</th><th>备注</th></tr></thead><tbody>"
+            + "".join(
+                "<tr>"
+                f"<td>{html.escape(str(item.get('at') or ''))}</td>"
+                f"<td>{html.escape(str(item.get('symbol') or ''))}</td>"
+                f"<td>{html.escape(str(item.get('side') or ''))}</td>"
+                f"<td>{html.escape(str(item.get('precondition') or ''))}</td>"
+                f"<td>{html.escape(str(item.get('level') if item.get('level') is not None else '-'))}</td>"
+                f"<td>{html.escape(str(item.get('observed_price') if item.get('observed_price') is not None else '-'))}</td>"
+                f"<td>{html.escape(str(item.get('observed_low') if item.get('observed_low') is not None else '-'))}"
+                f" / {html.escape(str(item.get('observed_high') if item.get('observed_high') is not None else '-'))}</td>"
+                f"<td>{html.escape(str(item.get('note') or ''))}</td>"
+                "</tr>"
+                for item in intent_rows
+            )
+            + "</tbody></table>"
+            if intent_rows
+            else ""
+        )
+        + "</body></html>"
     )
     html_path.parent.mkdir(parents=True, exist_ok=True)
     html_path.write_text(html_doc, encoding="utf-8")
@@ -985,6 +1309,7 @@ def refresh_owner_outputs(
     daily_dir: Path,
     as_of: str,
     extra_manifest: dict[str, Any] | None = None,
+    intents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     scored = score_decision_log(records, daily_dir=daily_dir, as_of=as_of)
     write_decision_records(paths["log"], scored)
@@ -996,7 +1321,7 @@ def refresh_owner_outputs(
         "records": scored,
     }
     atomic_write_json(paths["latest"], latest)
-    render_owner_page(scored, html_path=paths["html"], md_path=paths["md"])
+    render_owner_page(scored, html_path=paths["html"], md_path=paths["md"], intents=intents)
     manifest = git_run_manifest()
     manifest.update(
         {
@@ -1033,7 +1358,10 @@ def record_evening_and_refresh_page(
     paths = c_line_output_paths(runtime)
     incoming = records_from_plan(plan, daily_dir=daily_dir, rejections=rejections, backfill=False)
     merged = upsert_decision_records(paths["log"], incoming)
-    return refresh_owner_outputs(merged, paths=paths, daily_dir=daily_dir, as_of=as_of)
+    from ai_trader.daytime_intent import load_daytime_intents_for
+
+    intents = load_daytime_intents_for(as_of, intents_path=runtime.daytime_intents)
+    return refresh_owner_outputs(merged, paths=paths, daily_dir=daily_dir, as_of=as_of, intents=intents)
 
 
 def ingest_state(
@@ -1094,6 +1422,7 @@ def ingest_state(
 
 def apply_gate_to_plan(plan: dict[str, Any], *, daily_dir: Path) -> StatementGateResult:
     gated = gate_plan_statements(plan, daily_dir=daily_dir)
+    plan["statement_review"] = statement_gate_summary(gated)
     plan["intents"] = gated.accepted_intents
     if gated.rejections:
         plan["statement_rejections"] = [

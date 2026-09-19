@@ -7,13 +7,15 @@ observations, but it must not present them as a current-day review.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable
 
 from quantdesk.daily_feature_engine import daily_feature_status
+from quantdesk.daily_candidate_refresh import load_formal_candidate_intake
 from quantdesk.daily_price_providers import latest_date_for_symbol
-from quantdesk.daily_price_update_engine import daily_price_status
+from quantdesk.daily_price_update_engine import daily_price_status, infer_target_date, local_daily_status_for_symbols
 from quantdesk.shared import normalize_symbol, read_json
 from quantdesk.time_utils import now_text
 
@@ -63,29 +65,46 @@ def _iter_positions(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
         yield from _iter_positions(nested)
 
 
-def collect_current_review_symbols() -> list[str]:
-    """Collect current candidates and auto-paper positions without scanning all A."""
+def collect_current_review_scope(target_date: str | None = None) -> dict[str, Any]:
+    """Keep exact-date formal candidates and current ledger holdings distinct."""
+    target = str(target_date or infer_target_date()[0])[:10]
+    intake = load_formal_candidate_intake(RESULTS_DIR.parent, target_date=target)
+    batch = intake.get("batch") if intake.get("status") == "passed" else {}
+    batch = batch if isinstance(batch, dict) else {}
+    candidates = sorted({symbol for row in batch.get("candidates", [])
+                         if isinstance(row, dict) and (symbol := _normalize_symbol(row.get("symbol")))})
+    position_error = ""
+    position_hash = ""
+    try:
+        content = AUTO_PAPER_PORTFOLIO_STATE_JSON.read_bytes()
+        position_hash = hashlib.sha256(content).hexdigest()
+        ledger = json.loads(content.decode("utf-8-sig"))
+        if not isinstance(ledger, dict):
+            raise ValueError("paper ledger is not an object")
+    except (OSError, UnicodeError, ValueError) as exc:
+        ledger = {}
+        position_error = f"paper_positions_unavailable:{type(exc).__name__}"
+    positions = sorted({symbol for row in _iter_positions(ledger)
+                        if (symbol := _normalize_symbol(row.get("symbol") or row.get("code")))})
+    return {
+        "symbols": sorted(set(candidates) | set(positions)),
+        "candidate_scope": {
+            **{key: value for key, value in intake.items() if key != "batch"},
+            "symbols": candidates, "symbol_count": len(candidates),
+        },
+        "position_scope": {
+            "status": "unavailable" if position_error else "passed", "source": "strategy_paper_ledger",
+            "path": str(AUTO_PAPER_PORTFOLIO_STATE_JSON), "source_hash": position_hash,
+            "as_of": str(ledger.get("updated_at") or ""), "target_date": target,
+            "symbols": positions, "symbol_count": len(positions),
+            "reason_codes": [position_error] if position_error else [],
+        },
+    }
 
-    symbols: list[str] = []
-    seen: set[str] = set()
 
-    def add(value: Any) -> None:
-        symbol = _normalize_symbol(value)
-        if symbol and symbol not in seen:
-            seen.add(symbol)
-            symbols.append(symbol)
-
-    strategy = read_json(AUTO_STRATEGY_LATEST_JSON, {})
-    for key in ("long_candidates", "board_candidates"):
-        for row in strategy.get(key) or []:
-            if isinstance(row, dict):
-                add(row.get("symbol") or row.get("code"))
-
-    for path in (AUTO_PAPER_PORTFOLIO_LATEST_JSON, AUTO_PAPER_PORTFOLIO_STATE_JSON):
-        payload = read_json(path, {})
-        for row in _iter_positions(payload):
-            add(row.get("symbol") or row.get("code"))
-    return symbols
+def collect_current_review_symbols(target_date: str | None = None) -> list[str]:
+    """Compatibility list view of the verified candidate/position scope."""
+    return collect_current_review_scope(target_date)["symbols"]
 
 
 def _has_intraday_for_date(symbol: str, trade_date: str) -> bool:
@@ -107,6 +126,56 @@ def _has_intraday_for_date(symbol: str, trade_date: str) -> bool:
     return trade_date in tail
 
 
+def paper_review_data_status(
+    state: dict[str, Any], *, target_date: str, daily_dir: Path
+) -> dict[str, Any]:
+    """Check existing holdings without falling back to a research candidate pool."""
+    symbols = sorted({
+        symbol for row in _iter_positions(state)
+        if (symbol := _normalize_symbol(row.get("symbol") or row.get("code")))
+    })
+    if not symbols:
+        return {
+            "ok": True, "status": "not_applicable", "scope": "paper_positions",
+            "target_date": target_date, "symbols": [], "total_symbols": 0,
+            "latest_local_date": "", "max_local_date": "", "latest_by_symbol": {},
+            "fresh_count": 0, "stale_count": 0, "missing_count": 0, "is_stale": False,
+            "message": "没有待估值持仓；到期计划的成交价格由撮合逐笔核验。",
+        }
+    status = local_daily_status_for_symbols(
+        [{"symbol": symbol} for symbol in symbols],
+        target_date=target_date, daily_dir=daily_dir,
+    )
+    return {
+        **status, "target_date": target_date, "total_symbols": len(symbols),
+        "symbols": symbols, "scope": "paper_positions",
+    }
+
+
+def evaluate_paper_review_freshness(
+    state: dict[str, Any], *, target_date: str, daily_dir: Path
+) -> dict[str, Any]:
+    status = paper_review_data_status(state, target_date=target_date, daily_dir=daily_dir)
+    symbols = status["symbols"]
+    gate = evaluate_data_freshness(
+        daily_price_payload=status, daily_feature_payload={},
+        target_date=target_date, symbols=symbols, include_research_context=False,
+    )
+    gate["scope"] = "paper_positions"
+    gate["strategy_features_required"] = False
+    if not symbols:
+        gate.update({
+            "status": "not_applicable", "data_freshness_status": "not_applicable",
+            "warning_kind": "", "is_daily_stale": False, "stale_mode": False,
+            "can_review_yesterday_positions": True, "can_run_current_day_review": True,
+            "can_update_portfolio_valuation": True, "portfolio_review_valid": True,
+            "review_mode": "no_existing_positions", "warnings": [],
+            "reason": "没有待估值持仓；到期计划的成交价格由撮合逐笔核验。",
+            "message": "没有待估值持仓；到期计划的成交价格由撮合逐笔核验。",
+        })
+    return gate
+
+
 def _low_price_report_date() -> str:
     payload = read_json(LOW_PRICE_REPORT_JSON, {})
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
@@ -119,17 +188,22 @@ def evaluate_data_freshness(
     daily_feature_payload: dict[str, Any] | None = None,
     target_date: str | None = None,
     symbols: list[str] | None = None,
+    include_research_context: bool = True,
 ) -> dict[str, Any]:
     """Return a conservative gate decision for current-day review validity."""
 
-    daily_price = daily_price_payload if isinstance(daily_price_payload, dict) else daily_price_status(only_low_price=True, target_date=target_date)
+    target = _date_text(target_date or (daily_price_payload or {}).get("target_date") or infer_target_date()[0])
+    scope = collect_current_review_scope(target) if symbols is None else {}
+    review_symbols = list(scope.get("symbols") or []) if symbols is None else list(symbols)
+    daily_price = daily_price_payload if isinstance(daily_price_payload, dict) else local_daily_status_for_symbols(
+        [{"symbol": symbol} for symbol in review_symbols], target_date=target,
+        daily_dir=RESULTS_DIR.parent / "data/daily", metadata_dir=RESULTS_DIR.parent / "data/metadata",
+    )
     feature = daily_feature_payload if isinstance(daily_feature_payload, dict) else daily_feature_status()
-    target = _date_text(target_date or daily_price.get("target_date"))
     max_local_date = _date_text(daily_price.get("max_local_date"))
     pool_latest = _date_text(daily_price.get("latest_local_date") or max_local_date)
     feature_date = _date_text(feature.get("latest_date"))
-    low_report_date = _low_price_report_date()
-    review_symbols = symbols if symbols is not None else collect_current_review_symbols()
+    low_report_date = _low_price_report_date() if include_research_context else ""
     normalized_review_symbols = [
         normalized
         for normalized in (_normalize_symbol(item) for item in review_symbols)
@@ -142,7 +216,7 @@ def evaluate_data_freshness(
             symbol: _date_text(
                 latest_by_symbol.get(symbol)
                 if symbol in latest_by_symbol
-                else latest_date_for_symbol(symbol)
+                else latest_date_for_symbol(symbol, daily_dir=RESULTS_DIR.parent / "data/daily")
             )
             for symbol in normalized_review_symbols
         }
@@ -207,6 +281,8 @@ def evaluate_data_freshness(
         data_freshness_status = "no_universe"
         warning_kind = "no_universe"
         reason = "当前没有可分析股票，无法判断本地日线新鲜度；请先运行 data-bootstrap 或指定 --symbols。"
+        if symbols is None and (scope.get("candidate_scope") or {}).get("status") != "passed":
+            reason = "目标日正式候选批次不可用，且没有待复核持仓；旧研究候选不会代替正式来源。"
     elif no_data:
         data_freshness_status = "no_data"
         warning_kind = "data_missing"
@@ -236,6 +312,9 @@ def evaluate_data_freshness(
         "local_daily_latest_date": local_daily_latest,
         "latest_complete_daily_date_for_scope": complete_scope_latest,
         "review_scope_symbol_count": len(normalized_review_symbols),
+        "review_scope_source": "explicit_symbols" if symbols is not None else "formal_candidates_and_positions",
+        "candidate_scope": scope.get("candidate_scope") or {"status": "not_requested", "reason_codes": []},
+        "position_scope": scope.get("position_scope") or {"status": "not_requested", "reason_codes": []},
         "review_scope_latest_by_symbol": review_latest_by_symbol,
         "review_scope_stale_symbol_count": scope_stale_symbol_count,
         "review_scope_missing_symbol_count": scope_missing_symbol_count,
@@ -264,7 +343,9 @@ def evaluate_data_freshness(
         "stale_mode": bool(is_daily_stale or is_feature_stale),
         "message": message,
         "reason": reason,
-        "warnings": [item for item in (reason if warning_kind else "", pool_partial_warning) if item],
+        "warnings": [item for item in (reason if warning_kind else "", pool_partial_warning) if item]
+        + list((scope.get("candidate_scope") or {}).get("reason_codes") or [])
+        + list((scope.get("position_scope") or {}).get("reason_codes") or []),
         "suggested_next_action": (
             "python scripts/qd.py data-bootstrap --preset low_price_demo --network false"
             if data_freshness_status == "no_universe"

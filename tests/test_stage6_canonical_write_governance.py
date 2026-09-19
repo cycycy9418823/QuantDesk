@@ -97,6 +97,12 @@ def test_canonical_minute_writer_surface_has_explicit_allowlist_and_guards() -> 
         "scripts/generate_intraday_1m_import_template.py": {
             "generate_template",
         },
+        # Reviewed state/config writer: the minute path occurs only in its
+        # shares_only metadata. Runtime preservation is covered by
+        # test_ai_trader_profile_isolation, not an intraday import exemption.
+        "scripts/init_ai_trader_profile.py": {
+            "_rewrite_ledger_id", "_write_profile_env", "fork_profile",
+        },
     }
     canonical_markers = (
         "INTRADAY_1M_DIR",
@@ -117,6 +123,21 @@ def test_canonical_minute_writer_surface_has_explicit_allowlist_and_guards() -> 
                 if any(marker in segment for marker in canonical_markers) and (
                     _dangerous_writer_tokens(node)
                 ):
+                    if relative == "scripts/init_ai_trader_profile.py":
+                        literals = {
+                            id(item) for item in ast.walk(node)
+                            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                            and any(marker in item.value for marker in canonical_markers)
+                        }
+                        metadata = {
+                            id(item) for dictionary in ast.walk(node) if isinstance(dictionary, ast.Dict)
+                            for key, value in zip(dictionary.keys, dictionary.values)
+                            if isinstance(key, ast.Constant) and key.value == "shares_only"
+                            for item in ast.walk(value) if isinstance(item, ast.Constant)
+                            and isinstance(item.value, str)
+                            and any(marker in item.value for marker in canonical_markers)
+                        }
+                        assert node.name == "fork_profile" and literals == metadata and literals
                     marker_writer_functions.add((relative, node.name))
 
     reviewed_pairs = {

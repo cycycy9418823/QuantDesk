@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from ai_trader.ledger import empty_ledger
+from ai_trader.trader import _limit_blocked
 from quantdesk.paper.auto_paper_portfolio import _empty_state
 from quantdesk.paper.matching import (
     POLICY_DAILY_APPROX,
@@ -16,7 +17,6 @@ from quantdesk.paper.matching import (
     next_open_limit_blocked,
     stamp_fill_policy,
 )
-from ai_trader.trader import _limit_blocked
 
 
 def test_ai_ledger_header_declares_next_open() -> None:
@@ -64,3 +64,9 @@ def test_ensure_declared_is_idempotent() -> None:
     ensure_declared_fill_policy(ledger)
     ensure_declared_fill_policy(ledger)
     assert ledger["fill_policy"] == POLICY_NEXT_OPEN
+
+
+@pytest.mark.parametrize("symbol", ["300001", "688001", "920001"])
+def test_known_st_on_wider_boards_keeps_its_existing_board_limit(symbol: str) -> None:
+    assert next_open_limit_blocked(symbol, 5.0, "buy", is_st=True) is None
+    assert next_open_limit_blocked(symbol, -5.0, "sell", is_st=True) is None

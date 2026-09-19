@@ -24,6 +24,9 @@ temporary project root, so no canonical dataset is touched.
 
 from __future__ import annotations
 
+import socket
+from unittest.mock import Mock
+
 import pandas as pd
 import pytest
 
@@ -69,6 +72,18 @@ def project(tmp_path):
     _write_local(bench / "zz500.csv", _ZZ500_HEADER, _ZZ500_ROWS)
     _write_local(bench / "sh000001.csv", _SH_HEADER, _SH_ROWS)
     return root
+
+
+@pytest.fixture(autouse=True)
+def _forbid_live_network(monkeypatch):
+    """The benchmark node must never reach the network in these tests."""
+
+    denied = Mock(side_effect=AssertionError("benchmark tests must not access the network"))
+    monkeypatch.setattr(socket, "create_connection", denied)
+    monkeypatch.setattr(socket.socket, "connect", denied)
+    monkeypatch.setattr(socket.socket, "connect_ex", denied)
+    yield
+    denied.assert_not_called()
 
 
 def _remote(rows: list[tuple[str, float]]) -> pd.DataFrame:
@@ -281,13 +296,15 @@ def test_missing_local_file_is_skipped_not_created(project):
 
 def test_second_run_is_up_to_date_and_idempotent(project):
     fetcher = _agreeing_fetcher([("2026-07-13", 4695.383)])
-    update_benchmark_files(project, fetcher=fetcher, fetched_at="x")
+    update_benchmark_files(project, fetcher=fetcher, fetched_at="x", target_date="2026-07-13")
     snapshot = {
         name: (project / "data" / "benchmark" / name).read_bytes()
         for name in ("hs300.csv", "zz500.csv", "sh000001.csv")
     }
 
-    payload = update_benchmark_files(project, fetcher=fetcher, fetched_at="y")
+    payload = update_benchmark_files(
+        project, fetcher=fetcher, fetched_at="y", target_date="2026-07-13"
+    )
 
     assert payload["status"] == "up_to_date"
     assert {item["status"] for item in payload["results"]} == {"up_to_date"}
@@ -454,6 +471,23 @@ def _stub_chain(monkeypatch, chain):
         "resolve_symbols",
         lambda **k: [{"symbol": "600000", "name": "600000", "included": "True"}],
     )
+    # The benchmark node test has no dependency on this machine's scheduler.
+    monkeypatch.setattr(chain, "_refresh_data_health_snapshot",
+                        lambda *args, **kwargs: {"status": "fixture_not_requested"})
+    # The session check becomes network-enabled on a designated canonical root
+    # (a suspended-symbol query via akshare).  It is not what these tests
+    # exercise, so it is replaced with a deterministic offline payload instead
+    # of letting the temporary root trigger a real provider call.
+    monkeypatch.setattr(
+        chain,
+        "build_session_expectation",
+        lambda *a, **k: {
+            "status": "passed",
+            "formal_eligible": True,
+            "unknown_symbols": [],
+            "legitimate_no_session_symbols": [],
+        },
+    )
     monkeypatch.setattr(
         chain,
         "build_runtime_preflight",
@@ -588,6 +622,7 @@ def test_chain_benchmark_node_reports_a_fetch_failure_without_killing_the_run(
     monkeypatch.setattr(chain, "PROJECT_ROOT", tmp_path.resolve())
 
     def boom(*a, **k):
+        assert k["target_date"] == "2026-07-24"
         raise RuntimeError("index_fetch_failed:sh000300:SSLError:boom")
 
     monkeypatch.setattr(chain, "update_benchmark_files", boom)
@@ -595,11 +630,12 @@ def test_chain_benchmark_node_reports_a_fetch_failure_without_killing_the_run(
     payload = chain.run_daily_data_chain(
         project_root=tmp_path,
         target_date="2026-07-24",
-        symbols=["600000"],
+        symbols=None,  # Formal full-pool mode; resolve_symbols is the one-row fixture above.
         network=True,
         dry_run=False,
         run_id="bench-fail",
         rebuild_features=False,
+        refresh_universe=False,
     )
 
     node = payload["components"]["benchmark_update"]

@@ -61,7 +61,15 @@ def main(argv: list[str] | None = None) -> int:
     target = str(resolved.get("target_date") or "")[:10]
     network = bool(args.enable_network or truthy(args.network))
     apply = truthy(args.apply)
-    if args.daily_only:
+    if apply:
+        from quantdesk.full_a_daily_reconciliation import run_full_a_daily_reconciliation
+
+        payload = run_full_a_daily_reconciliation(
+            project_root=PROJECT_ROOT, target_date=target, audit_only=True,
+        )
+        payload["legacy_weekly_request"] = True
+        payload["maintenance_mode"] = "daily_coverage_audit"
+    elif args.daily_only:
         # 排除策略必须与联合路径同源：否则 --daily-only 会在 4603 只全池上跑，
         # 被那 4 只永久取不到数的票挡住，与"已排除"的报告口径互相矛盾。
         daily_policy = PROJECT_ROOT / "config" / "weekly_daily_wide_pool_exclusions.json"
@@ -113,6 +121,9 @@ def main(argv: list[str] | None = None) -> int:
         "completed",
         "completed_staging_only",
         "planned_offline",
+        "completed_all_executed",
+        "completed_with_skips",
+        "completed_with_warnings",
     } else 4
 
 

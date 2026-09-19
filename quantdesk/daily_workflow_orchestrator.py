@@ -33,7 +33,7 @@ from quantdesk.daily_intraday_live_snapshot import (
     render_daily_intraday_live_snapshot_markdown,
 )
 from quantdesk.daily_output_summary import build_daily_console_summary
-from quantdesk.daily_price_update_engine import daily_price_status, update_daily_prices
+from quantdesk.daily_price_update_engine import daily_price_status, infer_target_date, update_daily_prices
 from quantdesk.daily_research_snapshot import load_research_dashboard_snapshot, render_daily_research_snapshot_markdown
 from quantdesk.daily_risk_attribution_snapshot import (
     load_risk_attribution_snapshot,
@@ -42,6 +42,8 @@ from quantdesk.daily_risk_attribution_snapshot import (
 from quantdesk.data_confidence import build_reference_confidence
 from quantdesk.data_freshness_gate import (
     evaluate_data_freshness,
+    evaluate_paper_review_freshness,
+    paper_review_data_status,
     waiting_decision_review,
     waiting_yesterday_holding_review,
 )
@@ -70,6 +72,7 @@ from quantdesk.paper.auto_paper_portfolio import (
     run_auto_paper_portfolio,
 )
 from quantdesk.paper.state_store import PaperStateStore
+from quantdesk.plan_review_receipts import plan_review_snapshot
 from quantdesk.remediation_advisor import build_remediation_plan
 from quantdesk.research.daily_watchpool_step import build_daily_watchpool_step
 from quantdesk.research.daily_research_snapshots import (
@@ -126,7 +129,7 @@ STEP_NAMES = [
 
 def _display_path(path: Path) -> str:
     try:
-        return str(path.relative_to(PROJECT_ROOT))
+        return path.relative_to(PROJECT_ROOT).as_posix()
     except ValueError:
         return str(path)
 
@@ -204,6 +207,9 @@ def _run_daily_paper_consistency_check(
     input_dir: str | Path = RESULTS_DIR,
     output_dir: str | Path = RESULTS_DIR,
     report_dir: str | Path = REPORTS_DIR,
+    paper_payload: dict[str, Any] | None = None,
+    execution_payload: dict[str, Any] | None = None,
+    intraday_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the local-only paper-vs-backtest consistency gate for daily workflow."""
 
@@ -215,6 +221,9 @@ def _run_daily_paper_consistency_check(
             input_dir=input_dir,
             output_dir=output_dir,
             report_dir=report_dir,
+            paper_payload=paper_payload,
+            execution_payload=execution_payload,
+            intraday_payload=intraday_payload,
             network=False,
             strict=False,
             write=True,
@@ -480,6 +489,8 @@ def _build_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "theme_failed_reason": theme.get("failed_reason") or "",
         "long_candidate_count": long_count,
         "board_candidate_count": board_count,
+        "legacy_research_status": strategy_payload.get("status", "requested"),
+        "formal_candidate_intake": payload.get("formal_candidate_intake") or {},
         "conditional_plan_count": _int(plan_summary.get("symbol_count") or plan_summary.get("total_symbols")),
         "execution_event_count": _int(execution_summary.get("event_count")),
         "no_fill_count": _int(execution_summary.get("no_fill_count")),
@@ -777,7 +788,16 @@ def build_daily_guardrail_summary(
 def _workflow_status(steps: list[dict[str, Any]], errors: list[str]) -> str:
     if errors and all(step.get("status") in {"failed", "skipped"} for step in steps):
         return "failed"
-    if errors or any(step.get("status") in {"warning", "failed", "skipped"} for step in steps):
+    incomplete = any(
+        step.get("status") in {"warning", "failed"}
+        or (
+            step.get("status") == "skipped"
+            and (step.get("outputs") or {}).get("reason")
+            not in {"not_requested", "no_existing_positions", "no_execution_symbols"}
+        )
+        for step in steps
+    )
+    if errors or incomplete:
         return "partial"
     return "completed"
 
@@ -1104,6 +1124,16 @@ def build_daily_workflow_report(payload: dict[str, Any]) -> str:
     experiment_tracker_snapshot = payload.get("experiment_tracker_snapshot") if isinstance(payload.get("experiment_tracker_snapshot"), dict) else {}
     if experiment_tracker_snapshot:
         lines += ["", render_daily_experiment_tracker_snapshot_markdown(experiment_tracker_snapshot), ""]
+    plan_review = payload.get("plan_review_summary") or {}
+    if plan_review:
+        lines += ["", "## 到期计划证据", "",
+                  f"- 已复核 {plan_review.get('reviewed_count', 0)}；复核通过 {plan_review.get('review_passed_count', 0)}；"
+                  f"已模拟 {plan_review.get('replayed_count', 0)}；账本应用记录 {plan_review.get('applied_count', 0)}。",
+                  f"- 证据不足 {plan_review.get('evidence_insufficient_count', 0)}；旧收据未绑定计划 {plan_review.get('legacy_unbound_count', 0)}；"
+                  f"尚未闭合 {plan_review.get('unresolved_count', 0)}。"]
+        for item in (payload.get("plan_review_items") or [])[:20]:
+            reasons = "; ".join(str(value) for value in item.get("missing_evidence_reasons") or [])
+            lines.append(f"- {item.get('trade_date', '')} / {item.get('plan_id', '')}: {item.get('status', 'unreviewed')}。{reasons}")
     for step in payload.get("steps") or []:
         lines.append(
             f"- {step.get('name')}: {step.get('status')}。{step.get('message') or ''}"
@@ -1251,12 +1281,23 @@ def daily_workflow_latest() -> dict[str, Any]:
     return payload
 
 
+def _review_daily_status(target_date: str) -> dict[str, Any]:
+    return paper_review_data_status(
+        read_json_safe(AUTO_PAPER_PORTFOLIO_STATE_JSON, {}),
+        target_date=target_date, daily_dir=DAILY_DIR,
+    )
+
+
 def daily_workflow_status() -> dict[str, Any]:
     theme = theme_map_status()
     theme["current_candidate_theme_status"] = validate_theme_map_for_current_candidates()
     feature = daily_feature_status()
-    daily_price = daily_price_status(only_low_price=True)
-    freshness = evaluate_data_freshness(daily_price_payload=daily_price, daily_feature_payload=feature)
+    target_date, _ = infer_target_date()
+    daily_price = _review_daily_status(target_date)
+    freshness = evaluate_paper_review_freshness(
+        read_json_safe(AUTO_PAPER_PORTFOLIO_STATE_JSON, {}),
+        target_date=target_date, daily_dir=DAILY_DIR,
+    )
     latest = daily_workflow_latest()
     low_price = _low_price_status()
     payload = {
@@ -1269,7 +1310,7 @@ def daily_workflow_status() -> dict[str, Any]:
         "data_freshness_gate": freshness,
         "theme_map_status": theme,
         "auto_paper_portfolio_exists": AUTO_PAPER_PORTFOLIO_STATE_JSON.exists(),
-        "local_complete_daily_date": daily_price.get("latest_local_date") or _latest_daily_date(),
+        "local_complete_daily_date": daily_price.get("latest_local_date") or "",
         "message": "今日一键复盘状态只读，不会生成文件、不会联网、不会运行重任务。",
     }
     if latest.get("exists"):
@@ -1294,29 +1335,21 @@ def run_daily_workflow(
     with_guardrails: bool = True,
     guardrails_mode: str = "quick",
     run_strategy_lab: bool = False,
+    run_legacy_research: bool = False,
+    run_brain_shadow: bool = False,
+    target_date: str | None = None,
 ) -> dict[str, Any]:
+    review_target_date, _ = infer_target_date(target_date)
     generated_at = now_text()
     run_id = f"daily_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     steps: list[dict[str, Any]] = []
     warnings: list[str] = []
     errors: list[str] = []
-    artifacts: dict[str, Any] = {
-        "daily_report": "reports/daily_quant_report_latest.md",
-        "daily_result": "results/daily_workflow_latest.json",
-        "data_health": "results/data_health/data_health_dashboard_latest.json",
-        "guardrails": "results/strategy_validation_latest.json",
-        "command_center": "results/command_center_status_latest.json",
-        "daily_workflow_latest": _display_path(DAILY_WORKFLOW_LATEST_JSON),
-        "stock_theme_map": "data/universe/stock_theme_map.csv",
-        "stock_theme_map_import": "data/universe/stock_theme_map_import.csv",
-        "auto_strategy_latest": "results/auto_strategy_latest.json",
-        "auto_paper_portfolio_latest": "results/auto_paper_portfolio_latest.json",
-        "paper_vs_backtest_consistency_latest": "results/paper_vs_backtest_consistency_latest.json",
-        "paper_vs_backtest_consistency_report": "reports/paper_vs_backtest_consistency_report_latest.md",
-        "conditional_trade_plans_latest": "results/conditional_trade_plans_latest.json",
-        "conditional_execution_latest": "results/conditional_execution_latest.json",
-        "intraday_gap_status_latest": "results/intraday_gap_status_latest.json",
-    }
+    artifacts: dict[str, Any] = {}
+    input_artifacts: dict[str, Any] = {}
+    review_symbols: set[str] = set()
+    due_loaded: dict[str, Any] = {}
+    portfolio_ran = False
 
     low_status: dict[str, Any] = {}
     low_report: dict[str, Any] = {}
@@ -1333,6 +1366,7 @@ def run_daily_workflow(
     formal_candidate_status = "missing"
     watchpool_payload: dict[str, Any] = {}
     portfolio_payload: dict[str, Any] = {}
+    plan_review_payload: dict[str, Any] = {}
     intraday_status_payload: dict[str, Any] = {}
     paper_consistency_payload: dict[str, Any] = {}
     freshness_gate: dict[str, Any] = {}
@@ -1355,13 +1389,15 @@ def run_daily_workflow(
         error: str = "",
         input_source: str = "in_memory",
     ) -> None:
-        if input_source == "in_memory":
+        if status == "skipped":
+            input_source = "not_run"
+        elif input_source == "in_memory":
             input_source = {
                 "auto_strategy_sandbox": "generated_in_memory",
                 "current_candidate_theme_sync": "candidates_in_memory",
-                "conditional_trade_plan": "candidates_in_memory",
-                "conditional_execution": "plan_payload_in_memory",
-                "portfolio_update": "strategy_payload_in_memory",
+                "conditional_trade_plan": "dated_due_plan_archive",
+                "conditional_execution": "dated_due_plan_in_memory",
+                "portfolio_update": "dated_formal_candidate_batch_and_due_plan",
             }.get(name, input_source)
         step = _start_step(name)
         steps.append(_finish_step(step, status, message, outputs=outputs, error=error, input_source=input_source))
@@ -1371,37 +1407,36 @@ def run_daily_workflow(
             errors.append(error or message)
 
     try:
-        try:
-            low_status = _low_price_status()
-            add_step(
-                "low_price_pool_check",
-                "ok" if low_status.get("ok") else "warning",
-                low_status.get("message", ""),
-                {"included_count": low_status.get("included_count", 0), "path": low_status.get("path", "")},
-            )
-        except Exception as exc:  # noqa: BLE001
-            low_status = {"ok": False, "included_count": 0, "message": str(exc)}
-            add_step("low_price_pool_check", "failed", "低价学习池检查失败。", error=str(exc))
+        if run_legacy_research:
+            try:
+                low_status = _low_price_status()
+                add_step(
+                    "low_price_pool_check",
+                    "ok" if low_status.get("ok") else "warning",
+                    low_status.get("message", ""),
+                    {"included_count": low_status.get("included_count", 0), "path": low_status.get("path", "")},
+                )
+            except Exception as exc:  # noqa: BLE001
+                low_status = {"ok": False, "included_count": 0, "message": str(exc)}
+                add_step("low_price_pool_check", "warning", "低价策略输入检查失败；持仓复盘单独检查。", error=str(exc))
+        else:
+            low_status = {"status": "skipped", "reason": "not_requested"}
+            add_step("low_price_pool_check", "skipped", "低价过滤器研究未请求；持仓复盘独立检查。", low_status)
 
         try:
-            daily_price_payload = daily_price_status(only_low_price=True)
-            local_daily_date = str(daily_price_payload.get("latest_local_date") or _latest_daily_date())
+            daily_price_payload = _review_daily_status(review_target_date)
+            local_daily_date = str(daily_price_payload.get("latest_local_date") or "")
+            review_symbols.update(
+                normalize_symbol(symbol) for symbol in daily_price_payload.get("symbols", [])
+                if normalize_symbol(symbol)
+            )
             if daily_price_payload.get("is_stale") and allow_daily_price_online_update:
-                daily_price_update = update_daily_prices(
-                    only_low_price=True,
-                    target_date=str(daily_price_payload.get("target_date") or "") or None,
-                    network=True,
-                    rebuild_features=True,
-                )
-                daily_price_payload = daily_price_status(only_low_price=True)
-                local_daily_date = str(daily_price_payload.get("latest_local_date") or local_daily_date)
-                updated = _int(daily_price_update.get("updated_symbols"))
-                failed = _int(daily_price_update.get("failed_symbols"))
+                daily_price_update = {"status": "skipped", "reason": "pipeline_writer_required"}
                 add_step(
                     "daily_cache_check",
-                    "ok" if updated > 0 and failed == 0 else "warning",
-                    f"已尝试联网补全低价池日线：更新 {updated} 只，失败 {failed} 只。",
-                    {"target_date": daily_price_payload.get("target_date", ""), "latest_local_date": local_daily_date, "provider_results": daily_price_update.get("provider_results", [])},
+                    "warning",
+                    "日线更新由收盘数据流程统一处理；本次复盘只读已有日线。",
+                    {"target_date": review_target_date, "latest_local_date": local_daily_date},
                 )
             elif daily_price_payload.get("is_stale"):
                 stale_count = _int(daily_price_payload.get("stale_count"))
@@ -1421,10 +1456,10 @@ def run_daily_workflow(
                     "daily_cache_check",
                     "warning",
                     (
-                        f"低价研究池仍有 {stale_count} 只日期滞后、{missing_count} 只缺失；"
-                        "这些股票不会进入目标日候选，目标日可用股票由当前复核范围门禁单独判定。"
+                        f"持仓复盘范围有 {stale_count} 只日期滞后、{missing_count} 只缺失；"
+                        "缺少目标日价格时不生成有效收益复盘，也不假装成交。"
                         if partially_current
-                        else "本地日线滞后，未启用联网补全，因此本次复盘仍基于现有完整日线。"
+                        else "持仓日线未覆盖复盘日期；本次仅展示已有记录，不把旧价格当作当日估值。"
                     ),
                     {
                         "target_date": daily_price_payload.get("target_date", ""),
@@ -1436,6 +1471,8 @@ def run_daily_workflow(
                         "missing_count": missing_count,
                     },
                 )
+            elif daily_price_payload.get("status") == "not_applicable":
+                add_step("daily_cache_check", "skipped", daily_price_payload["message"], {"reason": "no_existing_positions"})
             else:
                 add_step(
                     "daily_cache_check",
@@ -1443,65 +1480,44 @@ def run_daily_workflow(
                     f"本地日线已覆盖理论目标完整交易日 {daily_price_payload.get('target_date') or '-'}。",
                     {"local_daily_latest_date": local_daily_date, "target_date": daily_price_payload.get("target_date", "")},
                 )
-            artifacts["daily_price_update_latest"] = "results/daily_price_update_latest.json"
         except Exception as exc:  # noqa: BLE001
             daily_price_payload = {"ok": False, "message": str(exc), "target_date": "", "is_stale": True}
-            local_daily_date = _latest_daily_date()
+            local_daily_date = ""
             add_step(
                 "daily_cache_check",
                 "warning",
-                "日线 provider fallback 检查失败，本次仍基于现有本地日线继续复盘。",
+                "持仓日线检查失败；价格证据未通过时不更新估值或模拟成交。",
                 {"local_daily_latest_date": local_daily_date},
                 error=str(exc),
             )
 
-        try:
-            local_daily_date = str(daily_price_payload.get("latest_local_date") or local_daily_date or _latest_daily_date())
-            pool_max_daily_date = str(
-                daily_price_payload.get("max_local_date")
-                or daily_price_payload.get("latest_date_max")
-                or local_daily_date
-            )
-            coverage_message = (
-                f"低价研究池共同覆盖日期下限：{local_daily_date or '-'}；池内最晚覆盖日期：{pool_max_daily_date or '-'}。"
-                if pool_max_daily_date and pool_max_daily_date != local_daily_date
-                else f"低价研究池共同覆盖日期：{local_daily_date or '-'}。"
-            )
-            add_step(
-                "daily_cache_check",
-                "ok" if local_daily_date else "warning",
-                coverage_message,
-                {
-                    "pool_common_coverage_date": local_daily_date,
-                    "pool_max_latest_date": pool_max_daily_date,
-                    "local_daily_latest_date": local_daily_date,
-                },
-            )
-        except Exception as exc:  # noqa: BLE001
-            add_step("daily_cache_check", "failed", "本地日线检查失败。", error=str(exc))
+        if run_legacy_research:
+            try:
+                low_report = _run_low_price_report()
+                low_summary = low_report.get("summary") if isinstance(low_report.get("summary"), dict) else {}
+                low_files = low_report.get("files") if isinstance(low_report.get("files"), dict) else {}
+                report_path = low_report.get("report_path") or low_files.get("markdown_path") or low_files.get("report_path")
+                if report_path:
+                    artifacts["low_price_report"] = report_path
+                add_step(
+                    "low_price_report",
+                    "ok" if low_report.get("ok", True) else "warning",
+                    low_report.get("message", "低价学习池报告已生成。"),
+                    {"report_path": report_path or "", "analyzed_count": low_summary.get("analyzed_count", 0)},
+                )
+            except Exception as exc:  # noqa: BLE001
+                add_step("low_price_report", "warning", "低价策略报告生成失败；不改变持仓复盘日期。", error=str(exc))
+        else:
+            low_report = {"status": "skipped", "reason": "not_requested"}
+            add_step("low_price_report", "skipped", "低价学习报告未请求。", low_report)
 
         try:
-            low_report = _run_low_price_report()
-            low_summary = low_report.get("summary") if isinstance(low_report.get("summary"), dict) else {}
-            if low_summary.get("latest_complete_daily_date"):
-                local_daily_date = str(low_summary.get("latest_complete_daily_date"))
-            low_files = low_report.get("files") if isinstance(low_report.get("files"), dict) else {}
-            report_path = low_report.get("report_path") or low_files.get("markdown_path") or low_files.get("report_path")
-            if report_path:
-                artifacts["low_price_report"] = report_path
-            add_step(
-                "low_price_report",
-                "ok" if low_report.get("ok", True) else "warning",
-                low_report.get("message", "低价学习池报告已生成。"),
-                {"report_path": report_path or "", "analyzed_count": low_summary.get("analyzed_count", 0)},
-            )
-        except Exception as exc:  # noqa: BLE001
-            add_step("low_price_report", "failed", "低价学习池报告生成失败。", error=str(exc))
-
-        try:
-            feature_payload = build_daily_features(only_low_price=True, reuse_if_fresh=True)
             feature_status = daily_feature_status()
-            artifacts["daily_features"] = feature_status.get("path", "data/features/daily_features_latest.csv")
+            feature_payload = {
+                **feature_status, "status": "read_only",
+                "message": "读取收盘流程生成的日线特征；本次不重建研究子集。",
+            }
+            input_artifacts["daily_features"] = feature_status.get("path", "data/features/daily_features_latest.csv")
             add_step(
                 "daily_features",
                 "ok" if feature_payload.get("ok") else "warning",
@@ -1509,13 +1525,13 @@ def run_daily_workflow(
                 {"feature_count": feature_status.get("feature_count", 0), "latest_date": feature_status.get("latest_date", "")},
             )
         except Exception as exc:  # noqa: BLE001
-            feature_status = daily_feature_status()
-            add_step("daily_features", "failed", "本地日线量化特征生成失败。", error=str(exc))
+            feature_status = {"ok": False, "status": "missing", "error": str(exc)}
+            add_step("daily_features", "warning", "研究特征未读到；持仓估值仍逐只检查价格。", error=str(exc))
 
         try:
-            freshness_gate = evaluate_data_freshness(
-                daily_price_payload=daily_price_payload,
-                daily_feature_payload=feature_status,
+            freshness_gate = evaluate_paper_review_freshness(
+                read_json_safe(AUTO_PAPER_PORTFOLIO_STATE_JSON, {}),
+                target_date=review_target_date, daily_dir=DAILY_DIR,
             )
             gate_status = "warning" if freshness_gate.get("stale_mode") or not freshness_gate.get("can_review_yesterday_positions") else "ok"
             add_step(
@@ -1587,73 +1603,79 @@ def run_daily_workflow(
 
         long_count = 0
         board_count = 0
-        try:
-            strategy_payload = run_auto_strategy_cycle(
-                mode="live",
-                strategy=strategy,
-                initial_cash=_paper_initial_cash(),
-                max_long_total=max_long_total,
-                max_board_total=max_board_total,
-            )
-            standard_candidates = candidate_rows_from_strategy_payload(strategy_payload, strategy=strategy)
-            standard_candidates = attach_theme_map_to_candidates(standard_candidates, load_theme_map(THEME_MAP_PATH))
-            reference_target_date = str(
-                (freshness_gate or {}).get("target_complete_trade_date")
-                or daily_price_payload.get("target_date")
-                or local_daily_date
-                or ""
-            )[:10]
-            standard_candidates = _attach_reference_confidence_to_candidates(
-                standard_candidates,
-                target_date=reference_target_date,
-            )
-            strategy_payload["standard_candidates"] = standard_candidates
-            strategy_payload["candidate_strategy_counts"] = summarize_candidates_by_strategy(standard_candidates)
-            strategy_payload["candidate_theme_coverage"] = summarize_candidate_theme_coverage(standard_candidates)
-            long_count, board_count = _extract_strategy_counts(strategy_payload)
-            add_step(
-                "auto_strategy_sandbox",
-                "ok" if strategy_payload.get("ok") else "warning",
-                f"自动策略沙盒已运行：长线 {long_count} 只，打板 {board_count} 只。",
-                {
-                    "long_candidate_count": long_count,
-                    "board_candidate_count": board_count,
-                    "candidate_strategy_counts": strategy_payload["candidate_strategy_counts"],
-                    "candidate_theme_coverage": strategy_payload["candidate_theme_coverage"],
-                },
-                input_source="generated_in_memory",
-            )
-            current_theme = validate_theme_map_for_current_candidates()
-            theme_status["current_candidate_theme_status"] = current_theme
-            add_step(
-                "current_candidate_theme_sync",
-                "ok" if current_theme.get("unknown_current_candidates", 0) == 0 else "warning",
-                current_theme.get("message") or "当前候选板块映射已检查。",
-                current_theme,
-                input_source="candidates_in_memory",
-            )
-            # 候选池 → 观察池：综合评分（技术面为主）选 top 写入本地观察池并复盘。
+        if run_legacy_research:
             try:
-                watchpool_payload = build_daily_watchpool_step(standard_candidates)
+                strategy_payload = run_auto_strategy_cycle(
+                    mode="live",
+                    strategy=strategy,
+                    initial_cash=_paper_initial_cash(),
+                    max_long_total=max_long_total,
+                    max_board_total=max_board_total,
+                )
+                standard_candidates = candidate_rows_from_strategy_payload(strategy_payload, strategy=strategy)
+                standard_candidates = attach_theme_map_to_candidates(standard_candidates, load_theme_map(THEME_MAP_PATH))
+                reference_target_date = str(
+                    (freshness_gate or {}).get("target_complete_trade_date")
+                    or daily_price_payload.get("target_date")
+                    or local_daily_date
+                    or ""
+                )[:10]
+                standard_candidates = _attach_reference_confidence_to_candidates(
+                    standard_candidates,
+                    target_date=reference_target_date,
+                )
+                strategy_payload["standard_candidates"] = standard_candidates
+                strategy_payload["candidate_strategy_counts"] = summarize_candidates_by_strategy(standard_candidates)
+                strategy_payload["candidate_theme_coverage"] = summarize_candidate_theme_coverage(standard_candidates)
+                long_count, board_count = _extract_strategy_counts(strategy_payload)
                 add_step(
-                    "composite_watchpool",
-                    "ok" if watchpool_payload.get("ok") else "warning",
-                    "综合评分（技术面为主）已选 top 候选写入观察池并完成本地复盘；纯纸面观察，不成交。",
+                    "auto_strategy_sandbox",
+                    "ok" if strategy_payload.get("ok") else "warning",
+                    f"自动策略沙盒已运行：长线 {long_count} 只，打板 {board_count} 只。",
                     {
-                        "candidate_count": watchpool_payload.get("candidate_count", 0),
-                        "selected_count": watchpool_payload.get("selected_count", 0),
-                        "added_count": watchpool_payload.get("added_count", 0),
-                        "watchlist_count": watchpool_payload.get("watchlist_count", 0),
-                        "added_symbols": watchpool_payload.get("added_symbols", []),
+                        "long_candidate_count": long_count,
+                        "board_candidate_count": board_count,
+                        "candidate_strategy_counts": strategy_payload["candidate_strategy_counts"],
+                        "candidate_theme_coverage": strategy_payload["candidate_theme_coverage"],
                     },
+                    input_source="generated_in_memory",
+                )
+                current_theme = validate_theme_map_for_current_candidates()
+                theme_status["current_candidate_theme_status"] = current_theme
+                add_step(
+                    "current_candidate_theme_sync",
+                    "ok" if current_theme.get("unknown_current_candidates", 0) == 0 else "warning",
+                    current_theme.get("message") or "当前候选板块映射已检查。",
+                    current_theme,
                     input_source="candidates_in_memory",
                 )
+                # 候选池 → 观察池：综合评分（技术面为主）选 top 写入本地观察池并复盘。
+                try:
+                    watchpool_payload = build_daily_watchpool_step(standard_candidates)
+                    add_step(
+                        "composite_watchpool",
+                        "ok" if watchpool_payload.get("ok") else "warning",
+                        "综合评分（技术面为主）已选 top 候选写入观察池并完成本地复盘；纯纸面观察，不成交。",
+                        {
+                            "candidate_count": watchpool_payload.get("candidate_count", 0),
+                            "selected_count": watchpool_payload.get("selected_count", 0),
+                            "added_count": watchpool_payload.get("added_count", 0),
+                            "watchlist_count": watchpool_payload.get("watchlist_count", 0),
+                            "added_symbols": watchpool_payload.get("added_symbols", []),
+                        },
+                        input_source="candidates_in_memory",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    watchpool_payload = {"ok": False, "error": str(exc), "watchlist_count": 0}
+                    add_step("composite_watchpool", "warning", "观察池综合评分接入失败，不影响后续本地复盘。", error=str(exc))
             except Exception as exc:  # noqa: BLE001
-                watchpool_payload = {"ok": False, "error": str(exc), "watchlist_count": 0}
-                add_step("composite_watchpool", "warning", "观察池综合评分接入失败，不影响后续本地复盘。", error=str(exc))
-        except Exception as exc:  # noqa: BLE001
-            strategy_payload = {"ok": False, "summary": {}, "long_candidates": [], "board_candidates": []}
-            add_step("auto_strategy_sandbox", "failed", "自动策略沙盒运行失败。", error=str(exc))
+                strategy_payload = {"ok": False, "summary": {}, "long_candidates": [], "board_candidates": []}
+                add_step("auto_strategy_sandbox", "warning", "可选沙盒研究失败；持仓复盘继续。", error=str(exc))
+        else:
+            strategy_payload = {"status": "skipped", "reason": "not_requested"}
+            watchpool_payload = {"status": "skipped", "reason": "not_requested"}
+            for step_name in ("auto_strategy_sandbox", "current_candidate_theme_sync", "composite_watchpool"):
+                add_step(step_name, "skipped", "旧沙盒研究未请求；正式纸面候选仍按目标日独立读取。", {"reason": "not_requested"}, input_source="not_run")
 
         # ---- Strategy Lab (v420) — optional research-only step ----
         # The formal, date-addressed batch is the only source allowed to feed
@@ -1673,6 +1695,7 @@ def run_daily_workflow(
                 pit_sector_payload,
                 output_path=RESULTS_DIR / "pit_sector_status_latest.json",
             )
+            artifacts["pit_sector_status"] = _display_path(Path(pit_sector_path))
             add_step(
                 "pit_sector_status",
                 "ok" if pit_sector_payload.get("pit_eligible") is True else "warning",
@@ -1764,13 +1787,13 @@ def run_daily_workflow(
                 )
             except Exception as exc:  # noqa: BLE001
                 strategy_lab_result = {"ok": False, "error": str(exc)}
-                add_step("strategy_lab", "failed", "策略实验室运行失败。", error=str(exc))
+                add_step("strategy_lab", "warning", "可选策略实验室失败；持仓复盘继续。", error=str(exc))
         else:
             add_step(
                 "strategy_lab",
                 "skipped",
                 "策略实验室为可选研究步骤，本次未开启；不影响 daily workflow 基础复盘。",
-                {"enabled": False},
+                {"enabled": False, "reason": "not_requested"},
             )
 
         portfolio_exists = AUTO_PAPER_PORTFOLIO_STATE_JSON.exists()
@@ -1824,8 +1847,8 @@ def run_daily_workflow(
                     if not init_payload.get("ok"):
                         warnings.append(init_payload.get("message", "自动虚拟组合初始化未完成。"))
                 due_trade_date = str(
-                    local_daily_date
-                    or daily_price_payload.get("target_date")
+                    review_target_date
+                    or local_daily_date
                     or ""
                 )[:10]
                 due_loaded = (
@@ -1840,11 +1863,19 @@ def run_daily_workflow(
                         ],
                     }
                 )
+                if due_loaded.get("status") == "passed" and isinstance(due_loaded.get("plan"), dict):
+                    review_symbols.update(
+                        normalize_symbol(row.get("symbol"))
+                        for row in due_loaded["plan"].get("symbols", [])
+                        if isinstance(row, dict) and normalize_symbol(row.get("symbol"))
+                    )
+                    if due_loaded.get("archive_path"):
+                        input_artifacts["due_plan_archive"] = due_loaded["archive_path"]
                 add_step(
                     "due_plan_archive",
                     "ok" if due_loaded.get("status") == "passed" else "warning",
                     (
-                        "到期计划已从归档加载，本轮模拟它而不是未来的下一计划。"
+                        "到期计划已从归档加载；本轮只读复核它，模拟是否运行另行记录。"
                         if due_loaded.get("status") == "passed"
                         else "归档中没有到期计划；本轮不模拟（不会假装成交）。"
                     ),
@@ -1854,57 +1885,6 @@ def run_daily_workflow(
                         "plan_id": due_loaded.get("plan_id") or "",
                         "archive_path": due_loaded.get("archive_path") or "",
                         "reason_codes": due_loaded.get("reason_codes") or [],
-                    },
-                )
-                # 漏放检测：例行漏跑一天，那天触发的退出信号就永久不可追溯
-                # （止损带每次按滚动 support 重算，次日已不匹配）。此扫描只读地
-                # 把漏放摆到台面上；补放需单独授权，绝不在此自动进行。
-                try:
-                    ledger_state = PaperStateStore(
-                        AUTO_PAPER_PORTFOLIO_STATE_JSON,
-                        schema_version=API_SCHEMA_VERSION,
-                        max_backups=7,
-                    ).read({})
-                    ledger_ids = [
-                        str(item)
-                        for item in (ledger_state.get("applied_execution_ids") or [])
-                        if str(item or "").strip()
-                    ]
-                    replay_gap = scan_unreplayed_archived_plans(
-                        PROJECT_ROOT,
-                        as_of=due_trade_date or str(generated_at)[:10],
-                        applied_execution_ids=ledger_ids,
-                    )
-                except Exception as exc:  # noqa: BLE001 - 扫描失败不得中断例行
-                    replay_gap = {
-                        "status": "blocked",
-                        "unreplayed_count": -1,
-                        "reason_codes": [f"replay_gap_scan_failed:{type(exc).__name__}:{exc}"],
-                    }
-                # 扫描崩掉与"真检出漏放"必须分开说。二者都是 warning，但把崩溃
-                # 说成检出，等于用一个假结论盖掉一个真故障。
-                _gap_status = replay_gap.get("status")
-                if _gap_status == "passed":
-                    _gap_message = "归档计划与账本一致，无漏放的到期计划。"
-                elif _gap_status == "blocked":
-                    _gap_message = "漏放扫描未能得出结论（扫描自身失败），本次不构成「无漏放」的证据。"
-                else:
-                    _gap_message = (
-                        "检出到期未重放的归档计划；漏放日退出信号不可追溯，补放需单独授权。"
-                    )
-                add_step(
-                    "replay_gap_scan",
-                    "ok" if _gap_status == "passed" else "warning",
-                    _gap_message,
-                    {
-                        "scan_status": _gap_status,
-                        "as_of": replay_gap.get("as_of"),
-                        "archive_scanned": replay_gap.get("archive_scanned"),
-                        "unreplayed_count": replay_gap.get("unreplayed_count"),
-                        "unreplayed": (replay_gap.get("unreplayed") or [])[:5],
-                        "archive_unreadable": replay_gap.get("archive_unreadable") or [],
-                        "reason_codes": replay_gap.get("reason_codes") or [],
-                        "recovery_authorized": False,
                     },
                 )
                 portfolio_payload = run_auto_paper_portfolio(
@@ -1917,6 +1897,7 @@ def run_daily_workflow(
                     formal_candidate_batch_path=formal_candidate_batch_path or None,
                     formal_candidate_status=formal_candidate_status,
                     publish_next_plan=False,
+                    review_target_date=review_target_date,
                     due_plan_payload=(
                         dict(due_loaded["plan"])
                         if due_loaded.get("status") == "passed"
@@ -1924,6 +1905,10 @@ def run_daily_workflow(
                         else None
                     ),
                 )
+                portfolio_ran = True
+                execution_path = (portfolio_payload.get("conditional_execution") or {}).get("path")
+                if execution_path and portfolio_payload.get("ok"):
+                    artifacts["conditional_execution"] = execution_path
                 due_enrichment = portfolio_payload.get("due_plan_enrichment")
                 if isinstance(due_enrichment, dict):
                     enrichment_status = str(due_enrichment.get("status") or "blocked")
@@ -1945,13 +1930,15 @@ def run_daily_workflow(
                 add_step(
                     "conditional_trade_plan",
                     "ok" if _int(plan_summary.get("symbol_count")) > 0 or (portfolio_payload.get("conditional_plan") or {}).get("plan_id") else "warning",
-                    "条件交易计划已生成。",
+                    "本轮使用已归档的到期条件计划；下一交易日计划由收盘流程发布。",
                     plan_summary,
                 )
                 add_step(
                     "conditional_execution",
-                    "ok" if portfolio_payload.get("conditional_execution") else "warning",
-                    "盘中触发模拟已执行；缺少分钟线时不假装成交。",
+                    "ok" if enable_intraday and portfolio_payload.get("conditional_execution") and not (portfolio_payload.get("conditional_execution") or {}).get("skipped") else "skipped",
+                    "盘中触发模拟已运行；成交与缺证据结果见独立收据。"
+                    if enable_intraday and portfolio_payload.get("conditional_execution") and not (portfolio_payload.get("conditional_execution") or {}).get("skipped")
+                    else "本轮未执行盘中模拟；只读到期复核与账本应用分别记录。",
                     execution_summary,
                 )
                 add_step(
@@ -1972,12 +1959,56 @@ def run_daily_workflow(
                 add_step("conditional_execution", "skipped", "组合更新失败，未执行盘中模拟。")
                 add_step("portfolio_update", "failed", "自动虚拟组合更新失败。", error=str(exc))
 
+        # Expiry review is independent from simulation and portfolio valuation.
+        # Review only this invocation's target plan; older gaps are scanned,
+        # never silently backfilled or given applied execution IDs.
         try:
-            plan_trade_date = ((portfolio_payload.get("conditional_plan") or {}).get("trade_date") or "")
-            intraday_status_payload = intraday_gap_status(target_trade_date=str(plan_trade_date or ""), source="current", write=True)
+            ledger_state = PaperStateStore(AUTO_PAPER_PORTFOLIO_STATE_JSON, schema_version=API_SCHEMA_VERSION, max_backups=7).read({})
+            plan_review_payload = plan_review_snapshot(
+                PROJECT_ROOT, trade_date=review_target_date, checked_at=now_text(),
+                applied_execution_ids=list(ledger_state.get("applied_execution_ids") or []),
+                simulation_enabled=enable_intraday, write=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - an evidence failure stays visible
+            plan_review_payload = {
+                "plan_review_summary": {"status": "blocked", "as_of": review_target_date,
+                                        "reason_codes": [f"plan_review_failed:{type(exc).__name__}:{exc}"]},
+                "plan_review_items": [],
+            }
+        portfolio_payload.update(plan_review_payload)
+        review_summary = plan_review_payload["plan_review_summary"]
+        add_step("replay_gap_scan", "ok" if review_summary.get("status") == "passed" else "warning",
+                 "到期已复核、盘中已模拟、已应用到账本分别统计；缺证据与旧无绑定收据保留。",
+                 {**review_summary, "items": plan_review_payload.get("plan_review_items", []), "recovery_authorized": False},
+                 input_source="immutable_plan_review_receipts")
+
+        try:
+            if review_symbols:
+                intraday_status_payload = intraday_gap_status(
+                    target_trade_date=review_target_date,
+                    source="symbols", symbols=sorted(review_symbols), write=False,
+                    intraday_dir=PROJECT_ROOT / "data" / "intraday" / "1m",
+                    plan_path=Path(due_loaded.get("archive_path") or (
+                        RESULTS_DIR / "conditional_trade_plans_daily" / f"{review_target_date}.json"
+                    )),
+                )
+                intraday_status_payload["scope"] = "paper_positions_and_due_plans"
+            else:
+                intraday_status_payload = {
+                    "ok": True, "status": "not_applicable", "reason": "no_execution_symbols",
+                    "target_trade_date": review_target_date, "source": "symbols",
+                    "scope": "paper_positions_and_due_plans", "total_symbols": 0,
+                    "available_count": 0, "missing_count": 0, "invalid_count": 0,
+                    "stale_count": 0, "insufficient_count": 0,
+                    "message": "本轮没有持仓或到期计划标的需要分钟证据。",
+                }
+            minute_ok = intraday_status_payload.get("ok") is True and not any(
+                _int(intraday_status_payload.get(key))
+                for key in ("missing_count", "invalid_count", "stale_count", "insufficient_count")
+            ) and intraday_status_payload.get("source_manifest_formal_eligible") is not False
             add_step(
                 "intraday_gap_check",
-                "ok" if _int(intraday_status_payload.get("missing_count")) == 0 and _int(intraday_status_payload.get("invalid_count")) == 0 else "warning",
+                "skipped" if not review_symbols else ("ok" if minute_ok else "warning"),
                 intraday_status_payload.get("message") or "分钟线缺口状态已检查。",
                 {
                     "target_trade_date": intraday_status_payload.get("target_trade_date", ""),
@@ -1985,6 +2016,9 @@ def run_daily_workflow(
                     "available_count": intraday_status_payload.get("available_count", 0),
                     "missing_count": intraday_status_payload.get("missing_count", 0),
                     "invalid_count": intraday_status_payload.get("invalid_count", 0),
+                    "stale_count": intraday_status_payload.get("stale_count", 0),
+                    "insufficient_count": intraday_status_payload.get("insufficient_count", 0),
+                    "reason": intraday_status_payload.get("reason", ""),
                     "missing_symbols": intraday_status_payload.get("missing_symbols", []),
                     "boundary_note": "完整日线控制收益复盘；分钟线控制盘中触发验证。",
                 },
@@ -1994,11 +2028,17 @@ def run_daily_workflow(
             add_step("intraday_gap_check", "warning", "分钟线缺口状态检查失败；缺少分钟线时仍不会假装成交。", error=str(exc))
 
         paper_consistency_payload = _run_daily_paper_consistency_check(
-            target_date=str(daily_price_payload.get("target_date") or local_daily_date or generated_at)[:10],
+            target_date=review_target_date,
             input_dir=RESULTS_DIR,
             output_dir=RESULTS_DIR,
             report_dir=REPORTS_DIR,
+            paper_payload=portfolio_payload if portfolio_ran else {},
+            execution_payload=(portfolio_payload.get("conditional_execution") or {}) if portfolio_ran else {},
+            intraday_payload=intraday_status_payload,
         )
+        for key in ("json_path", "report_path"):
+            if paper_consistency_payload.get(key):
+                artifacts[f"paper_vs_backtest_consistency_{key}"] = paper_consistency_payload[key]
         if paper_consistency_payload.get("warnings"):
             warnings.extend(str(item) for item in (paper_consistency_payload.get("warnings") or [])[:5])
         add_step(
@@ -2042,45 +2082,41 @@ def run_daily_workflow(
                 "quick_guardrails",
                 "skipped",
                 "用户传入 --with-guardrails false，已跳过 quick guardrails。",
-                {"enabled": False, "mode": guardrails_mode},
+                {"enabled": False, "mode": guardrails_mode, "reason": "not_requested"},
             )
 
-        # Stage 1 read-only brain step (task book section 5): the ONLY entry to
-        # the new brain stack from this legacy chain is the market_brain_daily
-        # assembly layer.  Shadow-only, results/ artifacts only; any failure
-        # degrades to a warning step and never blocks the legacy workflow.
         brain_payload: dict[str, Any] = {}
-        try:
-            from quantdesk.market_brain_daily import run_daily_brain_snapshots
+        if run_brain_shadow:
+            try:
+                from quantdesk.market_brain_daily import run_daily_brain_snapshots
 
-            # Follow the orchestrator's (patchable) RESULTS_DIR so tests that
-            # redirect runtime output keep brain artifacts out of real results/.
-            brain_payload = run_daily_brain_snapshots(project_root=RESULTS_DIR.parent)
-            brain_snapshot = (brain_payload.get("market_brain") or {}).get("snapshot") or {}
-            shadow_snapshot = (brain_payload.get("strategy_brain_shadow") or {}).get("snapshot") or {}
-            brain_regime = str(brain_snapshot.get("formal_regime") or brain_snapshot.get("regime") or "UNKNOWN")
-            brain_eligible = brain_snapshot.get("evidence_eligible") is True
+                brain_payload = run_daily_brain_snapshots(project_root=RESULTS_DIR.parent)
+                brain_snapshot = (brain_payload.get("market_brain") or {}).get("snapshot") or {}
+                shadow_snapshot = (brain_payload.get("strategy_brain_shadow") or {}).get("snapshot") or {}
+                brain_regime = str(brain_snapshot.get("formal_regime") or brain_snapshot.get("regime") or "UNKNOWN")
+                brain_eligible = brain_snapshot.get("evidence_eligible") is True
+                add_step(
+                    "market_brain_shadow",
+                    "ok" if brain_payload.get("ok") and brain_eligible else "warning",
+                    f"Market Brain 研究快照：{brain_regime}（shadow，纸面未验证）。",
+                    {
+                        "regime": brain_regime,
+                        "confidence": brain_snapshot.get("confidence"),
+                        "evidence_eligible": brain_eligible,
+                        "reason_codes": (brain_snapshot.get("reason_codes") or [])[:6],
+                        "shadow_candidate_count": shadow_snapshot.get("candidate_count", 0),
+                        "shadow_eligible_count": shadow_snapshot.get("eligible_candidate_count", 0),
+                        "assembly_warnings": (brain_payload.get("assembly_warnings") or [])[:6],
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - optional research remains non-blocking
+                brain_payload = {"ok": False, "error": str(exc)}
+                add_step("market_brain_shadow", "warning", "影子研究失败。", error=str(exc))
+        else:
+            brain_payload = {"status": "skipped", "reason": "not_requested"}
             add_step(
-                "market_brain_shadow",
-                "ok" if brain_payload.get("ok") and brain_eligible else "warning",
-                f"Market Brain 只读快照：{brain_regime}（shadow，仅研究观察，不影响候选与纸面账本）。",
-                {
-                    "regime": brain_regime,
-                    "confidence": brain_snapshot.get("confidence"),
-                    "evidence_eligible": brain_eligible,
-                    "reason_codes": (brain_snapshot.get("reason_codes") or [])[:6],
-                    "shadow_candidate_count": shadow_snapshot.get("candidate_count", 0),
-                    "shadow_eligible_count": shadow_snapshot.get("eligible_candidate_count", 0),
-                    "assembly_warnings": (brain_payload.get("assembly_warnings") or [])[:6],
-                },
-            )
-        except Exception as exc:  # noqa: BLE001 - brain step must never break legacy chain
-            brain_payload = {"ok": False, "error": str(exc)}
-            add_step(
-                "market_brain_shadow",
-                "warning",
-                "Market Brain 只读快照生成失败，旧链继续运行。",
-                error=str(exc),
+                "market_brain_shadow", "skipped", "影子研究未请求。",
+                {"enabled": False, "reason": "not_requested"},
             )
 
         plan_summary = portfolio_payload.get("conditional_plan_summary") or (portfolio_payload.get("conditional_plan") or {}).get("summary") or {}
@@ -2126,8 +2162,10 @@ def run_daily_workflow(
             "app_version": APP_VERSION,
             "generated_at": generated_at,
             "task_type": "daily_workflow",
-            "scope": "low_price_included_only",
-            "network": bool(allow_theme_map_online_update or allow_daily_price_online_update),
+            "target_date": review_target_date,
+            **plan_review_payload,
+            "scope": "paper_positions_and_due_plans",
+            "network": bool(allow_theme_map_online_update),
             "full_scan": False,
             "user_triggered": True,
             "strategy": strategy,
@@ -2139,7 +2177,15 @@ def run_daily_workflow(
             "with_guardrails": bool(with_guardrails),
             "guardrails_mode": guardrails_mode,
             "low_price_status": low_status,
-            "low_price_report": {"summary": low_summary, "report_path": low_report.get("report_path")},
+            "low_price_report": {**low_report, "summary": low_summary},
+            "run_legacy_research": bool(run_legacy_research),
+            "formal_candidate_intake": {
+                "status": formal_candidate_status, "path": formal_candidate_batch_path,
+                "target_date": formal_target_date,
+                "source_run_id": ((formal_candidate_batch or {}).get("provenance") or {}).get("source_run_id", ""),
+                "candidate_count": (formal_candidate_batch or {}).get("candidate_count") if formal_candidate_status == "passed" else None,
+                "candidates": list((formal_candidate_batch or {}).get("candidates") or []) if formal_candidate_status == "passed" else [],
+            },
             "daily_price_status": daily_price_payload,
             "daily_price_update": daily_price_update,
             "daily_feature_status": feature_status,
@@ -2171,19 +2217,20 @@ def run_daily_workflow(
             "dates": dates,
             "steps": steps,
             "input_sources": {
-                "auto_strategy": "generated_in_memory",
-                "auto_strategy_sandbox": "generated_in_memory",
-                "composite_watchpool": "candidates_in_memory",
-                "auto_paper_portfolio": "strategy_payload_in_memory" if isinstance(strategy_payload, dict) and strategy_payload.get("standard_candidates") is not None else "latest_file_fallback",
-                "conditional_trade_plan": "candidates_in_memory",
-                "conditional_execution": "plan_payload_in_memory",
-                "theme_map_sync": "candidates_in_memory",
+                "auto_strategy": "generated_in_memory" if run_legacy_research else "not_run",
+                "auto_strategy_sandbox": "generated_in_memory" if run_legacy_research else "not_run",
+                "composite_watchpool": "candidates_in_memory" if run_legacy_research else "not_run",
+                "auto_paper_portfolio": "dated_formal_candidate_batch_and_due_plan" if portfolio_ran else "not_run",
+                "conditional_trade_plan": "dated_due_plan_archive" if portfolio_ran else "not_run",
+                "conditional_execution": "dated_due_plan_in_memory" if portfolio_ran else "not_run",
+                "theme_map_sync": "candidates_in_memory" if run_legacy_research else "not_run",
                 "strategy_lab": "generated_in_memory" if strategy_lab_result else "not_run",
                 "latest_json_role": "archive_and_fallback",
             },
             "warnings": _dedupe_warnings(warnings),
             "errors": errors,
             "artifacts": artifacts,
+            "input_artifacts": input_artifacts,
             "disclaimer": DISCLAIMER,
         }
         payload["summary"] = _build_summary(payload)
@@ -2194,9 +2241,10 @@ def run_daily_workflow(
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         timestamped_report_path = REPORTS_DIR / f"daily_workflow_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-        payload["report_path"] = "reports/daily_quant_report_latest.md"
+        latest_report_path = REPORTS_DIR / "daily_quant_report_latest.md"
+        payload["report_path"] = _display_path(latest_report_path)
         payload["timestamped_report_path"] = _display_path(timestamped_report_path)
-        payload["latest_path"] = "results/daily_workflow_latest.json"
+        payload["latest_path"] = _display_path(DAILY_WORKFLOW_LATEST_JSON)
         payload["output_paths"] = {
             "latest_json": payload["latest_path"],
             "report": payload["report_path"],
@@ -2218,7 +2266,7 @@ def run_daily_workflow(
         payload["ok"] = payload["workflow_status"] != "failed"
         report_text = build_daily_workflow_report(payload)
         timestamped_report_path.write_text(report_text, encoding="utf-8")
-        DAILY_REPORT_LATEST_MD.write_text(report_text, encoding="utf-8")
+        latest_report_path.write_text(report_text, encoding="utf-8")
         atomic_write_json(DAILY_WORKFLOW_LATEST_JSON, payload)
         return payload
     except Exception as exc:  # noqa: BLE001
@@ -2234,8 +2282,8 @@ def run_daily_workflow(
             "workflow_status": "failed",
             "status": "failed",
             "task_type": "daily_workflow",
-            "scope": "low_price_included_only",
-            "network": bool(allow_theme_map_online_update or allow_daily_price_online_update),
+            "scope": "paper_positions_and_due_plans",
+            "network": bool(allow_theme_map_online_update),
             "full_scan": False,
             "user_triggered": True,
             "with_guardrails": bool(with_guardrails),

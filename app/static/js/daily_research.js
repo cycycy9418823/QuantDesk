@@ -7,6 +7,12 @@ let realtimeRefreshTimer = null;
 let startupStatusPollTimer = null;
 let currentDetailChartData = null;
 let currentDetailResearchReference = null;
+let detailRequestSequence = 0;
+let currentWorkbenchContext = null;
+const workbenchSourceLists = Object.create(null);
+let currentStockSearchRows = [];
+let decisionHistoryRequestSequence = 0;
+let currentReviewBucket = "mismatch";
 let agentChatHistory = [];
 let agentStatusLoaded = false;
 let pendingAgentCandidate = null;
@@ -24,9 +30,9 @@ const SIDEBAR_COLLAPSE_KEY = "quantdesk_daily_sidebar_collapsed";
 // related sections together instead of splitting the detail into many tabs.
 const DETAIL_NAV_SECTIONS = {
     candidate: [
-        { id: "overview", title: "总览", summary: "研究简报、状态、优先级与风险层级。", members: ["brief", "overview", "risk"] },
+        { id: "charts", title: "看盘", summary: "大 K 线、成交量和当前判断。", members: ["charts", "brief"] },
+        { id: "overview", title: "判断详情", summary: "状态、价位、优先级与风险。", members: ["overview", "risk", "scenario"] },
         { id: "logic", title: "入选逻辑", summary: "为什么选、指标解读，以及现在是否还成立。", members: ["signals", "tracking"] },
-        { id: "charts", title: "图表 / 情景", summary: "价格量能 MACD/KDJ/RSI 与研究情景推演。", members: ["charts", "scenario"] },
         { id: "context", title: "线索 / 操作", summary: "新闻行业对比，并决定保留 / 转观察 / 移出。", members: ["context", "actions"] },
     ],
     realtime: [
@@ -71,13 +77,20 @@ document.addEventListener("DOMContentLoaded", () => {
     loadCandidates();
     loadStrategyScorecard();
     loadHomeEquity();
+    loadHomeAiLedger();
     loadNewsStatus();
     loadMarketBrainHome();
+    window.setTimeout(() => {
+        const sub = document.getElementById("kpiPrevBatchSub");
+        if (sub && /正在加载/.test(sub.textContent || "")) {
+            sub.textContent = "成绩单仍在读（较慢），不是页面卡死";
+        }
+    }, 1500);
     setupProjectStatus();
     loadProjectStatus();
     window.setInterval(() => loadRealtimeMarket(false), 300000);
     startStartupStatusPolling();
-    triggerStartupRefresh();
+    // Opening the viewer only reads local state. The refresh button owns writes.
 });
 
 async function requestJson(url) {
@@ -131,6 +144,14 @@ function setupProjectStatus() {
             openFull.textContent = projectStatusFullOpen ? "收起完整状态" : "查看完整状态";
         });
     }
+    const openSystem = document.getElementById("projectStatusOpenSystemButton");
+    if (openSystem) {
+        openSystem.addEventListener("click", () => {
+            if (typeof window.quantdeskShowPage === "function") {
+                window.quantdeskShowPage("system");
+            }
+        });
+    }
 }
 
 function setText(id, value) {
@@ -138,7 +159,7 @@ function setText(id, value) {
     if (node) node.textContent = value == null || value === "" ? "未提供" : String(value);
 }
 
-function renderProjectStatusFailure(message, keepPrevious) {
+function renderProjectStatusFailure(message, keepPrevious, readAt = "") {
     const banner = document.getElementById("projectStatusBanner");
     if (banner) {
         banner.hidden = false;
@@ -146,12 +167,14 @@ function renderProjectStatusFailure(message, keepPrevious) {
             ? `上次读取；本次失败。${message} 这是状态文件问题，不是账本清空，也不是行情全部坏掉。`
             : `${message} 这是状态文件问题，不是账本清空，也不是行情全部坏掉。`;
     }
+    setText("projectStatusReadTime", readAt || "本次读取失败（服务器时间未提供）");
+    const health = document.getElementById("projectStatusHealth");
+    if (health) health.classList.add("has-red");
     if (!keepPrevious) {
+        setText("projectStatusMeta", "来源：STATUS.md · 本次不可读 · 非实时核验");
         setText("projectStatusHealth", "无法读取 STATUS.md");
         setText("projectStatusExplain", "红格解释：本次没有可用记录");
         setText("projectStatusPhase", "当前阶段：未提供");
-        const health = document.getElementById("projectStatusHealth");
-        if (health) health.classList.remove("has-red");
     }
 }
 
@@ -195,7 +218,7 @@ function renderProjectStatusPayload(data, { stale = false } = {}) {
     const phase = data.phase || {};
     setText(
         "projectStatusPhase",
-        `当前阶段：${phase.raw || "未提供"} · 检查点 ${phase.checkpoint || "未提供"} · 剩余交易日 ${phase.remaining_trading_days || "未提供"}`
+        `当前阶段：${phase.summary || "未提供"} · 检查点 ${phase.checkpoint || "未提供"} · 剩余交易日 ${phase.remaining_trading_days || "未提供"}`
     );
     setText("projectStatusTradeDate", `健康行对应交易日：${data.health_trade_date_label || "记录未明确标注"}`);
     if (raw) raw.textContent = data.raw_text || "";
@@ -243,9 +266,9 @@ async function loadProjectStatus() {
             const message = `本次读取失败：${(data && data.error) || "unknown"}`;
             if (projectStatusLastOk) {
                 renderProjectStatusPayload(projectStatusLastOk, { stale: true });
-                renderProjectStatusFailure(message, true);
+                renderProjectStatusFailure(message, true, data && data.read_at);
             } else {
-                renderProjectStatusFailure(message, false);
+                renderProjectStatusFailure(message, false, data && data.read_at);
             }
             return;
         }
@@ -297,6 +320,10 @@ const STATUS_LABELS = {
     low: "低",
     moderate: "中",
     completed_with_warnings: "完成（有警告）",
+    interrupted: "已中断",
+    aborted: "已中断",
+    unreadable: "记录无法读取",
+    unknown: "状态待核实",
     completed: "完成",
     failed: "失败",
     timeout: "超时",
@@ -450,6 +477,8 @@ function preferredDateText(...values) {
 
 function startupTargetDateText(data = {}, summary = {}, generation = {}, update = {}) {
     const explanation = data.startup_update_explanation || {};
+    const recordedTarget = latestIsoDate(data.target_date) || latestIsoDate(explanation.target_date);
+    if (recordedTarget) return recordedTarget;
     const freshness = data.data_freshness_gate || data.source_status?.auto_paper_portfolio?.data_freshness_gate || {};
     const target = latestIsoDate(
         summary.target_date,
@@ -496,6 +525,9 @@ function providerDisplayName(value) {
 }
 
 function numericValue(value) {
+    if (value === null || value === undefined || typeof value === "boolean") return null;
+    if (typeof value !== "number" && typeof value !== "string") return null;
+    if (typeof value === "string" && !value.trim()) return null;
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
 }
@@ -614,35 +646,66 @@ function setupSidebarCollapse() {
 
 function setupModuleNavigation() {
     const homeSections = Array.from(document.querySelectorAll("[data-home-section]"));
+    const extraHomeBlocks = Array.from(document.querySelectorAll("[data-home-page]")).filter((node) => !node.matches("[data-home-section], [data-module-view]"));
     const moduleSections = Array.from(document.querySelectorAll("[data-module-view]"));
     const moduleButtons = Array.from(document.querySelectorAll("[data-module-target], [data-side-module-target]"));
+    const pageButtons = Array.from(document.querySelectorAll("[data-page]"));
     const homeButtons = Array.from(document.querySelectorAll("[data-module-home]"));
     const backButtons = Array.from(document.querySelectorAll("[data-module-back]"));
     if (!moduleSections.length) return;
 
     const moduleIds = new Set(moduleSections.map((section) => section.id));
+    const HASH_ALIASES = {
+        today: "",
+        watch: "__watch__",
+        ledgers: "paper-watchlist-section",
+        "ledgers/strategy": "paper-watchlist-section",
+        "ledgers/ai": "ai-trader-section",
+        review: "decision-history-section",
+        tools: "performance-section",
+        system: "__system__",
+        dashboard: "",
+        "watch-pool": "paper-watchlist-section",
+        "decision-history": "decision-history-section",
+        "ai-log": "ai-log-section",
+        "ai-trader": "ai-trader-section",
+        "daily-focus": "daily-focus-section",
+        "candidate-pool": "candidate-pool-section",
+        "agent": "agent-section",
+        "backtest": "backtest-section",
+        "strategy-lab": "strategy-lab-section",
+        "data-ops": "data-ops-section",
+        "performance": "performance-section",
+    };
     const titleMap = {
         "ai-log-section": "AI 日志",
-        "decision-history-section": "Decision History",
+        "decision-history-section": "复盘学习",
         "daily-focus-section": "每日研究候选",
-        "candidate-pool-section": "观察候选池",
+        "candidate-pool-section": "观察列表",
         "quant-summary-section": "Quant 日总结",
         "limit-review-section": "涨停复盘",
         "theme-map-section": "板块/题材映射",
         "agent-section": "LLM 研究室",
-        "ai-trader-section": "AI 纸面交易员",
+        "ai-trader-section": "AI账",
         "data-ops-section": "设置",
-        "paper-watchlist-section": "Watch Pool",
+        "paper-watchlist-section": "策略账",
         "strategy-lab-section": "因子分析",
-        "performance-section": "Strategy Center",
+        "performance-section": "策略成绩",
         "risk-notifications-section": "风险/通知看板",
-        "smart-stop-section": "观察退出参考",
+        "smart-stop-section": "止损参考",
         "notification-center-section": "通知中心",
         "backtest-section": "回测",
+        __watch__: "看盘",
+        __system__: "系统状态",
     };
     const setTopbarTitle = (targetId) => {
         const title = document.getElementById("topbarTitle");
-        if (title) title.textContent = targetId && titleMap[targetId] ? titleMap[targetId] : "研究概览";
+        if (!title) return;
+        if (targetId && titleMap[targetId]) {
+            title.textContent = titleMap[targetId];
+            return;
+        }
+        title.textContent = "今天";
     };
 
     // Opening a module pulls that module's data fresh, so the view always
@@ -676,24 +739,42 @@ function setupModuleNavigation() {
             .catch((error) => console.warn("[module] refresh on enter failed", error));
     };
 
-    const setActiveButton = (targetId) => {
-        const isHome = !targetId;
-        homeButtons.forEach((button) => {
-            button.setAttribute("aria-pressed", isHome ? "true" : "false");
-            if (isHome) {
-                button.setAttribute("aria-current", "page");
-            } else {
-                button.removeAttribute("aria-current");
+    const pageOf = (node) => String(node?.dataset?.homePage || "today").split(/\s+/).filter(Boolean);
+
+    const applyHomePage = (pageName) => {
+        homeSections.forEach((section) => {
+            section.hidden = !pageOf(section).includes(pageName);
+        });
+        extraHomeBlocks.forEach((node) => {
+            if (node.id === "newsStatusBanner") {
+                if (pageName !== "today") node.hidden = true;
+                return;
             }
+            node.hidden = !pageOf(node).includes(pageName);
+        });
+    };
+
+    const setActiveButton = (targetId, pageName = "") => {
+        const isHome = !targetId && pageName !== "system" && pageName !== "watch";
+        homeButtons.forEach((button) => {
+            const active = isHome;
+            button.setAttribute("aria-pressed", active ? "true" : "false");
+            if (active) button.setAttribute("aria-current", "page");
+            else button.removeAttribute("aria-current");
+        });
+        pageButtons.forEach((button) => {
+            const page = button.dataset.page || "";
+            const active = (pageName && page === pageName) || (targetId && (button.dataset.moduleTarget || button.dataset.sideModuleTarget) === targetId && page === pageName);
+            if (!pageName && targetId) return;
+            button.setAttribute("aria-pressed", active ? "true" : "false");
+            if (active) button.setAttribute("aria-current", "page");
+            else if (page && page !== "today") button.removeAttribute("aria-current");
         });
         moduleButtons.forEach((button) => {
             const active = (button.dataset.moduleTarget || button.dataset.sideModuleTarget) === targetId;
             button.setAttribute("aria-pressed", active ? "true" : "false");
-            if (active) {
-                button.setAttribute("aria-current", "page");
-            } else {
-                button.removeAttribute("aria-current");
-            }
+            if (active) button.setAttribute("aria-current", "page");
+            else button.removeAttribute("aria-current");
         });
     };
 
@@ -703,56 +784,176 @@ function setupModuleNavigation() {
         window.scrollTo({ top: 0, behavior: "auto" });
     };
 
+    const setHash = (hash, updateUrl) => {
+        if (!updateUrl) return;
+        const next = hash ? `#${hash}` : `${window.location.pathname}${window.location.search}`;
+        if (hash) history.pushState(null, "", next);
+        else if (window.location.hash) history.replaceState(null, "", next);
+    };
+
     const showHomeView = (updateUrl = true, scroll = true) => {
         document.body.dataset.view = "home";
-        homeSections.forEach((section) => {
-            section.hidden = false;
-        });
+        document.body.dataset.page = "today";
+        applyHomePage("today");
         moduleSections.forEach((section) => {
             section.hidden = true;
         });
-        setActiveButton("");
+        setActiveButton("", "today");
         setTopbarTitle("");
         window.requestAnimationFrame(resizeHomeCharts);
-        if (updateUrl && window.location.hash) {
-            history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
-        }
+        setHash("", updateUrl);
         if (scroll) scrollToTop();
     };
 
+    const showSystemView = (updateUrl = true, scroll = true, refresh = true) => {
+        document.body.dataset.view = "system";
+        document.body.dataset.page = "system";
+        applyHomePage("system");
+        moduleSections.forEach((section) => {
+            section.hidden = section.id !== "data-ops-section";
+        });
+        setActiveButton("data-ops-section", "system");
+        setTopbarTitle("__system__");
+        setHash("system", updateUrl);
+        if (scroll) scrollToTop();
+        if (refresh) refreshModuleData("data-ops-section");
+        resizeActiveCharts();
+    };
+
+    const showWatchView = (updateUrl = true, scroll = true, refresh = true) => {
+        document.body.dataset.view = "watch";
+        document.body.dataset.page = "watch";
+        applyHomePage("watch");
+        moduleSections.forEach((section) => {
+            section.hidden = section.id !== "daily-focus-section";
+        });
+        setActiveButton("daily-focus-section", "watch");
+        setTopbarTitle("__watch__");
+        setHash("watch", updateUrl);
+        if (scroll) scrollToTop();
+        if (refresh) refreshModuleData("daily-focus-section");
+        resizeActiveCharts();
+    };
+
     const showModuleView = (targetId, updateUrl = true, scroll = true, refresh = true) => {
+        if (targetId && typeof targetId === "object" && targetId.page === "__watch__") {
+            if (isDetailModalOpen() && currentWorkbenchContext?.symbol === targetId.symbol
+                && currentWorkbenchContext?.source === targetId.source) return;
+            const origin = targetFromHash(targetId.returnHash || "#watch");
+            if (!origin || typeof origin === "string") showModuleView(origin, false, scroll, refresh);
+            else showWatchView(false, scroll, refresh);
+            showDetail({ symbol: targetId.symbol, name: targetId.symbol, detail_lane: targetId.lane, select_date: targetId.entryDate },
+                { source: targetId.source, returnHash: targetId.returnHash, updateUrl: false });
+            return;
+        }
+        if (targetId === "__system__") {
+            showSystemView(updateUrl, scroll, refresh);
+            return;
+        }
+        if (targetId === "__watch__") {
+            showWatchView(updateUrl, scroll, refresh);
+            return;
+        }
         if (!moduleIds.has(targetId)) {
             showHomeView(updateUrl, scroll);
             return;
         }
         document.body.dataset.view = "module";
+        const pageName = targetId === "paper-watchlist-section" || targetId === "ai-trader-section"
+            ? "ledgers"
+            : targetId === "decision-history-section" || targetId === "ai-log-section"
+                ? "review"
+                : targetId === "daily-focus-section"
+                    ? "watch"
+                    : targetId === "data-ops-section"
+                        ? "system"
+                        : "tools";
+        document.body.dataset.page = pageName;
+        applyHomePage(pageName === "watch" ? "watch" : "__none__");
         homeSections.forEach((section) => {
-            section.hidden = true;
+            if (pageName !== "watch") section.hidden = true;
+        });
+        extraHomeBlocks.forEach((node) => {
+            if (pageName !== "watch") node.hidden = true;
         });
         moduleSections.forEach((section) => {
             section.hidden = section.id !== targetId;
         });
-        setActiveButton(targetId);
+        setActiveButton(targetId, pageName);
         setTopbarTitle(targetId);
-        if (updateUrl) {
-            history.pushState(null, "", `#${targetId}`);
-        }
+        setHash(targetId, updateUrl);
         if (scroll) scrollToTop();
         if (refresh) refreshModuleData(targetId);
         resizeActiveCharts();
     };
     window.quantdeskShowModuleView = showModuleView;
+    window.quantdeskShowPage = (page) => {
+        if (page === "system") showSystemView();
+        else if (page === "watch") showWatchView();
+        else if (page === "ledgers") showModuleView("paper-watchlist-section");
+        else if (page === "review") showModuleView("decision-history-section");
+        else if (page === "tools") showModuleView("performance-section");
+        else showHomeView();
+    };
 
-    const targetFromHash = () => {
-        const hash = decodeURIComponent(window.location.hash.replace(/^#/, ""));
+    const targetFromHash = (value = window.location.hash) => {
+        const raw = String(value || "").replace(/^#/, "");
+        const question = raw.indexOf("?");
+        const path = question < 0 ? raw : raw.slice(0, question);
+        const params = new URLSearchParams(question < 0 ? "" : raw.slice(question + 1));
+        let hash;
+        try { hash = decodeURIComponent(path); } catch (_) { return ""; }
         if (!hash) return "";
+        const watchStock = hash.match(/^watch\/([^/]+)$/);
+        if (watchStock) {
+            const from = params.get("from") || "#watch";
+            return {
+                page: "__watch__", symbol: watchStock[1], source: params.get("source") || "stock",
+                lane: params.get("lane") || "", entryDate: params.get("entry_date") || "",
+                returnHash: from.startsWith("#") && !from.startsWith("#watch/") ? from : "#watch",
+            };
+        }
+        if (Object.prototype.hasOwnProperty.call(HASH_ALIASES, hash)) return HASH_ALIASES[hash];
         if (moduleIds.has(hash)) return hash;
         const sectionId = `${hash}-section`;
         return moduleIds.has(sectionId) ? sectionId : "";
     };
 
+    const openFromControl = (button) => {
+        const page = button.dataset.page || "";
+        if (page === "system") {
+            showSystemView();
+            return;
+        }
+        if (page === "watch") {
+            showWatchView();
+            return;
+        }
+        if (page === "today") {
+            showHomeView();
+            return;
+        }
+        if (page === "ledgers") {
+            showModuleView("paper-watchlist-section");
+            return;
+        }
+        if (page === "review") {
+            showModuleView("decision-history-section");
+            return;
+        }
+        if (page === "tools") {
+            showModuleView("performance-section");
+            return;
+        }
+        showModuleView(button.dataset.moduleTarget || button.dataset.sideModuleTarget || "");
+    };
+
     moduleButtons.forEach((button) => {
-        button.addEventListener("click", () => showModuleView(button.dataset.moduleTarget || button.dataset.sideModuleTarget || ""));
+        button.addEventListener("click", () => openFromControl(button));
+    });
+    pageButtons.forEach((button) => {
+        if (button.matches("[data-module-target], [data-side-module-target], [data-module-home]")) return;
+        button.addEventListener("click", () => openFromControl(button));
     });
     homeButtons.forEach((button) => {
         button.addEventListener("click", () => showHomeView());
@@ -761,28 +962,21 @@ function setupModuleNavigation() {
         button.addEventListener("click", () => showHomeView());
     });
     document.addEventListener("keydown", (event) => {
-        if (document.body.dataset.view !== "module" || isDetailModalOpen()) return;
+        if (document.body.dataset.view === "home" || isDetailModalOpen()) return;
         if (event.key === "Escape" || (event.altKey && event.key === "ArrowLeft")) {
             event.preventDefault();
             showHomeView();
         }
     });
-    window.addEventListener("popstate", () => {
+    const applyHash = (updateUrl, scroll, refresh) => {
         const targetId = targetFromHash();
-        if (targetId) {
-            showModuleView(targetId, false, false);
-        } else {
-            showHomeView(false, false);
-        }
-    });
-    window.addEventListener("hashchange", () => {
-        const targetId = targetFromHash();
-        if (targetId) {
-            showModuleView(targetId, false, false);
-        } else {
-            showHomeView(false, false);
-        }
-    });
+        if (typeof targetId !== "object" && isDetailModalOpen()) closeModal({ restore: false });
+        if (targetId) showModuleView(targetId, updateUrl, scroll, refresh);
+        else showHomeView(updateUrl, scroll);
+    };
+    window.quantdeskRestoreView = () => applyHash(false, false, false);
+    window.addEventListener("popstate", () => applyHash(false, false, false));
+    window.addEventListener("hashchange", () => applyHash(false, false, false));
     const initialTargetId = targetFromHash();
     if (initialTargetId) {
         showModuleView(initialTargetId, false, false, true);
@@ -913,66 +1107,234 @@ async function loadDecisionHistory() {
     const panel = document.getElementById("decisionHistoryPanel");
     const note = document.getElementById("decisionHistoryNote");
     if (!panel) return;
-    panel.innerHTML = '<div class="empty-state">正在读取后端权威事件与 Watch Pool 生命周期…</div>';
+    const requestId = ++decisionHistoryRequestSequence;
+    panel.innerHTML = '<div class="empty-state">正在读取复盘记录…</div>';
+    if (note) note.textContent = "正在读取各来源；尚未确认记录数量。";
     try {
-        const board = await requestJson("/api/decision-board");
-        renderDecisionHistory(board);
-        const eventCount = Array.isArray(board.events) ? board.events.length : 0;
-        const watchCount = Array.isArray(board.watchlist) ? board.watchlist.length : 0;
-        if (note) note.textContent = `后端权威事件 ${eventCount} 条 · Watch Pool 生命周期 ${watchCount} 条。`;
+        const settled = await Promise.allSettled([
+            requestJson("/api/decision-board"),
+            requestJson("/api/ai-trader/dashboard"),
+            requestJson("/api/ai-trader/decisions"),
+        ]);
+        if (requestId !== decisionHistoryRequestSequence) return;
+        const sources = settled.map((result, index) => {
+            const value = result.status === "fulfilled" ? result.value : null;
+            const available = Boolean(value && typeof value === "object" && value.ok !== false
+                && (index === 0 ? Array.isArray(value.watchlist) || Array.isArray(value.events)
+                    : index === 1 ? Array.isArray(value.filled_trades) : value.available === true && Array.isArray(value.records)));
+            return {
+                label: ["策略观察与策略账事件", "AI 账近期成交", "AI 判断核对"][index],
+                path: ["/api/decision-board", "/api/ai-trader/dashboard", "/api/ai-trader/decisions"][index],
+                warnings: Array.isArray(value?.warnings) ? value.warnings : [],
+                available,
+                degraded: available && (value.degraded === true || value.status === "degraded"),
+                asOf: available ? value.as_of || value.account?.as_of || value.updated_at : "",
+                value: available ? value : null,
+            };
+        });
+        const board = sources[0].value;
+        const ai = sources[1].value;
+        const items = buildReviewItems(board, ai, sources[2].value);
+        const unavailable = sources.filter((source) => !source.available);
+        const failure = unavailable.length === sources.length ? new Error("所有复盘来源读取失败，记录数量未知。") : null;
+        renderDecisionHistory(board, failure, items, sources);
+        if (note) note.textContent = [
+            failure ? "复盘记录读取失败；数量未知。" : `当前已读 ${items.length} 条；仅统计本次可读取范围。`,
+            ...sources.filter((source) => !source.available || source.degraded).map((source) => `${source.label}${source.available ? "降级" : "读取失败"}`),
+            sources[2].available ? `AI 判断 ${sources[2].value.records.length} 条；核对截至 ${safeText(sources[2].asOf)}。` : "AI 判断数量未知。",
+        ].join(" ");
     } catch (error) {
-        renderDecisionHistory(null, error);
-        if (note) note.textContent = "决策历史读取失败；未生成浏览器侧替代记录。";
+        if (requestId !== decisionHistoryRequestSequence) return;
+        renderDecisionHistory(null, error, []);
+        if (note) note.textContent = "复盘记录读取失败；未生成浏览器侧替代记录。";
     }
 }
 
-function renderDecisionHistory(board, error = null) {
+function reviewBucketOf(item) {
+    if (item.kind === "paper_fill") return "fill";
+    if (item.kind === "ai_decision") {
+        if (item.backfill === true || item.provenance === "historical_review") return "historical";
+        return ({ "错": "mismatch", "陈述与数据不符": "mismatch", "已到期 · 证据不足": "evidence_gap",
+            "未到期": "pending", "对": "match", "不适用": "other" })[item.result] || "other";
+    }
+    // Only producer-owned status fields classify records. A reason mentioning
+    // "未到期" or "兑现" is prose, not a verified outcome or maturity clock.
+    const statement = String(item.statement_verification?.status || item.statement_status || "").toLowerCase();
+    if (["mismatch", "statement_mismatch", "陈述与数据不符"].includes(statement)) return "mismatch";
+    const status = String(item.outcome_status || item.result_status || item.review_status || "").toLowerCase();
+    if (["statement_mismatch", "verified_incorrect", "condition_failed", "review_required", "hold_review", "needs_review", "陈述与数据不符", "错"].includes(status)) return "mismatch";
+    if (["due_missing_evidence", "due_unverifiable", "到期缺证据"].includes(status)) return "evidence_gap";
+    if (["missing_evidence", "unverifiable", "missing_intraday", "no_fill"].includes(status)) {
+        return item.maturity_status === "due" ? "evidence_gap" : "data_gap";
+    }
+    if (["not_due", "pending_maturity", "未到期"].includes(status)) return "pending";
+    if (["verified_correct", "condition_met", "对"].includes(status)) return "match";
+    return "other";
+}
+
+function buildReviewItems(board, ai, decisions = null) {
+    const items = [];
+    const watchlist = Array.isArray(board && board.watchlist) ? board.watchlist : [];
+    for (const row of watchlist) {
+        const item = {
+            ...row,
+            symbol: row.symbol,
+            name: row.name,
+            date: row.latest_date || row.entry_date,
+            ledger: "策略观察",
+            action: row.review_label || row.review_status || "观察中",
+            reason: row.review_reason || "missing/degraded",
+            review_status: row.review_status,
+            review_label: row.review_label,
+            kind: "rule_signal",
+            source_scope: "/api/decision-board · watchlist（策略观察，不是 C 线核验）",
+        };
+        item.bucket = reviewBucketOf(item);
+        items.push(item);
+    }
+    const events = Array.isArray(board && board.events) ? board.events : [];
+    for (const event of events) {
+        const item = {
+            ...event,
+            symbol: event.symbol,
+            name: event.name,
+            date: event.date || event.trade_date || event.decision_date,
+            ledger: "策略账",
+            action: event.action || event.event_type || "missing",
+            reason: event.reason || event.note || "missing/degraded",
+            kind: event.action === "buy" || event.action === "sell" ? "paper_fill" : "other",
+            source_scope: "/api/decision-board · events",
+        };
+        item.bucket = reviewBucketOf(item);
+        items.push(item);
+    }
+    const fills = Array.isArray(ai && ai.filled_trades) ? ai.filled_trades : [];
+    for (const fill of fills) {
+        const item = {
+            ...fill,
+            symbol: fill.symbol,
+            name: fill.symbol,
+            date: fill.date || fill.settled_on,
+            ledger: "AI账",
+            action: fill.side === "sell" ? "纸面卖出" : "纸面买入",
+            reason: `成交价 ${safeText(fill.price)} · ${safeText(fill.status || "filled")}`,
+            kind: "paper_fill",
+            source_scope: "/api/ai-trader/dashboard · filled_trades（近期片段）",
+        };
+        item.bucket = reviewBucketOf(item);
+        items.push(item);
+    }
+    for (const record of Array.isArray(decisions?.records) ? decisions.records : []) {
+        const item = { ...record, kind: "ai_decision", ledger: "AI 判断", date: record.decision_date,
+            action: record.result || "未分类", reason: record.judgment, source_scope: "AI 判断核对记录" };
+        item.bucket = reviewBucketOf(item);
+        items.push(item);
+    }
+    const rank = (item) => item.kind === "ai_decision" && item.bucket !== "historical"
+        ? ({ "陈述与数据不符": 0, "错": 1, "已到期 · 证据不足": 2, "未到期": 3, "对": 4 })[item.result] ?? 5 : 6;
+    return items.sort((left, right) => rank(left) - rank(right) || safeText(right.date).localeCompare(safeText(left.date)));
+}
+
+function renderAiDecisionRecord(row, index) {
+    const text = (value) => escapeHtml(safeText(value));
+    const seen = row.seen && typeof row.seen === "object" ? row.seen : {};
+    const verification = row.verification && typeof row.verification === "object" ? row.verification : {};
+    const historical = row.backfill === true || row.provenance === "historical_review";
+    const fields = [
+        ["当时判断", row.judgment], ["风格", row.style], ["计划持有交易日", row.planned_hold_days],
+        ["验证条件", verification.text], ["验证价位", verification.level], ["到期日", verification.due_date],
+        ["条件来源", verification.source === "derived_from_declared_horizon" ? "程序推导条件，非 AI 事前声明" : verification.source],
+        ["当时数据日期", seen.as_of], ["当时收盘价", seen.close], ["当时涨跌幅（%）", seen.pct_chg],
+        ["程序核对结果", row.result], ["结果截至", row.result_as_of],
+        ["记录类型", historical ? "事后复盘" : "事前记录"], ["落盘时间", row.recorded_at],
+        ["整理时间", row.structured_at], ["决策已接收", row.committed === true ? "是" : row.committed === false ? "否" : null],
+        ["提示词版本", row.prompt_version], ["数据菜单版本", row.menu_version], ["记录编号", row.decision_id],
+    ];
+    return `<details class="review-decision">
+        <summary class="report-row review-row">
+            <span>${text(row.date)}</span><strong>${text(row.symbol || "市场判断")}</strong>
+            <span>${text(row.result)}<small>${historical ? "事后复盘" : "事前记录"} · 纸面 · 未验证</small></span>
+            <span class="review-judgment-preview">${text(row.judgment)}</span>
+        </summary>
+        <div class="review-decision-body">
+            <dl>${fields.map(([label, value]) => `<dt>${text(label)}</dt><dd>${text(value)}</dd>`).join("")}</dl>
+            <details><summary>核对证据</summary><pre>${text(JSON.stringify(row.result_evidence ?? [], null, 2))}</pre></details>
+            ${row.symbol ? `<button type="button" class="action-button" data-review-index="${index}" data-review-symbol="${text(row.symbol)}">查看 ${text(row.symbol)}</button>` : ""}
+        </div>
+    </details>`;
+}
+
+function renderDecisionHistory(board, error = null, items = [], sources = []) {
     const panel = document.getElementById("decisionHistoryPanel");
     if (!panel) return;
-    if (!board || board.ok === false) {
-        panel.innerHTML = missingBlock(`后端决策历史不可用：${escapeHtml(safeText(error?.message || board?.message_for_ui || "missing/degraded"))}`);
+    rememberWorkbenchSource("review", items);
+    if (error && !items.length) {
+        panel.onclick = null;
+        panel.innerHTML = missingBlock(`复盘来源读取失败，记录数量未知：${escapeHtml(errorText(error))}`);
         return;
     }
-    const events = Array.isArray(board.events) ? board.events : [];
-    const watchlist = Array.isArray(board.watchlist) ? board.watchlist : [];
-    const eventRows = events.slice().reverse().slice(0, 60).map((event) => ({
-        date: event.date || event.trade_date || event.decision_date || event.generated_at,
-        subject: [event.name, event.symbol].filter(hasValue).join(" ") || "组合事件",
-        action: event.action || event.event_type || event.status || "missing",
-        reason: event.reason || event.note || event.message || event.review_reason || "missing/degraded",
-        strategy: event.strategy || event.strategy_id || "missing",
-    }));
-    const watchRows = watchlist.slice().reverse().slice(0, 60).map((item) => ({
-        date: item.latest_date || item.entry_date,
-        subject: [item.name, item.symbol].filter(hasValue).join(" ") || "Watch Pool 样本",
-        action: item.review_label || item.review_status || "missing",
-        reason: item.review_reason || "missing/degraded",
-        strategy: item.strategy || "missing",
-    }));
-    const rows = [...eventRows, ...watchRows].sort((left, right) => safeText(right.date).localeCompare(safeText(left.date)));
+    const buckets = [
+        { id: "mismatch", label: "需复核" },
+        { id: "pending", label: "未到期" },
+        { id: "evidence_gap", label: "到期缺证据" },
+        { id: "match", label: "符合" },
+        { id: "historical", label: "事后复盘" },
+        { id: "fill", label: "纸面成交" },
+        { id: "data_gap", label: "缺证据·到期未知" },
+        { id: "other", label: "观察/未分类" },
+        { id: "all", label: "全部" },
+    ];
+    const countOf = (id) => (id === "all" ? items.length : items.filter((item) => item.bucket === id).length);
+    const renderRows = (bucketId) => {
+        const rows = bucketId === "all" ? items : items.filter((item) => item.bucket === bucketId);
+        if (!rows.length) return missingBlock("这一类目前没有记录。");
+        return rows.map((row) => row.kind === "ai_decision" ? renderAiDecisionRecord(row, items.indexOf(row)) : `
+            <button class="report-row review-row" type="button" data-review-index="${items.indexOf(row)}" data-review-symbol="${escapeHtml(safeText(row.symbol))}">
+                <span>${escapeHtml(safeText(row.date))}</span>
+                <strong>${escapeHtml(safeText([row.name, row.symbol].filter(Boolean).join(" ")))}</strong>
+                <span>${escapeHtml(safeText(row.ledger))} · ${escapeHtml(safeText(row.action))}</span>
+                <span>${escapeHtml(safeText(row.reason))}<small>${escapeHtml(safeText(row.source_scope))}</small></span>
+            </button>
+        `).join("");
+    };
+    if (!buckets.some((bucket) => bucket.id === currentReviewBucket)) currentReviewBucket = "mismatch";
     panel.innerHTML = `
+        <p class="section-note">纸面 · 未验证</p>
+        ${sources.map((source) => `<p class="section-note">${escapeHtml(source.label)} · ${source.available ? (source.degraded ? "降级，范围可能不完整" : "本次已读") : "读取失败，数量未知"} · 截至 ${escapeHtml(safeText(source.asOf))}${(source.warnings || []).map((warning) => ` · ${escapeHtml(safeText(warning))}`).join("")}</p>`).join("")}
         <div class="metric-row">
-            <article class="metric-box"><span>As of</span><strong>${escapeHtml(safeText(board.as_of || "missing"))}</strong></article>
-            <article class="metric-box"><span>事件</span><strong>${escapeHtml(safeText(events.length))}</strong></article>
-            <article class="metric-box"><span>Watch Pool</span><strong>${escapeHtml(safeText(watchlist.length))}</strong></article>
-            <article class="metric-box"><span>清单</span><strong>${escapeHtml(safeText(board.envelope?.manifest?.manifest_id || "missing"))}</strong></article>
+            ${["陈述与数据不符", "错", "已到期 · 证据不足", "未到期", "对"].map((result) => {
+                const source = sources.find((entry) => entry.path === "/api/ai-trader/decisions");
+                const count = items.filter((item) => item.kind === "ai_decision" && item.bucket !== "historical" && item.result === result).length;
+                return `<article class="metric-box"><span>AI · ${escapeHtml(result)}</span><strong>${source?.available ? `${count}${source.degraded ? "（已读）" : ""}` : "未知"}</strong></article>`;
+            }).join("")}
         </div>
-        <div class="quant-summary-head" style="margin-top:14px">
-            <strong>完整决策追溯</strong>
-            <div class="section-note">只读消费后端事件和生命周期字段；没有证据就保持 missing/degraded。</div>
+        <div class="review-filters" role="tablist">
+            ${buckets.map((bucket) => `
+                <button type="button" class="review-filter" data-review-bucket="${bucket.id}" ${bucket.id === currentReviewBucket ? 'aria-current="page"' : ""}>
+                    ${escapeHtml(bucket.label)} ${countOf(bucket.id)}
+                </button>
+            `).join("")}
         </div>
-        <div class="paper-daily-report">
-            ${rows.length ? rows.map((row) => `
-                <div class="report-row">
-                    <span>${escapeHtml(safeText(row.date))}</span>
-                    <strong>${escapeHtml(safeText(row.subject))}</strong>
-                    <span>${escapeHtml(safeText(row.action))}</span>
-                    <span>${escapeHtml(`${safeText(row.strategy)} · ${safeText(row.reason)}`)}</span>
-                </div>
-            `).join("") : missingBlock("后端当前没有可展示的决策事件；未补造历史记录。")}
-        </div>
-        <p class="panel-disclaimer">Research Only / Paper Account Only / No Broker Route / Live Execution Locked / QMT Order Route Locked / Not Investment Advice / Not Position Advice.</p>
+        <div id="reviewRowHost" class="paper-daily-report">${renderRows(currentReviewBucket)}</div>
+        <p class="panel-disclaimer">事后复盘另计；记录接收不代表成交。Research Only · 纸面 · 未验证。</p>
     `;
+    const host = panel.querySelector("#reviewRowHost");
+    panel.querySelectorAll("[data-review-bucket]").forEach((button) => {
+        button.addEventListener("click", () => {
+            currentReviewBucket = button.dataset.reviewBucket || "all";
+            panel.querySelectorAll("[data-review-bucket]").forEach((other) => other.removeAttribute("aria-current"));
+            button.setAttribute("aria-current", "page");
+            if (host) host.innerHTML = renderRows(button.dataset.reviewBucket || "all");
+        });
+    });
+    // This host survives reloads; assigning one handler avoids listener buildup.
+    panel.onclick = (event) => {
+        const row = event.target.closest("[data-review-symbol]");
+        if (!row || !row.dataset.reviewSymbol) return;
+        const item = items[Number(row.dataset.reviewIndex)];
+        if (!item) return;
+        showDetail({ symbol: item.symbol, name: item.name || item.symbol }, { source: "review", items, eventId: item.event_id || item.id || "" });
+    };
 }
 
 function setupAgentAssistant() {
@@ -1221,9 +1583,33 @@ function buildAgentClientContext() {
 // 数据全部来自 /api/ai-trader/dashboard 与 /api/ai-trader/chat 后端字段；
 // 前端不重算纸面权益、收益、持仓或回撤。聊天只能解释，不能下单。
 
+let aiTraderProfile = "default";
+
+function aiTraderProfileQuery() {
+    return aiTraderProfile === "default" ? "" : `?profile=${encodeURIComponent(aiTraderProfile)}`;
+}
+
+function setAiTraderProfile(profile) {
+    aiTraderProfile = profile === "glm" ? "glm" : "default";
+    for (const button of document.querySelectorAll("[data-ai-trader-profile]")) {
+        button.setAttribute("aria-pressed", button.dataset.aiTraderProfile === aiTraderProfile ? "true" : "false");
+    }
+    const chatDisabled = aiTraderProfile !== "default";
+    const input = document.getElementById("aiTraderChatInput");
+    const sendButton = document.getElementById("sendAiTraderChatButton");
+    if (input) input.disabled = chatDisabled;
+    if (sendButton) sendButton.disabled = chatDisabled;
+}
+
 function setupAiTraderPanel() {
     const refreshButton = document.getElementById("refreshAiTraderButton");
     if (refreshButton) refreshButton.addEventListener("click", () => loadAiTraderPanel());
+    for (const button of document.querySelectorAll("[data-ai-trader-profile]")) {
+        button.addEventListener("click", () => {
+            setAiTraderProfile(button.dataset.aiTraderProfile);
+            loadAiTraderPanel();
+        });
+    }
     const sendButton = document.getElementById("sendAiTraderChatButton");
     const input = document.getElementById("aiTraderChatInput");
     if (sendButton) sendButton.addEventListener("click", () => sendAiTraderChat());
@@ -1253,21 +1639,22 @@ function aiTraderKv(label, value, valueClass = "") {
 }
 
 function aiTraderNum(value, digits = 2) {
-    const n = Number(value);
-    if (!Number.isFinite(n)) return "—";
+    const n = numericValue(value);
+    if (n === null) return "—";
     return n.toLocaleString("zh-CN", { maximumFractionDigits: digits });
 }
 
 function aiTraderPnlClass(value) {
-    const n = Number(value);
-    if (!Number.isFinite(n) || n === 0) return "";
+    const n = numericValue(value);
+    if (n === null || n === 0) return "";
     return n > 0 ? "ai-pnl-up" : "ai-pnl-down";
 }
 
 async function loadAiTraderPanel() {
     const note = document.getElementById("aiTraderStatusNote");
-    if (note) note.textContent = "正在读取 AI 纸面交易员状态…";
-    const result = await fetchAiTraderJson("/api/ai-trader/dashboard", { headers: { Accept: "application/json" } });
+    const label = aiTraderProfile === "default" ? "默认·Kimi" : aiTraderProfile.toUpperCase();
+    if (note) note.textContent = `正在读取 ${label} 的 AI 纸面交易员状态…`;
+    const result = await fetchAiTraderJson("/api/ai-trader/dashboard" + aiTraderProfileQuery(), { headers: { Accept: "application/json" } });
     const payload = result.payload;
     if (!payload) {
         if (note) note.textContent = `AI 纸面交易员数据读取失败（HTTP ${result.status}）。`;
@@ -1277,8 +1664,8 @@ async function loadAiTraderPanel() {
     await loadAiTraderChatHistory();
     if (note) {
         note.textContent = payload.degraded
-            ? `已降级展示：${(payload.warnings || []).slice(0, 2).join("；") || "部分数据缺失"}`
-            : `已加载 · 更新时间 ${safeText(payload.updated_at)}`;
+            ? `${label} · 已降级展示：${(payload.warnings || []).slice(0, 2).join("；") || "部分数据缺失"}`
+            : `${label} · 已加载 · 更新时间 ${safeText(payload.updated_at)}`;
     }
 }
 
@@ -1287,7 +1674,7 @@ function renderAiTraderDashboard(payload) {
     renderAiTraderAccount(payload.account || {});
     renderAiTraderSchedule(payload.schedule_status || {}, payload.llm || {});
     renderAiTraderLlmRuntime(payload.llm_runtime || {});
-    renderAiTraderPositions(payload.positions || []);
+    renderAiTraderPositions(payload.positions || [], payload.degraded === true && numericValue(payload.account?.equity) === null);
     renderAiTraderJournal(payload.latest_journal || {}, payload.llm || {});
     renderAiTraderProposed(payload);
     renderAiTraderFills(payload);
@@ -1350,7 +1737,7 @@ function renderAiTraderAccount(account) {
     host.innerHTML = [
         aiTraderKv("权益（模拟）", aiTraderNum(account.equity)),
         aiTraderKv("现金", aiTraderNum(account.cash)),
-        aiTraderKv("持仓数", safeText(account.positions_count ?? "0")),
+        aiTraderKv("持仓数", aiTraderNum(account.positions_count, 0)),
         aiTraderKv("账本更新时间", safeText(account.updated_at)),
         aiTraderKv("数据日期", safeText(account.as_of)),
         aiTraderKv("初始资金", aiTraderNum(account.initial_cash)),
@@ -1368,21 +1755,26 @@ function renderAiTraderSchedule(schedule, llm) {
         aiTraderKv("计划状态", humanStatus(schedule.plan_status)),
         aiTraderKv("是否提交", schedule.plan_committed ? "committed=true" : "committed=false"),
         aiTraderKv("目标交易日", safeText(schedule.trade_date)),
-        aiTraderKv("数据是否陈旧", schedule.stale ? `陈旧（${safeText(schedule.age_days)} 天未更新）` : `正常（${safeText(schedule.age_days ?? "—")} 天内）`),
+        aiTraderKv("数据是否陈旧", numericValue(schedule.age_days) === null || typeof schedule.stale !== "boolean"
+            ? "未知（未提供可核对的时间状态）"
+            : schedule.stale ? `陈旧（${safeText(schedule.age_days)} 天未更新）` : `正常（${safeText(schedule.age_days)} 天内）`),
         aiTraderKv("调度入口", "晚间 20:20 计划任务（本页只读，无启动/停止按钮）"),
     ].join("");
 }
 
-function renderAiTraderPositions(positions) {
+function renderAiTraderPositions(positions, unavailable = false) {
+    rememberWorkbenchSource("ai_positions", positions);
     const host = document.getElementById("aiTraderPositionsPanel");
     if (!host) return;
     if (!positions.length) {
-        host.innerHTML = '<div class="empty-state">当前没有纸面持仓（空仓也是它的决定之一）。</div>';
+        host.innerHTML = unavailable
+            ? '<div class="empty-state">AI 纸面账缺失或不可读，纸面持仓状态未知；不能据此认定纸面账户空仓。</div>'
+            : '<div class="empty-state">当前没有纸面持仓（空仓也是它的决定之一）。</div>';
         return;
     }
     const rows = positions.map((p) => `
         <tr>
-            <td>${escapeHtml(safeText(p.symbol))}</td>
+            <td><button type="button" class="action-button secondary-action" data-ai-position-symbol="${escapeHtml(safeText(p.symbol))}">${escapeHtml(safeText(p.symbol))}</button></td>
             <td>${escapeHtml(safeText(p.name !== undefined ? p.name : ""))}</td>
             <td>${escapeHtml(aiTraderNum(p.quantity, 0))}</td>
             <td>${escapeHtml(aiTraderNum(p.avg_cost))}</td>
@@ -1401,6 +1793,12 @@ function renderAiTraderPositions(positions) {
             </table>
         </div>
     `;
+    host.querySelectorAll("[data-ai-position-symbol]").forEach((button) => {
+        button.onclick = () => {
+            const item = positions.find((position) => String(position.symbol) === button.dataset.aiPositionSymbol);
+            if (item) return showDetail(item, { source: "ai_positions", items: positions });
+        };
+    });
 }
 
 function renderAiTraderJournal(journal, llm) {
@@ -1596,6 +1994,10 @@ function renderAiTraderSource(payload) {
 async function loadAiTraderChatHistory() {
     const host = document.getElementById("aiTraderChatLog");
     if (!host) return;
+    if (aiTraderProfile !== "default") {
+        host.innerHTML = `<div class="empty-state">${escapeHtml(aiTraderProfile.toUpperCase())} 分支的聊天面板暂不可用（聊天仍只读默认账）；它自己的结论看上方账户、计划与决策页。</div>`;
+        return;
+    }
     const result = await fetchAiTraderJson("/api/ai-trader/chat", { headers: { Accept: "application/json" } });
     const messages = result.payload?.messages;
     if (!Array.isArray(messages)) {
@@ -1620,6 +2022,10 @@ async function sendAiTraderChat() {
     const button = document.getElementById("sendAiTraderChatButton");
     const status = document.getElementById("aiTraderChatStatus");
     const question = String(input?.value || "").trim();
+    if (aiTraderProfile !== "default") {
+        if (status) status.textContent = "GLM 分支的聊天暂不可用：聊天面板只读默认账，两个大脑互看聊天记录。";
+        return;
+    }
     if (!question) {
         if (status) status.textContent = "先输入问题再发送。聊天不能下单，仓位只在晚间纸面流程中变化。";
         return;
@@ -1924,14 +2330,10 @@ function setupForwardPitHome() {
 
 function setupDataOps() {
     const refresh = document.getElementById("refreshDataHealthButton");
-    const updCand = document.getElementById("updateCandidatesDailyButton");
     const updAll = document.getElementById("updateAllDataButton");
-    const repair = document.getElementById("repairDailyButton");
     const auto = document.getElementById("dataOpsAutoCheck");
     if (refresh) refresh.addEventListener("click", () => loadDataHealth());
-    if (updCand) updCand.addEventListener("click", () => runDataOpsUpdate("candidates"));
     if (updAll) updAll.addEventListener("click", () => runDataOpsUpdate("all"));
-    if (repair) repair.addEventListener("click", runDailyRepair);
     if (auto) {
         auto.addEventListener("change", () => {
             if (dataOpsAutoTimer) { window.clearInterval(dataOpsAutoTimer); dataOpsAutoTimer = 0; }
@@ -2605,33 +3007,14 @@ async function runDataOpsUpdate(kind) {
     const button = document.getElementById(isAll ? "updateAllDataButton" : "updateCandidatesDailyButton");
     const note = document.getElementById("dataOpsNote");
     const original = button ? button.textContent : "";
-    if (button) { button.disabled = true; button.textContent = isAll ? "有界更新中（最多120只）…" : "更新中…"; }
-    if (note) note.textContent = isAll ? "正在联网执行有界日线更新（最多120只）；正式914链状态请查看独立卡片。" : "正在联网更新当前候选日线…";
+    if (button) { button.disabled = true; button.textContent = "收盘更新中…"; }
+    if (note) note.textContent = "正在运行全 A 收盘更新…";
     try {
-        const payload = isAll
-            ? await postJson("/api/data/update-all", { max_symbols: 120 })
-            : await postJson("/api/daily/update-candidates", { max_symbols: 40 });
+        const payload = await postJson("/api/data/update-all", { explicit_network: true });
         if (note) note.textContent = safeText(payload.message_for_ui || payload.message || "更新完成。");
         await loadDataHealth();
     } catch (error) {
         if (note) note.textContent = `更新失败：${escapeHtml(errorText(error))}`;
-    } finally {
-        if (button) { button.disabled = false; button.textContent = original; }
-    }
-}
-
-async function runDailyRepair() {
-    const button = document.getElementById("repairDailyButton");
-    const note = document.getElementById("dataOpsNote");
-    const original = button ? button.textContent : "";
-    if (button) { button.disabled = true; button.textContent = "修复中…"; }
-    if (note) note.textContent = "正在扫描并修正本地日线损坏价格（已自动备份原文件）…";
-    try {
-        const payload = await postJson("/api/data/repair-daily", {});
-        if (note) note.textContent = safeText(payload.message_for_ui || "修复完成。");
-        await loadDataHealth();
-    } catch (error) {
-        if (note) note.textContent = `日线修复失败：${escapeHtml(errorText(error))}`;
     } finally {
         if (button) { button.disabled = false; button.textContent = original; }
     }
@@ -2986,36 +3369,27 @@ async function loadLLMDailyReview(account, actionRows) {
         contentEl.innerHTML = missingBlock("当前没有可复盘的纸面入池或退出复核记录。");
         return;
     }
-    if (statusEl) statusEl.textContent = "正在分析...";
     const actionSummary = reportRows.slice(0, 16).map((row) => {
         const kind = paperActionKind(row) === "entry" ? "纸面入池" : paperActionKind(row) === "exit" ? "退出复核" : "纸面记录";
         const pending = row.is_pending ? "待验证未成交" : humanStatus(row.status || "已记录");
         return `${safeText(row.symbol)} ${safeText(row.name || "")}：${kind}，${pending}，${sanitizeTradingTerms(humanizeStatusTerms(row.note || ""))}`;
     }).join("\n");
     const question = `请复盘 ${reportDate} 的 QuantDesk 纸面研究动作，重点说明入池/退出复核理由、数据缺口、是否存在分钟线待验证或口径风险。不要给出买卖指令或真实配置指令。\n${actionSummary}`;
-    try {
-        const result = await postJson("/api/agent/chat", {
-            question,
-            context: {
-                report_date: reportDate,
-                today_actions: reportRows,
-                portfolio_summary: {
-                    active_count: account.activeCount,
-                    needs_review_count: account.needsReviewCount,
-                    data_gap_count: account.dataGapCount,
-                    latest_reference_date: account.latestReferenceDate,
-                    has_portfolio: account.hasPortfolio,
-                },
-            },
-            skill: "daily_review",
-        });
-        const isStub = result.provider === "offline_stub" || result.status === "fallback" || result.mode === "offline_stub";
-        if (statusEl) statusEl.textContent = isStub ? "离线模板分析" : "LLM 复盘完成";
-        contentEl.innerHTML = formatLLMAnalysis(result.answer || result.report || result.message || "复盘结果为空");
-    } catch (error) {
-        if (statusEl) statusEl.textContent = "复盘失败";
-        contentEl.innerHTML = missingBlock(`LLM 复盘不可用：${escapeHtml(errorText(error))}`);
-    }
+    renderAssistantDraft(contentEl, statusEl, question, "daily_review", `策略账 ${reportDate} 已读动作`);
+}
+
+function renderAssistantDraft(contentEl, statusEl, question, skill, sourceLabel) {
+    if (statusEl) statusEl.textContent = "尚未请求模型";
+    contentEl.innerHTML = `<p class="section-note">${escapeHtml(sourceLabel)}。查看页面只读取记录；可把这些内容带到研究室，检查后手动发送。</p><button type="button" class="action-button secondary-action" data-review-draft>带到研究室</button>`;
+    const button = contentEl.querySelector("[data-review-draft]");
+    if (!button) return;
+    button.onclick = () => {
+        if (typeof window.quantdeskShowModuleView === "function") window.quantdeskShowModuleView("agent-section");
+        const input = document.getElementById("agentQuestionInput");
+        const skillSelect = document.getElementById("agentSkillSelect");
+        if (skillSelect && Array.from(skillSelect.options).some((option) => option.value === skill)) skillSelect.value = skill;
+        if (input) { input.value = question; input.focus(); }
+    };
 }
 
 function renderPaperStrategyPanel(data, account) {
@@ -3076,6 +3450,8 @@ function renderPositionsTable(positions, account = {}) {
     const rows = Array.isArray(positions) ? positions : [];
     const portfolioRows = Array.isArray(account.portfolioPositions) && account.portfolioPositions.length ? account.portfolioPositions : (account.hasPortfolio ? rows : []);
     const watchRows = Array.isArray(account.watchPositions) ? account.watchPositions : (!account.hasPortfolio ? rows : []);
+    rememberWorkbenchSource("strategy_positions", portfolioRows);
+    rememberWorkbenchSource("strategy_watchlist", watchRows);
     const portfolioBody = portfolioRows.map((item) => {
         const status = checkPositionStatus(item);
         const entryDate = safeText(item.entry_date || item.buy_date || item.added_at || "");
@@ -3086,7 +3462,7 @@ function renderPositionsTable(positions, account = {}) {
         const pnlAmount = numericValue(item.unrealized_pnl);
         return `
             <tr>
-                <td>${escapeHtml(safeText(item.symbol))}<br><span style="font-size:11px;color:var(--text-muted)">${escapeHtml(safeText(item.name || ""))}</span></td>
+                <td><button type="button" class="action-button secondary-action" data-position-source="strategy_positions" data-position-symbol="${escapeHtml(safeText(item.symbol))}">${escapeHtml(safeText(item.symbol))}</button><br><span style="font-size:11px;color:var(--text-muted)">${escapeHtml(safeText(item.name || ""))}</span></td>
                 <td class="number">${escapeHtml(String(entryDate).slice(0, 10) || "—")}</td>
                 <td class="number">${holdingDays === null ? missingBadge() : `${escapeHtml(String(holdingDays))}天`}</td>
                 <td class="number">${entryPrice !== null ? escapeHtml(numText(entryPrice, 2)) : missingBadge()}</td>
@@ -3107,7 +3483,7 @@ function renderPositionsTable(positions, account = {}) {
         const pnlAmount = numericValue(item.paper_pnl);
         return `
             <tr>
-                <td>${escapeHtml(safeText(item.symbol))}<br><span style="font-size:11px;color:var(--text-muted)">${escapeHtml(safeText(item.name || ""))}</span></td>
+                <td><button type="button" class="action-button secondary-action" data-position-source="strategy_watchlist" data-position-symbol="${escapeHtml(safeText(item.symbol))}">${escapeHtml(safeText(item.symbol))}</button><br><span style="font-size:11px;color:var(--text-muted)">${escapeHtml(safeText(item.name || ""))}</span></td>
                 <td class="number">${escapeHtml(String(entryDate).slice(0, 10) || "—")}</td>
                 <td class="number">${holdingDays === null ? missingBadge() : `${escapeHtml(String(holdingDays))}天`}</td>
                 <td class="number">${entryPrice !== null ? escapeHtml(numText(entryPrice, 2)) : missingBadge()}</td>
@@ -3148,6 +3524,13 @@ function renderPositionsTable(positions, account = {}) {
             </div>
         </section>
     `;
+    panel.querySelectorAll("[data-position-symbol]").forEach((button) => {
+        button.onclick = () => {
+            const items = button.dataset.positionSource === "strategy_positions" ? portfolioRows : watchRows;
+            const item = items.find((position) => String(position.symbol) === button.dataset.positionSymbol);
+            if (item) return showDetail(item, { source: button.dataset.positionSource, items });
+        };
+    });
 }
 
 function buildPaperActionRows(items, paper = null) {
@@ -3369,16 +3752,16 @@ function renderPaperWatchlistLegacy(data) {
 
 function bindPaperCardClicks(root) {
     if (!root) return;
-    root.querySelectorAll(".paper-card-compact").forEach((card) => {
+    const cards = Array.from(root.querySelectorAll(".paper-card-compact"));
+    const items = cards.map((card) => ({
+        symbol: card.dataset.symbol || "", name: card.dataset.name || card.dataset.symbol || "",
+        detail_lane: card.dataset.lane || "", select_date: card.dataset.entryDate || "",
+    }));
+    cards.forEach((card, index) => {
         card.addEventListener("click", (event) => {
             // Let the lifecycle action buttons work without opening the detail.
             if (event.target instanceof Element && event.target.closest("[data-paper-action]")) return;
-            showDetail({
-                symbol: card.dataset.symbol || "",
-                name: card.dataset.name || card.dataset.symbol || "",
-                detail_lane: card.dataset.lane || "",
-                select_date: card.dataset.entryDate || "",
-            });
+            showDetail(items[index], { source: "strategy_watchlist", items });
         });
     });
 }
@@ -3660,7 +4043,7 @@ function renderHomeKpiMarketBrain(data, error = null) {
     const confidence = Number(snapshot.confidence);
     valueEl.textContent = label;
     if (eligible && Number.isFinite(confidence)) {
-        subEl.textContent = `置信度 ${(confidence * 100).toFixed(0)}%（shadow 研究观察，as-of ${safeText(snapshot.as_of || snapshot.target_date || "—")}）`;
+        subEl.textContent = `置信度 ${(confidence * 100).toFixed(0)}% · 研究观察 · 截至 ${safeText(snapshot.as_of || snapshot.target_date || "—")}`;
         feedDutyLamp("brain", label, `置信度 ${(confidence * 100).toFixed(0)}%`, "");
     } else {
         const reasons = Array.isArray(snapshot.reason_codes) ? snapshot.reason_codes.slice(0, 2).join(", ") : "";
@@ -4956,14 +5339,19 @@ function renderStrategyScreeningStatus(data) {
 async function loadRealtimeMarket(forceRefresh) {
     const button = document.getElementById("refreshRealtimeButton");
     const note = document.getElementById("realtimeStatusNote");
-    const url = forceRefresh ? "/api/realtime/market?refresh=1&network=1" : "/api/realtime/market";
+    // A plain GET is a read-only cache view; an explicit refresh is a POST that
+    // carries the intent (B6), so a page load or a cross-site embed can never
+    // trigger a provider refresh through a query string.
+    const url = "/api/realtime/market";
     if (button && forceRefresh) {
         button.disabled = true;
         button.textContent = "正在刷新实时观察…";
     }
     if (note && forceRefresh) note.textContent = "正在刷新实时快照和行业板块；这些数据不会覆盖正式日线。";
     try {
-        const data = await requestJson(url);
+        const data = forceRefresh
+            ? await postJson(url, { refresh: true, network: true })
+            : await requestJson(url);
         renderRealtimeMarket(data);
     } catch (error) {
         const metrics = document.getElementById("realtimeMetrics");
@@ -5107,6 +5495,8 @@ async function searchRealtimeStock() {
 }
 
 function renderStockSearchResults(rows) {
+    currentStockSearchRows = Array.isArray(rows) ? rows.slice() : [];
+    rememberWorkbenchSource("search", currentStockSearchRows);
     const results = document.getElementById("stockSearchResults");
     if (!results) return;
     if (!rows.length) {
@@ -5129,31 +5519,7 @@ function renderStockSearchResults(rows) {
 
 async function showRealtimeStockDetail(symbol, name) {
     if (!symbol) return;
-    const modal = document.getElementById("detailModal");
-    const body = document.getElementById("modalBody");
-    document.getElementById("modalTitle").textContent = `${name || symbol} ${symbol}`;
-    document.getElementById("modalSubtitle").textContent = "正在读取实时观察详情…";
-    body.innerHTML = missingBlock("正在加载实时观察详情…");
-    document.body.classList.add("modal-open");
-    modal.classList.add("open");
-    let detail;
-    try {
-        detail = await requestJson(`/api/realtime/stock/${encodeURIComponent(symbol)}?refresh_quote=1&refresh_daily=1&network=1`);
-    } catch (error) {
-        body.innerHTML = missingBlock(`单股观察详情加载失败：${escapeHtml(errorText(error))}`);
-        return;
-    }
-    document.getElementById("modalTitle").textContent = `${safeText(detail.name)} ${safeText(detail.symbol)}`;
-    document.getElementById("modalSubtitle").textContent = "实时观察层 · 临时快照不覆盖正式日线";
-    currentDetailChartData = detail.chart_data || {};
-    currentDetailResearchReference = detail.research_reference || {};
-    body.innerHTML = renderRealtimeDetailContent(detail);
-    setupDetailNavigation("realtime");
-    const addButton = document.getElementById("addManualObservationButton");
-    if (addButton) {
-        addButton.addEventListener("click", () => addManualObservation(detail.symbol, detail.name));
-    }
-    activateDetailPane("overview");
+    return showDetail({ symbol, name: name || symbol }, { source: "search", items: currentStockSearchRows });
 }
 
 async function addManualObservation(symbol, name) {
@@ -5605,44 +5971,44 @@ async function updateCurrentCandidates() {
     const panel = document.getElementById("candidateGapPanel");
     if (button) {
         button.disabled = true;
-        button.textContent = "正在联网更新候选日线…";
+        button.textContent = "收盘更新中…";
     }
     if (panel) {
-        panel.innerHTML = "<strong>正在更新</strong><div>只更新当前候选池，不扫描全 A；Research Only，No Broker Route。</div>";
+        panel.innerHTML = "<strong>全 A 收盘更新中</strong>";
     }
     try {
-        const payload = await postJson("/api/daily/update-candidates", { max_symbols: 40 });
+        const payload = await postJson("/api/data/update-all", { explicit_network: true });
         if (panel) {
-            panel.innerHTML = `<strong>更新完成</strong><div>${escapeHtml(safeText(payload.message_for_ui || payload.message))}</div>`;
+            panel.innerHTML = `<strong>${payload.ok === true ? "更新完成" : "更新未完成"}</strong><div>${escapeHtml(safeText(payload.message_for_ui || payload.message))}</div>`;
         }
         await loadStartupUpdateStatus();
         await loadMarketOverview();
         await loadCandidates();
+        return payload;
     } catch (error) {
         if (panel) {
             panel.innerHTML = `<strong>更新失败</strong><div>${escapeHtml(errorText(error))}</div>`;
         }
+        return null;
     } finally {
         if (button) {
             button.disabled = false;
-            button.textContent = "联网更新当前候选日线";
+            button.textContent = "收盘更新";
         }
     }
 }
 
-// Always-visible "更新数据" button in the top dock. Reuses updateCurrentCandidates
-// (refresh the current candidate pool's daily lines, then reload affected views)
-// and shows its own transient state on the dock button.
+// The dock and settings share the same explicit Pipeline update.
 async function runGlobalDataUpdate() {
     const button = document.getElementById("globalUpdateButton");
-    const original = "更新候选日线";
+    const original = "收盘更新";
     if (button) {
         button.disabled = true;
         button.textContent = "更新中…";
     }
     try {
-        await updateCurrentCandidates();
-        if (button) button.textContent = "已更新";
+        const result = await updateCurrentCandidates();
+        if (button) button.textContent = result?.ok === true ? "已更新" : "未完成";
     } finally {
         if (button) {
             button.disabled = false;
@@ -5725,8 +6091,8 @@ function setupDutyStrip() {
         const target = document.getElementById(lamp.dataset.dutyTarget || "");
         if (!target) return;
         const jump = () => document.getElementById(lamp.dataset.dutyTarget || "")?.scrollIntoView({ behavior: "smooth", block: "start" });
-        if (document.body.dataset.view === "module") {
-            document.querySelector(".side-nav [data-module-home]")?.click();
+        if (typeof window.quantdeskShowPage === "function" && document.body.dataset.page !== "system") {
+            window.quantdeskShowPage("system");
             window.requestAnimationFrame(() => window.requestAnimationFrame(jump));
         } else {
             jump();
@@ -5756,6 +6122,12 @@ async function loadStartupUpdateStatus() {
     }
 }
 
+function startupFailureDetailsHtml(details) {
+    const items = Array.isArray(details) ? details.filter((item) => item && hasValue(item.message)) : [];
+    if (!items.length) return "";
+    return `<div class="startup-update-explain"><strong>本轮未完成事项</strong><ul>${items.map((item) => `<li>${escapeHtml(safeText(item.message))}</li>`).join("")}</ul></div>`;
+}
+
 function renderStartupUpdateStatus(data) {
     const panel = document.getElementById("startupUpdateStatus");
     if (!panel) return;
@@ -5765,7 +6137,7 @@ function renderStartupUpdateStatus(data) {
     const actionHtml = actionableReasons.has(safeText(explanation.reason_code)) ? `
         <div class="startup-update-actions">
             <button class="action-button" type="button" data-research-loop-refresh>刷新研究闭环</button>
-            <span>更新当前研究池、重新生成今日重点、同步纸面模拟池并刷新策略成绩单。</span>
+            <span>查看全 A 收盘更新和当前研究结果；未完成的步骤会保留说明。</span>
         </div>
     ` : "";
     const failedSymbols = Array.isArray(diagnosis.failed_symbols_sample) ? diagnosis.failed_symbols_sample.filter(Boolean).slice(0, 8) : [];
@@ -5785,8 +6157,9 @@ function renderStartupUpdateStatus(data) {
             ${actionHtml}
         </div>
         ${diagnosisHtml}
+        ${startupFailureDetailsHtml(data.failure_details)}
     `;
-    if (data.current_view_override === true) {
+    if (data.current_view_override === true && ["completed", "completed_all_executed"].includes(safeText(data.status))) {
         const summary = data.current_candidate_gap_summary || {};
         const generation = data.candidate_generation || {};
         const title = safeText(data.current_status_label || "当前候选已补齐");
@@ -5852,12 +6225,12 @@ function renderStartupUpdateStatus(data) {
     const network = data.provider_network_authorized ? "本次启动已显式授权网络数据更新" : "本次启动未授权网络数据更新";
     const generationFreshness = safeText(generation.freshness_label || "研究候选批次状态缺失");
     const generationMessage = safeText(generation.freshness_message || generation.message_for_ui || "");
-    const warning = ["failed", "timeout", "completed_with_warnings", "partial", "blocked", "not_run", "skipped"].includes(status);
+    const warning = !["completed", "completed_all_executed"].includes(status);
     panel.className = `startup-update ${warning ? "startup-update-warning" : "startup-update-ok"}`;
     panel.innerHTML = `
         <div class="startup-update-line">
             <strong>启动数据更新：${escapeHtml(humanStatus(status))}</strong>
-            <span class="startup-update-brief">${escapeHtml(attempted)}。${escapeHtml(network)}；范围仅限当前研究池，不扫描全 A。</span>
+            <span class="startup-update-brief">${escapeHtml(attempted)}。${escapeHtml(network)}；完整日线由全 A 收盘更新流程维护。</span>
         </div>
         <details class="startup-update-details">
             <summary>详情与处理建议</summary>
@@ -5946,6 +6319,10 @@ function syncStartupStatusPolling(data) {
 
 async function triggerStartupRefresh(options = {}) {
     const manual = options.manual === true;
+    if (!manual) {
+        await loadStartupUpdateStatus();
+        return;
+    }
     try {
         startupRefreshApplied = false;
         startupRefreshTaskSeen = true;
@@ -6105,6 +6482,7 @@ async function loadCandidates() {
         currentCandidates = data.all_candidates || data.candidates || [];
         currentTodayRecommendations = data.today_recommendations || [];
         currentObservationCandidates = data.observation_candidates || [];
+        rememberWorkbenchSource("research_candidates", currentCandidates);
         document.getElementById("candidateDataNote").textContent = safeText(data.message);
         renderCandidateGenerationPanel(data.candidate_generation || {});
         renderCandidateConfidencePanel(data.candidate_confidence_summary || {});
@@ -6311,25 +6689,12 @@ async function loadLLMSelectionAnalysis(candidates) {
         contentEl.innerHTML = missingBlock("今日无策略候选。");
         return;
     }
-    if (statusEl) statusEl.textContent = "正在分析...";
     const candidateSummary = rows.slice(0, 10).map((candidate) => {
         const reasons = candidateMatchedConditions(candidate).slice(0, 3).join("；") || "入选原因缺失";
         return `${safeText(candidate.symbol)} ${safeText(candidate.name || "")}（${safeText(candidate.strategy_name || candidate.strategy_lane || "策略")}：${reasons}）`;
     }).join("\n");
     const question = `今日策略候选如下，请从研究合理性、数据质量风险、纸面跟踪注意点三个角度分析，不要给出买卖指令、确定价格结论或真实配置指令。\n${candidateSummary}`;
-    try {
-        const result = await postJson("/api/agent/chat", {
-            question,
-            context: { candidates: rows.slice(0, 10) },
-            skill: "selection_analysis",
-        });
-        const isStub = result.provider === "offline_stub" || result.status === "fallback" || result.mode === "offline_stub";
-        if (statusEl) statusEl.textContent = isStub ? "离线模板分析" : "LLM 分析完成";
-        contentEl.innerHTML = formatLLMAnalysis(result.answer || result.report || result.message || "分析结果为空");
-    } catch (error) {
-        if (statusEl) statusEl.textContent = "分析失败";
-        contentEl.innerHTML = missingBlock(`LLM 选股分析不可用：${escapeHtml(errorText(error))}`);
-    }
+    renderAssistantDraft(contentEl, statusEl, question, "selection_analysis", "本次已读研究候选");
 }
 
 function renderDailyFocus(candidates) {
@@ -6847,11 +7212,59 @@ function findCandidateForButton(button) {
     };
 }
 
-async function showDetail(candidate) {
-    if (!candidate) return;
+function workbenchSourceLabel(source) {
+    return {
+        research_candidates: "研究候选", strategy_positions: "纸面策略账持仓",
+        ai_positions: "纸面 AI 账持仓", strategy_watchlist: "策略观察名单",
+        search: "股票搜索", review: "复盘记录", stock: "直接查看",
+    }[source] || "直接查看";
+}
+
+function rememberWorkbenchSource(source, items) {
+    workbenchSourceLists[source] = Array.isArray(items) ? items.slice() : [];
+    const context = currentWorkbenchContext;
+    if (!context || context.source !== source || context.sourceItemsReady) return;
+    const matched = source === "research_candidates"
+        ? [currentTodayRecommendations, currentObservationCandidates, currentCandidates]
+            .find((list) => list.some((item) => String(item.symbol) === context.symbol))
+        : null;
+    context.items = (matched || workbenchSourceLists[source]).slice();
+    context.sourceItemsReady = true;
+    setupWorkbenchSwitcher(context.symbol);
+}
+
+function workbenchContext(candidate, options, wasOpen) {
+    if (options.context) return options.context;
+    const defaultLists = [currentTodayRecommendations, currentObservationCandidates, currentCandidates];
+    const matching = defaultLists.find((items) => items.some((item) => String(item.symbol) === String(candidate.symbol)));
+    const source = options.source || (matching ? "research_candidates" : "stock");
+    const supplied = Array.isArray(options.items) && options.items.length ? options.items : null;
+    const known = supplied || workbenchSourceLists[source] || (source === "research_candidates" ? matching : null);
+    const items = known || [candidate];
+    const fromHash = options.returnHash || (wasOpen ? currentWorkbenchContext?.returnHash : window.location.hash) || "#watch";
+    return {
+        source,
+        sourceItemsReady: Boolean(known),
+        items: items.slice(),
+        returnHash: /^#watch\//.test(fromHash) ? "#watch" : fromHash,
+        scrollY: wasOpen ? currentWorkbenchContext?.scrollY || 0 : window.scrollY || 0,
+        eventId: options.eventId || "",
+    };
+}
+
+async function showDetail(candidate, options = {}) {
+    if (!candidate || !hasValue(candidate.symbol)) return;
+    const requestId = ++detailRequestSequence;
     const modal = document.getElementById("detailModal");
     const body = document.getElementById("modalBody");
-    document.getElementById("modalTitle").textContent = `${candidate.name} ${candidate.symbol}`;
+    const wasOpen = modal.classList.contains("open");
+    currentWorkbenchContext = workbenchContext(candidate, options, wasOpen);
+    currentWorkbenchContext.symbol = String(candidate.symbol);
+    currentDetailChartData = null;
+    currentDetailResearchReference = null;
+    disposeActiveCharts();
+    const isCurrent = () => requestId === detailRequestSequence && modal.classList.contains("open");
+    document.getElementById("modalTitle").textContent = `${candidate.name || candidate.symbol} ${candidate.symbol}`;
     document.getElementById("modalSubtitle").textContent = "正在读取本地详情…";
     body.innerHTML = missingBlock("正在加载详情…");
     document.body.classList.add("modal-open");
@@ -6859,29 +7272,44 @@ async function showDetail(candidate) {
     const params = new URLSearchParams();
     if (hasValue(candidate.detail_lane)) params.set("lane", candidate.detail_lane);
     if (hasValue(candidate.select_date)) params.set("entry_date", candidate.select_date);
-    if (candidate.manual_network_refresh === true) {
-        params.set("refresh_daily", "1");
-        params.set("network", "1");
-    }
     const suffix = params.toString() ? `?${params.toString()}` : "";
+    const hashParams = new URLSearchParams(params);
+    hashParams.set("source", currentWorkbenchContext.source);
+    hashParams.set("from", currentWorkbenchContext.returnHash);
+    const detailHash = `#watch/${encodeURIComponent(String(candidate.symbol))}?${hashParams.toString()}`;
+    if (options.updateUrl !== false && window.location.hash !== detailHash) {
+        const changeHistory = wasOpen ? "replaceState" : "pushState";
+        history[changeHistory]({ quantdeskWorkbench: true }, "", detailHash);
+    }
+    setupWorkbenchSwitcher(candidate.symbol);
     let detail;
     try {
         detail = await requestJson(`/api/stock/${encodeURIComponent(candidate.symbol)}/detail${suffix}`);
     } catch (error) {
+        if (!isCurrent()) return;
         body.innerHTML = missingBlock(`详情接口加载失败：${escapeHtml(errorText(error))}。请确认本地服务仍在运行，并检查 data/daily。`);
         return;
     }
+    if (!isCurrent()) return;
     try {
-        document.getElementById("modalSubtitle").textContent = `${safeText(detail.basic_info?.date)} · research-only`;
-        currentDetailChartData = detail.chart_data || {};
+        document.getElementById("modalTitle").textContent = `${detail.basic_info?.name || candidate.name || candidate.symbol} ${candidate.symbol}`;
+        document.getElementById("modalSubtitle").textContent = `${workbenchSourceLabel(currentWorkbenchContext.source)} · ${safeText(detail.basic_info?.date)} · Research Only · 纸面 · 未验证`;
+        currentDetailChartData = { ...(detail.chart_data || {}) };
         currentDetailResearchReference = detail.research_reference || {};
         body.innerHTML = renderDetailContent(detail);
         setupDetailNavigation("candidate");
         bindCandidateActionButtons(detail);
-        // Auto-refresh news in background
-        refreshNewsForSymbol(candidate.symbol);
-        activateDetailPane("overview");
+        // The detail payload already contains locally read news. A read must
+        // not implicitly invoke the separate news/provider refresh endpoint.
+        activateDetailPane("charts");
+        const overlays = await loadChartOverlays(candidate.symbol);
+        if (!isCurrent()) return;
+        currentDetailChartData.markers = mergeChartMarkers(currentDetailChartData.markers, overlays);
+        renderWorkbenchEventList(currentDetailChartData.markers, currentDetailChartData, overlays.warnings || []);
+        renderChart(currentDetailChartData);
+        setupWorkbenchSwitcher(candidate.symbol);
     } catch (error) {
+        if (!isCurrent()) return;
         console.error("[daily_research] detail render failed", error);
         body.innerHTML = missingBlock(`详情渲染失败：页面脚本已拿到接口数据，但渲染时出错。${escapeHtml(errorText(error))}`);
     }
@@ -7326,6 +7754,7 @@ function renderDetailContent(detail) {
         <section class="detail-section detail-brief">
             <h3>研究简报 · 直接说人话（研究观察，不是买卖指令）</h3>
             ${renderResearchBrief(detail.research_brief || {})}
+            <div id="workbenchEventList" class="workbench-event-box"></div>
         </section>`,
         },
         {
@@ -7448,6 +7877,8 @@ function renderDetailContent(detail) {
                     </div>
                     <div id="volumeChart" class="split-chart split-chart-volume"></div>
                 </article>
+                <details class="chart-extra-indicators">
+                    <summary>更多指标副图（MACD / KDJ / RSI，默认收起）</summary>
                 <article class="chart-card">
                     <div class="chart-card-head">
                         <h4>MACD</h4>
@@ -7469,6 +7900,7 @@ function renderDetailContent(detail) {
                     </div>
                     <div id="rsiChart" class="split-chart"></div>
                 </article>
+                </details>
             </div>
         </section>`,
         },
@@ -7543,6 +7975,10 @@ function setupDetailNavigation(mode) {
     buttons.forEach((button) => {
         button.addEventListener("click", () => activateDetailPane(button.dataset.detailTarget || ""));
     });
+    const extras = shell.querySelector(".chart-extra-indicators");
+    if (extras) {
+        extras.addEventListener("toggle", () => window.setTimeout(() => renderDetailCharts(mode), 0));
+    }
 }
 
 function activateDetailPane(targetId) {
@@ -7845,13 +8281,16 @@ function safeHtml(html) {
     const template = document.createElement("template");
     template.innerHTML = text;
     // Remove dangerous element types.
-    template.content.querySelectorAll("script, iframe, object, embed, form, input, textarea, select, button, link, meta").forEach((node) => node.remove());
+    template.content.querySelectorAll("script, iframe, object, embed, form, input, textarea, select, button, link, meta, img, picture, video, audio, source, svg, math, style").forEach((node) => node.remove());
     // Strip on* event-handler attributes, javascript: URIs, and inline styles
     // from every surviving element to close the remaining XSS vectors.
     template.content.querySelectorAll("*").forEach((el) => {
         for (const attr of [...el.attributes]) {
             const name = attr.name.toLowerCase();
             if (name.startsWith("on")) {
+                el.removeAttribute(attr.name);
+            } else if (["src", "srcset", "background", "poster"].includes(name)) {
+                // Explanatory HTML is text, never permission to load resources.
                 el.removeAttribute(attr.name);
             } else if ((name === "href" || name === "src" || name === "action") && /^\s*javascript\s*:/i.test(attr.value)) {
                 el.removeAttribute(attr.name);
@@ -7867,6 +8306,8 @@ function setupModal() {
     const modal = document.getElementById("detailModal");
     const closeButton = document.getElementById("closeModalButton");
     closeButton.addEventListener("click", closeModal);
+    const returnButton = document.getElementById("workbenchReturn");
+    if (returnButton) returnButton.addEventListener("click", closeModal);
     modal.addEventListener("click", (event) => {
         if (event.target === modal) closeModal();
     });
@@ -7875,12 +8316,219 @@ function setupModal() {
     });
 }
 
-function closeModal() {
+function closeModal(options = {}) {
+    const context = currentWorkbenchContext;
+    detailRequestSequence += 1;
     document.getElementById("detailModal").classList.remove("open");
     document.body.classList.remove("modal-open");
     currentDetailChartData = null;
     currentDetailResearchReference = null;
+    currentWorkbenchContext = null;
     disposeActiveCharts();
+    if (options.restore !== false && /^#watch\//.test(window.location.hash || "")) {
+        history.replaceState(null, "", context?.returnHash || "#watch");
+        if (typeof window.quantdeskRestoreView === "function") window.quantdeskRestoreView();
+        window.scrollTo({ top: context?.scrollY || 0, behavior: "auto" });
+    }
+}
+
+function workbenchCandidates() {
+    return currentWorkbenchContext?.items || [];
+}
+
+function setupWorkbenchSwitcher(symbol) {
+    const prev = document.getElementById("workbenchPrev");
+    const next = document.getElementById("workbenchNext");
+    const list = workbenchCandidates().filter((item) => hasValue(item && item.symbol));
+    const index = list.findIndex((item) => String(item.symbol) === String(symbol));
+    const go = (offset) => {
+        if (!list.length || index < 0) return;
+        const nextItem = list[(index + offset + list.length) % list.length];
+        if (nextItem) return showDetail(nextItem, { context: currentWorkbenchContext });
+    };
+    if (prev) {
+        prev.disabled = list.length < 2 || index < 0;
+        prev.onclick = () => go(-1);
+    }
+    if (next) {
+        next.disabled = list.length < 2 || index < 0;
+        next.onclick = () => go(1);
+    }
+}
+
+let workbenchOverlayCache = null;
+
+function chartEventLayer(kind) {
+    if (kind === "paper_fill") return "paper_fill";
+    if (kind === "ai_plan") return "ai_plan";
+    return ["rule_signal", "selection", "reason", "expected_review", "next_review"].includes(kind) ? "rule_signal" : "unclassified";
+}
+
+function chartEventMetadata(row) {
+    const evidence = row.evidence ?? row.price_evidence ?? row.fill_evidence ?? row.result_evidence ?? null;
+    return {
+        ...row,
+        event_id: row.event_id || row.fill_id || row.trade_id || row.intent_id || row.decision_id || row.id || "",
+        source: row.source || row.price_source || evidence?.source || "",
+        event_time: row.event_time || row.confirmed_at || row.executed_at || row.filled_at || row.price_timestamp || row.timestamp || evidence?.timestamp || "",
+        price_basis: row.price_basis || evidence?.price_basis || "unknown",
+        evidence,
+    };
+}
+
+function chartFramePriceBasis(chartData) {
+    const labels = [];
+    if (hasValue(chartData.price_basis)) labels.push(String(chartData.price_basis).trim().toLowerCase());
+    for (const row of chartData.kline_data || []) {
+        if (hasValue(row.price_basis)) labels.push(String(row.price_basis).trim().toLowerCase());
+        else if (!hasValue(chartData.price_basis)) return "unknown";
+    }
+    const unique = new Set(labels);
+    const basis = labels[0];
+    return unique.size === 1 && ["raw", "qfq", "hfq"].includes(basis) ? basis : "unknown";
+}
+
+function chartEventPlotState(marker, chartData, dates) {
+    const reasons = [];
+    const date = String(marker.date || "").slice(0, 10);
+    const stamp = String(marker.event_time || "");
+    const price = numericValue(marker.price);
+    const basis = String(marker.price_basis || "unknown").toLowerCase();
+    const chartBasis = chartFramePriceBasis(chartData);
+    if (marker.plot === false) reasons.push(marker.unplotted_reason || "来源记录没有允许绘图的成交/计划状态");
+    if (!hasValue(marker.event_id)) reasons.push("缺少来源记录 ID");
+    if (!hasValue(marker.source)) reasons.push("缺少价格/事件来源");
+    if (!/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(stamp) || !Number.isFinite(Date.parse(stamp))) reasons.push("缺少有效事件时间戳");
+    else {
+        const eventDate = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(stamp)
+            ? new Date(Date.parse(stamp) + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+            : stamp.slice(0, 10);
+        if (date !== eventDate) reasons.push("记录日期与事件时间不一致，不倒填图点");
+    }
+    if (!dates.includes(date)) reasons.push("事件日期不在当前 K 线范围，未移到末根 K 线");
+    if (chartBasis === "unknown") reasons.push("K 线价格口径未提供或混合");
+    if (!["raw", "qfq", "hfq"].includes(basis)) reasons.push("事件价格口径缺失/未知");
+    else if (chartBasis !== "unknown" && basis !== chartBasis) reasons.push(`价格口径不一致：事件 ${basis} / K 线 ${chartBasis}，未进行转换`);
+    if (marker.kind === "paper_fill" && (price === null || price <= 0)) reasons.push("缺少有效成交价，不用收盘价代填");
+    if (chartEventLayer(marker.kind) === "unclassified") reasons.push("此记录不是可绘图的规则信号、AI 计划或纸面成交");
+    return { plot: reasons.length === 0, reasons };
+}
+
+async function loadChartOverlays(symbol) {
+    const wanted = String(symbol || "");
+    const overlays = [];
+    if (!wanted) return overlays;
+    if (!workbenchOverlayCache) {
+        // Cache the in-flight promise, never a half-filled object. Another
+        // stock opened while this is loading must await the same evidence.
+        workbenchOverlayCache = Promise.allSettled([
+            requestJson("/api/decision-board"),
+            requestJson("/api/ai-trader/dashboard"),
+        ]);
+    }
+    const settled = await workbenchOverlayCache;
+    overlays.warnings = settled.flatMap((result, index) => {
+        const name = index === 0 ? "策略账事件" : "AI 账计划/成交";
+        if (result.status !== "fulfilled" || !result.value || result.value.ok === false) return [`${name}读取失败，事件范围不完整。`];
+        return result.value.degraded ? [`${name}降级展示，记录可能不完整。`] : [];
+    });
+    const board = settled[0].status === "fulfilled" && settled[0].value?.ok !== false ? settled[0].value || {} : {};
+    for (const event of Array.isArray(board.events) ? board.events : []) {
+        if (String(event.symbol || "") !== wanted) continue;
+        const action = String(event.action || "");
+        const date = event.date || event.trade_date || event.decision_date || "";
+        const noFill = action === "no_fill" || String(event.fill_model || "") === "missing_intraday";
+        overlays.push(chartEventMetadata({
+            ...event,
+            layer: "paper_fill",
+            ledger: "策略账",
+            kind: action === "buy" || action === "sell" ? "paper_fill" : "paper_event",
+            panel: "price",
+            date,
+            label: noFill ? "策略账·未成交" : (action === "sell" ? "策略账·纸面卖" : action === "buy" ? "策略账·纸面买" : `策略账·${action || "事件"}`),
+            text: safeText(event.reason || event.note || "纸面账本事件，不是真成交。"),
+            side: action,
+            price: event.price,
+            price_basis: event.price_basis || "unknown",
+            api_source: "/api/decision-board · events",
+            plot: !noFill && Boolean(date) && (action === "buy" || action === "sell"),
+            unplotted_reason: noFill ? "策略账记录为未成交" : "",
+        }));
+    }
+    const ai = settled[1].status === "fulfilled" && settled[1].value?.ok !== false ? settled[1].value || {} : {};
+    const plan = ai.latest_plan || {};
+    const addIntent = (intent, committed) => {
+        if (String(intent.symbol || "") !== wanted) return;
+        const recordedAt = intent.recorded_at || intent.created_at || plan.recorded_at || plan.created_at || "";
+        overlays.push(chartEventMetadata({
+            ...intent,
+            layer: "ai_plan",
+            ledger: "AI账",
+            kind: "ai_plan",
+            panel: "price",
+            date: recordedAt ? String(recordedAt).slice(0, 10) : plan.decision_date || "",
+            event_time: recordedAt,
+            target_date: plan.trade_date || "",
+            label: committed ? "AI·已提交" : "AI·拟议",
+            text: `${committed ? "已提交次日纸面计划" : "仅提议、未提交"}；${safeText(intent.side || "")} ${safeText(intent.quantity || "")}。不是成交。`,
+            side: intent.side,
+            api_source: `/api/ai-trader/dashboard · ${committed ? "committed_intents" : "uncommitted_intents"}`,
+        }));
+    };
+    (Array.isArray(ai.committed_intents) ? ai.committed_intents : []).forEach((row) => addIntent(row, true));
+    (Array.isArray(ai.uncommitted_intents) ? ai.uncommitted_intents : []).forEach((row) => addIntent(row, false));
+    const fills = Array.isArray(ai.filled_trades) ? ai.filled_trades : [];
+    for (const fill of fills) {
+        if (String(fill.symbol || "") !== wanted) continue;
+        const date = fill.date || fill.settled_on || "";
+        overlays.push(chartEventMetadata({
+            ...fill,
+            layer: "paper_fill",
+            ledger: "AI账",
+            kind: "paper_fill",
+            panel: "price",
+            date,
+            label: fill.side === "sell" ? "AI账·纸面卖" : "AI账·纸面买",
+            text: `账本记录成交价 ${safeText(fill.price)}；是否可叠图还需核对时间、来源和价格口径。`,
+            side: fill.side,
+            price: fill.price,
+            api_source: "/api/ai-trader/dashboard · filled_trades",
+        }));
+    }
+    return overlays;
+}
+
+function mergeChartMarkers(baseMarkers, overlays) {
+    return [...(Array.isArray(baseMarkers) ? baseMarkers : []), ...(overlays || [])]
+        .map((item) => chartEventMetadata({ ...item, panel: item.panel || "price" }));
+}
+
+function renderWorkbenchEventList(overlays, chartData = {}, warnings = []) {
+    const host = document.getElementById("workbenchEventList");
+    if (!host) return;
+    if (!overlays.length) {
+        host.innerHTML = `<p class="section-note">当前已读来源没有这只股票的规则观察 / AI 计划 / 纸面成交。${escapeHtml(warnings.join(" "))}</p>`;
+        return;
+    }
+    host.innerHTML = `
+        <h3>本图事件（三种身份）</h3>
+        <p class="section-note">菱形=规则观察；空心圆=AI 计划；实心三角=纸面成交。入选观察不是买入。K 线口径：${escapeHtml(chartFramePriceBasis(chartData))}。缺证据的记录只列在下面。</p>
+        ${warnings.map((warning) => `<p class="section-note">${escapeHtml(warning)}</p>`).join("")}
+        <ul class="workbench-event-list">${overlays.map((item) => {
+            const status = chartEventPlotState(item, chartData, (chartData.kline_data || []).map((row) => String(row.date)));
+            return `<li data-chart-event-id="${escapeHtml(String(item.event_id || ""))}" data-chart-event-source="${escapeHtml(String(item.source || ""))}" data-chart-event-ledger="${escapeHtml(String(item.ledger || ""))}">
+                <strong>${escapeHtml(safeText(item.label))}</strong> · ${escapeHtml(safeText(item.ledger))}
+                · ${escapeHtml(safeText(item.event_time || item.date))}
+                <div>${escapeHtml(status.plot ? "已画在图上" : `只在列表：${status.reasons.join("；")}`)}</div>
+                <div>${escapeHtml(safeText(item.text))}</div>
+                <details><summary>记录与证据</summary>
+                    <p>ID：${escapeHtml(safeText(item.event_id))} · 来源：${escapeHtml(safeText(item.source))} · ${escapeHtml(safeText(item.api_source))}</p>
+                    <p>原价：${escapeHtml(safeText(item.price))} · 口径：${escapeHtml(safeText(item.price_basis))} · 目标日期：${escapeHtml(safeText(item.target_date))}</p>
+                    <pre>${escapeHtml(item.evidence === null || item.evidence === undefined ? "未提供附加证据" : JSON.stringify(item.evidence, null, 2))}</pre>
+                </details>
+            </li>`;
+        }).join("")}</ul>
+    `;
 }
 
 function renderChart(chartData) {
@@ -7900,7 +8548,7 @@ function renderChart(chartData) {
     const ohlc = rows.map((row) => {
         const values = [row.open, row.close, row.low, row.high].map((v) => numericValue(v));
         return values.includes(null) ? null : values;
-    }).filter(Boolean);
+    });
     const markers = normalizeMarkers(chartData, dates);
     renderPriceChart(rows, dates, ohlc, markers);
     renderVolumeChart(rows, dates, ohlc, markers);
@@ -7910,40 +8558,10 @@ function renderChart(chartData) {
 }
 
 function normalizeMarkers(chartData, dates) {
-    const latestDate = dates[dates.length - 1] || "";
-    if (Array.isArray(chartData.markers) && chartData.markers.length) {
-        // Declutter: drop markers whose date hasn't occurred yet (e.g. the
-        // 1/3/5-day review points of a candidate selected today, which would all
-        // clamp onto the last bar) and collapse multiple markers on the same bar.
-        const dateSet = new Set(dates.map((d) => safeText(d)));
-        const seen = new Set();
-        const kept = [];
-        for (const marker of chartData.markers) {
-            const date = safeText(marker.date);
-            if (date && dateSet.size && !dateSet.has(date)) continue;
-            const key = `${marker.panel || "price"}@${date}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            kept.push(marker);
-        }
-        if (kept.length) return kept;
-    }
-    return [
-        {
-            panel: "price",
-            date: hasValue(chartData.select_date) ? chartData.select_date : latestDate,
-            label: "入选观察",
-            text: safeText(chartData.select_reason),
-            kind: "selection",
-        },
-        {
-            panel: "price",
-            date: latestDate,
-            label: "后续观察",
-            text: "下一次复盘观察锚点，只用于学习，不构成价格判断，不构成操作建议。",
-            kind: "next_review",
-        },
-    ];
+    // Two events on one date are two records. Never deduplicate by panel/date,
+    // clamp a future event onto today's bar, or fabricate fallback signals.
+    return (Array.isArray(chartData.markers) ? chartData.markers : [])
+        .filter((marker) => chartEventPlotState(marker, chartData, dates).plot);
 }
 
 function renderPriceChart(rows, dates, ohlc, markers) {
@@ -7967,7 +8585,7 @@ function renderPriceChart(rows, dates, ohlc, markers) {
             lineSeries("MA5", rows.map((row) => row.ma5)),
             lineSeries("MA10", rows.map((row) => row.ma10)),
             lineSeries("MA20", rows.map((row) => row.ma20)),
-            markerSeries("price", markers, dates, rows, (row) => row.close),
+            ...markerSeries("price", markers, dates, rows, (row) => row.close),
         ].filter(Boolean),
     }));
 }
@@ -7982,12 +8600,15 @@ function renderVolumeChart(rows, dates, ohlc, markers) {
             {
                 name: "成交量",
                 type: "bar",
-                data: rows.map((row) => numericValue(row.volume) ?? 0),
+                data: rows.map((row) => numericValue(row.volume)),
                 itemStyle: {
-                    color: (params) => ohlc[params.dataIndex][1] >= ohlc[params.dataIndex][0] ? "#DC2626" : "#15803D",
+                    color: (params) => {
+                        const bar = ohlc[params.dataIndex];
+                        return bar ? (bar[1] >= bar[0] ? "#DC2626" : "#15803D") : "#64748B";
+                    },
                 },
             },
-            markerSeries("volume", markers, dates, rows, (row) => row.volume, "#a16207"),
+            ...markerSeries("volume", markers, dates, rows, (row) => row.volume, "#a16207"),
         ].filter(Boolean),
     }));
 }
@@ -8007,7 +8628,7 @@ function renderMacdChart(rows, dates, markers) {
                 data: rows.map((row) => numericValue(row.macd_bar) ?? 0),
                 itemStyle: { color: (params) => params.data >= 0 ? "#DC2626" : "#15803D" },
             },
-            markerSeries("macd", markers, dates, rows, (row) => row.macd_dif),
+            ...markerSeries("macd", markers, dates, rows, (row) => row.macd_dif),
         ].filter(Boolean),
     }));
 }
@@ -8022,7 +8643,7 @@ function renderKdjChart(rows, dates, markers) {
             lineSeries("K", rows.map((row) => row.kdj_k), { markLine: thresholdLines([20, 80]) }),
             lineSeries("D", rows.map((row) => row.kdj_d)),
             lineSeries("J", rows.map((row) => row.kdj_j)),
-            markerSeries("kdj", markers, dates, rows, (row) => row.kdj_k),
+            ...markerSeries("kdj", markers, dates, rows, (row) => row.kdj_k),
         ].filter(Boolean),
     }));
 }
@@ -8035,7 +8656,7 @@ function renderRsiChart(rows, dates, markers) {
         yAxis: { min: 0, max: 100 },
         series: [
             lineSeries("RSI", rows.map((row) => row.rsi), { markLine: thresholdLines([30, 70]) }),
-            markerSeries("rsi", markers, dates, rows, (row) => row.rsi),
+            ...markerSeries("rsi", markers, dates, rows, (row) => row.rsi),
         ].filter(Boolean),
     }));
 }
@@ -8078,53 +8699,66 @@ function lineSeries(name, data, options = {}) {
 }
 
 function markerSeries(panel, markers, dates, rows, valueResolver, color = "#1D4ED8") {
-    const data = markers
-        .filter((marker) => marker.panel === panel)
-        .map((marker) => {
-            const date = safeText(marker.date);
-            const index = findMarkerIndex(dates, date, marker.kind);
-            if (index < 0 || !rows[index]) return null;
-            const y = numericValue(valueResolver(rows[index], index));
-            if (y === null) return null;
-            const isNextReview = marker.kind === "next_review";
-            return {
-                value: [dates[index], y],
-                date: dates[index],
-                label: safeText(marker.label),
-                markerText: safeText(marker.text),
-                kind: safeText(marker.kind),
-                itemStyle: { color: isNextReview ? "#7C3AED" : color },
-            };
-        })
-        .filter(Boolean);
-    if (!data.length) return null;
-    return {
-        name: "研究标记",
-        type: "scatter",
-        data,
-        symbol: "pin",
-        symbolSize: (value, params) => params.data.kind === "next_review" ? 54 : 62,
-        tooltip: {
-            trigger: "item",
-            formatter: (params) => {
-                const item = params.data || {};
-                return `${escapeHtml(item.label)}<br/>${escapeHtml(item.date)}<br/>${escapeHtml(item.markerText)}`;
-            },
-        },
-        label: {
-            show: true,
-            formatter: (params) => params.data.label,
-            position: "top",
-            color: "#0F172A",
-            fontSize: 11,
-            backgroundColor: "rgba(255,255,255,.96)",
-            borderColor: "#CBD5E1",
-            borderWidth: 1,
-            borderRadius: 4,
-            padding: [2, 4],
-        },
-        z: 10,
+    const styles = {
+        rule_signal: { name: "入选观察", symbol: "diamond", color: "#2563C9" },
+        ai_plan: { name: "AI计划", symbol: "emptyCircle", color: "#B45309" },
+        paper_fill: { name: "纸面成交", symbol: "triangle", color: "#0F766E" },
     };
+    return Object.entries(styles).map(([layer, style]) => {
+        const data = markers
+            .filter((marker) => marker.panel === panel && chartEventLayer(marker.kind) === layer)
+            .map((marker) => {
+                const date = safeText(marker.date);
+                const index = findMarkerIndex(dates, date, marker.kind);
+                if (index < 0 || !rows[index]) return null;
+                const y = marker.kind === "paper_fill"
+                    ? numericValue(marker.price)
+                    : numericValue(marker.price) ?? numericValue(valueResolver(rows[index], index));
+                if (y === null) return null;
+                // ECharts reserves data.symbol for its marker shape. The
+                // stock's source-owned symbol belongs in separate metadata.
+                const { symbol: stockSymbol, ...eventMetadata } = marker;
+                return {
+                    ...eventMetadata,
+                    stock_symbol: stockSymbol,
+                    value: [dates[index], y],
+                    date: dates[index],
+                    label: safeText(marker.label),
+                    markerText: safeText(marker.text),
+                    kind: safeText(marker.kind),
+                    itemStyle: { color: style.color },
+                };
+            })
+            .filter(Boolean);
+        if (!data.length) return null;
+        return {
+            name: style.name,
+            type: "scatter",
+            data,
+            symbol: style.symbol,
+            symbolSize: 18,
+            tooltip: {
+                trigger: "item",
+                formatter: (params) => {
+                    const item = params.data || {};
+                    return `${escapeHtml(item.label)}<br/>${escapeHtml(safeText(item.event_time))}<br/>${escapeHtml(safeText(item.source))} · ${escapeHtml(safeText(item.price_basis))}<br/>ID ${escapeHtml(safeText(item.event_id))}<br/>${escapeHtml(item.markerText)}`;
+                },
+            },
+            label: {
+                show: true,
+                formatter: (params) => params.data.label,
+                position: "top",
+                color: "#0F172A",
+                fontSize: 11,
+                backgroundColor: "rgba(255,255,255,.96)",
+                borderColor: "#CBD5E1",
+                borderWidth: 1,
+                borderRadius: 4,
+                padding: [2, 4],
+            },
+            z: 10,
+        };
+    }).filter(Boolean);
 }
 
 function thresholdLines(values) {
@@ -8141,6 +8775,19 @@ function initChart(id) {
     const element = document.getElementById(id);
     if (!element) return null;
     const chart = echarts.init(element, null, { renderer: "canvas" });
+    chart.on("click", (params) => {
+        const event = params.data;
+        if (!event || !event.event_id) return;
+        const host = document.getElementById("workbenchEventList");
+        const row = Array.from(host?.querySelectorAll("[data-chart-event-id]") || []).find((node) =>
+            node.dataset.chartEventId === String(event.event_id)
+            && node.dataset.chartEventSource === String(event.source || "")
+            && node.dataset.chartEventLedger === String(event.ledger || ""));
+        if (!row) return;
+        const details = row.querySelector("details");
+        if (details) details.open = true;
+        row.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    });
     activeCharts.push(chart);
     return chart;
 }
@@ -8149,6 +8796,7 @@ function findMarkerIndex(dates, markerDate, kind) {
     const cleanDate = safeText(markerDate);
     const exact = dates.indexOf(cleanDate);
     if (exact >= 0) return exact;
+    if (kind === "paper_fill" || kind === "ai_plan") return -1;
     return kind === "next_review" ? dates.length - 1 : findSelectIndex(dates, cleanDate);
 }
 
@@ -8271,11 +8919,17 @@ function renderHomeKpiCandidates(data) {
         return;
     }
     const generation = data.candidate_generation || {};
-    const todayCount = Array.isArray(data.today_recommendations) && data.today_recommendations.length
-        ? data.today_recommendations.length
-        : (numericValue(generation.candidate_count) || 0);
-    valueEl.textContent = `${todayCount} 只`;
-    const parts = [`长期 ${safeText(generation.long_count ?? 0)}`, `打板 ${safeText(generation.board_count ?? 0)}`];
+    const todayCount = Array.isArray(data.today_recommendations) ? data.today_recommendations.length : 0;
+    const focusCount = Array.isArray(data.daily_focus) ? data.daily_focus.length : 0;
+    const observationCount = Array.isArray(data.observation_candidates) ? data.observation_candidates.length : currentObservationCandidates.length;
+    const generatedCount = numericValue(generation.candidate_count) || 0;
+    const readable = Math.max(todayCount, focusCount, observationCount, generatedCount);
+    valueEl.textContent = `${readable} 只`;
+    const parts = [];
+    if (todayCount > 0 || generatedCount > 0) parts.push(`今日新生成 ${todayCount || generatedCount}`);
+    else parts.push("今日未新生成");
+    if (focusCount) parts.push(`可读复核池 ${focusCount}`);
+    else if (observationCount) parts.push(`观察池 ${observationCount}`);
     const freshness = safeText(generation.freshness_label || "");
     if (freshness && freshness !== "数据缺失") parts.push(freshness);
     subEl.textContent = parts.join(" · ");
@@ -8417,10 +9071,22 @@ function renderHomePrevBatch(data) {
         : {};
     const items = Array.isArray(previous.items) ? previous.items : [];
     if (valueEl && subEl) {
-        if (!previous.available || !items.length) {
+        const reviewNeeded = Array.isArray(data && data.review_needed) ? data.review_needed.length : null;
+        const reviewCount = numericValue(data && data.review_needed_count) ?? reviewNeeded;
+        if (!data) {
             valueEl.textContent = "—";
             valueEl.className = "home-kpi-value";
-            subEl.textContent = data ? "暂无上一批候选复盘样本" : "策略成绩单暂时不可用";
+            subEl.textContent = "策略成绩单暂时不可用";
+        } else if (reviewCount !== null) {
+            valueEl.textContent = `${reviewCount} 只`;
+            valueEl.className = "home-kpi-value";
+            subEl.textContent = reviewCount
+                ? "成绩单标记需复核 · 不是实时对错证明"
+                : "暂无到期复核样本";
+        } else if (!previous.available || !items.length) {
+            valueEl.textContent = "—";
+            valueEl.className = "home-kpi-value";
+            subEl.textContent = "暂无上一批候选复盘样本";
         } else {
             const avg = numericValue(previous.avg_return_since_select_pct);
             valueEl.textContent = avg === null ? "—" : formatSignedPercent(avg);
@@ -8501,7 +9167,7 @@ function renderHomeKpiDataHealth(data) {
     }
     const level = String(data.health_level || "").trim().toLowerCase();
     valueEl.textContent = HOME_HEALTH_LABELS[level] || humanStatus(data.health_level || "unknown");
-    valueEl.className = `home-kpi-value ${level === "green" ? "" : level === "red" ? "negative" : ""}`.trim();
+    valueEl.className = `home-kpi-value${level === "red" ? " health-bad" : level === "yellow" ? " health-warn" : ""}`;
     feedDutyLamp(
         "data",
         HOME_HEALTH_LABELS[level] || humanStatus(data.health_level || "unknown"),
@@ -8519,7 +9185,12 @@ function renderHomeKpiDataHealth(data) {
     const minuteDone = numericValue(data.tushare_minute_symbol_done_count);
     const minuteTarget = numericValue(data.tushare_minute_target_symbol_count) ?? numericValue(data.tushare_minute_symbol_count);
     if (minuteDone !== null && minuteTarget !== null && minuteTarget > 0) parts.push(`分钟采集 ${minuteDone}/${minuteTarget}`);
-    subEl.textContent = parts.length ? parts.join(" · ") : safeText(data.summary_text);
+    const reasons = Array.isArray(data.health_degraded_reason_codes) ? data.health_degraded_reason_codes.filter(Boolean) : [];
+    if (reasons.includes("daily_data_scheduler_disabled")) {
+        subEl.textContent = "日线计划任务是关掉的 · 健康快照偏旧";
+    } else {
+        subEl.textContent = parts.length ? parts.join(" · ") : safeText(data.summary_text);
+    }
 }
 
 async function loadHomeEquity() {
@@ -8529,6 +9200,30 @@ async function loadHomeEquity() {
     } catch (error) {
         console.warn("[home-dashboard] equity history unavailable", error);
         renderHomeEquity(null);
+    }
+}
+
+async function loadHomeAiLedger() {
+    const valueEl = document.getElementById("kpiAiValue");
+    const subEl = document.getElementById("kpiAiSub");
+    if (!valueEl || !subEl) return;
+    try {
+        const data = await requestJson("/api/ai-trader/dashboard");
+        if (!data || data.ok === false) throw new Error("AI 账不可读");
+        const account = (data && data.account) || {};
+        const equity = numericValue(account.equity);
+        const positions = numericValue(account.positions_count);
+        valueEl.textContent = equity === null ? "—" : `¥${Math.round(equity).toLocaleString("zh-CN")}`;
+        const parts = [];
+        if (equity === null) parts.push("AI 账权益缺失，不能据此判定空仓或亏损");
+        if (data.degraded === true) parts.push("AI 账降级展示");
+        if (positions !== null) parts.push(`纸面持仓 ${positions} 只`);
+        if (hasValue(account.as_of)) parts.push(`截至 ${safeText(account.as_of)}`);
+        subEl.textContent = parts.length ? parts.join(" · ") : "独立 AI 纸面账；数据日期未提供";
+    } catch (error) {
+        console.warn("[home-dashboard] AI ledger unavailable", error);
+        valueEl.textContent = "—";
+        subEl.textContent = "AI 账暂时不可读";
     }
 }
 

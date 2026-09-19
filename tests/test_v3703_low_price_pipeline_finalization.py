@@ -33,7 +33,7 @@ from scripts.validate_historical_listings import validate_historical_listings
 from tests._cli_capture import run_main_json
 
 ROOT = Path(__file__).resolve().parents[1]
-TMP_ROOT = ROOT / ".quantdesk_test_tmp"
+TMP_ROOT = Path(tempfile.gettempdir()) / ".quantdesk_test_tmp"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 

@@ -35,6 +35,9 @@ def _shadow_record(**overrides: Any) -> dict[str, Any]:
 
 
 def _patch_auto_root(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    from tests.test_b5_formal_candidate_intake import dump, make_formal_batch
+    from tests.test_daily_candidate_refresh import _strategy_payload
+
     results = root / "results"
     reports = root / "reports"
     state = root / "state"
@@ -66,6 +69,8 @@ def _patch_auto_root(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
     for name, value in values.items():
         monkeypatch.setattr(auto, name, value, raising=False)
     monkeypatch.setattr(auto, "now_text", lambda: FIXED_NOW)
+    monkeypatch.setattr(auto, "infer_target_date", lambda target_date=None: (target_date or "2026-07-17", "fixture"))
+    monkeypatch.setattr(auto, "evaluate_paper_review_freshness", lambda _state, **_kwargs: auto.evaluate_data_freshness())
     monkeypatch.setattr(auto, "_load_auto_adjustment_factors", lambda symbols: AdjustmentFactorTable())
     monkeypatch.setattr(
         auto,
@@ -84,25 +89,18 @@ def _patch_auto_root(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
             "reason": "",
         },
     )
+    candidate = _strategy_payload("2026-07-17")["standard_candidates"][0]
+    candidate.update(name="shadow hook sample", close=10.0, sector="bank", amount_ma20=50_000_000.0)
+    batch = make_formal_batch("2026-07-17", candidate=candidate)
+    dump(root / "results/candidate_refresh/daily/2026-07-17.json", batch)
 
 
 def _candidate_payload() -> dict[str, Any]:
-    return {
-        "ok": True,
-        "generated_at": FIXED_NOW,
-        "long_candidates": [
-            {
-                "symbol": "600000",
-                "name": "shadow hook sample",
-                "strategy_type": "long",
-                "sector": "bank",
-                "data_latest_date": "2026-07-17",
-                "amount_ma20": 50_000_000.0,
-                "source_item": {"close": 10.0},
-            }
-        ],
-        "board_candidates": [],
-    }
+    from quantdesk.daily_candidate_refresh import formal_candidate_strategy_payload, load_formal_candidate_intake
+
+    intake = load_formal_candidate_intake(auto.PROJECT_ROOT, target_date="2026-07-17")
+    assert intake["status"] == "passed", intake
+    return formal_candidate_strategy_payload(intake)
 
 
 def _run_auto_once(
@@ -139,6 +137,36 @@ def _strip_shadow_section(text: str) -> str:
     )
 
 
+def _normalize_run_root(value: bytes | str, root: Path) -> bytes | str:
+    """Replace a run's own temporary root with a constant token.
+
+    Provenance fields legitimately embed the project root (e.g.
+    ``candidate_envelope.batch_path``), so two isolated runs under different
+    temp roots differ by that token alone. Normalising it lets the tests assert
+    that the shadow flag changes nothing else; it never touches ledger, price or
+    shadow assertions.
+    """
+    tokens = sorted(
+        {str(root), str(root).replace("\\", "\\\\"), root.as_posix()},
+        key=len,
+        reverse=True,
+    )
+    for token in tokens:
+        if isinstance(value, bytes):
+            value = value.replace(token.encode("utf-8"), b"<RUN_ROOT>")
+        else:
+            value = value.replace(token, "<RUN_ROOT>")
+    return value
+
+
+def _run_files(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
 def test_auto_shadow_off_on_and_enforced_flag_keep_state_bytes_identical(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -148,10 +176,16 @@ def test_auto_shadow_off_on_and_enforced_flag_keep_state_bytes_identical(
     on_state, on_report = _run_auto_once(monkeypatch, tmp_path / "on", enabled=True, enforced=False)
     enforced_state, _ = _run_auto_once(monkeypatch, tmp_path / "enforced", enabled=True, enforced=True)
 
-    assert on_state == off_state == enforced_state
+    assert (
+        _normalize_run_root(on_state, tmp_path / "on")
+        == _normalize_run_root(off_state, tmp_path / "off")
+        == _normalize_run_root(enforced_state, tmp_path / "enforced")
+    )
     assert "## 影子风险门（Shadow Risk Gate）" not in off_report
     assert "## 影子风险门（Shadow Risk Gate）" in on_report
-    assert _strip_shadow_section(on_report) == off_report
+    assert _strip_shadow_section(
+        _normalize_run_root(on_report, tmp_path / "on")
+    ) == _normalize_run_root(off_report, tmp_path / "off")
     summary = json.loads((tmp_path / "on" / "results" / "risk_gate_shadow_latest.json").read_text(encoding="utf-8"))
     assert summary["evaluation_count"] == 1
     assert summary["insufficient_evidence_count"] == 1
@@ -219,7 +253,9 @@ def test_auto_daily_buy_shadow_exception_and_error_log_exception_do_not_change_l
     )
     on_state, _ = _run_auto_once(monkeypatch, tmp_path / "on", enabled=True)
 
-    assert on_state == off_state
+    assert _normalize_run_root(on_state, tmp_path / "on") == _normalize_run_root(
+        off_state, tmp_path / "off"
+    )
     written = json.loads((tmp_path / "on" / "state" / "auto_paper_portfolio.json").read_text(encoding="utf-8"))
     assert any(action.get("action") == "buy" for action in written["actions"])
 
@@ -315,7 +351,9 @@ def test_auto_intraday_swing_shadow_exception_isolated_and_state_byte_stable(
         enabled=True,
     )
 
-    assert on_state == off_state
+    assert _normalize_run_root(on_state, tmp_path / "on") == _normalize_run_root(
+        off_state, tmp_path / "off"
+    )
     assert len(calls) == 1
     assert calls[0]["surface"] == "auto_paper_intraday_swing_buy"
     assert calls[0]["price_data_cutoff"] == "2026-07-17"
@@ -481,6 +519,9 @@ def test_auto_dry_run_shadow_failure_writes_no_runtime_files(
         "evaluate_shadow_risk_order",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("dry-run-shadow-failure")),
     )
+    # The fixture inputs written by _patch_auto_root are not runtime output; a
+    # failing shadow evaluation during dry-run must add no new runtime file.
+    before = _run_files(tmp_path)
 
     payload = auto.run_auto_paper_portfolio(
         mode="init",
@@ -493,8 +534,7 @@ def test_auto_dry_run_shadow_failure_writes_no_runtime_files(
     )
 
     assert payload["ok"] is True
-    for directory in (tmp_path / "state", tmp_path / "results", tmp_path / "reports"):
-        assert not [path for path in directory.rglob("*") if path.is_file()]
+    assert _run_files(tmp_path) == before
 
 
 def test_conditional_update_dry_run_shadow_failure_preserves_runtime_manifests(

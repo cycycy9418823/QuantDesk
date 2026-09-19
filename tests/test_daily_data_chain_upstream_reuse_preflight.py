@@ -159,34 +159,29 @@ def test_verified_upstream_reuse_runs_chain_despite_same_day_completed(
     assert payload["components"]["upstream_reuse"]["run_id"] == "pipe-1"
 
 
-def test_pipeline_run_id_stamps_latest_and_archive(
+def test_pipeline_run_id_is_published_with_latest_and_archive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import scripts.run_daily_data_chain as runner
 
     run_id = "daily-data-chain-stamp-test"
-    body = {
-        "run_id": run_id,
-        "status": "completed",
-        "target_date": TARGET,
-        "ok": True,
-    }
+    chain = _install_minimal_chain_fakes(monkeypatch, ["600000"])
+    monkeypatch.setattr(chain, "new_run_id", lambda: run_id)
+    universe = tmp_path / "data/universe/a_share_symbols.csv"
+    universe.parent.mkdir(parents=True)
+    universe.write_text("symbol,name\n600000,TEST\n", encoding="utf-8")
     latest = tmp_path / "results" / "data_chain" / "daily_data_chain_latest.json"
     archive = tmp_path / "results" / "data_chain" / "runs" / run_id / "manifest.json"
-    latest.parent.mkdir(parents=True, exist_ok=True)
-    archive.parent.mkdir(parents=True, exist_ok=True)
-    latest.write_text(json.dumps(body), encoding="utf-8")
-    archive.write_text(json.dumps(body), encoding="utf-8")
     monkeypatch.setattr(runner, "PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(
-        runner,
-        "run_daily_data_chain",
-        lambda **kwargs: dict(body),
-    )
 
-    assert runner.main(["--json", "false", "--pipeline-run-id", "pipe-stamp"]) == 0
+    assert runner.main([
+        "--json", "false", "--pipeline-run-id", "pipe-stamp", "--target-date", TARGET,
+        "--enable-network", "--refresh-universe", "false", "--rebuild-features", "false",
+    ]) == 0
 
     latest_doc = json.loads(latest.read_text(encoding="utf-8"))
     archive_doc = json.loads(archive.read_text(encoding="utf-8"))
     assert latest_doc == archive_doc
+    assert latest_doc["run_id"] == run_id
+    assert latest_doc["published_latest"] is True
     assert latest_doc["pipeline_run_id"] == "pipe-stamp"

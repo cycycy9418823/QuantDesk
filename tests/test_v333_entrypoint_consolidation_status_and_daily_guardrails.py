@@ -16,7 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - unittest discovery adds tests/
 isolate_operation_log_dir()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TEST_TMP_ROOT = PROJECT_ROOT / ".quantdesk_test_tmp"
+TEST_TMP_ROOT = Path(tempfile.gettempdir()) / ".quantdesk_test_tmp"
 
 
 class V333EntrypointStatusDailyGuardrailsTests(unittest.TestCase):
@@ -587,12 +587,12 @@ class V333EntrypointStatusDailyGuardrailsTests(unittest.TestCase):
                 mock.patch.object(dwo, "DAILY_WORKFLOW_LATEST_JSON", root / "results" / "daily_workflow_latest.json"),
                 mock.patch.object(dwo, "AUTO_PAPER_PORTFOLIO_STATE_JSON", root / "state" / "auto_paper_portfolio.json"),
                 mock.patch.object(dwo, "_low_price_status", return_value={"ok": True, "included_count": 2, "path": "data/universe/low.csv", "message": "ok"}),
-                mock.patch.object(dwo, "daily_price_status", return_value=fake_daily),
+                mock.patch.object(dwo, "_review_daily_status", return_value=fake_daily),
                 mock.patch.object(dwo, "_latest_daily_date", return_value="2026-05-21"),
                 mock.patch.object(dwo, "_run_low_price_report", return_value={"ok": True, "summary": {"analyzed_count": 0}, "files": {}}),
                 mock.patch.object(dwo, "build_daily_features", return_value={"ok": True, "message": "ok"}),
                 mock.patch.object(dwo, "daily_feature_status", return_value={"ok": True, "feature_count": 0, "latest_date": "2026-05-21", "path": "data/features/daily_features_latest.csv"}),
-                mock.patch.object(dwo, "evaluate_data_freshness", return_value=fake_freshness),
+                mock.patch.object(dwo, "evaluate_paper_review_freshness", return_value=fake_freshness),
                 mock.patch.object(dwo, "theme_map_status", return_value={"mapped_count": 1, "unknown_count": 0}),
                 mock.patch.object(dwo, "run_auto_strategy_cycle", return_value={"ok": True, "summary": {}, "long_candidates": [], "board_candidates": []}),
                 mock.patch.object(dwo, "load_theme_map", return_value={}),
@@ -601,15 +601,15 @@ class V333EntrypointStatusDailyGuardrailsTests(unittest.TestCase):
                 mock.patch.object(dwo, "build_daily_watchpool_step", return_value={"ok": True, "candidate_count": 0, "selected_count": 0, "added_count": 0, "watchlist_count": 0, "added_symbols": []}),
             ]
             with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11], patches[12], patches[13], patches[14], patches[15], patches[16]:
-                enabled = dwo.run_daily_workflow(with_guardrails=True)
-                disabled = dwo.run_daily_workflow(with_guardrails=False)
+                enabled = dwo.run_daily_workflow(with_guardrails=True, target_date="2026-05-21")
+                disabled = dwo.run_daily_workflow(with_guardrails=False, target_date="2026-05-21")
         self.assertIn("guardrail_summary", enabled)
         self.assertTrue(enabled["guardrail_summary"]["enabled"])
         self.assertNotEqual(enabled["workflow_status"], "failed")
         self.assertFalse(disabled["guardrail_summary"]["enabled"])
         self.assertTrue(any(step["name"] == "quick_guardrails" and step["status"] == "skipped" for step in disabled["steps"]))
 
-    def test_daily_workflow_distinguishes_partial_pool_from_fresh_review_scope(self) -> None:
+    def test_daily_workflow_keeps_legacy_pool_date_out_of_fresh_holdings_review(self) -> None:
         from quantdesk import daily_workflow_orchestrator as dwo
 
         with self._temp_dir() as tmp:
@@ -617,13 +617,14 @@ class V333EntrypointStatusDailyGuardrailsTests(unittest.TestCase):
             fake_daily = {
                 "ok": True,
                 "target_date": "2026-07-10",
-                "total_symbols": 914,
-                "latest_local_date": "2026-06-29",
+                "scope": "paper_positions",
+                "total_symbols": 1,
+                "latest_local_date": "2026-07-10",
                 "max_local_date": "2026-07-10",
-                "fresh_count": 700,
-                "stale_count": 214,
+                "fresh_count": 1,
+                "stale_count": 0,
                 "missing_count": 0,
-                "is_stale": True,
+                "is_stale": False,
             }
             fake_freshness = {
                 "status": "passed",
@@ -638,9 +639,10 @@ class V333EntrypointStatusDailyGuardrailsTests(unittest.TestCase):
                 "review_scope_missing_symbol_count": 0,
                 "stale_symbol_count": 0,
                 "missing_symbol_count": 0,
-                "daily_pool_partial": True,
-                "daily_pool_latest_date": "2026-06-29",
-                "daily_pool_stale_symbol_count": 214,
+                "scope": "paper_positions",
+                "daily_pool_partial": False,
+                "daily_pool_latest_date": "2026-07-10",
+                "daily_pool_stale_symbol_count": 0,
                 "daily_pool_missing_symbol_count": 0,
                 "review_mode": "daily_review_only",
                 "message": "完整日线可用于收益复盘，但缺少分钟线，无法验证盘中条件触发。",
@@ -651,12 +653,12 @@ class V333EntrypointStatusDailyGuardrailsTests(unittest.TestCase):
                 mock.patch.object(dwo, "DAILY_WORKFLOW_LATEST_JSON", root / "results" / "daily_workflow_latest.json"),
                 mock.patch.object(dwo, "AUTO_PAPER_PORTFOLIO_STATE_JSON", root / "state" / "auto_paper_portfolio.json"),
                 mock.patch.object(dwo, "_low_price_status", return_value={"ok": True, "included_count": 914, "path": "data/universe/low.csv", "message": "ok"}),
-                mock.patch.object(dwo, "daily_price_status", return_value=fake_daily),
+                mock.patch.object(dwo, "_review_daily_status", return_value=fake_daily),
                 mock.patch.object(dwo, "_latest_daily_date", return_value="2026-07-10"),
                 mock.patch.object(dwo, "_run_low_price_report", return_value={"ok": True, "summary": {"analyzed_count": 700, "latest_complete_daily_date": "2026-06-29"}, "files": {}}),
                 mock.patch.object(dwo, "build_daily_features", return_value={"ok": True, "message": "ok"}),
                 mock.patch.object(dwo, "daily_feature_status", return_value={"ok": True, "feature_count": 914, "latest_date": "2026-07-10", "path": "data/features/daily_features_latest.csv"}),
-                mock.patch.object(dwo, "evaluate_data_freshness", return_value=fake_freshness),
+                mock.patch.object(dwo, "evaluate_paper_review_freshness", return_value=fake_freshness),
                 mock.patch.object(dwo, "theme_map_status", return_value={"mapped_count": 1, "unknown_count": 0}),
                 mock.patch.object(dwo, "run_auto_strategy_cycle", return_value={"ok": True, "summary": {}, "long_candidates": [], "board_candidates": []}),
                 mock.patch.object(dwo, "load_theme_map", return_value={}),
@@ -665,25 +667,26 @@ class V333EntrypointStatusDailyGuardrailsTests(unittest.TestCase):
                 mock.patch.object(dwo, "build_daily_watchpool_step", return_value={"ok": True, "candidate_count": 0, "selected_count": 0, "added_count": 0, "watchlist_count": 0, "added_symbols": []}),
             ]
             with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11], patches[12], patches[13], patches[14], patches[15], patches[16]:
-                payload = dwo.run_daily_workflow(with_guardrails=False)
-                report = Path(payload["report_path"]).read_text(encoding="utf-8")
+                payload = dwo.run_daily_workflow(with_guardrails=False, target_date="2026-07-10")
+                report_path = PROJECT_ROOT / payload["report_path"]
+                self.assertTrue(report_path.resolve().is_relative_to(root.resolve()))
+                report = report_path.read_text(encoding="utf-8")
 
         cache_steps = [step for step in payload["steps"] if step["name"] == "daily_cache_check"]
         messages = "\n".join(step["message"] for step in cache_steps)
 
-        self.assertIn("低价研究池仍有 214 只日期滞后", messages)
-        self.assertIn("不会进入目标日候选", messages)
+        self.assertNotIn("214 只日期滞后", messages)
+        self.assertIn("本地日线已覆盖理论目标完整交易日 2026-07-10", messages)
         self.assertNotIn("本次复盘仍基于现有完整日线", messages)
-        self.assertIn("共同覆盖日期下限：2026-06-29", messages)
-        self.assertIn("池内最晚覆盖日期：2026-07-10", messages)
+        self.assertNotIn("2026-06-29", messages)
         self.assertNotIn("本地完整日线最新日期：2026-06-29", messages)
         self.assertEqual(payload["summary"]["data_freshness_status"], "fresh")
         self.assertTrue(payload["summary"]["portfolio_review_valid"])
         self.assertEqual(payload["summary"]["local_daily_latest_date"], "2026-07-10")
         self.assertEqual(payload["summary"]["stale_symbol_count"], 0)
-        self.assertEqual(payload["summary"]["daily_pool_stale_symbol_count"], 214)
+        self.assertEqual(payload["summary"]["daily_pool_stale_symbol_count"], 0)
         self.assertIn("当前复核范围滞后股票数：0", report)
-        self.assertIn("低价研究池日期滞后股票数：214", report)
+        self.assertNotIn("低价研究池日期滞后股票数：214", report)
         self.assertNotIn("本次日线补全未完成，因此策略候选和特征可能仍基于", report)
 
     def test_daily_report_guardrail_section_uses_user_facing_labels(self) -> None:

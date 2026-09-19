@@ -281,6 +281,7 @@ def run_full_a_daily_reconciliation(
     target_date: str,
     network: bool = False,
     apply: bool = False,
+    audit_only: bool = False,
     run_id: str | None = None,
     lock_timeout_seconds: float = 0,
     update_runner: Callable[..., Mapping[str, Any]] = update_daily_prices,
@@ -308,6 +309,26 @@ def run_full_a_daily_reconciliation(
         payload["reason_codes"] = ["partition_invalid"]
         manifest_path, _run_dir = _write_manifest(root, payload)
         payload["manifest_path"] = str(manifest_path.relative_to(root)).replace("\\", "/")
+        return payload
+    if audit_only:
+        raw_coverage = build_full_a_daily_coverage(
+            target_date=target, universe_path=root / UNIVERSE_RELATIVE,
+            daily_dir=root / DAILY_RELATIVE,
+        )
+        coverage = _effective_coverage_from_partition(raw_coverage, partition, target_date=target)
+        pending = list(partition["pending_symbols"])
+        payload = _manifest(
+            run_id=current_run_id, target=target, partition=partition,
+            status="completed_with_warnings" if pending else "completed", coverage=coverage,
+        )
+        payload.update({
+            "audit_only": True, "accepted_symbols": list(partition["accepted_symbols"]),
+            "retry_symbols": pending, "raw_coverage": raw_coverage, "effective_coverage": coverage,
+            "reason_codes": ["daily_gaps_retained"] if pending else [],
+            "coverage_contract": "Date coverage only; price validity is checked by each consumer.",
+        })
+        manifest_path, _ = _write_manifest(root, payload)
+        payload["manifest_path"] = manifest_path.relative_to(root).as_posix()
         return payload
     if apply and not network:
         payload = _manifest(run_id=current_run_id, target=target, partition=partition, status="blocked")

@@ -430,17 +430,40 @@ def merge_daily_frames(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFr
     return repaired
 
 
-def write_daily(symbol: str, frame: pd.DataFrame, *, daily_dir: Path | None = None) -> None:
+def write_daily(
+    symbol: str,
+    frame: pd.DataFrame,
+    *,
+    daily_dir: Path | None = None,
+    lock: bool = False,
+    lock_timeout_seconds: float = 60.0,
+) -> None:
     """Atomically replace one canonical daily CSV.
 
     The temporary file lives beside the target so os.replace cannot cross
     filesystems. A failed write leaves the previous canonical file intact.
+
+    Pass ``lock=True`` only when the caller does NOT already hold the
+    per-symbol daily lock: the lock is a file lock, not re-entrant, so a
+    nested acquire from a caller that already holds it would deadlock.
     """
 
     normalized, _warnings = normalize_daily_df(frame, symbol, source="")
     base_dir = daily_dir or DAILY_DIR
-    path = base_dir / f"{normalize_symbol(symbol)}.csv"
+    normalized_symbol = normalize_symbol(symbol)
+    path = base_dir / f"{normalized_symbol}.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
+    if lock:
+        with interprocess_file_lock(
+            base_dir / ".locks" / f"{normalized_symbol}.lock",
+            timeout_seconds=float(lock_timeout_seconds),
+        ):
+            _write_daily_bytes(path, normalized)
+        return
+    _write_daily_bytes(path, normalized)
+
+
+def _write_daily_bytes(path: Path, normalized: pd.DataFrame) -> None:
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(

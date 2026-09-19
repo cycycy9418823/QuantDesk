@@ -5,6 +5,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+from tests._isolated_project import IsolatedProject
+import quantdesk.chanlun_bi_engine as engine
 from pathlib import Path
 
 from quantdesk.chanlun_bi_engine import (
@@ -35,6 +38,18 @@ def fractal(ftype: str, index: int, high: float, low: float, *, confirmed: bool 
 
 
 class ChanlunBiEngineTests(unittest.TestCase):
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.runtime = Path(temporary.name)
+        paths = mock.patch.multiple(
+            engine, PROJECT_ROOT=self.runtime, REPORTS_DIR=self.runtime / "reports",
+            CHANLUN_BI_RUNTIME_DIR=self.runtime / "data" / "chanlun",
+        )
+        paths.start()
+        self.addCleanup(paths.stop)
+
     def test_normalize_fractals_for_bi_reads_v302_payload(self):
         payload = {"symbol": "002115", "timeframe": "daily", "fractals": [fractal("bottom", 1, 9, 4, symbol="002115")]}
         result = normalize_fractals_for_bi(payload)
@@ -140,7 +155,9 @@ class ChanlunBiEngineTests(unittest.TestCase):
             "--timeframe",
             "daily",
         ]
-        completed = subprocess.run(cmd, cwd=PROJECT_ROOT, text=True, capture_output=True, timeout=60)
+        with IsolatedProject(PROJECT_ROOT, temp_parent=self.runtime) as project:
+            cmd[1] = str(project.root / "scripts" / "run_chanlun_bi_analysis.py")
+            completed = subprocess.run(cmd, cwd=project.root, env=project.subprocess_env(), text=True, capture_output=True, timeout=60)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("chanlun_bi_analysis", completed.stdout)
 

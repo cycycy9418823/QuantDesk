@@ -79,9 +79,13 @@ def _load_calendar_cached(calendar_path_text: str) -> dict[str, Any]:
                     continue
                 is_open = truthy(row.get("is_open") or row.get("open") or row.get("是否交易") or row.get("交易日"))
                 is_open_by_date[day] = bool(is_open)
+                raw_open = next((row[key] for key in ("is_open", "open", "是否交易", "交易日") if key in row), None)
+                row_count = int(rows_by_date.get(day, {}).get("row_count", "0")) + 1
                 rows_by_date[day] = {
                     "date": day,
                     "is_open": str(bool(is_open)).lower(),
+                    "is_open_raw": "" if raw_open is None else str(raw_open),
+                    "row_count": str(row_count),
                     "source": str(row.get("source") or "").strip(),
                     "note": str(row.get("note") or "").strip(),
                 }

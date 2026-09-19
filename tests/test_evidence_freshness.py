@@ -247,7 +247,11 @@ def test_market_health_and_audit_evidence_are_separate_surfaces() -> None:
     assert "audit_evidence_stale_or_missing" in payload["health_degraded_reason_codes"]
 
 
-def test_cached_dashboard_degrades_abandoned_chain_and_surfaces_evidence(tmp_path: Path) -> None:
+def test_cached_dashboard_degrades_abandoned_chain_and_surfaces_evidence(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "quantdesk.data_health_dashboard.daily_data_scheduler_status",
+        lambda **kwargs: {"status": "healthy", "automatic_update_configured": True},
+    )
     snapshot = tmp_path / "snapshot.json"
     snapshot.write_text(
         json.dumps(

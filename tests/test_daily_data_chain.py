@@ -9,6 +9,15 @@ import pandas as pd
 import pytest
 
 
+def _write_full_a_fixture(root: Path, symbols: list[str]) -> None:
+    path = root / "data" / "universe" / "a_share_symbols.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "symbol,name\n" + "".join(f"{symbol},fixture\n" for symbol in symbols),
+        encoding="utf-8",
+    )
+
+
 def _full_session_frame(
     symbol: str = "600000",
     target_date: str = "2026-07-16",
@@ -233,6 +242,7 @@ def test_dry_run_never_replaces_authoritative_latest(tmp_path: Path, monkeypatch
         dry_run=True,
         run_id="dry-run-fixed",
         rebuild_features=False,
+        include_critical_minute=True,
     )
 
     assert payload["status"] == "dry_run"
@@ -243,6 +253,7 @@ def test_dry_run_never_replaces_authoritative_latest(tmp_path: Path, monkeypatch
     assert json.loads(latest.read_text(encoding="utf-8")) == previous
     assert next(kwargs for name, kwargs in calls if name == "daily")["write_result"] is False
     assert next(kwargs for name, kwargs in calls if name == "daily")["require_raw_price_basis"] is True
+    assert any(name == "intraday" for name, _kwargs in calls)
     assert all(
         kwargs["dry_run"] is True
         for name, kwargs in calls
@@ -732,6 +743,7 @@ def test_analysis_minute_batches_use_bounded_concurrency(tmp_path: Path, monkeyp
         dry_run=True,
         batch_size=2,
         batch_workers=4,
+        skip_analysis_pool_minute=False,
         rebuild_features=False,
     )
 
@@ -939,8 +951,17 @@ def test_latest_chain_rejects_pre_contract_terminal_manifest(tmp_path: Path) -> 
     assert payload["published_latest"] is False
 
 
-def test_cached_dashboard_overlays_live_chain_without_rescanning(tmp_path: Path) -> None:
+def test_cached_dashboard_overlays_live_chain_without_rescanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from quantdesk.data_health_dashboard import build_cached_data_health_dashboard
+    import quantdesk.data_health_dashboard as dashboard
+
+    monkeypatch.setattr(
+        dashboard,
+        "daily_data_scheduler_status",
+        lambda **kwargs: {"status": "ready", "ok": True},
+    )
 
     snapshot = tmp_path / "data_health_dashboard_latest.json"
     snapshot.write_text(
@@ -962,6 +983,11 @@ def test_cached_dashboard_overlays_live_chain_without_rescanning(tmp_path: Path)
             "status": "running",
             "run_id": "live-run",
             "target_date": "2026-07-16",
+        },
+        evidence_freshness_payload={
+            "status": "passed",
+            "metrics_trustworthy": True,
+            "reason_codes": [],
         },
     )
 
@@ -1023,7 +1049,7 @@ def test_refresh_data_health_snapshot_fails_closed(
     assert "snapshot boom" in result["error"]
 
 
-def test_authoritative_run_downgrades_when_health_snapshot_refresh_fails(
+def test_explicit_subset_remains_non_authoritative_when_snapshot_refresh_is_unavailable(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -1187,11 +1213,11 @@ def test_authoritative_run_downgrades_when_health_snapshot_refresh_fails(
         run_id="health-failure-run",
     )
 
-    assert payload["status"] == "partial"
-    assert payload["ui_snapshot_ready"] is False
-    assert payload["components"]["data_health_snapshot"]["status"] == "failed"
-    assert "data_health_snapshot_refresh_failed" in payload["warnings"]
-    assert payload["published_latest"] is True
+    assert payload["status"] == "completed"
+    assert payload["ui_snapshot_ready"] is True
+    assert payload["components"]["data_health_snapshot"]["status"] == "skipped"
+    assert payload["components"]["data_health_snapshot"]["reason"] == "explicit_symbol_subset"
+    assert payload["published_latest"] is False
     assert existing_plan.read_bytes() == old_plan_bytes
     assert candidate_refresh_calls == []
 
@@ -1202,6 +1228,7 @@ def test_unexpected_component_failure_publishes_failed_terminal_manifest(
 ) -> None:
     from quantdesk import daily_data_chain as chain
 
+    _write_full_a_fixture(tmp_path, ["600000"])
     refresh_calls: list[dict[str, object]] = []
     monkeypatch.setattr(
         chain,
@@ -1238,10 +1265,11 @@ def test_unexpected_component_failure_publishes_failed_terminal_manifest(
     payload = chain.run_daily_data_chain(
         project_root=tmp_path,
         target_date="2026-07-16",
-        symbols=["600000"],
+        symbols=None,
         network=True,
         dry_run=False,
         rebuild_features=False,
+        refresh_universe=False,
         run_id="unexpected-failure-run",
     )
 
@@ -1514,6 +1542,7 @@ def test_process_lock_covers_universe_refresh_before_network_work(
         }
 
     monkeypatch.setattr(chain, "refresh_universe_snapshot", blocking_refresh)
+    _write_full_a_fixture(tmp_path, ["600000"])
 
     def run_first() -> None:
         first_result.update(
@@ -1548,7 +1577,7 @@ def test_process_lock_covers_universe_refresh_before_network_work(
     assert refresh_calls == ["2026-07-17"]
     assert feature_calls == [
         {
-            "only_low_price": True,
+                "only_low_price": False,
             "symbols": ["600000"],
             "daily_dir": tmp_path / "data" / "daily",
             "low_price_universe_path": (
@@ -1560,7 +1589,7 @@ def test_process_lock_covers_universe_refresh_before_network_work(
     ]
 
 
-def test_formal_network_subset_cannot_publish_authoritative_latest(
+def test_explicit_subset_failure_cannot_publish_authoritative_latest(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -1579,7 +1608,7 @@ def test_formal_network_subset_cannot_publish_authoritative_latest(
         chain,
         "_protected_fingerprints",
         lambda root: (_ for _ in ()).throw(
-            AssertionError("formal subset must block before fingerprints")
+            RuntimeError("fingerprint unavailable")
         ),
     )
     candidate_refresh_calls: list[dict[str, object]] = []
@@ -1604,10 +1633,11 @@ def test_formal_network_subset_cannot_publish_authoritative_latest(
     )
 
     latest = tmp_path / "results" / "data_chain" / "daily_data_chain_latest.json"
-    assert payload["status"] == "blocked"
+    assert payload["status"] == "failed"
     assert payload["authoritative"] is False
     assert payload["published_latest"] is False
-    assert "formal_scope_not_full_current_analysis_pool" in payload["errors"]
+    assert "unexpected_component_failure" in payload["errors"]
+    assert "fingerprint unavailable" in payload["error"]
     assert latest.exists() is False
     assert candidate_refresh_calls == []
 
@@ -1768,7 +1798,7 @@ def test_candidate_refresh_step_isolates_gate_exceptions(
     assert manifest["components"]["candidate_refresh"] == result
 
 
-def test_daily_coverage_rejects_partial_and_invalid_basis_even_when_fresh() -> None:
+def test_daily_coverage_keeps_invalid_basis_rejected_in_a_partial_update() -> None:
     from quantdesk.daily_data_chain import _daily_coverage
 
     payload = {
@@ -1788,7 +1818,8 @@ def test_daily_coverage_rejects_partial_and_invalid_basis_even_when_fresh() -> N
     assert gate["reported_count"] == 914
     assert gate["failed_count"] == 1
     assert gate["invalid_price_basis_count"] == 1
-    assert "daily_component_not_completed" in gate["reason_codes"]
+    assert "daily_symbols_failed" in gate["reason_codes"]
+    assert "daily_component_not_completed" not in gate["reason_codes"]
     assert "daily_price_basis_not_raw" in gate["reason_codes"]
 
 
@@ -2182,6 +2213,8 @@ def test_checkpoint_publishes_each_completed_future_before_slower_batches(
         },
     )
 
+    _write_full_a_fixture(tmp_path, symbols)
+
     def run_chain() -> None:
         result_holder["payload"] = chain.run_daily_data_chain(
             project_root=tmp_path,
@@ -2191,6 +2224,7 @@ def test_checkpoint_publishes_each_completed_future_before_slower_batches(
             run_id="checkpoint-progress-run",
             batch_size=1,
             batch_workers=8,
+            skip_analysis_pool_minute=False,
             rebuild_features=False,
         )
 
@@ -2564,6 +2598,7 @@ def test_retry_from_abandoned_run_reuses_only_matching_batch_artifact_accepts(
         },
     )
 
+    _write_full_a_fixture(tmp_path, symbols)
     payload = chain.run_daily_data_chain(
         project_root=tmp_path,
         target_date="2026-07-16",
@@ -2572,6 +2607,7 @@ def test_retry_from_abandoned_run_reuses_only_matching_batch_artifact_accepts(
         run_id="recovered-run",
         batch_size=1,
         batch_workers=2,
+        skip_analysis_pool_minute=False,
         rebuild_features=False,
         retry_from_latest=True,
     )

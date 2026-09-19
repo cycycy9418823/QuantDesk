@@ -188,6 +188,31 @@ def test_connection_failure_is_not_reported_as_sent() -> None:
 
     assert result["status"] == "failed"
     assert result["reason_code"] == "transport_failed"
+    assert result["transport_error_type"] == "ConnectionError"
+    assert result["transport_error_category"] == "transport_error"
+
+
+def test_transport_failure_keeps_nested_dns_category_without_error_text() -> None:
+    import socket
+    from urllib.error import URLError
+
+    error = ConnectionError("server_chan_transport_failed")
+    error.__cause__ = URLError(socket.gaierror(-2, "temporary resolver detail"))
+    result = deliver_server_chan(
+        title="QuantDesk",
+        body="Research Only",
+        sendkey="SCT_FAKE_SECRET",
+        enabled=True,
+        channel_enabled=True,
+        network=True,
+        push=True,
+        dry_run=False,
+        transport=Recorder(error=error),
+    )
+    assert result["status"] == "failed"
+    assert result["transport_error_type"] == "gaierror"
+    assert result["transport_error_category"] == "dns_resolution_failed"
+    assert "temporary resolver detail" not in json.dumps(result)
 
 
 @pytest.mark.parametrize(

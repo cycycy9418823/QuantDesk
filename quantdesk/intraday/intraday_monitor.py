@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -166,19 +167,64 @@ def _load_daily_features(symbol: str) -> dict[str, Any]:
 # Price fetching
 # ---------------------------------------------------------------------------
 
+_MARKET_PREFIXES = ("sh", "sz", "bj")
+# A quote identity is either a bare six-digit code or an explicit allowed
+# market prefix + six-digit code. Nothing else is coerced.
+_QUOTE_SYMBOL_PATTERN = re.compile(r"^(?:(sh|sz|bj))?([0-9]{6})$")
+
+
+def _quote_symbol_key(raw_symbol: Any) -> str:
+    """Normalize a provider quote symbol to its 6-digit consumption key.
+
+    Only ``sh``/``sz``/``bj`` plus exactly six digits, or a bare six-digit code,
+    are accepted. Malformed identities (``hk920010``, ``bad920010``,
+    ``bj1920010``) are rejected instead of having their digits extracted, so a
+    corrupt response can never overwrite a valid quote under the same key.
+    """
+
+    text = str(raw_symbol or "").strip().lower()
+    match = _QUOTE_SYMBOL_PATTERN.fullmatch(text)
+    if not match:
+        return ""
+    return match.group(2)
+
+
+def _fetch_prices_detailed(
+    symbols: list[str],
+) -> tuple[dict[str, dict[str, Any]], list[str], list[str]]:
+    """Fetch quotes and return ``(quotes, provider_errors, warnings)``.
+
+    Keys are the normalized 6-digit consumption codes. Provider-level failures,
+    requested-but-unquoted symbols, and malformed quote identities are passed
+    back explicitly instead of being silently dropped.
+    """
+
+    if not symbols:
+        return {}, [], []
+    batch = fetch_spot_sina_batch(symbols, batch_size=50)
+    quotes: dict[str, dict[str, Any]] = {}
+    errors = [f"sina_provider_error: {item}" for item in list(getattr(batch, "provider_errors", []) or [])]
+    warnings = [f"sina_warning: {item}" for item in list(getattr(batch, "warnings", []) or [])]
+    for row in batch.rows:
+        raw = row.get("symbol")
+        code = _quote_symbol_key(raw)
+        price = safe_float(row.get("price")) or 0.0
+        if not code:
+            warnings.append(f"无法识别报价标识，已忽略：{raw!r}")
+            continue
+        if price > 0:
+            quotes[code] = dict(row)
+    for raw in symbols:
+        code = _quote_symbol_key(raw)
+        if code and code not in quotes:
+            warnings.append(f"{code}: 未返回可用行情")
+    return quotes, errors, warnings
+
+
 def _fetch_prices(symbols: list[str]) -> dict[str, dict[str, Any]]:
     """Fetch live Sina quotes for *symbols*, return dict keyed by 6-digit code."""
-    if not symbols:
-        return {}
-    batch = fetch_spot_sina_batch(symbols, batch_size=50)
-    result: dict[str, dict[str, Any]] = {}
-    for row in batch.rows:
-        raw_symbol = str(row.get("symbol") or "")
-        code = raw_symbol.replace("sh", "").replace("sz", "").zfill(6)
-        price = safe_float(row.get("price")) or 0.0
-        if code and price > 0:
-            result[code] = dict(row)
-    return result
+    quotes, _errors, _warnings = _fetch_prices_detailed(symbols)
+    return quotes
 
 
 def _merge_live_price(daily: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
@@ -324,8 +370,10 @@ def run_single_cycle(
 
     # Fetch live prices
     try:
-        quotes = _fetch_prices(all_symbols)
+        quotes, price_errors, price_warnings = _fetch_prices_detailed(all_symbols)
         result.prices_fetched = len(quotes)
+        result.errors.extend(price_errors)
+        result.warnings.extend(price_warnings)
     except Exception as exc:
         result.errors.append(f"行情获取失败: {exc}")
         return result

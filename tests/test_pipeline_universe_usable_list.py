@@ -223,7 +223,7 @@ def test_restored_flag_with_sha_mismatch_is_not_usable(tmp_path: Path) -> None:
     assert _universe_staleness_days(tmp_path) is None
 
 
-def test_stale_approved_csv_beyond_14_days_is_not_usable(tmp_path: Path) -> None:
+def test_stale_approved_csv_retains_its_age_for_degraded_use(tmp_path: Path) -> None:
     _write_spec(tmp_path)
     old = (datetime.now(SHANGHAI) - timedelta(days=UNIVERSE_MAX_STALENESS_DAYS + 1)).strftime(
         "%Y-%m-%d"
@@ -237,7 +237,7 @@ def test_stale_approved_csv_beyond_14_days_is_not_usable(tmp_path: Path) -> None
         source=APPROVED,
         updated_at=old,
     )
-    assert _universe_staleness_days(tmp_path) is None
+    assert _universe_staleness_days(tmp_path) == UNIVERSE_MAX_STALENESS_DAYS + 1
 
 
 def test_older_accepted_report_matching_csv_hash_is_usable(tmp_path: Path) -> None:

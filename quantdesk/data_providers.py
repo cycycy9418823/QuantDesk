@@ -77,7 +77,7 @@ def _as_str(value: object) -> str:
 
 
 def normalize_cn_symbol_for_sina(symbol: object) -> str | None:
-    """Normalize a CN A-share symbol to Sina's ``sh``/``sz`` prefixed form.
+    """Normalize a CN A-share symbol to Sina's ``sh``/``sz``/``bj`` form.
 
     Returns ``None`` when the symbol cannot be recognised.  Acceptable inputs
     include plain 6-digit codes, already-prefixed codes, and noisy variants
@@ -87,8 +87,8 @@ def normalize_cn_symbol_for_sina(symbol: object) -> str | None:
     text = _as_str(symbol).lower()
     if not text:
         return None
-    text = text.replace(".sh", "").replace(".sz", "").replace(".ss", "")
-    if text.startswith(("sh", "sz")):
+    text = text.replace(".sh", "").replace(".sz", "").replace(".ss", "").replace(".bj", "")
+    if text.startswith(("sh", "sz", "bj")):
         digits = "".join(ch for ch in text[2:] if ch.isdigit())
         if len(digits) != 6:
             return None
@@ -99,9 +99,12 @@ def normalize_cn_symbol_for_sina(symbol: object) -> str | None:
         return None
     head = digits[0]
     prefix3 = digits[:3]
+    # The 92 prefix is Beijing, not the Shanghai 900xxx B-share namespace.
+    if digits.startswith("92"):
+        return f"bj{digits}"
     if head == "6":
         return f"sh{digits}"
-    if prefix3.startswith(("000", "001", "002", "003", "300", "301")):
+    if prefix3.startswith(("000", "001", "002", "003", "300", "301", "302")):
         return f"sz{digits}"
     if prefix3.startswith(("688", "689")):
         return f"sh{digits}"

@@ -9,13 +9,30 @@ from flask import Flask, jsonify, render_template, request
 
 from ai_trader.ledger import init_ledger, load_ledger
 from ai_trader.mandate import BOUNDARY, DEFAULT_MANDATE
-from ai_trader.paths import SNAPSHOT_PATH, ensure_runtime_dirs
+from ai_trader.paths import active_profile, ensure_profile_dirs, profile_paths
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
 
+def _chat_scope_error() -> tuple[dict, int] | None:
+    """The chat panel reads the default book only; refuse rather than mislead."""
+
+    profile = active_profile()
+    if profile and profile != "default":
+        return (
+            {
+                "ok": False,
+                "reason": "chat_not_available_for_profile",
+                "detail": f"chat 面板目前只读默认账；本页是 {profile} 档，请用对比报告看它。",
+                "profile": profile,
+            },
+            501,
+        )
+    return None
+
+
 def _empty_snapshot() -> dict:
-    ledger = init_ledger()
+    ledger = init_ledger(path=profile_paths().ledger)
     return {
         "ok": True,
         "as_of": None,
@@ -49,10 +66,11 @@ def _empty_snapshot() -> dict:
 
 
 def load_snapshot() -> dict:
-    if not SNAPSHOT_PATH.is_file():
+    snapshot_path = profile_paths().snapshot
+    if not snapshot_path.is_file():
         return _empty_snapshot()
     try:
-        payload = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         snap = _empty_snapshot()
         snap["degraded"] = True
@@ -89,10 +107,13 @@ def create_app() -> Flask:
 
     @app.get("/api/ledger")
     def ledger():
-        return jsonify(load_ledger())
+        return jsonify(load_ledger(profile_paths().ledger))
 
     @app.get("/api/chat")
     def chat_history():
+        blocked = _chat_scope_error()
+        if blocked is not None:
+            return jsonify(blocked[0]), blocked[1]
         from ai_trader.chat import load_history
 
         return jsonify(
@@ -105,6 +126,9 @@ def create_app() -> Flask:
 
     @app.post("/api/chat")
     def chat_send():
+        blocked = _chat_scope_error()
+        if blocked is not None:
+            return jsonify(blocked[0]), blocked[1]
         from ai_trader.chat import answer_question
 
         payload = request.get_json(silent=True) or {}
@@ -133,7 +157,7 @@ def create_app() -> Flask:
 
 
 def main(host: str = "127.0.0.1", port: int = 8001) -> None:
-    ensure_runtime_dirs()
+    ensure_profile_dirs()
     init_ledger()
     create_app().run(host=host, port=port, debug=False)
 

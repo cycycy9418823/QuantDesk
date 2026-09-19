@@ -63,7 +63,9 @@ class PytestSuiteRunnerGovernanceTests(unittest.TestCase):
     def test_003_classifier_places_representative_files(self) -> None:
         by_path = {item.path: item for item in pytest_suite_runner.discover_pytest_suite_files(ROOT)}
         self.assertEqual(by_path["tests/test_daily_research_phase1.py"].suite, "slow")
-        self.assertEqual(by_path["tests/test_backtest_module.py"].suite, "slow")
+        # R4 slim: test_backtest_module.py was never migrated. Use a file that
+        # still exists and is classified slow via subprocess usage.
+        self.assertEqual(by_path["tests/test_candidate_status_reconciliation.py"].suite, "slow")
         self.assertEqual(by_path["tests/test_frontend_api_contract_governance.py"].suite, "v3_v4_governance")
         self.assertEqual(by_path["tests/test_v370_data_provider_chain_and_quality.py"].suite, "v3_v4_governance")
 

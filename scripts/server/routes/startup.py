@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from flask import Blueprint, Flask, jsonify, request
 
+from quantdesk.pipeline_terminal import pipeline_failure_details
 from scripts.server.helpers.util import clean_payload
 
 
@@ -37,8 +38,9 @@ def _default_startup_payload() -> dict[str, Any]:
         "provider_network_authorized": False,
         "network": False,
         "dry_run": True,
-        "scope": "current_analysis_pool",
-        "only_low_price": True,
+        "scope": "full_a",
+        "only_low_price": False,
+        "daily_writer": "data_close_pipeline",
         "full_scan": False,
         "updated_symbols": 0,
         "failed_symbols": 0,
@@ -76,122 +78,39 @@ def create_startup_blueprint(deps: StartupRouteDeps) -> Blueprint:
         payload.setdefault("no_buy_sell_advice", True)
         payload.setdefault("no_position_advice", True)
         payload.setdefault("no_real_money_allocation", True)
-        if not isinstance(payload.get("candidate_generation"), dict):
-            payload["candidate_generation"] = deps.generation_status_for_ui()
-        else:
-            payload["candidate_generation"] = deps.generation_status_for_ui(payload.get("candidate_generation"))
         state = deps.startup_refresh_state_payload()
         if deps.startup_payload_has_completed_after_state(payload, state):
-            deps.set_startup_refresh_state(
-                running=False,
-                status=str(payload.get("status") or "completed"),
-                request_id=state.get("request_id") or "",
-                message_for_ui=str(payload.get("message_for_ui") or payload.get("message") or "Startup refresh completed."),
-            )
+            deps.set_startup_refresh_state(running=False, status=payload.get("status") or "failed")
             state = deps.startup_refresh_state_payload()
-        state_running = bool(state.get("running"))
-        payload["running"] = state_running
-        payload.setdefault("request_id", state.get("request_id") or "")
-        if not state_running and payload.get("status") == "running":
-            update_result = payload.get("update_result") if isinstance(payload.get("update_result"), dict) else {}
-            candidate_generation = payload.get("candidate_generation") if isinstance(payload.get("candidate_generation"), dict) else {}
-            recovered_status = str(update_result.get("status") or candidate_generation.get("status") or "interrupted")
-            if recovered_status == "failed" and candidate_generation.get("status") == "completed":
-                recovered_status = "completed_with_warnings"
-            payload["status"] = recovered_status
-            payload["message"] = payload.get("message") or "启动更新任务未在当前服务进程中运行，已按最新本地结果恢复状态。"
-        if state_running:
+        payload["running"] = bool(state.get("running"))
+        payload["current_view_override"] = False
+        if state.get("running"):
             payload["status"] = "running"
-            payload["current_view_override"] = False
-            payload["message"] = state.get("message_for_ui") or payload.get("message") or "Startup refresh is running in the background."
-            payload["startup_update_attempted"] = True
-            payload["provider_network_authorized"] = True
-            payload["request_id"] = state.get("request_id") or payload.get("request_id") or ""
-        try:
-            rows = deps.candidate_rows(18)
-            summary = deps.data_gap_summary(rows)
-            payload["current_candidate_gap_summary"] = summary
-            if rows and payload.get("status") != "running":
-                update_result = payload.get("update_result") if isinstance(payload.get("update_result"), dict) else {}
-                target_date = payload.get("target_date") or update_result.get("target_date") or summary.get("target_date") or ""
-                latest_dates = [
-                    str(row.get("data_quality", {}).get("latest_date") or "")
-                    for row in rows
-                    if str(row.get("data_quality", {}).get("latest_date") or "") not in {"", "数据缺失"}
-                ]
-                latest_min = min(latest_dates) if latest_dates else ""
-                latest_max = max(latest_dates) if latest_dates else ""
-                gap_count = int(summary.get("gap_count") or 0)
-                field_gap_count = int(summary.get("field_gap_count") or 0)
-                stale_count = int(summary.get("stale_count") or 0)
-                missing_count = int(summary.get("missing_count") or 0)
-                if gap_count == 0 and field_gap_count == 0:
-                    status_label = "当前候选已补齐"
-                    status_tone = "ok"
-                    status = "completed"
-                    current_message = (
-                        f"当前页面 {summary.get('candidate_count', len(rows))} 只候选日线和关键字段可读取；"
-                        "启动时历史更新记录仅作参考。"
-                    )
-                elif gap_count == 0 and field_gap_count > 0:
-                    status_label = "价格日线已更新，成交额降级"
-                    status_tone = "warning"
-                    status = "completed_with_warnings"
-                    current_message = (
-                        f"当前页面 {summary.get('candidate_count', len(rows))} 只候选价格/K线可读取；"
-                        f"{field_gap_count} 只缺成交额/量能字段，量能解释降级，但不代表价格日线没有更新。"
-                    )
-                else:
-                    status_label = "部分候选仍需更新"
-                    status_tone = "warning"
-                    status = "completed_with_warnings"
-                    current_message = summary.get("message") or "当前候选仍有日线滞后或缺失，需要继续联网更新或导入 CSV。"
-                if gap_count > 0 and stale_count == 0 and missing_count == 0:
-                    status_label = "价格日线已更新，存在质量提示"
-                    status_tone = "warning"
-                    status = "completed_with_warnings"
-                    current_message = summary.get("message") or "当前候选价格日线已到目标交易日，但仍有字段或异常行过滤等质量提示。"
-                candidate_generation = payload.get("candidate_generation") if isinstance(payload.get("candidate_generation"), dict) else {}
-                if candidate_generation.get("freshness_status") == "stale":
-                    status_label = "研究候选批次需要更新"
-                    status_tone = "warning"
-                    status = "completed_with_warnings"
-                    freshness_message = str(candidate_generation.get("freshness_message") or "")
-                    if freshness_message and freshness_message not in current_message:
-                        current_message = f"{current_message} {freshness_message}".strip()
-                    if not target_date:
-                        target_date = str(candidate_generation.get("target_date") or "")
-                provider_diagnosis = deps.startup_provider_update_diagnosis(payload)
-                if stale_count > 0 and provider_diagnosis.get("tone") == "partial":
-                    status_label = str(provider_diagnosis.get("label") or "自动刷新已部分完成")
-                    status_tone = "warning"
-                    status = "completed_with_warnings"
-                    current_message = str(provider_diagnosis.get("summary") or current_message)
-                payload.update(
-                    {
-                        "current_view_override": True,
-                        "status": status,
-                        "current_status_label": status_label,
-                        "current_status_tone": status_tone,
-                        "current_message": current_message,
-                        "target_date": target_date,
-                        "current_candidate_latest_date_min": latest_min,
-                        "current_candidate_latest_date_max": latest_max,
-                        "latest_local_date_after": latest_min or target_date,
-                        "stale_count_after": summary.get("stale_count", 0),
-                        "missing_count_after": summary.get("missing_count", 0),
-                        "failed_symbols": summary.get("gap_count", 0),
-                        "provider_diagnosis": provider_diagnosis,
-                    }
-                )
-        except Exception as exc:  # noqa: BLE001
-            payload["current_candidate_gap_summary"] = {
-                "message": f"当前候选池健康状态复核失败：{exc}",
-                "gap_count": "数据缺失",
-                "field_gap_count": "数据缺失",
-            }
-        payload["startup_update_explanation"] = deps.startup_update_explanation(payload)
+            payload["message"] = state.get("message_for_ui") or "收盘更新正在进行。"
+            payload["request_id"] = state.get("request_id") or ""
+        elif payload.get("status") == "running":
+            payload["status"] = "interrupted"
+            payload["message"] = "上次更新未留下完成记录；当前未在运行。"
+        # Current candidate freshness is not evidence that this run completed.
+        payload.setdefault("daily_writer", "data_close_pipeline")
+        if payload.get("status") in {"completed", "completed_all_executed"} and not payload["running"]:
+            generation = deps.generation_status_for_ui()
+            current_rows = deps.candidate_rows(120)
+            summary = deps.data_gap_summary(current_rows)
+            payload["current_candidate_health"] = {"generation": generation, "summary": summary}
+            same_target = not payload.get("target_date") or payload.get("target_date") == generation.get("target_date")
+            if same_target and generation.get("freshness_status") in {"fresh", "current"} and not summary.get("gap_count"):
+                # Display an independently computed current view only after the
+                # original attempt already has its own successful terminal.
+                payload.update(current_view_override=True, candidate_generation=generation,
+                               current_candidate_gap_summary=summary,
+                               current_status_label="当前候选已补齐", current_status_tone="ok",
+                               current_message=summary.get("message") or "当前候选数据已核对。")
         payload.setdefault("provider_diagnosis", deps.startup_provider_update_diagnosis(payload))
+        payload["startup_update_explanation"] = deps.startup_update_explanation(payload)
+        if isinstance(payload.get("pipeline"), dict):
+            # Derive display fields for old records in memory; never rewrite them.
+            payload["failure_details"] = pipeline_failure_details(payload["pipeline"])
         return jsonify(clean_payload(payload))
 
     @bp.route("/api/startup/refresh", methods=["POST"])
@@ -210,7 +129,6 @@ def create_startup_blueprint(deps: StartupRouteDeps) -> Blueprint:
                 "no_live_trading": True,
                 "no_auto_execution": True,
             }
-            deps.write_startup_status_payload(payload)
             return jsonify(clean_payload(payload)), 200
         state = deps.startup_refresh_state_payload()
         if state.get("running"):
@@ -225,12 +143,12 @@ def create_startup_blueprint(deps: StartupRouteDeps) -> Blueprint:
         deps.set_startup_refresh_state(
             running=True,
             status="running",
-            reason="page_open",
+            reason="explicit_update",
             started_at=request_id,
             request_id=request_id,
-            message_for_ui="正在后台尝试刷新当前研究池；若外部数据源不可达，会回退到本地最新完整日线。",
+            message_for_ui="正在运行全 A 收盘更新。",
         )
-        deps.start_startup_refresh_worker("page_open", request_id)
+        deps.start_startup_refresh_worker("explicit_update", request_id)
         payload = {
             "ok": True,
             "status": "running",

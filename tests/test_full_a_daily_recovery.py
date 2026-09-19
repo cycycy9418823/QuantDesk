@@ -270,22 +270,33 @@ def test_daily_chain_passes_scheduler_safe_rate_contract_into_provider() -> None
     assert "workers=batch_workers" not in window
 
 
-def test_daily_chain_manifest_declares_data_and_research_scopes_separately() -> None:
-    """full-A daily *data* coverage must never read as full-A *strategy* research.
+def test_daily_chain_manifest_declares_data_and_research_scopes_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from quantdesk.daily_data_chain import run_daily_data_chain
+    from tests.test_research_pool_separation import _install_chain_fakes
 
-    The formal research path still uses resolve_symbols(only_low_price=True), so
-    the manifest has to state both scopes explicitly rather than letting a wide
-    data-coverage number imply a wide research scan.
-    """
+    _install_chain_fakes(monkeypatch)
+    universe = tmp_path / "data" / "universe" / "a_share_symbols.csv"
+    universe.parent.mkdir(parents=True)
+    universe.write_text("symbol,name\n600000,A\n600001,B\n", encoding="utf-8")
 
-    import inspect
-
-    from quantdesk.daily_data_chain import _run_daily_data_chain_impl
-
-    source = inspect.getsource(_run_daily_data_chain_impl)
-
-    assert '"market_data_scope": "all_a"' in source
-    assert '"research_scope": "all_a"' in source
-    assert '"full_a_research_scan": False' in source
-    assert "宇宙=全A" in source
-    assert "本链默认不跑该过滤器" in source
+    for symbols, expected_scope, expected_count in (
+        (None, "all_a", 2),
+        (["600000"], "explicit_symbols", 1),
+    ):
+        payload = run_daily_data_chain(
+            project_root=tmp_path,
+            target_date="2026-07-17",
+            symbols=symbols,
+            network=False,
+            dry_run=True,
+            refresh_universe=False,
+            rebuild_features=False,
+            run_id=f"scope-{expected_scope}",
+        )
+        assert payload["scope"]["market_data_scope"] == "all_a"
+        assert payload["scope"]["research_scope"] == expected_scope
+        assert payload["scope"]["research_universe_count"] == expected_count
+        assert payload["scope"]["full_a_research_scan"] is False
+        assert payload["scope"]["filters"][0]["used"] is False

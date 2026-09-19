@@ -152,6 +152,18 @@ def build_journal(
     }
 
 
+def _journal_identity(note: dict[str, Any]) -> str:
+    """Stable per-evening identity so a same-cycle retry is not re-journalled."""
+
+    return "|".join(
+        [
+            str(note.get("as_of") or ""),
+            str(note.get("run_id") or ""),
+            str(note.get("plan_id") or ""),
+        ]
+    ).strip("|")
+
+
 def append_journal(
     note: dict[str, Any],
     *,
@@ -165,5 +177,19 @@ def append_journal(
     latest.parent.mkdir(parents=True, exist_ok=True)
     log.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(latest, note)
+    identity = _journal_identity(note)
+    if identity and log.is_file():
+        for line in log.read_text(encoding="utf-8").splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                existing = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(existing, dict) and _journal_identity(existing) == identity:
+                # Same evening/run already journalled (e.g. a crash-retry):
+                # reuse the record instead of appending a duplicate.
+                return
     with log.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(note, ensure_ascii=False) + "\n")

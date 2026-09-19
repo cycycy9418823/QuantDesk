@@ -35,8 +35,8 @@ def test_candidate_entry_price_uses_next_trading_day_open(tmp_path: Path) -> Non
     daily.mkdir(parents=True)
     pd.DataFrame(
         [
-            {"date": "2026-06-25", "open": 9.0, "high": 10.5, "low": 8.8, "close": 10.0, "volume": 1000},
-            {"date": "2026-06-26", "open": 11.0, "high": 12.5, "low": 10.8, "close": 12.0, "volume": 1000},
+            {"date": "2026-06-25", "open": 9.0, "high": 10.5, "low": 8.8, "close": 10.0, "volume": 1000, "adjust": "raw"},
+            {"date": "2026-06-26", "open": 11.0, "high": 12.5, "low": 10.8, "close": 12.0, "volume": 1000, "adjust": "raw"},
         ]
     ).to_csv(daily / "000001.csv", index=False)
 
@@ -51,9 +51,9 @@ def test_candidate_entry_price_falls_back_to_next_day_close_and_performance_star
     tracking.mkdir(parents=True)
     pd.DataFrame(
         [
-            {"date": "2026-06-25", "open": 9.0, "high": 10.5, "low": 8.8, "close": 10.0, "volume": 1000},
-            {"date": "2026-06-26", "open": 0.0, "high": 12.5, "low": 10.8, "close": 12.0, "volume": 1000},
-            {"date": "2026-06-29", "open": 12.5, "high": 13.5, "low": 12.4, "close": 13.0, "volume": 1000},
+            {"date": "2026-06-25", "open": 9.0, "high": 10.5, "low": 8.8, "close": 10.0, "volume": 1000, "adjust": "raw"},
+            {"date": "2026-06-26", "open": 0.0, "high": 12.5, "low": 10.8, "close": 12.0, "volume": 1000, "adjust": "raw"},
+            {"date": "2026-06-29", "open": 12.5, "high": 13.5, "low": 12.4, "close": 13.0, "volume": 1000, "adjust": "raw"},
         ]
     ).to_csv(daily / "000001.csv", index=False)
     pd.DataFrame(
@@ -70,7 +70,9 @@ def test_candidate_entry_price_falls_back_to_next_day_close_and_performance_star
         ]
     ).to_csv(tracking / "candidate_ledger.csv", index=False)
 
-    assert _entry_price(tmp_path, "000001", "2026-06-25") == "12.00"
+    # A zero next-session open is not a usable entry: fail closed instead of
+    # falling back to a later close (which would be look-ahead).
+    assert _entry_price(tmp_path, "000001", "2026-06-25") == "数据缺失"
     payload = build_candidate_performance(
         tmp_path,
         provenance={
@@ -79,14 +81,16 @@ def test_candidate_entry_price_falls_back_to_next_day_close_and_performance_star
             "source_hash": "sha256:fixture",
         },
     )
-    perf = pd.read_csv(tracking / "candidate_performance.csv")
 
+    # The row is kept visible, but no return is fabricated without a usable
+    # next-session open.
     assert payload["performance_rows"] == 1
+    perf = pd.read_csv(tracking / "candidate_performance.csv")
+    assert pd.isna(perf.loc[0, "hold_1d_ret"])
     assert payload["provenance"]["trigger"] == "scheduled_daily_review"
     assert payload["provenance"]["authoritative_chain_run_id"].endswith("fixture")
     assert payload["provenance"]["source_hash"] == "sha256:fixture"
     assert payload["generated_at"]
-    assert round(float(perf.loc[0, "hold_1d_ret"]), 6) == round((13.0 - 12.0) / 12.0, 6)
 
 
 def test_daily_candidate_generator_filters_untradable_metrics_before_strategy(monkeypatch, tmp_path: Path) -> None:

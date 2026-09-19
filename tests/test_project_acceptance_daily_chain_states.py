@@ -336,18 +336,56 @@ def test_dedicated_provenance_bound_alpha_evidence_validates_alpha(tmp_path: Pat
     assert alpha["reason_codes"] == []
 
 
-def test_real_repo_factor_verdicts_keep_alpha_not_validated() -> None:
-    """Guard against the live round22/round23 artifacts flipping alpha."""
+def test_factor_adjudication_loader_never_flips_alpha(tmp_path: Path) -> None:
+    """Routine round22/round23 factor keeps must never become tradable alpha.
+
+    Uses a complete offline fixture mirroring the producer artifact shape. The
+    real-repo round22/round23 artifact check stays a real-site item; this proves
+    the loader + disposition guard reject ordinary factor keeps offline.
+    """
 
     from quantdesk.project_acceptance import (
         _is_formal_tradable_alpha_verdict,
         _load_factor_verdicts,
     )
 
-    root = Path(__file__).resolve().parents[1]
-    verdicts = _load_factor_verdicts(root)
+    round22 = tmp_path / "results" / "round22_factor_adjudication"
+    round22.mkdir(parents=True)
+    (round22 / "adjudication_latest.json").write_text(
+        json.dumps(
+            {
+                "task_type": "factor_adjudication",
+                "verdicts": [
+                    {"verdict": "keep", "dimension": "momentum"},
+                    {
+                        "verdict": "keep",
+                        "dimension": "reversal",
+                        "formal_evidence_eligible": True,
+                        "evidence_schema_version": "alpha_evidence_v1",
+                        "adjudication_id": "adj-1",
+                        "publication_status": "draft",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    round23 = tmp_path / "results" / "round23_reversal_factor"
+    round23.mkdir(parents=True)
+    (round23 / "adjudication_latest.json").write_text(
+        json.dumps(
+            {
+                "task_type": "factor_adjudication",
+                "verdicts": [{"verdict": "keep", "dimension": "volatility"}],
+            }
+        ),
+        encoding="utf-8",
+    )
 
-    assert verdicts, "expected the real factor adjudication artifacts to be present"
+    verdicts = _load_factor_verdicts(tmp_path)
+
+    assert verdicts, "expected the factor adjudication loader to find fixture verdicts"
     assert not any(
-        _is_formal_tradable_alpha_verdict(item, project_root=root) for item in verdicts
+        _is_formal_tradable_alpha_verdict(item, project_root=tmp_path)
+        for item in verdicts
     )

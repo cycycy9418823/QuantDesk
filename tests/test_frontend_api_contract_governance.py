@@ -128,6 +128,10 @@ class FrontendApiContractGovernanceTests(unittest.TestCase):
         self.assertIn("/api/stock-detail", reviews)
         self.assertEqual(reviews["/api/stock-detail"]["usage_class"], "compatibility_alias")
         self.assertFalse(reviews["/api/stock-detail"]["action_required"])
+        for path, classification in (("/api/daily/update-candidates", "compatibility_alias"),
+                                     ("/api/data/repair-daily", "retired_endpoint")):
+            self.assertEqual(reviews[path]["usage_class"], classification)
+            self.assertFalse(reviews[path]["action_required"])
         self.assertIn("/api/theme-map/generate-import-draft", reviews)
         self.assertEqual(reviews["/api/theme-map/generate-import-draft"]["usage_class"], "compatibility_alias")
         self.assertFalse(reviews["/api/theme-map/generate-import-draft"]["action_required"])
@@ -173,6 +177,8 @@ class FrontendApiContractGovernanceTests(unittest.TestCase):
                     "line": 11,
                     "pattern": "/api/new-unreviewed-read",
                 },
+                {"path": "/api/daily/update-candidates", "method": "GET"},
+                {"path": "/api/data/repair-daily", "method": "GET"},
             ]
         )
         self.assertTrue(all(item["action_required"] for item in reviews))

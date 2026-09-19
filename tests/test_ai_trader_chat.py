@@ -62,6 +62,7 @@ def test_answer_question_reports_unconfigured(monkeypatch) -> None:
 
 def test_history_roundtrip_is_bounded(tmp_path, monkeypatch) -> None:
     path = tmp_path / "chat.jsonl"
+    monkeypatch.setattr(chat_mod, "STATE_DIR", tmp_path)
     monkeypatch.setattr(chat_mod, "CHAT_LOG_PATH", path)
     for i in range(chat_mod.HISTORY_TURNS + 10):
         chat_mod.append_turn(f"q{i}", f"a{i}", "model-x")

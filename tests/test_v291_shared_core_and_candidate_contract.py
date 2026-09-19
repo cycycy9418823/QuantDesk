@@ -172,6 +172,7 @@ class SharedCoreAndCandidateContractTests(unittest.TestCase):
         payload = build_conditional_trade_plan(
             auto_strategy_payload={"board_candidates": [{"symbol": "600744", "name": "华银电力", "strategy_type": "board", "price": 8.5}]},
             state={"positions": []},
+            candidate_mode="legacy_diagnostic",
             strategy="all",
             plan_date="2026-05-15",
             trade_date="2026-05-18",

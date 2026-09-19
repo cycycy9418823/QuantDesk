@@ -201,7 +201,9 @@ def run_candidate_tracking_and_validate(
     root: Path,
     target_date: str,
     authoritative_chain_run_id: str,
-) -> int:
+    *,
+    detailed: bool = False,
+) -> int | dict[str, Any]:
     """Materialize only the verified dated formal batch, then rebuild views."""
 
     from quantdesk.candidate_tracking import (
@@ -221,6 +223,13 @@ def run_candidate_tracking_and_validate(
         "completed_with_warnings",
         "idempotent",
     }:
+        if detailed:
+            return {
+                "status": "skipped", "reason_codes": list(result.get("reason_codes") or [])
+                or ["formal_candidate_tracking_unavailable"],
+                "source_status": result.get("status"), "target_date": target_date,
+                "source_run_id": authoritative_chain_run_id, "applied": False,
+            }
         print(
             "daily-review-orchestrator: candidate-tracking-blocked: "
             + json.dumps(result, ensure_ascii=False),
@@ -271,16 +280,8 @@ def main(argv: list[str] | None = None) -> int:
                 "-B",
                 str(root / "scripts" / "qd.py"),
                 "daily", "--network", "false",
+                "--target-date", target_date,
                 "--with-guardrails", "true",
-                "--summary", "true",
-            ]
-            stage4_command = [
-                sys.executable,
-                "-B",
-                str(root / "scripts" / "qd.py"),
-                "stage4-maintenance", "--network", "false",
-                "--as-of", target_date,
-                "--json", "true",
                 "--summary", "true",
             ]
             result = run_evening_review(
@@ -293,9 +294,7 @@ def main(argv: list[str] | None = None) -> int:
                     root,
                     target_date,
                     str(chain["run_id"]),
-                ),
-                stage4_runner=lambda: run_stage4_and_validate(
-                    stage4_command, root, target_date
+                    detailed=True,
                 ),
                 lease_seconds=args.lease_seconds,
             )

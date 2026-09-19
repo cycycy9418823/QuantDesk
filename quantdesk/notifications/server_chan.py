@@ -45,6 +45,37 @@ class _NoRedirectHandler(HTTPRedirectHandler):
         raise HTTPError(newurl, code, "server_chan_redirect_rejected", headers, fp)
 
 
+def _transport_diagnostics(error: BaseException) -> dict[str, Any]:
+    """Return bounded, secret-free diagnostics for a failed connection."""
+    current: BaseException = error
+    seen: set[int] = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        cause = getattr(current, "__cause__", None)
+        reason = getattr(current, "reason", None)
+        if isinstance(cause, BaseException):
+            current = cause
+            continue
+        if isinstance(reason, BaseException):
+            current = reason
+            continue
+        break
+    name = type(current).__name__
+    category = {
+        "gaierror": "dns_resolution_failed",
+        "ConnectionRefusedError": "connection_refused",
+        "ConnectionResetError": "connection_reset",
+        "PermissionError": "permission_denied",
+        "TimeoutError": "timeout",
+        "SSLError": "tls_failed",
+    }.get(name, "transport_error")
+    result: dict[str, Any] = {"transport_error_type": name, "transport_error_category": category}
+    errno = getattr(current, "errno", None)
+    if isinstance(errno, int):
+        result["transport_error_errno"] = errno
+    return result
+
+
 def _validate_url(url: str) -> None:
     parsed = urlsplit(url)
     if (
@@ -110,10 +141,13 @@ def _result(
     attempted: bool = False,
     http_status: int | None = None,
     provider_code: int | str | None = None,
+    transport_error_type: str | None = None,
+    transport_error_category: str | None = None,
+    transport_error_errno: int | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     current = now or datetime.now().astimezone()
-    return {
+    result = {
         "channel": "server_chan",
         "status": status,
         "reason_code": reason_code,
@@ -122,6 +156,13 @@ def _result(
         "provider_code": provider_code,
         "observed_at": current.isoformat(timespec="seconds"),
     }
+    if transport_error_type:
+        result["transport_error_type"] = transport_error_type
+    if transport_error_category:
+        result["transport_error_category"] = transport_error_category
+    if isinstance(transport_error_errno, int):
+        result["transport_error_errno"] = transport_error_errno
+    return result
 
 
 def _message_is_valid(title: str, body: str) -> bool:
@@ -186,21 +227,23 @@ def deliver_server_chan(
                 now=now,
             )
         )
-    except (ConnectionError, TimeoutError, OSError):
+    except (ConnectionError, TimeoutError, OSError) as exc:
         return safe(
             _result(
                 status="failed",
                 reason_code="transport_failed",
                 attempted=True,
+                **_transport_diagnostics(exc),
                 now=now,
             )
         )
-    except Exception:
+    except Exception as exc:
         return safe(
             _result(
                 status="failed",
                 reason_code="transport_failed",
                 attempted=True,
+                **_transport_diagnostics(exc),
                 now=now,
             )
         )

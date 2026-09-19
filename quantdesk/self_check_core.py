@@ -274,6 +274,31 @@ def find_hardcoded_project_paths(
     ),
 ) -> list[str]:
     """Walk ``root`` and return relative paths that contain any forbidden fragment."""
+
+    def contains_fragment(text: str, fragment: str) -> bool:
+        """Match a path fragment only at a path-segment boundary.
+
+        The hygiene check receives repository prefixes (for example,
+        ``E:/codex/quant``).  A plain substring check also matches distinct
+        sibling names such as ``quant_source_worktrees``.  Keep matching exact
+        prefixes and descendants while rejecting a longer name that merely
+        shares the prefix.
+        """
+        if not fragment:
+            return False
+        start = 0
+        while True:
+            index = text.find(fragment, start)
+            if index < 0:
+                return False
+            end = index + len(fragment)
+            if end == len(text):
+                return True
+            next_char = text[end]
+            if not (next_char.isalnum() or next_char in "_.-"):
+                return True
+            start = index + 1
+
     ignored = set(ignored_dirs)
     suffixes = set(allowed_suffixes)
     ignored_patterns = tuple(ignored_file_patterns)
@@ -303,7 +328,7 @@ def find_hardcoded_project_paths(
             # "E:/codex/quant".
             for allowed_fragment in excluded_fragments:
                 text = text.replace(allowed_fragment, "")
-            if any(fragment in text for fragment in forbidden_fragments):
+            if any(contains_fragment(text, fragment) for fragment in forbidden_fragments):
                 offenders.append(str(relative))
     return offenders
 

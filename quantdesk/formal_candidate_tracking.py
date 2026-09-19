@@ -19,7 +19,10 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Mapping
 
-from quantdesk.daily_candidate_refresh import verify_formal_candidate_batch
+from quantdesk.daily_candidate_refresh import (
+    resolve_chain_bound_formal_candidate_batch,
+    verify_formal_candidate_batch,
+)
 from quantdesk.price_basis import PRICE_BASIS_RAW, normalize_price_basis
 from quantdesk.shared import normalize_symbol
 from quantdesk.utils import atomic_write_json
@@ -204,6 +207,60 @@ def _load_formal_batch(
             reason_codes=list(dict.fromkeys(reasons)),
         )
     return batch, {}
+
+
+def load_tracking_formal_candidate_batch(
+    project_root: Path, *, target_date: str, authoritative_chain_run_id: str
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Bind tracking to a dated batch or a narrowly verified archived retry.
+
+    Never use mutable latest pointers. A missing or damaged dated batch cannot
+    be bypassed; only an otherwise valid batch belonging to an earlier run can
+    enter the shared same-day recovery resolver.
+    """
+    root = Path(project_root).resolve()
+    day = _strict_day(target_date)
+    run_id = _safe_run_id(authoritative_chain_run_id)
+    if not day or not run_id:
+        return None, _blocked(
+            target_date=day, run_id=run_id,
+            reason_codes=["formal_candidate_tracking_target_date_invalid"
+                          if not day else "formal_candidate_tracking_run_id_invalid"],
+        )
+    batch, blocked = _load_formal_batch(
+        root, target_date=day, authoritative_chain_run_id=run_id,
+    )
+    if batch is not None:
+        return batch, {
+            "source_path": f"results/candidate_refresh/daily/{day}.json",
+            "source_mode": "dated_verified_formal_batch",
+        }
+    if blocked.get("reason_codes") != ["formal_candidate_batch_source_run_mismatch"]:
+        return None, blocked
+
+    archive = root / "results" / "data_chain" / "runs" / run_id / "manifest.json"
+    manifest, read_error = _read_json_object(archive)
+    if read_error or manifest is None:
+        return None, blocked
+    if manifest.get("run_id") != run_id or manifest.get("target_date") != day:
+        return None, _blocked(
+            target_date=day, run_id=run_id,
+            reason_codes=["formal_candidate_tracking_archive_binding_mismatch"],
+        )
+    resolved = resolve_chain_bound_formal_candidate_batch(
+        root, data_chain_manifest=manifest,
+    )
+    recovered = resolved.get("batch")
+    if resolved.get("status") != "passed" or not isinstance(recovered, dict):
+        return None, _blocked(
+            target_date=day, run_id=run_id,
+            reason_codes=list(resolved.get("reason_codes") or [])
+            or ["formal_candidate_tracking_recovery_not_passed"],
+        )
+    return recovered, {
+        "source_path": _relative(root, Path(resolved["path"])),
+        "source_mode": str(resolved["source_mode"]),
+    }
 
 
 def _load_raw_history(
@@ -525,13 +582,13 @@ def materialize_formal_candidate_tracking(
             reason_codes=["formal_candidate_tracking_run_id_invalid"],
         )
 
-    batch, blocked = _load_formal_batch(
+    batch, source = load_tracking_formal_candidate_batch(
         root,
         target_date=normalized_date,
         authoritative_chain_run_id=run_id,
     )
     if batch is None:
-        return blocked
+        return source
 
     provenance = batch.get("provenance")
     provenance = provenance if isinstance(provenance, Mapping) else {}
@@ -579,15 +636,21 @@ def materialize_formal_candidate_tracking(
         "market_data_mutated": False,
         "disclaimer": DISCLAIMER,
     }
+    # Keep existing dated artifact hashes stable. Recovery artifacts explicitly
+    # record their run-scoped source; old immutable tracking is never replaced.
+    if source["source_mode"] == "run_scoped_conflict_recovery":
+        artifact.update(source)
     artifact["artifact_hash"] = _stable_hash(_artifact_projection(artifact))
     published = _publish(root, target_date=normalized_date, artifact=artifact)
     result = dict(artifact)
     result.update(published)
+    result.update(source)
     return result
 
 
 __all__ = [
     "FORMAL_CANDIDATE_TRACKING_SCHEMA_VERSION",
     "HORIZONS",
+    "load_tracking_formal_candidate_batch",
     "materialize_formal_candidate_tracking",
 ]

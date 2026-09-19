@@ -34,7 +34,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 from scripts.run_maintenance import main as run_maintenance_main  # noqa: E402
 from scripts.run_strategy_viability_sprint import main as run_strategy_viability_main  # noqa: E402
 
-TMP_ROOT = ROOT / ".quantdesk_test_tmp"
+TMP_ROOT = Path(tempfile.gettempdir()) / ".quantdesk_test_tmp"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 

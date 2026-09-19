@@ -30,6 +30,14 @@ DISCLAIMER = (
     "connect brokers, place real orders, or change strategy/backtest behavior."
 )
 AUDITED_UNREFERENCED_SERVER_ROUTES: dict[tuple[str, str], tuple[str, str, str]] = {
+    ("POST", "/api/daily/update-candidates"): (
+        "compatibility_alias", "keep_as_explicit_pipeline_alias",
+        "The legacy candidate update address invokes the shared full-A Pipeline only after explicit network authorization.",
+    ),
+    ("POST", "/api/data/repair-daily"): (
+        "retired_endpoint", "keep_gone_response_for_legacy_clients",
+        "The removed repair writer returns HTTP 410 without data writes; clients use the shared Pipeline entrypoint.",
+    ),
     (
         "GET",
         "/api/ai-trader/boundary",

@@ -157,7 +157,7 @@ class SelfCheckCoreVersionAndPathTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
     def test_find_hardcoded_project_paths_prunes_ignored_dirs(self) -> None:
-        tmp_parent = PROJECT_ROOT / ".quantdesk_test_tmp"
+        tmp_parent = Path(tempfile.gettempdir()) / "pathscan-fixtures"
         tmp_parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=tmp_parent) as tmp:
             root = Path(tmp)
@@ -171,6 +171,29 @@ class SelfCheckCoreVersionAndPathTests(unittest.TestCase):
             offenders = self_check_core.find_hardcoded_project_paths(root, ["E:\\codex\\quant"])
 
         self.assertEqual(offenders, [])
+
+    def test_find_hardcoded_project_paths_respects_path_segment_boundaries(self) -> None:
+        tmp_parent = Path(tempfile.gettempdir()) / "pathscan-fixtures"
+        tmp_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_parent) as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            (root / "docs" / "similar.md").write_text(
+                "E:/codex/quant_source_worktrees\n", encoding="utf-8"
+            )
+            (root / "docs" / "exact.md").write_text(
+                "E:/codex/quant/quantdesk\n", encoding="utf-8"
+            )
+
+            offenders = self_check_core.find_hardcoded_project_paths(
+                root, ["E:/codex/quant"]
+            )
+
+        # ``find_hardcoded_project_paths`` reports platform-native relative
+        # paths, so the expectation must be built the same way.  The CI full
+        # regression runs on Linux (python:3.11-slim), where a hardcoded
+        # backslash expectation would fail for the wrong reason.
+        self.assertEqual(offenders, [str(Path("docs") / "exact.md")])
 
 
 class SelfCheckCoreCleanZipTests(unittest.TestCase):
@@ -319,5 +342,4 @@ class CodebaseSlimmingDocsTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
-
 

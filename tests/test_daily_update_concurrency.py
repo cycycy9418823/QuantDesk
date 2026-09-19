@@ -6,7 +6,7 @@ import time
 import pandas as pd
 
 
-def test_daily_update_workers_fetch_symbols_concurrently(monkeypatch) -> None:
+def test_daily_update_workers_fetch_symbols_concurrently(monkeypatch, tmp_path) -> None:
     from quantdesk import daily_price_update_engine as engine
 
     symbols = ["600000", "600001", "600002", "600003"]
@@ -104,6 +104,7 @@ def test_daily_update_workers_fetch_symbols_concurrently(monkeypatch) -> None:
     monkeypatch.setattr(engine, "theme_map_status", lambda: {})
     monkeypatch.setattr(engine, "daily_feature_status", lambda: {})
     monkeypatch.setattr(engine, "atomic_write_json", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine, "DAILY_DIR", tmp_path / "daily")
 
     payload = engine.update_daily_prices(
         target_date="2026-07-16",
@@ -114,7 +115,7 @@ def test_daily_update_workers_fetch_symbols_concurrently(monkeypatch) -> None:
         write_result=False,
     )
 
-    assert payload["status"] == "completed"
+    assert payload["status"] == "completed", payload
     assert payload["updated_symbols"] == 4
     assert max_active >= 2
 

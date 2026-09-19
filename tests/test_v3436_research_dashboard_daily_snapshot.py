@@ -20,7 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover - unittest discovery adds tests/
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = Path(sys.executable)
-TEST_TMP_ROOT = PROJECT_ROOT / ".quantdesk_test_tmp"
+TEST_TMP_ROOT = Path(tempfile.gettempdir()) / ".quantdesk_test_tmp"
 DAILY_CLI_TIMEOUT_SECONDS = 300
 
 

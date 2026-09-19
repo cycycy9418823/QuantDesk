@@ -183,7 +183,7 @@ def build_minute_universe_coverage(chain: dict[str, Any] | None) -> dict[str, An
                 "status": "separate_historical_queue",
                 "requested_count": None,
                 "coverage_ratio": None,
-                "detail": "独立历史扩展队列；不参与当天 914 分析池质量门。",
+                "detail": "按需历史研究，不参与每日收盘完成判定。",
             },
         },
         "retry_symbols": list(payload.get("retry_symbols") or []),
@@ -196,7 +196,7 @@ def build_formal_daily_chain_status(
     *,
     scheduler: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Small UI-facing summary of the authoritative 914-symbol data chain."""
+    """Summarize full-A daily research and its separately requested minute scope."""
 
     payload = chain if isinstance(chain, dict) else {}
     schedule = scheduler if isinstance(scheduler, dict) else {}
@@ -232,18 +232,16 @@ def build_formal_daily_chain_status(
     missing_or_retry = sorted(dict.fromkeys(retry_symbols + failed_symbols))
     chain_status = str(payload.get("status") or "not_run")
     analysis_status = str(analysis.get("status") or "")
-    analysis_requested = int(
-        analysis.get("requested_count")
-        or analysis_universe.get("symbol_count")
-        or 0
-    )
+    analysis_requested = int(analysis.get("requested_count", analysis_universe.get("symbol_count", 0)) or 0)
     analysis_complete = int(
         analysis.get("complete_session_count")
         or analysis.get("formal_execution_eligible_count")
         or 0
     )
     pool_status = "missing"
-    if chain_status == "completed" and analysis_status == "passed":
+    if analysis_status == "not_requested":
+        pool_status = "not_requested"
+    elif chain_status == "completed" and analysis_status == "passed":
         pool_status = "full_pool"
     elif chain_status in {"completed", "partial", "blocked", "failed"} or analysis_status:
         pool_status = "partial_pool"

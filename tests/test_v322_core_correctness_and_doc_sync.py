@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,9 +11,55 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _write_offline_calendar(path: Path) -> None:
+    from scripts.build_trading_calendar import build_offline_calendar, write_calendar
+
+    rows = build_offline_calendar("2020-01-01", "2027-12-31", source="offline")
+    write_calendar(rows, path)
+
+
 class TradingCalendarStaticDataTests(unittest.TestCase):
+    """Validate the generated calendar asset contract using an offline fixture.
+
+    ``data/calendar/a_share_trading_calendar.csv`` is a generated local data
+    asset, not tracked source. Build a complete deterministic calendar with the
+    project's offline builder and point the default loader paths at it so the
+    contract (coverage, provisional 2027, holiday closure, self-check PASS) is
+    proven offline. Whether the real machine has produced the asset stays a
+    real-site item.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.mkdtemp(prefix="qd_calendar_v322_")
+        cls.fixture = (
+            Path(cls._tmp) / "data" / "calendar" / "a_share_trading_calendar.csv"
+        )
+        _write_offline_calendar(cls.fixture)
+
+        from quantdesk import market_clock, trading_calendar
+        from scripts import self_check
+
+        cls._patchers = [
+            mock.patch.object(trading_calendar, "DEFAULT_TRADING_CALENDAR_CSV", cls.fixture),
+            mock.patch.object(market_clock, "DEFAULT_CN_TRADING_CALENDAR_PATH", cls.fixture),
+            mock.patch.object(self_check, "PROJECT_ROOT", Path(cls._tmp)),
+        ]
+        for patcher in cls._patchers:
+            patcher.start()
+        trading_calendar.clear_calendar_cache()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        from quantdesk import trading_calendar
+
+        for patcher in reversed(cls._patchers):
+            patcher.stop()
+        trading_calendar.clear_calendar_cache()
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
     def test_calendar_csv_exists_and_covers_required_range(self) -> None:
-        path = ROOT / "data" / "calendar" / "a_share_trading_calendar.csv"
+        path = self.fixture
         self.assertTrue(path.exists(), "data/calendar/a_share_trading_calendar.csv must exist")
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))
@@ -22,7 +69,7 @@ class TradingCalendarStaticDataTests(unittest.TestCase):
         self.assertGreaterEqual(max(dates), "2027-12-31")
 
     def test_2027_rows_are_marked_provisional(self) -> None:
-        path = ROOT / "data" / "calendar" / "a_share_trading_calendar.csv"
+        path = self.fixture
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
             rows = [row for row in csv.DictReader(handle) if row["date"].startswith("2027-")]
         self.assertGreater(len(rows), 0)

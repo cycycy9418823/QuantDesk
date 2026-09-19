@@ -154,8 +154,8 @@ def _case(*, sellable: int = 200, last_buy_date: str = "2026-06-01", quantity: i
 def _minute_frame(day: str = "2026-07-13") -> pd.DataFrame:
     return pd.DataFrame(
         [
-            {"symbol": "600000", "datetime": f"{day} 09:30:00", "open": 10.2, "high": 10.3, "low": 10.1, "close": 10.25, "volume": 1000, "amount": 10250},
-            {"symbol": "600000", "datetime": f"{day} 09:31:00", "open": 10.25, "high": 10.35, "low": 10.2, "close": 10.3, "volume": 1200, "amount": 12360},
+            {"symbol": "600000", "datetime": f"{day} 09:30:00", "open": 10.2, "high": 10.3, "low": 10.1, "close": 10.25, "volume": 1000, "amount": 10250, "adjust": "raw"},
+            {"symbol": "600000", "datetime": f"{day} 09:31:00", "open": 10.25, "high": 10.35, "low": 10.2, "close": 10.3, "volume": 1200, "amount": 12360, "adjust": "raw"},
         ]
     )
 

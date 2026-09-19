@@ -8,6 +8,8 @@ from typing import Any
 
 import pandas as pd
 
+from quantdesk.market_clock import to_shanghai_datetime
+
 
 @dataclass
 class NewsFetchStatus:
@@ -31,7 +33,9 @@ NEWS_HEALTH_COLUMNS = [field.name for field in NewsFetchStatus.__dataclass_field
 
 
 def now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Shanghai-local so the news-status date is correct regardless of host
+    # timezone (e.g. right after Shanghai midnight).
+    return to_shanghai_datetime().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _symbol(value: Any) -> str:

@@ -13,7 +13,7 @@ except ModuleNotFoundError:  # pragma: no cover - unittest discovery adds tests/
     from _isolated_project import IsolatedProject
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TEST_TMP_ROOT = PROJECT_ROOT / ".quantdesk_test_tmp"
+TEST_TMP_ROOT = Path(tempfile.gettempdir()) / ".quantdesk_test_tmp"
 # The real local data workspace currently needs about 179 seconds for one
 # offline daily run. Keep a material Windows I/O margin while preserving every
 # return-code and payload assertion below.
@@ -113,8 +113,12 @@ class V334DailyOutputSummaryArtifactFollowthroughTests(unittest.TestCase):
         artifacts = payload["artifacts"]
         self.assertEqual(artifacts.get("daily_report"), "reports/daily_quant_report_latest.md")
         self.assertEqual(artifacts.get("daily_result"), "results/daily_workflow_latest.json")
-        self.assertIn("data_health", artifacts)
-        self.assertIn("command_center", artifacts)
+        self.assertNotIn("data_health", artifacts)
+        self.assertNotIn("command_center", artifacts)
+        self.assertIn("daily_features", payload["input_artifacts"])
+        for relative in artifacts.values():
+            if isinstance(relative, str):
+                self.assertTrue((self.isolated_project_root / relative).is_file(), relative)
         self.assertNotEqual(payload.get("workflow_status"), "failed")
 
     def test_status_reads_recent_daily_and_mentions_report_path(self) -> None:

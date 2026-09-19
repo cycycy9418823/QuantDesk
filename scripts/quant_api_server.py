@@ -226,9 +226,7 @@ def _run_full_market_catchup_for_route(
     max_symbols: int,
     priority_only: bool,
 ) -> dict[str, Any]:
-    from quantdesk.full_market_catchup_updater import run_full_market_catchup
-
-    return run_full_market_catchup(root, network=network, max_symbols=max_symbols, priority_only=priority_only)
+    return run_startup_data_update(root, enable_network=network)
 
 
 register_system_routes(app, build_id=SERVER_BUILD_ID, asset_versions_func=daily_research_asset_versions)
@@ -324,7 +322,9 @@ register_daily_generation_routes(
         realtime_network_enabled=lambda: realtime_network_enabled(),
         request_truthy=lambda value: request_truthy(value),
         candidate_rows=lambda limit: candidate_rows(limit=limit),
-        update_daily_prices=lambda **kwargs: update_daily_prices(**kwargs),
+        update_daily_prices=lambda **kwargs: run_startup_data_update(
+            project_root, enable_network=bool(kwargs.get("network")),
+        ),
         generate_daily_recommendations=lambda *args, **kwargs: generate_daily_recommendations(*args, **kwargs),
         append_paper_simulation_sync_to_generation_payload=lambda *args, **kwargs: (
             append_paper_simulation_sync_to_generation_payload(*args, **kwargs)
@@ -969,7 +969,7 @@ def startup_update_explanation(payload: dict[str, Any]) -> dict[str, Any]:
     generation = payload.get("candidate_generation") if isinstance(payload.get("candidate_generation"), dict) else {}
     summary = payload.get("current_candidate_gap_summary") if isinstance(payload.get("current_candidate_gap_summary"), dict) else {}
     update_result = payload.get("update_result") if isinstance(payload.get("update_result"), dict) else {}
-    target_date = str(generation.get("target_date") or payload.get("target_date") or summary.get("target_date") or "")[:10]
+    target_date = str(payload.get("target_date") or generation.get("target_date") or summary.get("target_date") or "")[:10]
     latest_local = str(
         payload.get("current_candidate_latest_date_min")
         or payload.get("latest_local_date_after")
@@ -993,6 +993,16 @@ def startup_update_explanation(payload: dict[str, Any]) -> dict[str, Any]:
         reason_label = "正在后台更新"
         summary_text = "页面打开后已触发后台数据更新，当前显示仍可能来自本地缓存。"
         next_action = "等待状态刷新完成；完成后页面会重新读取今日重点和纸面池。"
+    elif status in {"failed", "timeout", "timed_out", "interrupted", "aborted", "blocked", "provider_failed", "cancelled"}:
+        reason_code = "interrupted" if status in {"interrupted", "aborted", "cancelled"} else "provider_failed"
+        reason_label = "上次更新中断" if reason_code == "interrupted" else "更新失败或超时"
+        summary_text = str(payload.get("message") or "该次更新没有完成，已保留原诊断和本地数据。")
+        next_action = "查看这次更新的失败明细；收盘后由全 A 数据更新流程继续处理。"
+    elif status in {"unknown", "unreadable", "not_run", "missing", "skipped", "network_disabled"}:
+        reason_code = "record_unverified" if status in {"unknown", "unreadable"} else "not_attempted"
+        reason_label = "更新记录尚未核实" if reason_code == "record_unverified" else "本次未执行更新"
+        summary_text = str(payload.get("message") or "没有可核实的本次更新完成记录；当前数据仅作本地观察。")
+        next_action = "查看全 A 收盘更新状态和最近一次成功记录。"
     elif not attempted:
         reason_code = "not_attempted"
         reason_label = "本次打开未执行自动更新"
@@ -1002,12 +1012,12 @@ def startup_update_explanation(payload: dict[str, Any]) -> dict[str, Any]:
         reason_code = "network_not_authorized"
         reason_label = "未授权联网刷新"
         summary_text = "本次启动没有显式授权外部 provider，系统只能读取本地缓存和 CSV。"
-        next_action = "需要最新行情时，在本地确认网络开关后执行当前研究池更新。"
+        next_action = "盘中使用显式报价刷新；完整日线由全 A 收盘更新流程处理。"
     elif status in {"failed", "timeout", "blocked"}:
         reason_code = "provider_failed"
         reason_label = "provider 更新失败或超时"
         summary_text = str(payload.get("message") or "外部数据源返回失败、超时或被本地网络限制；已保留本地缓存。")
-        next_action = "稍后重试当前研究池更新；如果连续失败，查看 provider 失败明细或手工导入 CSV。"
+        next_action = "查看 provider 失败明细；完整日线由全 A 收盘更新流程处理。"
     elif generation.get("freshness_status") == "stale":
         reason_code = "recommendation_stale"
         reason_label = "研究候选批次滞后"
@@ -1600,8 +1610,8 @@ def search_stock_rows(query: str, limit: int = 8) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     direct_quote_result: dict[str, Any] = {}
-    if realtime_network_enabled() and q_symbol and len(q_symbol) == 6:
-        direct_quote_result = refresh_single_quote_cache(q_symbol)
+    # Search is an observation endpoint. Refresh intent belongs to the explicit
+    # stock POST route, independently of whether network use is enabled.
 
     def add(row: dict[str, Any]) -> None:
         symbol = normalize_symbol(str(row.get("symbol") or ""))
@@ -1655,7 +1665,7 @@ def search_stock_rows(query: str, limit: int = 8) -> list[dict[str, Any]]:
                 if len(rows) >= limit:
                     return rows
         except Exception as exc:  # noqa: BLE001 - local search should continue across fallback files
-            LOG.warning("stock_search_local_file_failed: path=%s query=%r error=%s", path, query, exc)
+            LOG.warning("stock_search_local_file_failed: path=%s query=%r error=%s", listings, query, exc)
 
     if q_symbol and q_symbol not in seen:
         add({"symbol": q_symbol, "name": candidate_name(q_symbol), "price": "数据缺失", "pct_chg": "数据缺失", "source": "代码输入"})
@@ -1677,43 +1687,11 @@ def ensure_single_stock_daily_with_auth(
     network_allowed: bool,
 ) -> dict[str, Any]:
     clean_symbol = normalize_symbol(symbol)
-    if not refresh_daily:
-        return {
-            "attempted": False,
-            "network_authorized": bool(network_allowed),
-            "message": "未请求补全该股票完整日线。",
-        }
-    if not network_allowed:
-        return {
-            "attempted": False,
-            "network_authorized": False,
-            "message": "当前请求未显式授权联网补全；仅读取本地日线。",
-        }
-    try:
-        payload = update_daily_prices(
-            only_low_price=False,
-            symbols=[clean_symbol],
-            limit=1,
-            network=True,
-            dry_run=False,
-            rebuild_features=False,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "attempted": True,
-            "network_authorized": True,
-            "status": "failed",
-            "message": f"单股完整日线补全失败：{exc}",
-        }
     return {
-        "attempted": True,
-        "network_authorized": True,
-        "status": payload.get("status", ""),
-        "target_date": payload.get("target_date", ""),
-        "latest_local_date_after": payload.get("latest_local_date_after", ""),
-        "updated_symbols": payload.get("updated_symbols", 0),
-        "failed_symbols": payload.get("failed_symbols", 0),
-        "message": payload.get("message", ""),
+        "attempted": False, "status": "read_only", "symbol": clean_symbol,
+        "network_authorized": bool(network_allowed), "canonical_write": False,
+        "daily_writer": "data_close_pipeline", "update_endpoint": "/api/data/update-all",
+        "message": "仅读取已有日线。" if not refresh_daily else "单股查看不补写日线；日线缺口保留到收盘更新。",
     }
 
 
@@ -6313,334 +6291,36 @@ def _write_startup_status_payload(payload: dict[str, Any]) -> None:
 
 
 def _run_startup_refresh_worker(reason: str, request_id: str | None = None) -> None:
+    """Run an explicitly requested close update using the single daily writer."""
     request_id = request_id or datetime.now().isoformat(timespec="seconds")
     _set_startup_refresh_state(
-        running=True,
-        status="running",
-        reason=reason,
-        started_at=request_id,
-        request_id=request_id,
-        message_for_ui="正在后台尝试刷新当前研究池；若外部数据源不可达，会回退到本地最新完整日线。",
-    )
-    try:
-        python = Path(sys.executable)
-        script = project_root / "scripts" / "startup_data_update.py"
-        command = [
-            str(python),
-            str(script),
-            "--enable-network",
-            "--max-symbols",
-            "18",
-            "--rebuild-features",
-            "true",
-            "--generate-candidates",
-            "true",
-            "--candidate-max-scan-symbols",
-            "300",
-            "--candidate-max-candidates",
-            "18",
-            "--json",
-            "true",
-        ]
-        result = subprocess.run(
-            command,
-            cwd=str(project_root),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=45,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        stdout = (result.stdout or "").strip()
-        payload = json.loads(stdout.splitlines()[-1]) if stdout else {}
-        if not isinstance(payload, dict) or not payload:
-            payload = {
-                "task_id": "startup_data_update",
-                "status": "failed" if result.returncode else "completed_with_warnings",
-                "message": "Startup refresh finished without a readable JSON payload.",
-                "stdout_tail": stdout[-1200:],
-                "stderr_tail": (result.stderr or "")[-1200:],
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-                "research_only": True,
-                "paper_only": True,
-                "no_broker": True,
-                "no_live_trading": True,
-                "no_auto_execution": True,
-                "no_buy_sell_advice": True,
-                "no_position_advice": True,
-                "no_real_money_allocation": True,
-            }
-        _set_startup_refresh_state(
-            running=False,
-            status=str(payload.get("status") or "completed"),
-            request_id=request_id,
-            message_for_ui=str(payload.get("message") or payload.get("current_message") or "Startup refresh completed."),
-        )
-    except subprocess.TimeoutExpired:
-        failure = {
-            "task_id": "startup_data_update",
-            "status": "timeout",
-            "startup_update_attempted": True,
-            "provider_network_authorized": True,
-            "network": True,
-            "dry_run": False,
-            "message": "Startup refresh timed out after 45 seconds and fell back to local latest daily data.",
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "research_only": True,
-            "paper_only": True,
-            "no_broker": True,
-            "no_live_trading": True,
-            "no_auto_execution": True,
-            "no_buy_sell_advice": True,
-            "no_position_advice": True,
-            "no_real_money_allocation": True,
-        }
-        STARTUP_UPDATE_JSON.parent.mkdir(parents=True, exist_ok=True)
-        STARTUP_UPDATE_JSON.write_text(json.dumps(clean_payload(failure), ensure_ascii=False, indent=2), encoding="utf-8")
-        _set_startup_refresh_state(
-            running=False,
-            status="timeout",
-            request_id=request_id,
-            message_for_ui=str(failure["message"]),
-        )
-    except Exception as exc:  # noqa: BLE001
-        failure = {
-            "task_id": "startup_data_update",
-            "status": "failed",
-            "startup_update_attempted": True,
-            "provider_network_authorized": True,
-            "network": True,
-            "dry_run": False,
-            "message": f"Startup refresh failed: {type(exc).__name__}: {exc}",
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "research_only": True,
-            "paper_only": True,
-            "no_broker": True,
-            "no_live_trading": True,
-            "no_auto_execution": True,
-            "no_buy_sell_advice": True,
-            "no_position_advice": True,
-            "no_real_money_allocation": True,
-        }
-        STARTUP_UPDATE_JSON.parent.mkdir(parents=True, exist_ok=True)
-        STARTUP_UPDATE_JSON.write_text(json.dumps(clean_payload(failure), ensure_ascii=False, indent=2), encoding="utf-8")
-        _set_startup_refresh_state(
-            running=False,
-            status="failed",
-            request_id=request_id,
-            message_for_ui=str(failure["message"]),
-        )
-
-
-def _startup_focus_symbols(limit: int = 30) -> list[str]:
-    """Today's focus candidates + active paper-pool symbols (deduped).
-
-    Used to pull fresh 1-minute bars on startup so the detail charts have the
-    latest intraday data for the names the user actually looks at. Bounded and
-    best-effort; never raises.
-    """
-    syms: list[str] = []
-    seen: set[str] = set()
-
-    def _add(sym: Any) -> None:
-        s = normalize_symbol(sym)
-        if s and s not in seen:
-            seen.add(s)
-            syms.append(s)
-
-    try:
-        for row in annotate_recommendation_priorities(candidate_rows(limit=18)):
-            if row.get("is_today_recommendation"):
-                _add(row.get("symbol"))
-    except Exception as exc:  # noqa: BLE001 - best-effort symbol collection
-        LOG.warning("startup_focus_symbols_candidates_failed: %s", exc)
-    try:
-        watch = load_paper_simulation_watchlist()
-        for item in watch.get("items") or []:
-            if isinstance(item, dict) and str(item.get("paper_lifecycle_state") or "") != "archived":
-                _add(item.get("symbol"))
-    except Exception as exc:  # noqa: BLE001 - best-effort symbol collection
-        LOG.warning("startup_focus_symbols_paper_failed: %s", exc)
-    return syms[: max(1, int(limit))]
-
-
-def _run_startup_refresh_worker(reason: str, request_id: str | None = None) -> None:
-    """Run the page-open startup refresh to completion in the server process.
-
-    The previous implementation spawned ``startup_data_update.py`` with a
-    45-second timeout. Slow providers could be killed after partially updating
-    CSV files, leaving the UI with stale recommendations and a vague timeout
-    status. Keeping this in-process lets the background task finish and keeps
-    the detailed update payload intact.
-    """
-    request_id = request_id or datetime.now().isoformat(timespec="seconds")
-    _set_startup_refresh_state(
-        running=True,
-        status="running",
-        reason=reason,
-        started_at=request_id,
-        request_id=request_id,
-        message_for_ui=(
-            "正在后台刷新当前研究池日线，并在完成后重新生成今日研究候选；"
-            "如果外部数据源失败，会保留具体失败明细。"
-        ),
+        running=True, status="running", reason=reason, request_id=request_id,
+        started_at=request_id, message_for_ui="正在运行全 A 收盘更新。",
     )
     if not DATA_WRITE_LOCK.acquire(blocking=False):
-        failure = {
-            "task_id": "startup_data_update",
-            "status": "busy",
-            "startup_update_attempted": True,
-            "provider_network_authorized": True,
-            "network": True,
-            "dry_run": False,
-            "message": "Startup refresh skipped because another data-write task is running.",
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "research_only": True,
-            "paper_only": True,
-            "no_broker": True,
-            "no_live_trading": True,
-            "no_auto_execution": True,
-            "no_buy_sell_advice": True,
-            "no_position_advice": True,
-            "no_real_money_allocation": True,
-        }
-        _write_startup_status_payload(failure)
         _set_startup_refresh_state(
-            running=False,
-            status="busy",
-            request_id=request_id,
-            message_for_ui=str(failure["message"]),
+            running=False, status="busy", request_id=request_id,
+            message_for_ui="另一个数据更新正在进行。",
         )
         return
     try:
-        payload = run_startup_data_update(
-            project_root,
-            enable_network=True,
-            max_symbols=80,
-            providers=None,
-            rebuild_features=True,
-            generate_candidates=True,
-            candidate_max_scan_symbols=300,
-            candidate_max_candidates=18,
-        )
-        if not isinstance(payload, dict) or not payload:
-            payload = {
-                "task_id": "startup_data_update",
-                "status": "completed_with_warnings",
-                "startup_update_attempted": True,
-                "provider_network_authorized": True,
-                "network": True,
-                "dry_run": False,
-                "message": "Startup refresh finished without a readable payload.",
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-                "research_only": True,
-                "paper_only": True,
-                "no_broker": True,
-                "no_live_trading": True,
-                "no_auto_execution": True,
-                "no_buy_sell_advice": True,
-                "no_position_advice": True,
-                "no_real_money_allocation": True,
-            }
-        else:
-            payload = append_paper_simulation_sync_to_generation_payload(
-                payload,
-                max_candidates=18,
-                sync_paper=True,
-            )
-        # Best-effort minute / intraday refresh on each startup so the latest
-        # minute snapshot is pulled alongside the daily update. Self-gating (only
-        # fetches during a trading session) and bounded (<=80 symbols, 20s); the
-        # try/except guarantees a provider/network failure never breaks the daily
-        # refresh path. Research only — realtime quote snapshot, no orders.
-        try:
-            from quantdesk.intraday_snapshot_updater import run_intraday_snapshot_update
-            payload["intraday_snapshot_update"] = run_intraday_snapshot_update(
-                project_root, network=True, max_symbols=80, timeout_seconds=20
-            )
-        except Exception as exc:  # noqa: BLE001 - intraday refresh is best-effort
-            payload["intraday_snapshot_update"] = {
-                "task_id": "v424_intraday_snapshot_update",
-                "status": "failed",
-                "message": f"{type(exc).__name__}: {exc}",
-            }
-        # Focus-stock minute bars: pull full 1-minute K-line for today's focus +
-        # active paper-pool symbols so detail charts have fresh intraday data on
-        # startup. Bounded to the focus set, best-effort (never breaks the daily
-        # path). Research only.
-        try:
-            from quantdesk.intraday.intraday_update_engine import update_intraday_1m_for_symbols
-            focus_syms = _startup_focus_symbols(limit=30)
-            if focus_syms:
-                payload["intraday_1m_update"] = update_intraday_1m_for_symbols(
-                    symbols=focus_syms,
-                    network=True,
-                    max_symbols=len(focus_syms),
-                )
-        except Exception as exc:  # noqa: BLE001 - 1m refresh is best-effort
-            payload["intraday_1m_update"] = {
-                "task_id": "intraday_1m_update",
-                "status": "failed",
-                "message": f"{type(exc).__name__}: {exc}",
-            }
-        # Low-price pool catch-up: refresh ONLY the low-price symbols still behind
-        # the target completed trading day (e.g. names not in the candidate
-        # ledger, like 600000), so the data-health layer is not held red by a few
-        # stale stocks. Targeted + bounded + best-effort.
-        try:
-            if safe_int(payload.get("stale_count_after"), 0) > 0:
-                from quantdesk.daily_price_update_engine import daily_price_status as _dps
-                from quantdesk.daily_price_update_engine import update_daily_prices as _udp
-                stale_syms = [s for s in ((_dps(only_low_price=True) or {}).get("stale_symbols") or []) if s][:40]
-                if stale_syms:
-                    payload["low_price_pool_catchup"] = _udp(
-                        only_low_price=True,
-                        network=True,
-                        symbols=stale_syms,
-                        limit=len(stale_syms),
-                        rebuild_features=False,
-                        workers=4,
-                    )
-        except Exception as exc:  # noqa: BLE001 - catch-up is best-effort
-            payload["low_price_pool_catchup"] = {
-                "task_id": "low_price_pool_catchup",
-                "status": "failed",
-                "message": f"{type(exc).__name__}: {exc}",
-            }
+        payload = run_startup_data_update(project_root, enable_network=True)
         _write_startup_status_payload(payload)
         _set_startup_refresh_state(
-            running=False,
-            status=str(payload.get("status") or "completed"),
-            request_id=request_id,
-            message_for_ui=str(payload.get("message") or payload.get("current_message") or "Startup refresh completed."),
+            running=False, status=str(payload.get("status") or "failed"),
+            request_id=request_id, message_for_ui=str(payload.get("message") or ""),
         )
-    except Exception as exc:  # noqa: BLE001
-        failure = {
-            "task_id": "startup_data_update",
-            "status": "failed",
-            "startup_update_attempted": True,
-            "provider_network_authorized": True,
-            "network": True,
-            "dry_run": False,
-            "message": f"Startup refresh failed: {type(exc).__name__}: {exc}",
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "research_only": True,
-            "paper_only": True,
-            "no_broker": True,
-            "no_live_trading": True,
-            "no_auto_execution": True,
-            "no_buy_sell_advice": True,
-            "no_position_advice": True,
-            "no_real_money_allocation": True,
+    except Exception as exc:
+        payload = {
+            "task_id": "startup_data_update", "status": "failed", "ok": False,
+            "daily_writer": "data_close_pipeline", "scope": "full_a",
+            "request_id": request_id, "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "message": f"收盘更新失败：{type(exc).__name__}: {exc}",
+            "research_only": True, "paper_only": True, "no_broker": True,
         }
-        _write_startup_status_payload(failure)
-        _set_startup_refresh_state(
-            running=False,
-            status="failed",
-            request_id=request_id,
-            message_for_ui=str(failure["message"]),
-        )
+        _write_startup_status_payload(payload)
+        _set_startup_refresh_state(running=False, status="failed", request_id=request_id,
+                                  message_for_ui=payload["message"])
     finally:
         DATA_WRITE_LOCK.release()
 
@@ -7338,8 +7018,8 @@ def main() -> int:
         action="store_true",
         help="Permit explicit startup data refresh network access. Research-only; no broker route.",
     )
-    parser.add_argument("--update-max-symbols", type=int, default=80, help="Maximum current-pool symbols to update at startup")
-    parser.add_argument("--update-providers", default="", help="Comma-separated daily providers for startup update")
+    parser.add_argument("--update-max-symbols", type=int, default=80, help="Legacy option; updates now use the full-A Pipeline")
+    parser.add_argument("--update-providers", default="", help="Legacy option; Pipeline owns its provider policy")
     parser.add_argument(
         "--enable-realtime-network",
         action="store_true",
@@ -7387,12 +7067,7 @@ def main() -> int:
                 max_symbols=max(0, int(args.update_max_symbols or 0)),
                 providers=providers,
                 rebuild_features=True,
-                generate_candidates=True,
-            )
-            payload = append_paper_simulation_sync_to_generation_payload(
-                payload if isinstance(payload, dict) else {},
-                max_candidates=18,
-                sync_paper=True,
+                generate_candidates=False,
             )
             _write_startup_status_payload(payload)
             generation = payload.get("candidate_generation") if isinstance(payload.get("candidate_generation"), dict) else {}

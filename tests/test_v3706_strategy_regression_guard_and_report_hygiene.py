@@ -121,7 +121,7 @@ class V3706StrategyRegressionGuardTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        tmp_root = ROOT / ".quantdesk_test_tmp"
+        tmp_root = Path(tempfile.gettempdir()) / ".quantdesk_test_tmp"
         tmp_root.mkdir(parents=True, exist_ok=True)
         cls._shared_tmp = tempfile.TemporaryDirectory(dir=tmp_root)
         cls._shared_root = Path(cls._shared_tmp.name)

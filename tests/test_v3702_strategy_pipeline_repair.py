@@ -63,7 +63,7 @@ class StrategyPipelineRepairV3702Tests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls._shared_tmp = tempfile.TemporaryDirectory(dir=ROOT / ".quantdesk_test_tmp")
+        cls._shared_tmp = tempfile.TemporaryDirectory()
         cls._shared_root = Path(cls._shared_tmp.name)
         daily = cls._shared_root / "data" / "daily"
         for idx in range(12):
@@ -86,7 +86,7 @@ class StrategyPipelineRepairV3702Tests(unittest.TestCase):
         return cls._shared_baseline_payload
 
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(dir=ROOT / ".quantdesk_test_tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.daily = self.root / "data" / "daily"
         self.daily.mkdir(parents=True, exist_ok=True)

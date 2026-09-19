@@ -2074,6 +2074,61 @@ def build_word_report(
         report_dir=REPORT_DIR,
         helpers=word_report_helpers(),
     )
+
+
+def _restore_report_artifact_group(paths: dict, previous: dict) -> None:
+    """Restore the prior coherent report group after a partial save failure.
+
+    Only artifacts whose bytes actually changed are rewritten, so a fault that
+    fires on the first write leaves nothing to undo (and cannot re-trigger on
+    the restore of an untouched file).
+    """
+
+    for name, path in paths.items():
+        old = previous.get(name)
+        current = path.read_bytes() if path.is_file() else None
+        if current == old:
+            continue
+        try:
+            if old is None:
+                if path.is_file():
+                    path.unlink()
+            else:
+                path.write_bytes(old)
+        except OSError as restore_exc:  # noqa: BLE001 - best effort, original error re-raised
+            logging.warning("Failed to restore prior report artifact %s: %s", path, restore_exc)
+
+
+def _record_report_publish_failure(report_dir: Path, report_date: str, run_stamp, paths: dict, previous: dict, exc: BaseException) -> None:
+    """Persist this round's failure and per-artifact new/old ownership."""
+
+    ownership = {}
+    for name, path in paths.items():
+        old = previous.get(name)
+        current = path.read_bytes() if path.is_file() else None
+        ownership[name] = {
+            "path": str(path),
+            "previous": "present" if old is not None else "absent",
+            "after_failure": "present" if current is not None else "absent",
+            "restored_to_previous": current == old,
+        }
+    receipt = {
+        "status": "publish_failed",
+        "refresh_success": False,
+        "failed_steps": [f"daily_report_save:{type(exc).__name__}"],
+        "report_date": report_date,
+        "attempted_at": run_stamp.isoformat(timespec="seconds"),
+        "error": f"{type(exc).__name__}: {exc}",
+        "artifact_ownership": ownership,
+        "previous_success_preserved": all(item["restored_to_previous"] for item in ownership.values()),
+        "disclaimer": "Daily report publish failure record; research output only, not trading advice.",
+    }
+    try:
+        atomic_write_json(report_dir / f"{report_date}_quant_report_failure.json", receipt)
+    except Exception as record_exc:  # noqa: BLE001 - recording must not mask the real error
+        logging.warning("Failed to write report publish failure receipt: %s", record_exc)
+
+
 def write_report(
     features: pd.DataFrame,
     spot: pd.DataFrame,
@@ -2506,7 +2561,21 @@ This is the stable long-term watch pool. It changes slower than the daily candid
 - Sell/risk rule: use the listed stop level, MA20 trend break, or score deterioration.
 """
     report_path = REPORT_DIR / f"{report_date}_quant_report.md"
-    report_path.write_text(report, encoding="utf-8-sig")
+    dated_meta_path = REPORT_DIR / f"{report_date}_quant_report_meta.json"
+    latest_meta_path = REPORT_DIR / "latest_quant_report_meta.json"
+    word_path = REPORT_DIR / f"{report_date}_quant_report.docx"
+    report_artifacts = {
+        "md": report_path,
+        "dated_meta": dated_meta_path,
+        "latest_meta": latest_meta_path,
+        "word": word_path,
+    }
+    # Snapshot the previous coherent success group so a partial save can be
+    # rolled back instead of leaving a mixed-round report set on disk.
+    previous_group = {
+        name: (path.read_bytes() if path.is_file() else None)
+        for name, path in report_artifacts.items()
+    }
     app_config = args.loaded_config if isinstance(getattr(args, "loaded_config", None), dict) else {}
     app_section = app_config.get("app") if isinstance(app_config.get("app"), dict) else {}
     report_meta = {
@@ -2526,9 +2595,15 @@ This is the stable long-term watch pool. It changes slower than the daily candid
         "payload_loaded_at": run_stamp.isoformat(timespec="seconds"),
         **local_daily_cache_stats_payload(),
     }
-    atomic_write_json(REPORT_DIR / f"{report_date}_quant_report_meta.json", report_meta)
-    atomic_write_json(REPORT_DIR / "latest_quant_report_meta.json", report_meta)
-    docx_path = build_word_report(features, spot, metrics, args, report_date, backtest_files)
+    try:
+        report_path.write_text(report, encoding="utf-8-sig")
+        atomic_write_json(dated_meta_path, report_meta)
+        atomic_write_json(latest_meta_path, report_meta)
+        docx_path = build_word_report(features, spot, metrics, args, report_date, backtest_files)
+    except Exception as exc:
+        _restore_report_artifact_group(report_artifacts, previous_group)
+        _record_report_publish_failure(REPORT_DIR, report_date, run_stamp, report_artifacts, previous_group, exc)
+        raise
     logging.info("Saved candidates: %s", candidate_path)
     logging.info("Saved long candidates: %s", long_candidate_path)
     logging.info("Saved board candidates: %s", board_candidate_path)

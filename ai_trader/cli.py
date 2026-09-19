@@ -19,6 +19,7 @@ from ai_trader.paths import (
     RESULTS_DIR,
     SNAPSHOT_PATH,
     STATE_DIR,
+    profile_paths,
 )
 
 
@@ -46,11 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
         "decisions",
         help="C线：把已有20:20日记核成可对账记录并刷新对照页，不调模型、不改菜单、不跑周期",
     )
-    decisions.add_argument("--daily-dir", default=str(DEFAULT_DAILY_DIR))
-    decisions.add_argument("--state-dir", default=str(STATE_DIR))
+    decisions.add_argument("--daily-dir", default="")
+    decisions.add_argument("--state-dir", default="")
     decisions.add_argument("--plan", default="")
     decisions.add_argument("--journal", default="")
-    decisions.add_argument("--out-dir", default=str(RESULTS_DIR))
+    decisions.add_argument("--out-dir", default="")
     decisions.add_argument("--as-of", default="")
     return parser
 
@@ -58,11 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "init":
-        ledger = init_ledger(reset=False)
+        runtime = profile_paths()
+        ledger = init_ledger(reset=False, path=runtime.ledger)
         _print(
             {
                 "ok": True,
-                "ledger_path": str(LEDGER_PATH),
+                "ledger_path": str(runtime.ledger),
                 "forbidden_untouched": str(FORBIDDEN_QUANTDESK_LEDGER),
                 "cash": ledger.get("cash"),
                 "positions": ledger.get("positions"),
@@ -72,28 +74,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "reset":
         if not args.yes:
             raise SystemExit("reset 需要 --yes，避免误清账")
-        ledger = init_ledger(reset=True)
+        ledger = init_ledger(reset=True, path=profile_paths().ledger)
         _print({"ok": True, "cash": ledger.get("cash"), "reset": True})
         return 0
     if args.command == "run":
-        _print(run_cycle(network=not args.offline))
+        _print(run_cycle(paths=profile_paths(), network=not args.offline))
         return 0
     if args.command == "status":
-        if SNAPSHOT_PATH.is_file():
-            _print(json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8")))
+        snapshot_path = profile_paths().snapshot
+        if snapshot_path.is_file():
+            _print(json.loads(snapshot_path.read_text(encoding="utf-8")))
         else:
-            _print({"ok": True, "status": "not_started", "ledger": load_ledger()})
+            _print({"ok": True, "status": "not_started", "ledger": load_ledger(profile_paths().ledger)})
         return 0
     if args.command == "app":
         run_app(host=args.host, port=args.port)
         return 0
     if args.command == "decisions":
+        runtime = profile_paths()
         payload = ingest_state(
-            daily_dir=Path(args.daily_dir),
-            state_dir=Path(args.state_dir),
-            plan_path=Path(args.plan) if args.plan else None,
-            journal_path=Path(args.journal) if args.journal else None,
-            out_dir=Path(args.out_dir),
+            daily_dir=Path(args.daily_dir) if args.daily_dir else DEFAULT_DAILY_DIR,
+            state_dir=Path(args.state_dir) if args.state_dir else runtime.ledger.parent,
+            plan_path=Path(args.plan) if args.plan else runtime.plan_latest,
+            journal_path=Path(args.journal) if args.journal else runtime.journal_latest,
+            out_dir=Path(args.out_dir) if args.out_dir else runtime.decision_page_md.parent,
             as_of=args.as_of or None,
         )
         summary = {

@@ -1,5 +1,8 @@
 # Data and runtime state live outside git (junction to the archive repo).
-data/
+# Anchored: only the ROOT data/ is runtime. An unanchored "data/" also matched
+# source packages such as quantdesk/data/, silently keeping 11 tracked-source
+# files out of the repository.
+/data/
 state/
 results/
 reports/
@@ -78,3 +81,9 @@ external_refs/
 # Secrets
 *.env
 llm.env
+
+# User's product governance documents. These are the USER's tool to keep
+# Agents aligned with the approved product goals. They are intentionally
+# local-only: they are not project source, not to be committed, synced,
+# or included in any clean zip or release export.
+docs/product/

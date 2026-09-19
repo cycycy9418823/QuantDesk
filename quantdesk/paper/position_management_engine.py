@@ -139,7 +139,7 @@ def _write_shadow_ledger_snapshot_once(
     digest = hashlib.sha256(content).hexdigest()
     safe_symbol = normalize_symbol(symbol) or "unknown"
     target = Path(snapshot_dir) / (
-        f"event_{event_ordinal:04d}_{safe_symbol}_{digest}.json"
+        f"event_{event_ordinal:04d}_{safe_symbol}_{digest[:24]}.json"
     )
     target.parent.mkdir(parents=True, exist_ok=True)
     try:

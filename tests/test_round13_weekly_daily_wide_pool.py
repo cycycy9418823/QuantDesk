@@ -170,6 +170,10 @@ def test_cli_apply_accepts_bare_flag_and_explicit_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
+    from quantdesk import full_a_daily_reconciliation
+    audit_calls = []
+    monkeypatch.setattr(full_a_daily_reconciliation, "run_full_a_daily_reconciliation", lambda **kw:
+                        audit_calls.append(kw) or {"status": "completed_with_warnings", "target_date": kw["target_date"]})
     monkeypatch.setattr(
         weekly_cli,
         "resolve_target_complete_trade_date",
@@ -188,7 +192,12 @@ def test_cli_apply_accepts_bare_flag_and_explicit_false(
 
     assert weekly_cli.main([*apply_args, "--json", "false"]) == 0
 
-    assert captured["apply"] is expected_apply
+    if expected_apply:
+        assert captured == {}
+        assert audit_calls == [{"project_root": weekly_cli.PROJECT_ROOT, "target_date": "2026-07-31", "audit_only": True}]
+    else:
+        assert captured["apply"] is False
+        assert audit_calls == []
 
 
 def test_cli_summary_accepts_bare_flag_and_explicit_false() -> None:
