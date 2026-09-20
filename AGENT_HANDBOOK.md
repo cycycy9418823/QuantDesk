@@ -54,6 +54,11 @@ qd pause：停掉所有写手（Pipeline、快照采集器）和 AI 决策，只
 qd resume：恢复。
 暂停期间缺的数据就是缺，恢复后不补、不编。
 这两条命令是 B 线交付项。所有者只需要会这两条。
+H7b 数据写手
+data/daily 唯一写手 = scripts/run_data_close_pipeline.py，由计划任务 QuantDesk Data Close Pipeline 在交易日 15:40（失败则 18:30）触发。旧入口 scripts/run_daily_data_refresh.py、scripts/run_daily_data_chain.py、scripts/run_full_a_daily_reconciliation.py 不得再写 data/daily。
+全市场 5 分钟快照：scripts/collect_market_snapshots.py 写入 data/snapshots/<日期>/（0930–1125、1300–1455）。本机计划任务 QuantDesk A0 Snapshot Collector 已 Disabled；主本在 student 机 COLLECTOR_ROOT/data/snapshots，由 systemd quantdesk-snapshots.timer 触发。
+盘中 1 分钟刷新：scripts/run_intraday_data_refresh.py 写入 data/cache/spot_snapshot_latest.csv（全市场现价）和 data/intraday/1m/<symbol>.csv（相关标的、上限 100）。由计划任务 QuantDesk Intraday Data Refresh 在交易日 09:35–11:30、13:05–15:05 每 5 分钟触发。
+两套采集写不同目录，互不覆盖 latest 与历史快照。分钟线不是成交价。
 H8 备份
 每天收盘后自动把 state/ 下两本账、决策记录、所有者学习日志拷到仓库外的第二位置（位置见宪章 §13 待拍板）。
 备份成功与否进健康行。
