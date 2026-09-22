@@ -247,6 +247,19 @@ MINUTE_COLUMNS = (
 )
 MINUTE_HEADER = ",".join(MINUTE_COLUMNS)
 
+# Markets the raw Sina minute endpoint is verified to serve.  BSE (92xxxx) has no
+# verified minute source in this project, so a BSE code must never be sent to the
+# Shanghai/Shenzhen endpoint as a guess (2026-09-22 DATA-CAUSES minute cause §2).
+_SINA_MINUTE_PREFIXES = {"6": "sh", "0": "sz", "3": "sz"}
+
+
+def _sina_minute_prefix(symbol: str) -> str:
+    """Return the Sina market prefix, or "" when no verified fallback exists."""
+
+    if len(symbol) != 6 or not symbol.isdigit():
+        return ""
+    return _SINA_MINUTE_PREFIXES.get(symbol[0], "")
+
 
 def _minute_datetime_key(value: object) -> str:
     text = str(value or "").strip().replace("T", " ")
@@ -722,7 +735,8 @@ def _live_minute_rows(
     """Try the existing raw Sina source when the native minute request fails."""
     deadline = monotonic() + max(0.0, float(timeout_seconds))
     now = _now_shanghai(now)
-    supported = len(symbol) == 6 and symbol.isdigit() and symbol[0] in "036"
+    sina_prefix = _sina_minute_prefix(symbol)
+    supported = bool(sina_prefix)
     native_allowance = min(2.0, timeout_seconds / 3) if supported else timeout_seconds
     rows, error, diagnostics = _mootdx_minute_rows(
         symbol, offset=offset, now=now, monotonic=monotonic,
@@ -736,7 +750,7 @@ def _live_minute_rows(
         import pandas as pd
         from quantdesk.intraday.intraday_providers import _http_get_text, _normalize_provider_frame
 
-        prefix = "sh" if symbol.startswith("6") else "sz"
+        prefix = sina_prefix
         url = ("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData"
                f"?symbol={prefix}{symbol}&scale=1&ma=no&datalen=240")
         left = deadline - monotonic()
@@ -1301,6 +1315,12 @@ def collect_intraday_refresh(
                         "priority": entry.get("priority"),
                     })
                     provider_failed += 1
+                    if not _sina_minute_prefix(symbol):
+                        # No verified fallback for this market: keep the failure a
+                        # visible gap instead of letting it look recoverable.
+                        manifest["reason_codes"].append(
+                            f"minute_fallback_unavailable:{symbol}"
+                        )
                     if max_symbol_ms and duration_ms > max_symbol_ms:
                         manifest["reason_codes"].append(
                             f"symbol_budget_exceeded:{symbol}:{duration_ms}ms"
@@ -1425,11 +1445,26 @@ def collect_intraday_refresh(
 
 def _evaluate_freshness(manifest: dict[str, Any], *, current: datetime, critical: set[str], session: str) -> None:
     if session in ("closed", "lunch"):
-        # Freshness is not actionable; report counts without stale flags.
+        # Freshness is not actionable outside trading hours, so nothing is
+        # flagged stale.  The counts are still facts about this round: leaving
+        # the initial ``ready`` / ``missing_count=0`` values in place lets a
+        # round that wrote nothing look complete (2026-09-22: 82 ok / 8 missing
+        # was published as ``ready``).  Same aggregation as the trading-hours
+        # branch below, minus the stale verdicts.
         manifest["stale_count"] = 0
+        fresh = 0
+        missing = 0
         for entry in manifest["provider_status"]:
             if entry.get("status") == "ok":
-                manifest["fresh_count"] += 1
+                fresh += 1
+            else:
+                missing += 1
+        manifest["fresh_count"] = fresh
+        manifest["missing_count"] = missing
+        if missing and manifest["status"] not in (
+            "already_running", "blocked", "closed", "timed_out", "planned_offline",
+        ):
+            manifest["status"] = "partial"
         return
     stale = 0
     fresh = 0

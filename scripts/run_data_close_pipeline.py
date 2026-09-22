@@ -1350,11 +1350,39 @@ def _recovery_plan(
 # ---------------------------------------------------------------------------
 
 
+def _benchmark_target_covered(stage: Mapping[str, Any] | None) -> bool | None:
+    """Read a stored stage record's own benchmark target claim.
+
+    ``None`` means the record makes no claim at all (older checkpoints, or a
+    stage that never reached the benchmark phase).  Only an explicit ``False``
+    forces the stage to run again: an absent field is not evidence that the
+    target day is missing, so it must not turn a healthy checkpoint into a
+    repeated request (DATA-FIX-0922).
+    """
+
+    if not isinstance(stage, Mapping):
+        return None
+    payload = stage.get("payload")
+    evidence = payload.get("benchmark_evidence") if isinstance(payload, Mapping) else None
+    if not isinstance(evidence, Mapping):
+        return None
+    covered = evidence.get("target_covered")
+    if covered is None:
+        return None
+    return covered is True
+
+
 def _checkpoint_data_incomplete(doc: Mapping[str, Any]) -> bool:
     from quantdesk.pipeline_terminal import SUCCESS_STATUSES, classify_pipeline_status
 
     stages = doc.get("stages") or {}
     if not isinstance(stages, dict):
+        return True
+    # A benchmark phase reporting that the target day is not in the local index
+    # files leaves the afternoon claim incomplete no matter what the overall
+    # status says, so the evening run must request it again instead of reusing
+    # the whole checkpoint (DATA-FIX-0922 §1).  Other stages keep their rules.
+    if _benchmark_target_covered(stages.get("market_refresh")) is False:
         return True
     # Historical completion is a claim to validate, never permission to rerun
     # missing/skipped stages and manufacture a new successful result.
@@ -1693,6 +1721,18 @@ def run_pipeline(
                 # (Codex Round-3 #5: research_chain resumed with zero calls).
                 # Unknown inputs = unknown whether they changed = fail-closed.
                 pass
+            elif (
+                prev
+                and name == "market_refresh"
+                and _benchmark_target_covered(prev) is False
+            ):
+                # The stored record itself says the target day never reached the
+                # index files (9/21).  Reusing it would repeat the gap, so this
+                # stage runs again; every other stage keeps its own reuse rules.
+                report["reason_codes"].append(
+                    "market_refresh_benchmark_target_not_recorded"
+                )
+                prev = None
             elif prev and prev.get("status") in ("completed", "completed_with_warnings"):
                 prev = dict(prev)
                 prev["reused_from_checkpoint"] = True

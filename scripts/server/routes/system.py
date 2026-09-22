@@ -8,7 +8,7 @@ from typing import Any
 
 from flask import Blueprint, Flask, Response, current_app, jsonify, make_response, render_template
 
-from quantdesk.project_status import read_project_status
+from quantdesk.project_status import read_project_status, read_runtime_observations
 
 
 def create_system_blueprint(*, build_id: str, asset_versions_func: Callable[[], dict[str, str]]) -> Blueprint:
@@ -48,6 +48,9 @@ def create_system_blueprint(*, build_id: str, asset_versions_func: Callable[[], 
 
             root = Path(default_root)
         payload = read_project_status(root)
+        updated_at = payload.get("document_updated_at")
+        report_date = updated_at[:10] if isinstance(updated_at, str) else None
+        payload["runtime_observations"] = read_runtime_observations(root, report_date=report_date)
         response = jsonify(payload)
         response.headers["Cache-Control"] = "no-store"
         return response

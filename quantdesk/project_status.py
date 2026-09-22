@@ -1,4 +1,4 @@
-"""Read-only STATUS.md for the 8000 research home page.
+"""Read-only project records and bounded runtime observations for the home page.
 
 This module never writes STATUS.md, never fetches market data, and never
 runs health checks. ``readable`` means the file could be opened — not that
@@ -8,9 +8,10 @@ the desk is healthy.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -19,6 +20,7 @@ STATUS_FILENAME = "STATUS.md"
 SOURCE_LABEL = "项目记录 · 非实时核验"
 DISCLAIMER = "纸面 · 未验证"
 MAX_STATUS_BYTES = 256 * 1024
+MAX_RUNTIME_OBSERVATION_BYTES = 8 * 1024 * 1024
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 _HEADER_RE = re.compile(
@@ -408,8 +410,104 @@ def read_project_status(project_root: str | Path) -> dict[str, Any]:
     return payload
 
 
+def read_runtime_observations(project_root: str | Path, *, report_date: str | None = None) -> dict[str, Any]:
+    """Read small, existing result files; never run health checks or expose model bodies."""
+
+    root = Path(project_root).resolve()
+
+    def read_object(relative: str) -> dict[str, Any]:
+        try:
+            path = (root / relative).resolve()
+            path.relative_to(root)
+            with path.open("rb") as stream:
+                raw = stream.read(MAX_RUNTIME_OBSERVATION_BYTES + 1)
+            if len(raw) > MAX_RUNTIME_OBSERVATION_BYTES:
+                return {}
+            def reject_constant(value: str) -> None:
+                raise ValueError("Non-finite JSON")
+            value = json.loads(raw.decode("utf-8-sig"), parse_constant=reject_constant)
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError, UnicodeError):
+            return {}
+
+    def day(value: Any) -> str | None:
+        if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return None
+        try:
+            return date.fromisoformat(value).isoformat()
+        except ValueError:
+            return None
+
+    def count(value: Any) -> int | None:
+        return value if type(value) is int and value >= 0 else None
+
+    profiles: dict[str, dict[str, Any]] = {}
+    for profile, directory, label in (("default", "ai_trader", "默认档"), ("glm", "ai_trader_glm", "GLM 档")):
+        source = f"results/{directory}/cycle_latest.json"
+        cycle = read_object(source)
+        plan = cycle.get("plan") if isinstance(cycle.get("plan"), dict) else {}
+        llm = plan.get("llm") if isinstance(plan.get("llm"), dict) else {}
+        used = llm.get("used") if type(llm.get("used")) is bool else None
+        observed_date = day(cycle.get("as_of")) or day(plan.get("decision_date"))
+        reason = llm.get("unavailable_reason")
+        model = str(llm.get("model") or "").lower()
+        model_label = next((label for key, label in (("kimi", "Kimi"), ("glm", "GLM"), ("deepseek", "DeepSeek"))
+                            if key in model), None)
+        explanations = {
+            "transport:TimeoutError": "等待回答超时", "transport:timeout": "等待回答超时",
+            "transport:URLError": "连接模型服务失败，具体原因尚未确定",
+            "transport:HTTPError": "模型服务返回错误",
+        }
+        detail = explanations.get(reason, "未取得模型回答，具体原因待查") if isinstance(reason, str) else "未取得模型回答"
+        if used is True:
+            message = "模型已回应；判断未被接收" if plan.get("committed") is False else "模型已回应"
+        elif used is False:
+            message = f"{detail}；固定规则接管" if reason else "本轮未使用模型，由固定规则判断"
+        else:
+            message = "尚无可确认的模型回应记录，不能当作成功或零成交"
+        profiles[profile] = {
+            "label": label, "as_of": observed_date, "model_replied": used,
+            "model_label": model_label,
+            "decision_accepted": plan.get("committed") if type(plan.get("committed")) is bool else None,
+            "message": message, "source": source,
+        }
+
+    observed_dates = [item["as_of"] for item in profiles.values() if item["as_of"]]
+    target_date = max(observed_dates) if observed_dates else day(report_date)
+    source = f"data/snapshots/{target_date}/manifest.json" if target_date else None
+    manifest = read_object(source) if source else {}
+    declared_date = manifest.get("trade_date")
+    if declared_date is not None and declared_date != target_date:
+        manifest = {}
+    collected = count(manifest.get("collected_slot_count"))
+    expected = count(manifest.get("expected_slot_count"))
+    quoted = count(manifest.get("quoted_row_count"))
+    valid = count(manifest.get("valid_quote_count"))
+    ratio = valid / quoted if quoted and valid is not None and valid <= quoted else None
+    invalid = quoted - valid if ratio is not None else None
+    if collected is None or expected is None or expected == 0 or collected > expected:
+        collected = expected = None
+        message = "采集次数尚无可靠记录；数量未知"
+    else:
+        message = f"已采集 {collected}/{expected} 次"
+    if ratio is not None:
+        message += f"；{ratio:.2%} 的报价通过检查，缺失或无效 {invalid} 条"
+    else:
+        message += "；有效报价比例未知"
+    message += "。报价缺失单独提示，不阻断整个系统；具体股票成交仍需真实有效价格。"
+    return {
+        "source_label": "已有运行记录 · 查看不会重新运行任务", "profiles": profiles,
+        "snapshot": {
+            "as_of": target_date, "source": source, "collected_slots": collected, "expected_slots": expected,
+            "quoted_rows": quoted, "valid_quotes": valid, "invalid_quotes": invalid,
+            "valid_quote_ratio": ratio, "blocks_workflow": False, "message": message,
+        },
+    }
+
+
 __all__ = [
     "MAX_STATUS_BYTES",
     "STATUS_FILENAME",
     "read_project_status",
+    "read_runtime_observations",
 ]

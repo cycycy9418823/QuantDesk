@@ -635,6 +635,13 @@
             color: var(--text-primary);
         }
 
+        .action-button[data-ai-trader-profile][aria-pressed="true"] {
+            border-color: var(--color-accent);
+            background: var(--color-accent-soft);
+            color: var(--text-primary);
+            font-weight: 700;
+        }
+
         .close-button {
             width: 36px;
             height: 36px;
@@ -3347,6 +3354,69 @@
             }
         }
 
+        .owner-runtime-grid,
+        .owner-review-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+            margin: 14px 0;
+        }
+        .owner-runtime-card,
+        .owner-review-card {
+            min-width: 0;
+            padding: 18px;
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            background: var(--bg-primary);
+            overflow-wrap: anywhere;
+        }
+        .owner-runtime-card-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+        .owner-runtime-card-head span,
+        .owner-runtime-card p,
+        .owner-review-card p {
+            color: var(--text-secondary);
+            font-size: 13px;
+            line-height: 1.7;
+        }
+        .owner-runtime-value {
+            margin: 14px 0 10px;
+            font-size: clamp(19px, 1.7vw, 25px);
+            font-weight: 650;
+            line-height: 1.35;
+        }
+        .owner-runtime-badge {
+            display: inline-block;
+            padding: 4px 9px;
+            border-radius: 6px;
+            font-size: 12px;
+        }
+        .owner-tone-data { background: #eff6ff; color: #1d4ed8; }
+        .owner-tone-replied { background: #f0fdf4; color: #166534; }
+        .owner-tone-notice { background: #fffbeb; color: #92400e; }
+        .owner-source-details,
+        .owner-review-raw {
+            border-top: 1px solid var(--border-subtle);
+            margin-top: 16px;
+            padding-top: 12px;
+        }
+        .owner-source-details > summary,
+        .owner-review-raw > summary { cursor: pointer; padding: 6px 0; color: var(--text-secondary); }
+        .owner-review-number { font-size: 30px; font-weight: 650; margin-top: 12px; }
+        .owner-review-number small { font-size: 13px; font-weight: 400; margin-left: 6px; color: var(--text-secondary); }
+        .owner-review-card dl { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; font-size: 13px; }
+        .owner-review-card dd { margin: 0; font-variant-numeric: tabular-nums; }
+        @media (max-width: 760px) {
+            .owner-runtime-grid,
+            .owner-review-grid { grid-template-columns: minmax(0, 1fr); }
+            .owner-runtime-card,
+            .owner-review-card { padding: 15px; }
+        }
         .project-status-card {
             border: 1px solid var(--border-subtle);
             border-radius: var(--radius);
@@ -3717,13 +3787,16 @@
         <section id="projectStatusSection" class="section project-status" aria-labelledby="projectStatusTitle" data-home-section data-home-page="today system">
             <div class="section-head">
                 <div>
-                    <h2 id="projectStatusTitle">今天健康摘要</h2>
-                    <p class="section-note">来自 STATUS.md 的项目记录，不是实时核验，纸面 · 未验证。完整原文在「系统状态」。</p>
+                    <h2 id="projectStatusTitle">最近一轮发生了什么</h2>
+                    <p class="section-note">先看行情是否采到、模型有没有回应。各项按自己的记录日期显示，纸面 · 未验证。</p>
                 </div>
             </div>
             <article class="project-status-card" aria-live="polite">
                 <p class="project-status-kicker" id="projectStatusKicker">项目记录 · 非实时核验 · 纸面 · 未验证</p>
                 <p class="project-status-banner" id="projectStatusBanner" hidden></p>
+                <div id="projectRuntimeSummary" aria-live="polite"></div>
+                <details class="owner-source-details">
+                <summary>任务摘要与来源记录</summary>
                 <div class="project-status-meta" id="projectStatusMeta">正在读取 STATUS.md…</div>
                 <details class="project-status-times-details">
                     <summary>三个时间（文档 / 文件 / 本次读取）</summary>
@@ -3737,6 +3810,7 @@
                 <p class="project-status-explain" id="projectStatusExplain">红格解释：读取中</p>
                 <p class="project-status-phase" id="projectStatusPhase">当前阶段：读取中</p>
                 <p class="project-status-note" id="projectStatusTradeDate">健康行对应交易日：记录未明确标注</p>
+                </details>
                 <div class="project-status-actions">
                     <button id="projectStatusOpenFullButton" class="action-button" type="button">查看完整状态</button>
                     <button id="projectStatusOpenSystemButton" class="action-button secondary-action" type="button">打开系统状态</button>
@@ -4115,7 +4189,7 @@
                 <button type="button" class="action-button secondary-action" id="aiTraderProfileDefault" data-ai-trader-profile="default" aria-pressed="true">默认 · Kimi</button>
                 <button type="button" class="action-button secondary-action" id="aiTraderProfileGlm" data-ai-trader-profile="glm" aria-pressed="false">GLM · glm-5.3</button>
             </div>
-            <p class="section-note" style="margin:0 0 12px">两个大脑<strong>只共享同一份行情数据</strong>：账本、计划、日记、自选与决策各自隔离，互不可见；切换只改变本页读哪一本，不触发任何跑批。</p>
+            <p class="section-note" style="margin:0 0 12px">两个大脑<strong>只共享同一份行情数据</strong>：账本、计划、日记、自选与决策各自隔离，互不可见；切换会同步 AI 账与复盘学习的档位，不触发任何跑批。</p>
             <div class="badge-row" aria-label="AI 纸面交易员边界" style="justify-content:flex-start;margin-bottom:10px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
@@ -4257,6 +4331,12 @@
                     <button id="refreshDecisionHistoryButton" class="action-button" type="button">刷新决策历史</button>
                 </div>
             </div>
+            <div class="badge-row" role="group" aria-label="AI 复盘档位" style="justify-content:flex-start;margin:0 0 10px;gap:6px">
+                <span class="section-note" style="margin:0;align-self:center">AI 档位：</span>
+                <button type="button" class="action-button secondary-action" id="reviewAiProfileDefault" data-ai-trader-profile="default" aria-pressed="true">默认 AI</button>
+                <button type="button" class="action-button secondary-action" id="reviewAiProfileGlm" data-ai-trader-profile="glm" aria-pressed="false">GLM</button>
+            </div>
+            <p class="section-note" style="margin:0 0 12px">与 AI 账使用同一档位；下方 AI 成交与判断均来自所选档位，策略账记录独立展示。</p>
             <div class="badge-row" aria-label="决策历史边界" style="justify-content:flex-start;margin-bottom:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>

@@ -225,7 +225,9 @@ def test_tampered_coverage_metadata_is_not_counted_as_complete(tmp_path: Path) -
     assert "1000" in _history_module().snapshot_day_summary(tmp_path, "2026-09-07")["invalid_slots"]
 
 
-def test_missing_price_is_preserved_but_not_complete(tmp_path: Path) -> None:
+def test_lone_missing_price_is_written_but_never_completed(tmp_path: Path) -> None:
+    """One row, no usable price: the archive is written, the slot is not collected."""
+
     _calendar(tmp_path)
     quote = _quote()
     quote["price"] = None
@@ -233,8 +235,41 @@ def test_missing_price_is_preserved_but_not_complete(tmp_path: Path) -> None:
         tmp_path, network=True, now=_now(), clock=_now, symbols=["600000"],
         fetcher=lambda: ([quote], "fixture.sina"),
     )
-    assert result["status"] == "partial"
-    assert "snapshot_price_missing" in result["warnings"]
+    assert result["status"] == "written"
+    assert "snapshot_price_missing:1" in result["warnings"]
+    summary = _history_module().snapshot_day_summary(tmp_path, "2026-09-07", symbols=["600000"])
+    # A capture with no usable price at all is still not a collection (S3.4-r).
+    assert summary["completed_slots"] == []
+    assert summary["partial_slots"] == ["1000"]
+
+
+def test_twelve_zero_prices_keep_the_slot_written_and_completed(tmp_path: Path) -> None:
+    """5564 rows with 12 zero prices: counted warning, written slot, completed day."""
+
+    _calendar(tmp_path)
+    symbols = [f"{index:06d}" for index in range(5564)]
+    quotes = [_quote(symbol) for symbol in symbols]
+    for quote in quotes[:12]:
+        quote["price"] = 0
+    history = _history_module()
+    result = history.collect_market_snapshot(
+        tmp_path, network=True, now=_now(), clock=_now, symbols=symbols,
+        fetcher=lambda: (quotes, "fixture.sina"),
+    )
+
+    assert result["status"] == "written"
+    assert result["written"] is True
+    assert "snapshot_price_missing:12" in result["warnings"]
+    assert "snapshot_symbols_missing" not in result["warnings"]
+    metadata = json.loads((tmp_path / result["metadata_path"]).read_text(encoding="utf-8"))
+    assert metadata["price_missing_symbols"] == sorted(symbols[:12])
+    assert metadata["coverage_ratio"] == 1.0
+    manifest = json.loads((tmp_path / result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["completed_slots"] == ["1000"]
+    assert manifest["partial_slots"] == []
+    assert manifest["completed_slot_count"] == 1
+    summary = history.snapshot_day_summary(tmp_path, "2026-09-07", symbols=symbols)
+    assert summary["completed_slots"] == ["1000"]
 
 
 def test_write_failure_preserves_orphan_and_returns_failure(tmp_path: Path, monkeypatch) -> None:

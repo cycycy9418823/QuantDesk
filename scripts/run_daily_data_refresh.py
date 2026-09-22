@@ -59,6 +59,12 @@ UA = "Mozilla/5.0 QuantDesk research client"
 SINA_URL = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
 DISCLOSURE_MONTHS = {1, 4, 7, 8, 10}
 UNIVERSE_MISMATCH_WARN_THRESHOLD = 30
+# One bounded re-check per symbol the list snapshot silently dropped (9/21:
+# 689009 sat in the local roster and in no HQ request at all).  The cap keeps a
+# list outage from turning into a thousands-request sweep, which this project
+# requires explicit authorization for; codes above the cap are recorded as not
+# attempted instead of being skipped without a trace.
+UNIVERSE_DIFF_REQUERY_LIMIT = 50
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
@@ -142,10 +148,62 @@ def _dated_close_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
     return quotes
 
 
-def _close_quote_reason(
-    item: dict[str, Any], quote: dict[str, Any], target: str,
-    *, observed_at: datetime | None = None,
+def _requery_universe_diff(
+    symbols: list[str], *, lease: MarketWriterLease,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Re-check the symbols the list snapshot dropped, one bounded pass each.
+
+    The list endpoint is the primary source, but a code it silently omits would
+    otherwise never be requested by anything (9/21: 689009 was in the local
+    roster and in no HQ request).  Each difference code goes through the
+    existing dated-HQ path exactly once and whatever happens is written to the
+    receipt, so a dropped symbol can never be silent again.  Codes above
+    ``UNIVERSE_DIFF_REQUERY_LIMIT`` are recorded as not attempted rather than
+    turned into an unauthorized full-universe sweep.
+    """
+
+    quotes = _DatedQuotes()
+    outcomes: dict[str, dict[str, Any]] = {}
+    for code in symbols[:UNIVERSE_DIFF_REQUERY_LIMIT]:
+        lease.assert_active()
+        single = _dated_close_quotes([code])
+        for entry in getattr(single, "batch_diagnostics", None) or []:
+            quotes.batch_diagnostics.append(
+                {**entry, "scope": "universe_diff_requery", "symbol": code}
+            )
+        quote = single.get(code) or {}
+        if quote:
+            quotes[code] = quote
+            outcomes[code] = {
+                "attempted": True, "reason": "",
+                "quote_date": quote.get("date"), "quote_time": quote.get("time"),
+            }
+        else:
+            outcomes[code] = {
+                "attempted": True, "reason": "universe_diff_requery_no_quote",
+                "quote_date": "", "quote_time": "",
+                "note": "列表未返回该代码，单只补查也未取得报价；不写日线、不作排除。",
+            }
+    for code in symbols[UNIVERSE_DIFF_REQUERY_LIMIT:]:
+        outcomes[code] = {
+            "attempted": False, "reason": "universe_diff_requery_over_limit",
+            "quote_date": "", "quote_time": "",
+            "note": f"差集超过单轮上限 {UNIVERSE_DIFF_REQUERY_LIMIT}，本轮不请求，缺口保留。",
+        }
+    return quotes, outcomes
+
+
+def _dated_quote_target_reason(
+    quote: dict[str, Any], target: str, *, observed_at: datetime | None = None,
 ) -> str:
+    """Check a dated HQ quote is usable as the target day's closing evidence.
+
+    This is the list-independent half of ``_close_quote_reason``: it enforces
+    the date, completed-session and not-in-the-future rules.  The list-versus-HQ
+    value comparison stays in ``_close_quote_reason``, because a symbol the list
+    snapshot dropped has no list row to compare against.
+    """
+
     if quote.get("date") != target:
         return "quote_date_missing" if not quote.get("date") else "quote_date_mismatch"
     try:
@@ -166,6 +224,16 @@ def _close_quote_reason(
     # Keep same-day/after-close checks and reject future timestamps instead.
     if quoted_at > current:
         return "quote_timestamp_in_future"
+    return ""
+
+
+def _close_quote_reason(
+    item: dict[str, Any], quote: dict[str, Any], target: str,
+    *, observed_at: datetime | None = None,
+) -> str:
+    reason = _dated_quote_target_reason(quote, target, observed_at=observed_at)
+    if reason:
+        return reason
     for list_key, quote_key in (("open", "open"), ("high", "high"), ("low", "low"), ("trade", "price"), ("volume", "volume")):
         try:
             left, right = float(item[list_key]), float(quote[quote_key])
@@ -409,6 +477,24 @@ def family_bars_and_valuation(
     if len(symbols) < 5000:
         warnings.append(f"full_a_snapshot_low_coverage:{len(symbols)}")
 
+    # The list is the primary source; a code it silently drops (9/21: 689009)
+    # ended up in no request at all.  Every difference code gets one bounded
+    # re-check through the same dated-HQ path, and the outcome is kept.  The
+    # empty-list fallback already requested the whole roster, so it needs none.
+    diff_quotes: dict[str, dict[str, Any]] = {}
+    diff_outcomes: dict[str, dict[str, Any]] = {}
+    if missing and not dated_only:
+        diff_quotes, diff_outcomes = _requery_universe_diff(missing, lease=lease)
+        main_diagnostics = getattr(quotes, "batch_diagnostics", None)
+        if isinstance(main_diagnostics, list):
+            main_diagnostics.extend(getattr(diff_quotes, "batch_diagnostics", None) or [])
+        failed_diff = sorted(code for code, row in diff_outcomes.items() if row.get("reason"))
+        if failed_diff:
+            warnings.append(
+                "universe_diff_requery_failed:"
+                f"{len(failed_diff)}:{','.join(failed_diff[:8])}"
+            )
+
     val_fields = ["symbol", "name", "close", "pct_chg", "pe", "pb", "total_mv_raw", "circ_mv_raw",
                   "turnover_rate", "volume", "amount", "trade_date", "source", "provider",
                   "total_mv_unit", "pe_semantics", "quote_date", "quote_time"]
@@ -474,6 +560,54 @@ def family_bars_and_valuation(
         else:
             stats["appended"] += 1
             stats["created_files"] += int(was_new)
+    # Difference symbols have no list row to compare against, so their quotes are
+    # validated on the date/close rules only and appended through the same
+    # writer and per-symbol lock as every other daily row.
+    for code in sorted(diff_quotes):
+        lease.assert_active()
+        quote = diff_quotes[code]
+        outcome = diff_outcomes.setdefault(code, {"attempted": True, "reason": ""})
+        reason = _dated_quote_target_reason(quote, target)
+        if reason:
+            outcome["reason"] = f"universe_diff_requery:{reason}"
+            outcome["quote_date"] = quote.get("date")
+            outcome["quote_time"] = quote.get("time")
+            outcome["note"] = "补查报价不是目标日期的收盘证据；不写日线、不作排除。"
+            continue
+        valid, reason = daily_bar_validity_from_row({
+            "open": quote.get("open"), "high": quote.get("high"), "low": quote.get("low"),
+            "close": quote.get("price"), "volume": quote.get("volume"),
+        })
+        if not valid:
+            outcome["reason"] = f"universe_diff_requery:{reason}"
+            outcome["note"] = "补查行情异常或零成交；不写日线、不作排除。"
+            continue
+        price, previous = _fnum(quote.get("price")), _fnum(quote.get("prev_close"))
+        row = io.StringIO(newline="")
+        csv.writer(row, lineterminator="").writerow([
+            target, code, _fmt_price(quote.get("open")), _fmt_price(quote.get("high")),
+            _fmt_price(quote.get("low")), _fmt_price(quote.get("price")),
+            _fmt_float1(quote.get("volume")), _fmt_float1(quote.get("amount")),
+            _fmt_price(price - previous if previous > 0 else None),
+            _fmt_price((price / previous - 1) * 100 if previous > 0 else None), "raw",
+            "sina_dated_hq_universe_diff", now,
+        ])
+        path = DAILY_DIR / f"{code}.csv"
+        was_new = not path.exists()
+        with interprocess_file_lock(DAILY_DIR / ".locks" / f"{code}.lock"):
+            appended, reason = _append_daily_row(path, row.getvalue(), header=DAILY_HEADER, lease=lease)
+        if appended:
+            stats["appended"] += 1
+            stats["created_files"] += int(was_new)
+            outcome["appended"] = True
+        elif reason.startswith("daily_target_already_present:"):
+            stats["already_had_bar"] += 1
+            outcome["appended"] = False
+            outcome["note"] = "本地当日日线已存在，未重复写入。"
+        else:
+            stats["append_failed"] += 1
+            outcome["reason"] = f"universe_diff_requery:{reason}"
+            warnings.append(reason)
     stats["flagged_for_review"] = len(review)
     val_path = VAL_DIR / f"{target.replace('-', '')}.csv"
     if accepted_quotes and not dated_only:
@@ -486,6 +620,8 @@ def family_bars_and_valuation(
         "target_date": target, "generated_at": now, "pipeline_run_id": lease.run_id,
         "source": "sina_dated_hq_fallback" if dated_only else "sina_list_and_dated_hq", "verified_exclusions": {},
         "flagged_for_review": review, "missing_in_snapshot": missing,
+        "universe_diff_requery": diff_outcomes,
+        "universe_diff_requery_limit": UNIVERSE_DIFF_REQUERY_LIMIT,
         "quote_batch_diagnostics": getattr(quotes, "batch_diagnostics", []),
         "contract": "Missing or invalid data remains missing; no suspension is inferred.",
     }, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8"), lease=lease)
@@ -496,6 +632,12 @@ def family_bars_and_valuation(
         "valuation_snapshot": _display_path(val_path) if accepted_quotes and not dated_only else "",
         "quote_source": "sina_dated_hq_fallback" if dated_only else "sina_list_and_dated_hq",
         "review_evidence": _display_path(review_path), "suspension_evidence": "", "warnings": warnings,
+        "universe_diff_requery": {
+            "attempted": len([code for code, row in diff_outcomes.items() if row.get("attempted")]),
+            "appended": len([code for code, row in diff_outcomes.items() if row.get("appended")]),
+            "failed": len([code for code, row in diff_outcomes.items() if row.get("reason")]),
+            "limit": UNIVERSE_DIFF_REQUERY_LIMIT,
+        },
     }
 
 

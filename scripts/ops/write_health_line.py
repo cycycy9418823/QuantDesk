@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -66,9 +66,13 @@ def daily_cell(root: Path, target: str) -> tuple[str, str]:
         if last_csv_date(path) == target:
             have += 1
     universe = count_universe(root) or 5555
-    mark = "✓" if universe and (universe - have) / universe <= 0.01 else "✗"
-    extra = "" if mark == "✓" else f"日线缺口 {universe - have}/{universe}"
-    return f"日线 {mark}{have}/{universe}", extra
+    missing = max(0, universe - have)
+    mark = "✓" if universe and missing / universe <= 0.01 else "✗"
+    # The 1% threshold stays a rendering rule only: a non-zero gap is always
+    # printed, so a green mark can never swallow the number.
+    gap = f"(缺{missing})" if missing else ""
+    extra = "" if mark == "✓" else f"日线缺口 {missing}/{universe}"
+    return f"日线 {mark}{have}/{universe}{gap}", extra
 
 
 def stamp_date(stamp: str) -> str:
@@ -119,6 +123,13 @@ def last_snapshot_complete(root: Path) -> str:
     return ""
 
 
+def snapshot_slot_files(root: Path, target: str) -> int:
+    """How many slot CSVs exist for the day, independent of the manifest claim."""
+
+    day = root / "data" / "snapshots" / target
+    return len(list(day.glob("*.csv"))) if day.is_dir() else 0
+
+
 def snapshot_cell(root: Path, target: str) -> tuple[str, str]:
     man = root / "data" / "snapshots" / target / "manifest.json"
     collected = 0
@@ -129,12 +140,98 @@ def snapshot_cell(root: Path, target: str) -> tuple[str, str]:
                 collected = int(data.get("collected_slot_count") or 0)
             except (TypeError, ValueError):
                 collected = 0
+    files = snapshot_slot_files(root, target)
     mark = "✓" if collected >= 46 else "✗"
+    # Both numbers are always shown: how many sheets were pulled and how many
+    # slots the manifest calls complete ("48张/完成 0" must stay readable).
+    cell = f"快照 {mark}{files}张/完成 {collected}"
     if mark == "✓":
-        return f"快照 {mark}{collected}/48", ""
+        return cell, ""
     prev = last_snapshot_complete(root)
     prev_txt = prev or "从未成功"
-    return f"快照 {mark}{collected}/48", f"快照未拉回 {target}，上次完整 {prev_txt}"
+    return cell, f"快照未拉回 {target}，上次完整 {prev_txt}"
+
+
+BENCHMARK_FILES = ("hs300.csv", "zz500.csv", "sh000001.csv")
+
+
+def previous_trading_day(root: Path, target: str) -> tuple[str, str]:
+    """Previous open session before ``target`` (calendar first, weekday fallback)."""
+
+    cal = root / "data" / "calendar" / "a_share_trading_calendar.csv"
+    if cal.is_file():
+        try:
+            with cal.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
+                days = [
+                    str(row.get("date") or "").strip()
+                    for row in csv.DictReader(handle)
+                    if str(row.get("is_open") or "").strip().lower() == "true"
+                ]
+        except OSError:
+            days = []
+        earlier = sorted(day for day in days if day and day < target)
+        if earlier:
+            return earlier[-1], ""
+        if days:
+            return "", f"日历无 {target} 之前的上一个交易日"
+    try:
+        day = datetime.strptime(target, "%Y-%m-%d").date()
+    except ValueError:
+        return "", f"目标日 {target} 无法解析，基准只按日期文本比较"
+    day = day - timedelta(days=1)
+    while day.weekday() >= 5:
+        day = day - timedelta(days=1)
+    return day.isoformat(), "日历无记录，基准按前一工作日判定（降级，非交易日历）"
+
+
+def benchmark_cell(root: Path, target: str) -> tuple[str, str]:
+    """The three index files must already carry the previous trading day."""
+
+    expected, note = previous_trading_day(root, target)
+    stale: list[str] = []
+    for name in BENCHMARK_FILES:
+        path = root / "data" / "benchmark" / name
+        day = (last_csv_date(path) if path.is_file() else None) or "缺失"
+        if not expected or day != expected:
+            stale.append(f"{name.replace('.csv', '')}={day}")
+    if not stale:
+        return f"基准 ✓{expected}", note
+    detail = "基准停在哪天：" + ("无上一交易日" if not expected else f"应有 {expected}，实际 " + " ".join(stale))
+    return "基准 ✗", " · ".join(item for item in (detail, note) if item)
+
+
+def minute_cell(root: Path, target: str) -> tuple[str, str]:
+    """Minute round gaps, including storage-blocked writes, stay countable."""
+
+    data = load_json(root / "results" / "intraday" / "intraday_refresh_latest.json")
+    if data is None:
+        return "分钟 ✗", "分钟回执缺失 results/intraday/intraday_refresh_latest.json"
+    try:
+        requested = int(data.get("requested_count") or 0)
+        fresh = int(data.get("fresh_count") or 0)
+        missing = int(data.get("missing_count") or 0)
+    except (TypeError, ValueError):
+        requested = fresh = missing = 0
+    blocked = sum(
+        1
+        for row in (data.get("provider_status") or [])
+        if isinstance(row, dict) and row.get("status") == "storage_blocked"
+    )
+    as_of = str(data.get("target_date") or "")[:10]
+    mark = "✓" if requested and missing == 0 and blocked == 0 and as_of and as_of >= target else "✗"
+    counts = f"{fresh}/{requested}"
+    gap = []
+    if missing:
+        gap.append(f"缺{missing}")
+    if blocked:
+        gap.append(f"拒写{blocked}")
+    cell = f"分钟 {mark}{counts}" + (f"({'+'.join(gap)})" if gap else "")
+    if mark == "✓":
+        return cell, ""
+    detail = f"分钟数据日 {as_of or '缺失'}"
+    if gap:
+        detail += "，" + "，".join(gap)
+    return cell, detail
 
 
 def strategy_cell(root: Path, target: str) -> tuple[str, str]:
@@ -282,7 +379,8 @@ def build_line(root: Path, target: str) -> tuple[str, list[str], bool]:
             explains.append(extra)
         return line, explains, False
     cells = []
-    for fn in (daily_cell, snapshot_cell, strategy_cell, ai_cell, review_cell, backup_cell):
+    for fn in (daily_cell, benchmark_cell, snapshot_cell, minute_cell,
+               strategy_cell, ai_cell, review_cell, backup_cell):
         cell, extra = fn(root, target)
         cells.append(cell)
         if extra:

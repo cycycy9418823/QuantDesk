@@ -235,6 +235,32 @@ def _clean_value(value: Any) -> Any:
     return value
 
 
+# A slot is relabelled ``partial`` only by evidence against the slot itself: an
+# unknown roster, a roster gap, an unverified source, provider timestamps that
+# are not usable, or a fetch that landed outside the slot.  A missing price is a
+# counted warning (``snapshot_price_missing:<n>`` plus ``price_missing_symbols``)
+# and no longer relabels the slot: 2026-09-21 lost 12 of 5564 tickers to a zero
+# price while every symbol was present with a usable timestamp, and filing all
+# 48 slots as partial hid a fully collected day (S3.4-r).
+SLOT_BLOCKING_WARNINGS = frozenset({
+    "snapshot_symbols_missing",
+    "universe_unavailable",
+    "snapshot_source_unknown",
+    "fetch_completed_outside_requested_slot",
+    "fetch_outside_slot",
+})
+SLOT_BLOCKING_WARNING_PREFIXES = ("snapshot_quote_time_",)
+
+
+def _slot_blocked_by_warnings(warnings: Iterable[str]) -> bool:
+    """True when a warning is evidence against this slot, not just its quotes."""
+
+    for warning in warnings:
+        if warning in SLOT_BLOCKING_WARNINGS or warning.startswith(SLOT_BLOCKING_WARNING_PREFIXES):
+            return True
+    return False
+
+
 def _valid_price(value: Any) -> bool:
     try:
         price = float(value)
@@ -1309,14 +1335,19 @@ def _slot_evidence(root: Path, trade_date: str, slot: str) -> dict[str, Any]:
         quote_time_ok = all(
             _quote_time_state(row, trade_date, fetched_at=fetched) == "usable" for row in rows
         )
+        # One rule, both sides: a slot counts as complete when nothing blocks it.
+        # A price gap is counted (``snapshot_price_missing:<n>``) but no longer
+        # excludes a fully collected slot; the only floor kept is that a capture
+        # with no usable price at all is still not a collection (S3.4-r).
         complete = bool(
-            expected and not missing and not metadata.get("warnings")
+            expected and not missing
             and metadata.get("status") == "written"
+            and not _slot_blocked_by_warnings(metadata.get("warnings") or [])
             and metadata["source"] != "unknown_provider"
             and _as_shanghai(fetched).date().isoformat() == trade_date
             and _slot_for(_as_shanghai(fetched), include_close=slot == "1500") == slot
             and quote_time_ok
-            and all(_valid_price(row["price"]) for row in rows)
+            and any(_valid_price(row["price"]) for row in rows)
         )
         if metadata.get("status") not in {"written", "partial"}:
             raise ValueError("archive_status_invalid")
@@ -1719,8 +1750,11 @@ def _collect_locked(
         warnings.append("universe_unavailable")
     if missing_symbols:
         warnings.append("snapshot_symbols_missing")
-    if any(not _valid_price(row["price"]) for row in rows):
-        warnings.append("snapshot_price_missing")
+    price_missing_symbols = sorted(
+        {str(row["symbol"]) for row in rows if not _valid_price(row["price"])}
+    )
+    if price_missing_symbols:
+        warnings.append(f"snapshot_price_missing:{len(price_missing_symbols)}")
     quote_states: dict[str, int] = {}
     for row in rows:
         state = _quote_time_state(row, str(base["trade_date"]), fetched_at=fetch_time)
@@ -1766,7 +1800,7 @@ def _collect_locked(
         # is still archived as this slot's failed capture - the data is kept -
         # but it can never be read back as a complete or collected slot.
         base["reason_codes"] = [*base["reason_codes"], "provider_quotes_not_usable_for_slot"]
-    status = "partial" if warnings else "written"
+    status = "partial" if _slot_blocked_by_warnings(warnings) else "written"
     metadata = {
         "schema_version": "a0_snapshot_history_v1",
         "snapshot_path": _relative(root, target),
@@ -1781,6 +1815,7 @@ def _collect_locked(
         "expected_symbols": list(expected_symbols),
         "universe_sha256": _universe_hash(expected_symbols),
         "missing_symbols": missing_symbols,
+        "price_missing_symbols": price_missing_symbols,
         "unexpected_symbols": sorted(observed - set(expected_symbols)),
         "coverage_count": len(observed & set(expected_symbols)),
         "coverage_ratio": (len(observed & set(expected_symbols)) / len(expected_symbols)) if expected_symbols else None,
@@ -1792,10 +1827,12 @@ def _collect_locked(
         "ai_input": False,
         "latest_overwrite": False,
     }
-    if status == "partial":
-        # A partial archive must still say which stage failed, from which source,
-        # with which error and how long it took - the same evidence the attempt
-        # sidecar carries, kept next to the data it describes.
+    if status == "partial" or base.get("failure_detail"):
+        # A capture that fell back to a secondary source keeps the failure
+        # evidence next to the data whether or not the slot itself is relabelled:
+        # a written slot whose primary source failed must still say which stage
+        # failed, from which source, with which error and how long it took
+        # (S3.4-r; without this, a non-blocking source warning would hide it).
         metadata["stage_timings"] = list(base.get("stage_timings") or [])
         if base.get("failure_detail"):
             metadata["failure_detail"] = dict(base["failure_detail"])

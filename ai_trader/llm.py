@@ -21,10 +21,12 @@ import json
 import os
 import re
 import socket
+import ssl
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from ai_trader.paths import STATE_DIR, active_profile, profile_env_file
 from ai_trader.prompt_pack import load_prompt_pack
@@ -255,6 +257,123 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     return None
 
 
+_TRANSPORT_STAGES = frozenset({"request", "response", "decode"})
+_TRANSPORT_CATEGORIES = frozenset({
+    "http_error",
+    "timeout",
+    "connection_error",
+    "decode_error",
+    "unknown",
+})
+_URLERROR_CAUSES = frozenset({
+    "timeout",
+    "connection_refused",
+    "connection_reset",
+    "dns",
+    "ssl",
+    "network_unreachable",
+    "unknown",
+})
+_ERRNO_CAUSES = {
+    60: "timeout",
+    110: "timeout",
+    10060: "timeout",
+    111: "connection_refused",
+    10061: "connection_refused",
+    104: "connection_reset",
+    10054: "connection_reset",
+    101: "network_unreachable",
+    10051: "network_unreachable",
+    113: "network_unreachable",
+    10065: "network_unreachable",
+}
+
+
+def _classify_transport_leaf(exc: BaseException) -> str:
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "timeout"
+    if isinstance(exc, ConnectionRefusedError):
+        return "connection_refused"
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+        return "connection_reset"
+    if isinstance(exc, socket.gaierror):
+        return "dns"
+    if isinstance(exc, ssl.SSLError):
+        return "ssl"
+    errno = getattr(exc, "errno", None)
+    if isinstance(errno, int) and not isinstance(errno, bool):
+        return _ERRNO_CAUSES.get(errno, "unknown")
+    return "unknown"
+
+
+def _classify_urlerror_cause(exc: BaseException) -> str:
+    current: BaseException | None = exc
+    for _ in range(4):
+        if not isinstance(current, BaseException):
+            return "unknown"
+        if isinstance(current, urllib.error.HTTPError):
+            return "unknown"
+        if isinstance(current, urllib.error.URLError):
+            reason = getattr(current, "reason", None)
+            if isinstance(reason, BaseException) and reason is not current:
+                current = reason
+                continue
+            return "unknown"
+        return _classify_transport_leaf(current)
+    return "unknown"
+
+
+def _record_transport(
+    diagnostics: dict[str, Any] | None,
+    *,
+    stage: str,
+    started: float,
+    error_category: str | None = None,
+    http_status: int | None = None,
+    urlerror_cause: str | None = None,
+) -> None:
+    if diagnostics is None:
+        return
+    row: dict[str, Any] = {
+        "stage": stage,
+        "elapsed_ms": max(0, int((time.perf_counter() - started) * 1000)),
+    }
+    if error_category is not None:
+        row["error_category"] = error_category
+    if http_status is not None:
+        row["http_status"] = int(http_status)
+    if urlerror_cause is not None:
+        row["urlerror_cause"] = urlerror_cause
+    diagnostics["transport"] = row
+
+
+def persistable_transport_diagnostics(diagnostics: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Whitelist copy safe to store in an evening result. No exception text."""
+
+    if not isinstance(diagnostics, Mapping):
+        return {}
+    raw = diagnostics.get("transport")
+    if not isinstance(raw, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    stage = raw.get("stage")
+    if stage in _TRANSPORT_STAGES:
+        out["stage"] = stage
+    elapsed = raw.get("elapsed_ms")
+    if isinstance(elapsed, int) and not isinstance(elapsed, bool) and elapsed >= 0:
+        out["elapsed_ms"] = elapsed
+    category = raw.get("error_category")
+    if category in _TRANSPORT_CATEGORIES:
+        out["error_category"] = category
+    status = raw.get("http_status")
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        out["http_status"] = status
+    cause = raw.get("urlerror_cause")
+    if cause in _URLERROR_CAUSES:
+        out["urlerror_cause"] = cause
+    return out
+
+
 def _post_json(
     url: str,
     body: dict[str, Any],
@@ -273,18 +392,92 @@ def _post_json(
         method="POST",
         headers=headers,
     )
+    started = time.perf_counter()
+    status: int | None = None
     try:
         with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_S) as response:
+            status = int(getattr(response, "status", 200))
             if diagnostics is not None:
-                diagnostics["http_status"] = int(getattr(response, "status", 200))
-            return json.loads(response.read().decode("utf-8"))
+                diagnostics["http_status"] = status
+            try:
+                payload = json.loads(response.read().decode("utf-8"))
+            except (UnicodeError, ValueError) as exc:
+                _note(f"transport:{type(exc).__name__}")
+                _record_transport(
+                    diagnostics,
+                    stage="decode",
+                    started=started,
+                    error_category="decode_error",
+                    http_status=status,
+                )
+                return None
+            _record_transport(
+                diagnostics,
+                stage="response",
+                started=started,
+                http_status=status,
+            )
+            return payload
     except urllib.error.HTTPError as exc:
+        status = int(exc.code)
         if diagnostics is not None:
-            diagnostics["http_status"] = int(exc.code)
+            diagnostics["http_status"] = status
         _note(f"transport:{type(exc).__name__}")
+        _record_transport(
+            diagnostics,
+            stage="response",
+            started=started,
+            error_category="http_error",
+            http_status=status,
+        )
         return None
-    except (urllib.error.URLError, socket.timeout, TimeoutError, ValueError, OSError) as exc:
+    except urllib.error.URLError as exc:
+        cause = _classify_urlerror_cause(exc)
+        category = "timeout" if cause == "timeout" else "connection_error"
         _note(f"transport:{type(exc).__name__}")
+        _record_transport(
+            diagnostics,
+            stage="response" if status is not None else "request",
+            started=started,
+            error_category=category,
+            http_status=status,
+            urlerror_cause=cause,
+        )
+        return None
+    except (socket.timeout, TimeoutError) as exc:
+        _note(f"transport:{type(exc).__name__}")
+        _record_transport(
+            diagnostics,
+            stage="response" if status is not None else "request",
+            started=started,
+            error_category="timeout",
+            http_status=status,
+            urlerror_cause="timeout",
+        )
+        return None
+    except ValueError as exc:
+        _note(f"transport:{type(exc).__name__}")
+        _record_transport(
+            diagnostics,
+            stage="decode",
+            started=started,
+            error_category="unknown",
+        )
+        return None
+    except OSError as exc:
+        cause = _classify_transport_leaf(exc)
+        category = "timeout" if cause == "timeout" else (
+            "connection_error" if cause != "unknown" else "unknown"
+        )
+        _note(f"transport:{type(exc).__name__}")
+        _record_transport(
+            diagnostics,
+            stage="response" if status is not None else "request",
+            started=started,
+            error_category=category,
+            http_status=status,
+            urlerror_cause=cause if cause != "unknown" else None,
+        )
         return None
 
 
@@ -581,5 +774,6 @@ __all__ = [
     "LOOPBACK_HOSTS",
     "load_llm_config",
     "llm_runtime_descriptor",
+    "persistable_transport_diagnostics",
     "propose_picks",
 ]

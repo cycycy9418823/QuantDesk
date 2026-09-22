@@ -159,7 +159,43 @@ function setText(id, value) {
     if (node) node.textContent = value == null || value === "" ? "未提供" : String(value);
 }
 
+function renderOwnerRuntimeSummary(observations) {
+    const host = document.getElementById("projectRuntimeSummary");
+    if (!host) return;
+    if (!observations || typeof observations !== "object") {
+        host.innerHTML = '<p class="section-note">尚未读取日常运行记录；不能据此判断模型成功或行情完整。</p>';
+        return;
+    }
+    const snapshot = observations.snapshot || {};
+    const slotsKnown = Number.isInteger(snapshot.collected_slots) && Number.isInteger(snapshot.expected_slots)
+        && snapshot.collected_slots >= 0 && snapshot.expected_slots > 0 && snapshot.collected_slots <= snapshot.expected_slots;
+    const ratioKnown = typeof snapshot.valid_quote_ratio === "number"
+        && Number.isFinite(snapshot.valid_quote_ratio) && snapshot.valid_quote_ratio >= 0 && snapshot.valid_quote_ratio <= 1;
+    const quoteText = ratioKnown ? `有效报价 ${(snapshot.valid_quote_ratio * 100).toFixed(2)}%` : "有效报价比例未知";
+    const card = (label, stamp, main, badge, tone, detail) => `<article class="owner-runtime-card">
+        <div class="owner-runtime-card-head"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(stamp || "日期未知")}</span></div>
+        <div class="owner-runtime-value">${escapeHtml(main)}</div>
+        <span class="owner-runtime-badge ${tone}">${escapeHtml(badge)}</span>
+        <p>${escapeHtml(detail || "尚无可确认记录")}</p>
+    </article>`;
+    const cards = [card("行情采集", snapshot.as_of,
+        slotsKnown ? `${snapshot.collected_slots} / ${snapshot.expected_slots} 次` : "采集次数未知",
+        quoteText, "owner-tone-data", snapshot.message)];
+    for (const [profile, label] of [["default", "默认档"], ["glm", "GLM 档"]]) {
+        const item = observations.profiles?.[profile] || {};
+        const replied = item.model_replied;
+        const main = replied === true ? "模型有回应" : replied === false ? "固定规则接管" : "回应情况未知";
+        const badge = replied === true ? (item.decision_accepted === false ? "判断未接收" : item.model_label || "已取得模型回答")
+            : replied === false ? "本轮不是模型判断" : "不能按成功统计";
+        cards.push(card(label, item.as_of, main, badge,
+            replied === true && item.decision_accepted !== false ? "owner-tone-replied" : "owner-tone-notice", item.message));
+    }
+    host.innerHTML = `<div class="owner-runtime-grid">${cards.join("")}</div>
+        <p class="section-note">${escapeHtml(observations.source_label || "已有运行记录")}；各项日期分别列出。</p>`;
+}
+
 function renderProjectStatusFailure(message, keepPrevious, readAt = "") {
+    if (!keepPrevious) renderOwnerRuntimeSummary(null);
     const banner = document.getElementById("projectStatusBanner");
     if (banner) {
         banner.hidden = false;
@@ -179,6 +215,7 @@ function renderProjectStatusFailure(message, keepPrevious, readAt = "") {
 }
 
 function renderProjectStatusPayload(data, { stale = false } = {}) {
+    renderOwnerRuntimeSummary(data.runtime_observations);
     const banner = document.getElementById("projectStatusBanner");
     const health = document.getElementById("projectStatusHealth");
     const sectionsHost = document.getElementById("projectStatusSections");
@@ -838,12 +875,14 @@ function setupModuleNavigation() {
     const showModuleView = (targetId, updateUrl = true, scroll = true, refresh = true) => {
         if (targetId && typeof targetId === "object" && targetId.page === "__watch__") {
             if (isDetailModalOpen() && currentWorkbenchContext?.symbol === targetId.symbol
-                && currentWorkbenchContext?.source === targetId.source) return;
+                && currentWorkbenchContext?.source === targetId.source
+                && currentWorkbenchContext?.profile === targetId.profile) return;
+            setAiTraderProfile(targetId.profile);
             const origin = targetFromHash(targetId.returnHash || "#watch");
             if (!origin || typeof origin === "string") showModuleView(origin, false, scroll, refresh);
             else showWatchView(false, scroll, refresh);
             showDetail({ symbol: targetId.symbol, name: targetId.symbol, detail_lane: targetId.lane, select_date: targetId.entryDate },
-                { source: targetId.source, returnHash: targetId.returnHash, updateUrl: false });
+                { source: targetId.source, profile: targetId.profile, returnHash: targetId.returnHash, updateUrl: false });
             return;
         }
         if (targetId === "__system__") {
@@ -909,6 +948,7 @@ function setupModuleNavigation() {
             const from = params.get("from") || "#watch";
             return {
                 page: "__watch__", symbol: watchStock[1], source: params.get("source") || "stock",
+                profile: params.get("profile") === "glm" ? "glm" : "default",
                 lane: params.get("lane") || "", entryDate: params.get("entry_date") || "",
                 returnHash: from.startsWith("#") && !from.startsWith("#watch/") ? from : "#watch",
             };
@@ -1108,22 +1148,28 @@ async function loadDecisionHistory() {
     const note = document.getElementById("decisionHistoryNote");
     if (!panel) return;
     const requestId = ++decisionHistoryRequestSequence;
-    panel.innerHTML = '<div class="empty-state">正在读取复盘记录…</div>';
-    if (note) note.textContent = "正在读取各来源；尚未确认记录数量。";
+    const profile = aiTraderProfile;
+    const profileRevision = aiTraderProfileRevision;
+    const profileLabel = aiTraderProfileLabel(profile);
+    const profileQuery = aiTraderProfileQuery(profile);
+    rememberWorkbenchSource("review", []);
+    panel.onclick = null;
+    panel.innerHTML = `<div class="empty-state">正在读取 ${escapeHtml(profileLabel)} 的复盘记录…</div>`;
+    if (note) note.textContent = `${profileLabel} · 正在读取各来源；尚未确认记录数量。`;
     try {
         const settled = await Promise.allSettled([
             requestJson("/api/decision-board"),
-            requestJson("/api/ai-trader/dashboard"),
-            requestJson("/api/ai-trader/decisions"),
+            requestJson("/api/ai-trader/dashboard" + profileQuery),
+            requestJson("/api/ai-trader/decisions" + profileQuery),
         ]);
-        if (requestId !== decisionHistoryRequestSequence) return;
+        if (requestId !== decisionHistoryRequestSequence || profileRevision !== aiTraderProfileRevision) return;
         const sources = settled.map((result, index) => {
             const value = result.status === "fulfilled" ? result.value : null;
             const available = Boolean(value && typeof value === "object" && value.ok !== false
                 && (index === 0 ? Array.isArray(value.watchlist) || Array.isArray(value.events)
                     : index === 1 ? Array.isArray(value.filled_trades) : value.available === true && Array.isArray(value.records)));
             return {
-                label: ["策略观察与策略账事件", "AI 账近期成交", "AI 判断核对"][index],
+                label: ["策略观察与策略账事件", `${profileLabel} · AI 账近期成交`, `${profileLabel} · AI 判断核对`][index],
                 path: ["/api/decision-board", "/api/ai-trader/dashboard", "/api/ai-trader/decisions"][index],
                 warnings: Array.isArray(value?.warnings) ? value.warnings : [],
                 available,
@@ -1134,19 +1180,20 @@ async function loadDecisionHistory() {
         });
         const board = sources[0].value;
         const ai = sources[1].value;
-        const items = buildReviewItems(board, ai, sources[2].value);
+        const items = buildReviewItems(board, ai, sources[2].value, profile);
         const unavailable = sources.filter((source) => !source.available);
         const failure = unavailable.length === sources.length ? new Error("所有复盘来源读取失败，记录数量未知。") : null;
         renderDecisionHistory(board, failure, items, sources);
         if (note) note.textContent = [
+            `${profileLabel} ·`,
             failure ? "复盘记录读取失败；数量未知。" : `当前已读 ${items.length} 条；仅统计本次可读取范围。`,
             ...sources.filter((source) => !source.available || source.degraded).map((source) => `${source.label}${source.available ? "降级" : "读取失败"}`),
             sources[2].available ? `AI 判断 ${sources[2].value.records.length} 条；核对截至 ${safeText(sources[2].asOf)}。` : "AI 判断数量未知。",
         ].join(" ");
     } catch (error) {
-        if (requestId !== decisionHistoryRequestSequence) return;
+        if (requestId !== decisionHistoryRequestSequence || profileRevision !== aiTraderProfileRevision) return;
         renderDecisionHistory(null, error, []);
-        if (note) note.textContent = "复盘记录读取失败；未生成浏览器侧替代记录。";
+        if (note) note.textContent = `${profileLabel} · 复盘记录读取失败；未生成浏览器侧替代记录。`;
     }
 }
 
@@ -1154,6 +1201,7 @@ function reviewBucketOf(item) {
     if (item.kind === "paper_fill") return "fill";
     if (item.kind === "ai_decision") {
         if (item.backfill === true || item.provenance === "historical_review") return "historical";
+        if (item.review_context?.observation_status === "early_hit") return "early_hit";
         return ({ "错": "mismatch", "陈述与数据不符": "mismatch", "已到期 · 证据不足": "evidence_gap",
             "未到期": "pending", "对": "match", "不适用": "other" })[item.result] || "other";
     }
@@ -1172,7 +1220,7 @@ function reviewBucketOf(item) {
     return "other";
 }
 
-function buildReviewItems(board, ai, decisions = null) {
+function buildReviewItems(board, ai, decisions = null, profile = "default") {
     const items = [];
     const watchlist = Array.isArray(board && board.watchlist) ? board.watchlist : [];
     for (const row of watchlist) {
@@ -1216,16 +1264,20 @@ function buildReviewItems(board, ai, decisions = null) {
             name: fill.symbol,
             date: fill.date || fill.settled_on,
             ledger: "AI账",
+            profile,
+            profile_label: aiTraderProfileLabel(profile),
             action: fill.side === "sell" ? "纸面卖出" : "纸面买入",
             reason: `成交价 ${safeText(fill.price)} · ${safeText(fill.status || "filled")}`,
             kind: "paper_fill",
-            source_scope: "/api/ai-trader/dashboard · filled_trades（近期片段）",
+            source_scope: `${aiTraderProfileLabel(profile)} · /api/ai-trader/dashboard · filled_trades（近期片段）`,
         };
         item.bucket = reviewBucketOf(item);
         items.push(item);
     }
     for (const record of Array.isArray(decisions?.records) ? decisions.records : []) {
         const item = { ...record, kind: "ai_decision", ledger: "AI 判断", date: record.decision_date,
+            review_context: decisions?.review_summary?.record_context?.[record.decision_id],
+            profile, profile_label: aiTraderProfileLabel(profile),
             action: record.result || "未分类", reason: record.judgment, source_scope: "AI 判断核对记录" };
         item.bucket = reviewBucketOf(item);
         items.push(item);
@@ -1235,12 +1287,55 @@ function buildReviewItems(board, ai, decisions = null) {
     return items.sort((left, right) => rank(left) - rank(right) || safeText(right.date).localeCompare(safeText(left.date)));
 }
 
+function decisionOriginLabel(row) {
+    if (row.llm_used === false) return "固定规则";
+    if (row.llm_used !== true) return "来源未知";
+    const model = String(row.llm_model || "").toLowerCase();
+    if (model.includes("kimi") || model.includes("moonshot")) return "Kimi 模型";
+    if (model.includes("glm")) return "GLM 模型";
+    if (model.includes("deepseek")) return "DeepSeek 模型";
+    return "模型（名称未明确）";
+}
+
+function renderDecisionOutcomeSummary(source) {
+    const summary = source?.value?.review_summary;
+    if (!source?.available || !summary || typeof summary.groups !== "object") {
+        return '<p class="section-note">观察期统计尚未提供；下面保留原记录，不把未知当作零成绩。</p>';
+    }
+    const numberText = (value) => Number.isInteger(value) && value >= 0 ? String(value) : "未知";
+    const modelNames = [...new Set((source.value.records || []).filter((row) => row.llm_used === true).map(decisionOriginLabel))];
+    const originNote = modelNames.length
+        ? `<p class="section-note">本页模型记录：${escapeHtml(modelNames.join("、"))}。按当时实际模型标注，账本档位名称不代表每条记录的模型。</p>` : "";
+    const rows = Object.values(summary.groups).map((group) => {
+        const mature = numberText(group.mature_evaluable);
+        const result = group.mature_evaluable > 0
+            ? `其中对 ${numberText(group.mature_correct)} 条、错 ${numberText(group.mature_wrong)} 条`
+            : "暂不计算正确率";
+        const unknown = group.maturity_unknown > 0 ? `；另有 ${numberText(group.maturity_unknown)} 条观察日期不明` : "";
+        return `<article class="owner-review-card"><strong>${escapeHtml(group.label || "来源未知")}</strong>
+            <div class="owner-review-number">${mature}<small>条</small></div>
+            <p>观察期已结束的个股结果</p><p class="section-note">${result}${unknown}</p>
+            <dl><dt>提前命中，还在观察</dt><dd>${numberText(group.early_hits)} 条</dd>
+                <dt>尚在等待结果</dt><dd>${numberText(group.pending)} 条</dd></dl></article>`;
+    });
+    return `<div class="owner-review-summary">
+        <p class="section-note">核对截至 ${escapeHtml(summary.as_of || "日期未知")}。
+        提前满足条件先记“命中”；截止日以后，再归入完整观察期的统计。模型和固定规则分开看。</p>
+        ${originNote}
+        <div class="owner-review-grid">${rows.join("")}</div>
+    </div>`;
+}
+
 function renderAiDecisionRecord(row, index) {
     const text = (value) => escapeHtml(safeText(value));
     const seen = row.seen && typeof row.seen === "object" ? row.seen : {};
     const verification = row.verification && typeof row.verification === "object" ? row.verification : {};
     const historical = row.backfill === true || row.provenance === "historical_review";
+    const originLabel = decisionOriginLabel(row);
     const fields = [
+        ["AI 档位", row.profile_label],
+        ["判断来源", originLabel],
+        ["观察进度", row.review_context?.label || "尚无观察期说明"],
         ["当时判断", row.judgment], ["风格", row.style], ["计划持有交易日", row.planned_hold_days],
         ["验证条件", verification.text], ["验证价位", verification.level], ["到期日", verification.due_date],
         ["条件来源", verification.source === "derived_from_declared_horizon" ? "程序推导条件，非 AI 事前声明" : verification.source],
@@ -1253,7 +1348,7 @@ function renderAiDecisionRecord(row, index) {
     return `<details class="review-decision">
         <summary class="report-row review-row">
             <span>${text(row.date)}</span><strong>${text(row.symbol || "市场判断")}</strong>
-            <span>${text(row.result)}<small>${historical ? "事后复盘" : "事前记录"} · 纸面 · 未验证</small></span>
+            <span>${text(row.review_context?.observation_status === "early_hit" ? "提前命中" : row.result)}<small>${text(originLabel)} · ${historical ? "事后复盘" : "事前记录"} · 纸面 · 未验证</small></span>
             <span class="review-judgment-preview">${text(row.judgment)}</span>
         </summary>
         <div class="review-decision-body">
@@ -1276,6 +1371,7 @@ function renderDecisionHistory(board, error = null, items = [], sources = []) {
     const buckets = [
         { id: "mismatch", label: "需复核" },
         { id: "pending", label: "未到期" },
+        { id: "early_hit", label: "观察中·提前命中" },
         { id: "evidence_gap", label: "到期缺证据" },
         { id: "match", label: "符合" },
         { id: "historical", label: "事后复盘" },
@@ -1298,16 +1394,21 @@ function renderDecisionHistory(board, error = null, items = [], sources = []) {
         `).join("");
     };
     if (!buckets.some((bucket) => bucket.id === currentReviewBucket)) currentReviewBucket = "mismatch";
+    if (items.length && countOf(currentReviewBucket) === 0) {
+        currentReviewBucket = ["mismatch", "evidence_gap", "pending", "early_hit", "all"]
+            .find((bucket) => countOf(bucket) > 0) || "all";
+    }
     panel.innerHTML = `
         <p class="section-note">纸面 · 未验证</p>
+        ${renderDecisionOutcomeSummary(sources.find((source) => source.path === "/api/ai-trader/decisions"))}
         ${sources.map((source) => `<p class="section-note">${escapeHtml(source.label)} · ${source.available ? (source.degraded ? "降级，范围可能不完整" : "本次已读") : "读取失败，数量未知"} · 截至 ${escapeHtml(safeText(source.asOf))}${(source.warnings || []).map((warning) => ` · ${escapeHtml(safeText(warning))}`).join("")}</p>`).join("")}
-        <div class="metric-row">
+        <details class="owner-review-raw"><summary>查看原记录结果计数（含提前命中）</summary><div class="metric-row">
             ${["陈述与数据不符", "错", "已到期 · 证据不足", "未到期", "对"].map((result) => {
                 const source = sources.find((entry) => entry.path === "/api/ai-trader/decisions");
                 const count = items.filter((item) => item.kind === "ai_decision" && item.bucket !== "historical" && item.result === result).length;
-                return `<article class="metric-box"><span>AI · ${escapeHtml(result)}</span><strong>${source?.available ? `${count}${source.degraded ? "（已读）" : ""}` : "未知"}</strong></article>`;
+                return `<article class="metric-box"><span>原记录 · ${escapeHtml(result)}</span><strong>${source?.available ? `${count}${source.degraded ? "（已读）" : ""}` : "未知"}</strong></article>`;
             }).join("")}
-        </div>
+        </div></details>
         <div class="review-filters" role="tablist">
             ${buckets.map((bucket) => `
                 <button type="button" class="review-filter" data-review-bucket="${bucket.id}" ${bucket.id === currentReviewBucket ? 'aria-current="page"' : ""}>
@@ -1333,7 +1434,7 @@ function renderDecisionHistory(board, error = null, items = [], sources = []) {
         if (!row || !row.dataset.reviewSymbol) return;
         const item = items[Number(row.dataset.reviewIndex)];
         if (!item) return;
-        showDetail({ symbol: item.symbol, name: item.name || item.symbol }, { source: "review", items, eventId: item.event_id || item.id || "" });
+        showDetail({ symbol: item.symbol, name: item.name || item.symbol }, { source: "review", profile: item.profile || aiTraderProfile, items, eventId: item.event_id || item.id || "" });
     };
 }
 
@@ -1584,13 +1685,26 @@ function buildAgentClientContext() {
 // 前端不重算纸面权益、收益、持仓或回撤。聊天只能解释，不能下单。
 
 let aiTraderProfile = "default";
+let aiTraderProfileRevision = 0;
+let aiTraderRequestSequence = 0;
 
-function aiTraderProfileQuery() {
-    return aiTraderProfile === "default" ? "" : `?profile=${encodeURIComponent(aiTraderProfile)}`;
+function aiTraderProfileQuery(profile = aiTraderProfile) {
+    return profile === "default" ? "" : `?profile=${encodeURIComponent(profile)}`;
+}
+
+function aiTraderProfileLabel(profile = aiTraderProfile) {
+    return profile === "default" ? "默认 AI" : "GLM";
 }
 
 function setAiTraderProfile(profile) {
-    aiTraderProfile = profile === "glm" ? "glm" : "default";
+    const nextProfile = profile === "glm" ? "glm" : "default";
+    if (nextProfile !== aiTraderProfile) {
+        // A -> B -> A must invalidate the first A request as well.
+        aiTraderProfileRevision += 1;
+        decisionHistoryRequestSequence += 1;
+        aiTraderRequestSequence += 1;
+    }
+    aiTraderProfile = nextProfile;
     for (const button of document.querySelectorAll("[data-ai-trader-profile]")) {
         button.setAttribute("aria-pressed", button.dataset.aiTraderProfile === aiTraderProfile ? "true" : "false");
     }
@@ -1608,6 +1722,7 @@ function setupAiTraderPanel() {
         button.addEventListener("click", () => {
             setAiTraderProfile(button.dataset.aiTraderProfile);
             loadAiTraderPanel();
+            loadDecisionHistory();
         });
     }
     const sendButton = document.getElementById("sendAiTraderChatButton");
@@ -1652,20 +1767,29 @@ function aiTraderPnlClass(value) {
 
 async function loadAiTraderPanel() {
     const note = document.getElementById("aiTraderStatusNote");
-    const label = aiTraderProfile === "default" ? "默认·Kimi" : aiTraderProfile.toUpperCase();
+    const profile = aiTraderProfile;
+    const profileRevision = aiTraderProfileRevision;
+    const requestId = ++aiTraderRequestSequence;
+    const isCurrent = () => requestId === aiTraderRequestSequence && profileRevision === aiTraderProfileRevision;
+    const label = aiTraderProfileLabel(profile);
     if (note) note.textContent = `正在读取 ${label} 的 AI 纸面交易员状态…`;
-    const result = await fetchAiTraderJson("/api/ai-trader/dashboard" + aiTraderProfileQuery(), { headers: { Accept: "application/json" } });
-    const payload = result.payload;
-    if (!payload) {
-        if (note) note.textContent = `AI 纸面交易员数据读取失败（HTTP ${result.status}）。`;
-        return;
-    }
-    renderAiTraderDashboard(payload);
-    await loadAiTraderChatHistory();
-    if (note) {
-        note.textContent = payload.degraded
-            ? `${label} · 已降级展示：${(payload.warnings || []).slice(0, 2).join("；") || "部分数据缺失"}`
-            : `${label} · 已加载 · 更新时间 ${safeText(payload.updated_at)}`;
+    try {
+        const result = await fetchAiTraderJson("/api/ai-trader/dashboard" + aiTraderProfileQuery(profile), { headers: { Accept: "application/json" } });
+        if (!isCurrent()) return;
+        const payload = result.payload;
+        if (!payload) {
+            if (note) note.textContent = `${label} · AI 纸面交易员数据读取失败（HTTP ${result.status}）。`;
+            return;
+        }
+        renderAiTraderDashboard(payload);
+        await loadAiTraderChatHistory();
+        if (note && isCurrent()) {
+            note.textContent = payload.degraded
+                ? `${label} · 已降级展示：${(payload.warnings || []).slice(0, 2).join("；") || "部分数据缺失"}`
+                : `${label} · 已加载 · 更新时间 ${safeText(payload.updated_at)}`;
+        }
+    } catch (error) {
+        if (note && isCurrent()) note.textContent = `${label} · 数据读取失败：${errorText(error)}`;
     }
 }
 
@@ -1994,11 +2118,13 @@ function renderAiTraderSource(payload) {
 async function loadAiTraderChatHistory() {
     const host = document.getElementById("aiTraderChatLog");
     if (!host) return;
+    const profileRevision = aiTraderProfileRevision;
     if (aiTraderProfile !== "default") {
         host.innerHTML = `<div class="empty-state">${escapeHtml(aiTraderProfile.toUpperCase())} 分支的聊天面板暂不可用（聊天仍只读默认账）；它自己的结论看上方账户、计划与决策页。</div>`;
         return;
     }
     const result = await fetchAiTraderJson("/api/ai-trader/chat", { headers: { Accept: "application/json" } });
+    if (profileRevision !== aiTraderProfileRevision) return;
     const messages = result.payload?.messages;
     if (!Array.isArray(messages)) {
         host.innerHTML = '<div class="empty-state">聊天记录读取失败。</div>';
@@ -7244,6 +7370,7 @@ function workbenchContext(candidate, options, wasOpen) {
     const fromHash = options.returnHash || (wasOpen ? currentWorkbenchContext?.returnHash : window.location.hash) || "#watch";
     return {
         source,
+        profile: (options.profile || candidate.profile || aiTraderProfile) === "glm" ? "glm" : "default",
         sourceItemsReady: Boolean(known),
         items: items.slice(),
         returnHash: /^#watch\//.test(fromHash) ? "#watch" : fromHash,
@@ -7275,6 +7402,7 @@ async function showDetail(candidate, options = {}) {
     const suffix = params.toString() ? `?${params.toString()}` : "";
     const hashParams = new URLSearchParams(params);
     hashParams.set("source", currentWorkbenchContext.source);
+    if (currentWorkbenchContext.profile === "glm") hashParams.set("profile", "glm");
     hashParams.set("from", currentWorkbenchContext.returnHash);
     const detailHash = `#watch/${encodeURIComponent(String(candidate.symbol))}?${hashParams.toString()}`;
     if (options.updateUrl !== false && window.location.hash !== detailHash) {
@@ -7293,7 +7421,7 @@ async function showDetail(candidate, options = {}) {
     if (!isCurrent()) return;
     try {
         document.getElementById("modalTitle").textContent = `${detail.basic_info?.name || candidate.name || candidate.symbol} ${candidate.symbol}`;
-        document.getElementById("modalSubtitle").textContent = `${workbenchSourceLabel(currentWorkbenchContext.source)} · ${safeText(detail.basic_info?.date)} · Research Only · 纸面 · 未验证`;
+        document.getElementById("modalSubtitle").textContent = `${workbenchSourceLabel(currentWorkbenchContext.source)} · AI 图上记录：${aiTraderProfileLabel(currentWorkbenchContext.profile)} · ${safeText(detail.basic_info?.date)} · Research Only · 纸面 · 未验证`;
         currentDetailChartData = { ...(detail.chart_data || {}) };
         currentDetailResearchReference = detail.research_reference || {};
         body.innerHTML = renderDetailContent(detail);
@@ -7302,7 +7430,7 @@ async function showDetail(candidate, options = {}) {
         // The detail payload already contains locally read news. A read must
         // not implicitly invoke the separate news/provider refresh endpoint.
         activateDetailPane("charts");
-        const overlays = await loadChartOverlays(candidate.symbol);
+        const overlays = await loadChartOverlays(candidate.symbol, currentWorkbenchContext.profile);
         if (!isCurrent()) return;
         currentDetailChartData.markers = mergeChartMarkers(currentDetailChartData.markers, overlays);
         renderWorkbenchEventList(currentDetailChartData.markers, currentDetailChartData, overlays.warnings || []);
@@ -8414,21 +8542,24 @@ function chartEventPlotState(marker, chartData, dates) {
     return { plot: reasons.length === 0, reasons };
 }
 
-async function loadChartOverlays(symbol) {
+async function loadChartOverlays(symbol, profile = "default") {
     const wanted = String(symbol || "");
     const overlays = [];
     if (!wanted) return overlays;
-    if (!workbenchOverlayCache) {
+    if (!workbenchOverlayCache) workbenchOverlayCache = new Map();
+    if (!workbenchOverlayCache.has(profile)) {
         // Cache the in-flight promise, never a half-filled object. Another
         // stock opened while this is loading must await the same evidence.
-        workbenchOverlayCache = Promise.allSettled([
+        workbenchOverlayCache.set(profile, Promise.allSettled([
             requestJson("/api/decision-board"),
-            requestJson("/api/ai-trader/dashboard"),
-        ]);
+            requestJson("/api/ai-trader/dashboard" + aiTraderProfileQuery(profile)),
+        ]));
     }
-    const settled = await workbenchOverlayCache;
+    const settled = await workbenchOverlayCache.get(profile);
+    const aiSource = "/api/ai-trader/dashboard" + aiTraderProfileQuery(profile);
+    const aiLabel = profile === "default" ? "" : "GLM · ";
     overlays.warnings = settled.flatMap((result, index) => {
-        const name = index === 0 ? "策略账事件" : "AI 账计划/成交";
+        const name = index === 0 ? "策略账事件" : `${aiLabel}AI 账计划/成交`;
         if (result.status !== "fulfilled" || !result.value || result.value.ok === false) return [`${name}读取失败，事件范围不完整。`];
         return result.value.degraded ? [`${name}降级展示，记录可能不完整。`] : [];
     });
@@ -8469,10 +8600,10 @@ async function loadChartOverlays(symbol) {
             date: recordedAt ? String(recordedAt).slice(0, 10) : plan.decision_date || "",
             event_time: recordedAt,
             target_date: plan.trade_date || "",
-            label: committed ? "AI·已提交" : "AI·拟议",
+            label: aiLabel + (committed ? "AI·已提交" : "AI·拟议"),
             text: `${committed ? "已提交次日纸面计划" : "仅提议、未提交"}；${safeText(intent.side || "")} ${safeText(intent.quantity || "")}。不是成交。`,
             side: intent.side,
-            api_source: `/api/ai-trader/dashboard · ${committed ? "committed_intents" : "uncommitted_intents"}`,
+            api_source: `${aiSource} · ${committed ? "committed_intents" : "uncommitted_intents"}`,
         }));
     };
     (Array.isArray(ai.committed_intents) ? ai.committed_intents : []).forEach((row) => addIntent(row, true));
@@ -8488,11 +8619,11 @@ async function loadChartOverlays(symbol) {
             kind: "paper_fill",
             panel: "price",
             date,
-            label: fill.side === "sell" ? "AI账·纸面卖" : "AI账·纸面买",
+            label: aiLabel + (fill.side === "sell" ? "AI账·纸面卖" : "AI账·纸面买"),
             text: `账本记录成交价 ${safeText(fill.price)}；是否可叠图还需核对时间、来源和价格口径。`,
             side: fill.side,
             price: fill.price,
-            api_source: "/api/ai-trader/dashboard · filled_trades",
+            api_source: `${aiSource} · filled_trades`,
         }));
     }
     return overlays;

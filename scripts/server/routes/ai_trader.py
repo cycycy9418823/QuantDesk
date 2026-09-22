@@ -148,6 +148,9 @@ def _decisions_payload(profile: str = "") -> dict[str, Any]:
     payload.update(ok=available, available=available, status="degraded" if warnings else "available",
                    degraded=bool(warnings), schema=raw["schema"], records=records,
                    count=len(records) if available else None, as_of=raw.get("as_of"), warnings=warnings)
+    from ai_trader.decision_log import decision_review_summary
+
+    payload["review_summary"] = decision_review_summary(records, as_of=raw.get("as_of"))
     return payload
 
 

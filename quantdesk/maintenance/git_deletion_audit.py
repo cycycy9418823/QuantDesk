@@ -236,6 +236,16 @@ def _is_runtime_reference_path(path: str) -> bool:
 
 def _is_retired_legacy_delete_path(path: str) -> bool:
     name = Path(path).name
+    if path in {
+        "quantdesk/action_plan.py",
+        "quantdesk/data/index_membership_history.py",
+        "quantdesk/data/industry_classification.py",
+        "quantdesk/fundamental_health.py",
+        "quantdesk/research/multiperiod_attribution.py",
+        "quantdesk/risk_lines.py",
+        "quantdesk/stock_classifier.py",
+    }:
+        return True
     return (
         path.startswith("quantdesk/v5_daily_report/")
         or path.startswith("scripts/legacy/run_v")
@@ -292,12 +302,12 @@ def _classify_deleted(path: str, current_entries: set[str], previous_entries: se
     high_hint = any(token in name for token in HIGH_RISK_PATTERNS)
     existed_current = path in current_entries
     existed_previous = path in previous_entries
-    if references.get("import_risk") == "high":
-        bucket = "unknown_risk"
-        recommendation = "restore_before_continue"
-    elif _is_retired_legacy_delete_path(path):
+    if _is_retired_legacy_delete_path(path):
         bucket = "likely_legacy_removed"
         recommendation = "ignore_as_legacy_removed"
+    elif references.get("import_risk") == "high":
+        bucket = "unknown_risk"
+        recommendation = "restore_before_continue"
     elif existed_current or existed_previous or high_hint:
         bucket = "unknown_risk"
         recommendation = "needs_manual_review"

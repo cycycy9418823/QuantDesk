@@ -28,7 +28,7 @@ from ai_trader.ledger import (
     save_ledger,
 )
 from ai_trader.ledger import session_days_held as _session_days_held
-from ai_trader.llm import propose_picks
+from ai_trader.llm import persistable_transport_diagnostics, propose_picks
 from ai_trader.mandate import BOUNDARY, DEFAULT_MANDATE, max_open_gap_for_style
 from ai_trader.market import (
     focus_universe,
@@ -1268,6 +1268,7 @@ def run_evening(
         # Why the brain did not engage, when it did not. Recorded so a silent
         # fallback to the rule engine is never mistaken for the AI's own decision.
         "unavailable_reason": "" if llm_used else str(llm_diag.get("reason") or ""),
+        "diagnostics": persistable_transport_diagnostics(llm_diag),
         # A2: the recovery verdict for this cycle, and the raw reply (when one
         # was actually obtained) so an interruption is reconstructed, never
         # re-decided.

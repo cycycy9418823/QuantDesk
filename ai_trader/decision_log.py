@@ -979,6 +979,85 @@ def _count_results(records: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def _review_date(value: Any) -> date | None:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def decision_review_summary(records: list[dict[str, Any]], *, as_of: Any) -> dict[str, Any]:
+    """Describe published outcomes without rescoring, mutating, or using today's clock."""
+
+    cutoff = _review_date(as_of)
+    labels = {"model": "模型判断", "rule": "固定规则", "unknown": "来源未知"}
+    groups: dict[str, dict[str, Any]] = {}
+    for origin, label in labels.items():
+        groups[origin] = {
+            "label": label, "records": 0, "mature_evaluable": 0 if cutoff else None,
+            "mature_correct": 0 if cutoff else None, "mature_wrong": 0 if cutoff else None,
+            "early_hits": 0 if cutoff else None, "pending": 0 if cutoff else None,
+            "due_evidence_gap": 0, "maturity_unknown": 0, "unaccepted": 0,
+            "not_applicable": 0, "statement_mismatch": 0, "accuracy": None,
+        }
+    contexts: dict[str, dict[str, Any]] = {}
+    historical = 0
+    for row in records:
+        origin = "model" if row.get("llm_used") is True else "rule" if row.get("llm_used") is False else "unknown"
+        group = groups[origin]
+        verification = row.get("verification") if isinstance(row.get("verification"), dict) else {}
+        due = _review_date(verification.get("due_date"))
+        result_at = _review_date(row.get("result_as_of"))
+        result = row.get("result")
+        phase, note = "maturity_unknown", "观察截止日期或核对日期不明"
+        if _is_backfill(row):
+            historical += 1
+            phase, note = "historical", "事后补写，单独展示"
+        else:
+            group["records"] += 1
+            if row.get("committed") is False:
+                phase, note = "unaccepted", "判断未被接收，不计成绩"
+                group[phase] += 1
+            elif result == RESULT_MISMATCH:
+                phase, note = "statement_mismatch", "陈述与数据不符，不计预测成绩"
+                group[phase] += 1
+            elif not row.get("symbol") or result == RESULT_NA or verification.get("kind") == "none":
+                phase, note = "not_applicable", "本条没有可评价的个股条件"
+                group[phase] += 1
+            elif cutoff is None or due is None or (result_at and result_at > cutoff):
+                group["maturity_unknown"] += 1
+            elif due > cutoff:
+                if result == RESULT_RIGHT and result_at is not None:
+                    phase, note = "early_hit", "提前命中，观察期尚未结束"
+                    group["early_hits"] += 1
+                else:
+                    phase, note = "pending", "仍在观察期内"
+                    group[phase] += 1
+            elif result in (RESULT_RIGHT, RESULT_WRONG) and result_at is not None:
+                phase, note = "mature_evaluable", "观察期已结束，已有核对结果"
+                group[phase] += 1
+                group["mature_correct" if result == RESULT_RIGHT else "mature_wrong"] += 1
+            else:
+                phase, note = "due_evidence_gap", "观察期已结束，结果或证据尚未齐全"
+                group[phase] += 1
+        decision_id = row.get("decision_id")
+        if isinstance(decision_id, str) and decision_id:
+            contexts[decision_id] = {
+                "origin": origin, "origin_label": labels[origin], "observation_status": phase,
+                "label": note, "due_date": due.isoformat() if due else None,
+            }
+    for group in groups.values():
+        if group["mature_evaluable"]:
+            group["accuracy"] = group["mature_correct"] / group["mature_evaluable"]
+    return {
+        "as_of": cutoff.isoformat() if cutoff else None, "maturity_known": cutoff is not None,
+        "historical_records": historical, "groups": groups, "record_context": contexts,
+        "note": "提前命中保留原判定；观察期结束后才计入到期样本。模型、固定规则与来源未知分别统计。",
+    }
+
+
 def _result_names() -> tuple[str, ...]:
     return (
         RESULT_WRONG,

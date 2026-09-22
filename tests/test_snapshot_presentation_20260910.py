@@ -129,7 +129,7 @@ def test_valid_quote_ratio_is_not_roster_coverage(tmp_path: Path) -> None:
 
     _calendar(tmp_path)
     result = _archive_one_slot(tmp_path, ["600000"], [_quote("600000", price=0, quote_time="09:30:01")], 9, 30)
-    assert "snapshot_price_missing" in result["warnings"]
+    assert "snapshot_price_missing:1" in result["warnings"]
 
     summary = _history().snapshot_day_summary(tmp_path, DAY, symbols=["600000"], as_of=_at(9, 30))
     assert summary["roster_coverage_ratio"] == pytest.approx(1.0)

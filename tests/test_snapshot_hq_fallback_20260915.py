@@ -68,7 +68,12 @@ def test_known_list_failure_uses_hq_and_really_archives(tmp_path, monkeypatch, c
     assert all(float(row["volume"]) == 1000 and float(row["amount"]) == 11000 for row in rows)
     assert all(float(row["pct_chg"]) == pytest.approx(10) for row in rows)
     meta = json.loads(path.with_suffix(".json").read_bytes())
-    assert meta["status"] == "partial"  # Source failure remains visible.
+    # The secondary source covered both symbols with usable timestamps, so the
+    # slot itself is written; the failed primary source stays visible through the
+    # warning and through failure_detail, which is kept next to written archives
+    # for exactly this reason (S3.4-r).
+    assert meta["status"] == "written"
+    assert any(str(warning).startswith("sina.spot_direct:") for warning in meta["warnings"])
     original = next(row for row in meta["failure_detail"]["provider_errors"] if row["source"] == "sina.spot_direct")
     assert original["outcome"] == "failed"
     if cause == "http456":

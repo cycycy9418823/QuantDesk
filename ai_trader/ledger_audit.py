@@ -5,9 +5,14 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
 from ai_trader.execution_evidence import audit_trade_evidence
+from ai_trader.paths import ledger_id_for_profile
 
 ZERO = Decimal("0")
 HALF_MONEY_UNIT = Decimal("0.00005")
+ACCEPTED_LEDGER_IDS = frozenset({
+    ledger_id_for_profile(""),
+    ledger_id_for_profile("glm"),
+})
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -31,9 +36,10 @@ def audit_ledger(ledger: Mapping[str, Any]) -> dict[str, Any]:
     cost storage. A residual within that bound remains in the result; it is not
     rounded away or represented as exact equality.
     """
-    if ledger.get("ledger_id") != "ai_trader_100k":
+    ledger_id = ledger.get("ledger_id")
+    if not isinstance(ledger_id, str) or ledger_id not in ACCEPTED_LEDGER_IDS:
         return {"schema": "ai_ledger_audit_v1", "read_only": True,
-                "status": "foreign_ledger", "ledger_id": ledger.get("ledger_id"),
+                "status": "foreign_ledger", "ledger_id": ledger_id,
                 "checks": [], "historical_backfill": False}
     trades = [row for row in (ledger.get("trades") or []) if isinstance(row, dict)]
     positions = [row for row in (ledger.get("positions") or []) if isinstance(row, dict)]

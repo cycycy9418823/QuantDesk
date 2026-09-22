@@ -115,6 +115,43 @@ def test_read_only_amount_audit_keeps_small_residual_visible():
     assert ledger == original
 
 
+def test_registered_default_and_glm_ledgers_keep_amount_checks():
+    for ledger_id in ("ai_trader_100k", "ai_trader_100k_glm"):
+        ledger = empty_ledger(ledger_id=ledger_id)
+        original = deepcopy(ledger)
+        result = audit_ledger(ledger)
+        assert result["status"] == "exact"
+        assert result["ledger_id"] == ledger_id
+        assert result["checks"]
+        assert result["historical_backfill"] is False
+        assert result["read_only"] is True
+        assert ledger == original
+        ledger["cash"] -= 1
+        changed = deepcopy(ledger)
+        reviewed = audit_ledger(ledger)
+        assert reviewed["status"] == "requires_review"
+        assert reviewed["historical_backfill"] is False
+        assert ledger == changed
+
+
+@pytest.mark.parametrize(
+    "ledger_id",
+    [None, "", "ai_trader_100k_glm_extra", "ai_trader_100k_gl", "ai_trader_100k ", "strategy_book", [], {}, 42, True],
+)
+def test_missing_similar_and_unknown_ledger_ids_stay_foreign(ledger_id):
+    ledger = empty_ledger()
+    if ledger_id is None:
+        ledger.pop("ledger_id", None)
+    else:
+        ledger["ledger_id"] = ledger_id
+    original = deepcopy(ledger)
+    result = audit_ledger(ledger)
+    assert result["status"] == "foreign_ledger"
+    assert result["checks"] == []
+    assert result["historical_backfill"] is False
+    assert ledger == original
+
+
 def test_missing_nonfinite_foreign_and_material_amount_differences_remain_visible():
     ledger = empty_ledger()
     ledger["cash"] -= 1

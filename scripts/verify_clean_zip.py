@@ -304,7 +304,6 @@ VERSION_REQUIRED_FILES = {
         "quantdesk/risk/risk_alerts.py",
         "quantdesk/notifications/notification_center.py",
         "quantdesk/research/execution_realism.py",
-        "quantdesk/research/multiperiod_attribution.py",
         "quantdesk/research/barra_style_attribution.py",
         "quantdesk/research/stress_scenarios.py",
         "quantdesk/research/similar_day.py",
