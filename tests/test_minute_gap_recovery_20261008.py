@@ -194,7 +194,11 @@ def test_freshness_uses_new_source_without_touching_old_history(tmp_path, monkey
     assert path.read_bytes() == old
 
 
-@pytest.mark.parametrize("damage", ["truncated", "unknown", "qfq"])
+# A torn row is row-level damage (1C, owner plan 2026-10-11: isolate bad
+# rows, never refuse the whole file); tests/test_fix1c_minute_quarantine.py
+# proves it still cannot deduplicate or claim freshness. A non-raw segment is
+# file-level and stays blocked.
+@pytest.mark.parametrize("damage", ["unknown", "qfq"])
 def test_invalid_stored_segment_cannot_deduplicate_or_claim_fresh(tmp_path, damage):
     legacy = tmp_path/"data/intraday/1m/600000.csv"
     write_csv(legacy, [bar("2026-09-30 15:00:00")], legacy=True)

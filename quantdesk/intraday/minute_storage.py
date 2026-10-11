@@ -12,10 +12,36 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 DECLARED_BASIS_DIR = "declared_basis"
+QUARANTINE_DIR = ".quarantine"
 LEGACY_COLUMNS = {
     "symbol", "datetime", "date", "time", "open", "high", "low", "close",
     "volume", "amount", "source", "updated_at",
 }
+
+# Float serialization noise, not a price move. The stored archives carry values
+# such as open=39.690000000000005 against high=39.69 (600036, 2026-04-24
+# 09:32); across the 2026-10-09 storage_blocked files every envelope
+# "violation" was below 2e-14 relative. 1e-12 keeps a 50x margin and is still
+# about a million times smaller than one price tick.
+ENVELOPE_REL_TOLERANCE = 1e-12
+
+
+def envelope_violation(open_price: float, high: float, low: float, close: float) -> str:
+    """Return "" or the reason the OHLC envelope is inverted beyond float noise.
+
+    Same rule for raw and unknown rows, stored and incoming. Real inversions
+    (low above the body, high below the body, high below low) still fail.
+    """
+    body_top, body_bottom = max(open_price, close), min(open_price, close)
+
+    def _below(value: float, floor: float) -> bool:
+        return value < floor and not math.isclose(value, floor, rel_tol=ENVELOPE_REL_TOLERANCE, abs_tol=0.0)
+
+    if _below(body_bottom, low):
+        return "low_above_body"
+    if _below(high, body_top) or _below(high, low):
+        return "high_below_body"
+    return ""
 
 
 def is_legacy_minute_file(path: Path) -> bool:
@@ -79,18 +105,13 @@ def _has_unknown_basis_history(path: Path, *, now: datetime | None = None) -> bo
                 except (TypeError, ValueError):
                     return False
                 open_price, high, low, close = prices
-                body_top, body_bottom = max(open_price, close), min(open_price, close)
                 # Unknown rows stay quarantined and never become price
-                # evidence. Their old float serialization may differ in the
-                # last decimal digits; do not rewrite them to append new raw
-                # rows elsewhere. Raw history and incoming bars stay strict.
-                high_below = high < body_top
-                low_above = low > body_bottom
-                if basis != "raw":
-                    high_below = high_below and not math.isclose(high, body_top, rel_tol=1e-12, abs_tol=0.0)
-                    low_above = low_above and not math.isclose(low, body_bottom, rel_tol=1e-12, abs_tol=0.0)
+                # evidence. Old float serialization may differ in the last
+                # decimal digits for raw and unknown rows alike (2026-10-09:
+                # every raw "violation" was below 2e-14 relative); a real
+                # inversion still fails. Nothing here rewrites a row.
                 if (not all(math.isfinite(value) and value > 0 for value in prices)
-                        or high_below or low_above
+                        or envelope_violation(open_price, high, low, close)
                         or stamp.tzinfo is not None or stamp > checked_at + timedelta(minutes=2)
                         or row["date"] != stamp.date().isoformat()
                         or row["time"] not in {stamp.strftime("%H:%M"), stamp.strftime("%H:%M:%S")}):

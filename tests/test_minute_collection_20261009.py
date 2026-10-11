@@ -208,10 +208,13 @@ def test_new_or_preexisting_segment_must_still_declare_raw(tmp_path, basis):
     assert not (actual.parent / "declared_basis").exists()
 
 
+# 1C (owner plan 2026-10-11): raw rows get the same float-serialization
+# tolerance as unknown rows; a real inversion (8.959) still fails for both.
 @pytest.mark.parametrize(("basis", "high", "separate"), [
     ("unknown", "8.959999999999999", True),
-    ("raw", "8.959999999999999", False),
+    ("raw", "8.959999999999999", True),
     ("unknown", "8.959", False),
+    ("raw", "8.959", False),
 ])
 def test_unknown_float_serialization_never_relaxes_raw_validation(tmp_path, basis, high, separate):
     path = tmp_path / "600000.csv"
