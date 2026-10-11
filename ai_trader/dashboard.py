@@ -253,20 +253,123 @@ def build_dashboard_payload(
     llm_plan = _as_dict(plan.get("llm"))
     llm_cycle = _as_dict(cycle.get("plan")).get("llm") if isinstance(cycle.get("plan"), dict) else {}
     llm_cycle = _as_dict(llm_cycle)
+    llm_journal = _as_dict(journal.get("llm"))
     llm_used = bool(llm_plan.get("used"))
+    # T22：模型、是否调用、失败原因、来源必须**来自同一次判断**。先按 plan → cycle → 日记
+    # 选定一条记录，再从这一条里整组取值；存在计划时，其它记录必须与它的 plan_id/日期对得上
+    # 才允许回看，否则一律留未知——不能把不同记录的非空字段拼成一轮。
+    plan_id = str(plan.get("plan_id") or "")
+    plan_day = str(plan.get("decision_date") or plan.get("as_of") or "")[:10]
+
+    def _same_run(container: dict[str, Any], record: dict[str, Any]) -> bool:
+        other_id = str(record.get("plan_id") or "")
+        other_day = str(record.get("decision_date") or record.get("as_of") or "")[:10]
+        if plan_id and other_id:
+            return other_id == plan_id
+        if plan_day and other_day:
+            return other_day == plan_day
+        return False
+
+    cycle_plan = cycle.get("plan") if isinstance(cycle.get("plan"), dict) else {}
+    candidates: list[tuple[str, dict[str, Any], dict[str, Any]]] = [
+        ("plan_latest", llm_plan, plan),
+        ("cycle_latest", llm_cycle, cycle_plan if isinstance(cycle_plan, dict) else {}),
+        ("journal_latest", llm_journal, journal),
+    ]
+    chosen_source = ""
+    chosen: dict[str, Any] = {}
+    for source, container, record in candidates:
+        if not container:
+            continue
+        if source != "plan_latest" and (plan_id or plan_day) and not _same_run(container, record):
+            # 已有本次计划，却与它的 plan_id/日期对不上 → 那是另一轮记录，不得借它的模型或错误。
+            continue
+        chosen_source, chosen = source, container
+        break
+    llm_used = bool(chosen.get("used")) if chosen else False
+    model = str(chosen.get("model") or "").strip() if chosen else ""
+    unavailable_reason = str(chosen.get("unavailable_reason") or "") if chosen else ""
+    if chosen and llm_used:
+        mode = "model"
+    elif chosen:
+        mode = "rule_fallback"
+    else:
+        mode = "unknown"
     llm = {
         "used": llm_used,
-        "model": str(llm_plan.get("model") or ""),
-        "unavailable_reason": str(llm_plan.get("unavailable_reason") or ""),
-        "market_note": str(llm_plan.get("market_note") or ""),
-        "picked": list(_as_list(llm_plan.get("picked"))),
-        "sells_requested": list(_as_list(llm_plan.get("sells_requested"))),
+        "model": model,
+        "model_source": chosen_source,
+        "mode": mode,
+        "unavailable_reason": unavailable_reason,
+        "market_note": str(chosen.get("market_note") or ""),
+        "picked": list(_as_list(chosen.get("picked"))),
+        "sells_requested": list(_as_list(chosen.get("sells_requested"))),
         "source": "plan_latest.json",
+        "recovery_status": str(chosen.get("recovery_status") or ""),
+        "raw_response_reused": bool(_as_dict(chosen.get("raw_response")).get("reused")),
     }
     # Cross-check against the cycle snapshot when present: disagreement is a
     # warning, never silently rewritten to look consistent.
     if cycle and llm_cycle and bool(llm_cycle.get("used")) != llm_used:
         warnings.append("llm_state_mismatch_between_plan_and_cycle")
+
+    # T44：页面要一眼看清"缺什么、计划与成交、两本账收益、AI 原判断与后续核验"。
+    # 这些标记只反映真实文件状态，缺数/未知/跳过/回退都照实显示，不用标签掩盖失败。
+    decision_latest = _require(root_state / "decision_latest.json", "decisions")
+    decisions_available = isinstance(decision_latest.get("records"), list)
+    if not decisions_available:
+        degraded = True
+        warnings.append("decisions_invalid_records:decision_latest.json")
+    decision_rows = _as_list((decision_latest or {}).get("records")) if isinstance(decision_latest, dict) else []
+    decision_rows = [row for row in decision_rows if isinstance(row, dict)]
+    unverified_rows = [row for row in decision_rows if row.get("statement_unverified")]
+    rechecked_rows = [row for row in decision_rows if isinstance(row.get("recheck"), dict)]
+    st_unknown_fills = [row for row in filled + rejected if row.get("st_unknown")]
+
+    def _marker(flag: bool, label: str) -> dict[str, Any]:
+        return {"present": bool(flag), "label": label}
+
+    research_state = {
+        "markers": {
+            "missing_data": _marker(degraded, "有文件缺失/损坏，按缺数展示"),
+            "unknown_identity": _marker(bool(st_unknown_fills), "成交里存在 ST 身份未知的票"),
+            "unverified_statements": _marker(bool(unverified_rows), "有未核验的当晚陈述（不算对错）"),
+            "model_fallback": _marker(llm.get("mode") == "rule_fallback", "当次走的是备用规则"),
+            "model_unknown": _marker(llm.get("mode") == "unknown", "当次模型来源未知"),
+            "recheck_present": _marker(bool(rechecked_rows), "有补证后的关联评价（原判定不变）"),
+            "plan_uncommitted": _marker(classified["plan_committed"] is False, "今晚计划未提交/未成交"),
+        },
+        "plan_vs_fills": {
+            "committed_intents": len(classified["committed_intents"]),
+            "uncommitted_intents": len(classified["uncommitted_intents"]),
+            "filled": len(filled),
+            "rejected_or_abandoned": len(rejected),
+        },
+        "llm": {
+            "mode": llm.get("mode"), "model": llm.get("model"),
+            "model_source": llm.get("model_source"),
+            "recovery_status": llm["recovery_status"],
+            "raw_response_reused": llm["raw_response_reused"],
+            "unavailable_reason": llm.get("unavailable_reason"),
+            "configured": _as_dict(llm_runtime_descriptor()),
+        },
+        "records": {
+            "available": decisions_available,
+            "total": len(decision_rows) if decisions_available else None,
+            "unverified": len(unverified_rows) if decisions_available else None,
+            "rechecked": len(rechecked_rows) if decisions_available else None,
+            "rechecked_results": sorted({str((row.get("recheck") or {}).get("result") or "unknown")
+                                         for row in rechecked_rows}),
+        },
+        "book": {
+            "cash": ledger.get("cash"),
+            "equity": ledger.get("equity"),
+            "positions": len(positions) if isinstance(ledger.get("positions"), list) else None,
+            "trades": len(trades) if isinstance(ledger.get("trades"), list) else None,
+            "realized_pnl": ledger.get("realized_pnl"),
+        },
+        "dry_state": _read_json(root_state / "daytime_dry_state.json")[0] or {},
+    }
 
     stance = _as_dict(philosophy.get("stance"))
     style_ledger = _as_dict(philosophy.get("style_ledger"))
@@ -311,6 +414,13 @@ def build_dashboard_payload(
         "degraded": degraded,
         "warnings": warnings,
         "boundary": boundary,
+        "source_availability": {
+            "positions": isinstance(ledger.get("positions"), list),
+            "trades": isinstance(ledger.get("trades"), list),
+            "actions": any(isinstance(item.get("actions"), list) for item in (review, journal)),
+            "plan": bool(plan),
+            "philosophy": bool(philosophy),
+        },
         "account": {
             "equity": ledger.get("equity"),
             "cash": ledger.get("cash"),
@@ -320,7 +430,7 @@ def build_dashboard_payload(
             "initial_cash": ledger.get("initial_cash"),
             "as_of": ledger.get("as_of"),
             "updated_at": ledger.get("updated_at"),
-            "positions_count": len(positions),
+            "positions_count": len(positions) if isinstance(ledger.get("positions"), list) else None,
         },
         "positions": positions,
         "latest_journal": {
@@ -385,7 +495,9 @@ def build_dashboard_payload(
                 "本页面只读展示，不提供启动/停止/重跑。"
             ),
         },
+        "research_state": research_state,
         "source_paths": {
+
             "ledger": str(root_state / "ledger.json"),
             "plan_latest": str(root_state / "plan_latest.json"),
             "journal_latest": str(root_state / "journal_latest.json"),

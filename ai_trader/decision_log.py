@@ -43,6 +43,8 @@ RESULT_PENDING = "未到期"
 RESULT_MISMATCH = "陈述与数据不符"
 RESULT_EXPIRED_NO_EVIDENCE = "已到期 · 证据不足"
 RESULT_NA = "不适用"
+# 主体/时段本身定不下来的命中是"未核验"：安全拒收，但不得写成"已证实与数据不符"（T11）。
+RESULT_UNVERIFIED = "未核验"
 PAGE_ORDER = {
     RESULT_WRONG: 0,
     RESULT_MISMATCH: 1,
@@ -88,9 +90,10 @@ _DAILY_ROWS_CACHE: dict[tuple[str, str], _DailyRowsCacheEntry] = {}
 class StatementGateResult:
     accepted_intents: list[dict[str, Any]]
     rejections: list[dict[str, Any]] = field(default_factory=list)
-    market_note_ok: bool = True
+    market_note_ok: bool = False
     original_intents: list[dict[str, Any]] = field(default_factory=list)
     market_note_rejections: list[dict[str, Any]] = field(default_factory=list)
+    market_note_status: str = "未核验"
 
 
 def statement_gate_summary(gate: StatementGateResult) -> dict[str, Any]:
@@ -109,6 +112,7 @@ def statement_gate_summary(gate: StatementGateResult) -> dict[str, Any]:
         "accepted_intent_count": len(gate.accepted_intents),
         "rejected_intent_count": sum(row.get("side") in {"buy", "sell"} for row in gate.rejections),
         "market_note_ok": gate.market_note_ok,
+        "market_note_status": gate.market_note_status,
         "market_note_rejections": deepcopy(gate.market_note_rejections),
         "original_intents": deepcopy(gate.original_intents),
     }
@@ -206,7 +210,8 @@ def _claim_scope(text: str, start: int, decision_date: str) -> _ClaimScope:
 
 def _intent_fact_texts(intent: dict[str, Any]) -> list[str]:
     texts: list[str] = []
-    for key in _INTENT_FACT_FIELDS:
+    fields = ("reason",) if intent.get("side") == "sell" else _INTENT_FACT_FIELDS
+    for key in fields:
         value = str(intent.get(key) or "").strip()
         if value and value not in texts:
             texts.append(value)
@@ -319,6 +324,77 @@ def load_daily_bar(symbol: str, as_of: str, daily_dir: Path) -> dict[str, Any] |
     return None
 
 
+def _seen_snapshot(symbol: str, as_of: str, daily_dir: Path) -> dict[str, Any]:
+    """当晚核验时真正看到的日线快照，随被拒项一起落盘。
+
+    只在决策当晚取一次；日后行情被修正时，重建历史用的是这份快照，而不是重读日线。
+    这个键不参与 ``judgment``/``identity``/``decision_id`` 的推导。
+    """
+
+    bar = load_daily_bar(symbol, as_of, daily_dir) if symbol else None
+    return {
+        "as_of": as_of,
+        "open": None if bar is None else bar.get("open"),
+        "high": None if bar is None else bar.get("high"),
+        "low": None if bar is None else bar.get("low"),
+        "close": None if bar is None else bar.get("close"),
+        "pct_chg": None if bar is None else bar.get("pct_chg"),
+    }
+
+
+_SEEN_PRICE_KEYS = ("open", "high", "low", "close", "pct_chg")
+
+
+def _seen_field(
+    intent: dict[str, Any],
+    *,
+    recorded: dict[str, Any] | None,
+    bar: dict[str, Any] | None,
+    decision_date: str,
+) -> dict[str, Any]:
+    """记录的 ``seen``：当晚落盘的所见 > 现读日线 > 标缺失。
+
+    当晚真的看到了行情，就用它并标 ``recorded_at_decision``；当晚本来就没有日线
+    （``seen_at_decision`` 各项都为 null）同样标 ``missing``，不因为后来补上了行情
+    或行情被修正就改写当时所见。缺失时价格一律留 ``None``，不拿当前行情或当前时钟补造。
+    """
+
+    ref_close = _f(intent.get("ref_close"))
+    as_of = _as_day((recorded or {}).get("as_of")) or decision_date
+    if recorded is not None and any(recorded.get(key) is not None for key in _SEEN_PRICE_KEYS):
+        return {
+            "source": "recorded_at_decision",
+            "as_of": as_of,
+            "open": recorded.get("open"),
+            "high": recorded.get("high"),
+            "low": recorded.get("low"),
+            "close": recorded.get("close"),
+            "pct_chg": recorded.get("pct_chg"),
+            "ref_close": ref_close,
+        }
+    if recorded is None and bar is not None:
+        return {
+            "source": "data/daily",
+            "as_of": decision_date,
+            "open": bar.get("open"),
+            "high": bar.get("high"),
+            "low": bar.get("low"),
+            "close": bar.get("close"),
+            "pct_chg": bar.get("pct_chg"),
+            "ref_close": ref_close,
+        }
+    return {
+        "source": "missing",
+        "as_of": as_of,
+        "open": None,
+        "high": None,
+        "low": None,
+        "close": None,
+        "pct_chg": None,
+        "ref_close": ref_close,
+    }
+
+
 def _closes_from(symbol: str, start: str, daily_dir: Path, count: int) -> list[tuple[str, float]]:
     out: list[tuple[str, float]] = []
     rows = iter_daily_rows(symbol, daily_dir)
@@ -385,49 +461,13 @@ def _hold_days(intent: dict[str, Any]) -> int:
 
 
 def _mismatch(kind: str, detail: str, **extra: Any) -> dict[str, Any]:
+    """命中项。``claim_indeterminate`` 标记"这句话本身没法定死"（主体/时段定不下来）：
+    命中项的 label 保持既有语义（既有回归钉着它），记录与展示层据此把主结论写成"未核验"。"""
     payload = {"kind": kind, "detail": detail, "label": RESULT_MISMATCH}
     payload.update(extra)
     return payload
 
 
-def _check_price_claims(
-    text: str, bar: dict[str, Any], *, rows: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    hits: list[dict[str, Any]] = []
-    for pattern, field_name, label in (
-        (_CLOSE_PRICE, "close", "收盘"),
-        (_OPEN_PRICE, "open", "开盘"),
-    ):
-        for match in pattern.finditer(text or ""):
-            scope = _claim_scope(text, match.start(), str(bar.get("date") or ""))
-            if scope.forecast:
-                continue
-            claimed = float(match.group(1))
-            if scope.ambiguous or _scope_period_unspecified(scope):
-                hits.append(
-                    _mismatch(
-                        f"claimed_{field_name}_ambiguous_period",
-                        f"{label}价对应的时段不明确，不能核对。",
-                        claimed=claimed,
-                        evidence_status="unverified",
-                        evidence_date=scope.evidence_date,
-                    )
-                )
-                continue
-            dated = next((row for row in rows if row["date"] == scope.evidence_date), None)
-            actual = None if dated is None else dated.get(field_name)
-            if actual is None or not _price_close_enough(claimed, float(actual)):
-                hits.append(
-                    _mismatch(
-                        f"claimed_{field_name}",
-                        f"陈述{scope.evidence_date}{label}{claimed}，日线{label}{actual}",
-                        claimed=claimed,
-                        actual=actual,
-                        evidence_date=scope.evidence_date,
-                        **({"evidence_status": "unverified"} if actual is None else {}),
-                    )
-                )
-    return hits
 
 
 def _pct_claim_hits(
@@ -448,6 +488,7 @@ def _pct_claim_hits(
             _mismatch(
                 "claimed_pct_ambiguous_period",
                 "陈述的涨跌时段不明确，不能核对。",
+                claim_indeterminate=True,
                 evidence_status="unverified",
                 **evidence,
             )
@@ -492,21 +533,6 @@ def _pct_claim_hits(
     ]
 
 
-def _check_symbol_pct_claims(text: str, decision_date: str, daily_dir: Path) -> list[dict[str, Any]]:
-    hits: list[dict[str, Any]] = []
-    for match in _SYMBOL_PCT.finditer(text or ""):
-        scope = _claim_scope(text, match.start(), decision_date)
-        symbol, raw = match.group(1), match.group(2)
-        hits.extend(
-            _pct_claim_hits(
-                float(raw),
-                scope,
-                iter_daily_rows(symbol, daily_dir),
-                kind="claimed_pct",
-                symbol=symbol,
-            )
-        )
-    return hits
 
 
 def _signed_pct_claim(verb: str, raw: str) -> float:
@@ -519,24 +545,6 @@ def _signed_pct_claim(verb: str, raw: str) -> float:
     return magnitude
 
 
-def _check_untagged_pct(text: str, bar: dict[str, Any] | None, rows: list[dict[str, Any]], as_of: str) -> list[dict[str, Any]]:
-    if not text or bar is None:
-        return []
-    hits: list[dict[str, Any]] = []
-    symbol_spans = [match.span() for match in _SYMBOL_PCT.finditer(text)]
-    for match in _UNTAGGED_PCT.finditer(text):
-        if any(start <= match.start() < end for start, end in symbol_spans):
-            continue
-        scope = _claim_scope(text, match.start(), as_of)
-        hits.extend(
-            _pct_claim_hits(
-                _signed_pct_claim(match.group("verb"), match.group("pct")),
-                scope,
-                rows,
-                kind="claimed_pct_untagged",
-            )
-        )
-    return hits
 
 
 def _basis_untrusted(row: dict[str, Any] | None) -> str:
@@ -551,12 +559,183 @@ def _basis_untrusted(row: dict[str, Any] | None) -> str:
     return ""
 
 
+# T11：只有"证券简称形态"的中文词才当作陈述主体。清单能绑定时永远优先用清单；清单缺这条
+# 或重名绑不上时，这句话就是"主体缺证"，不得退回提议标的去核（禁止猜证券）。
+# 这里不用宽泛中文分词，避免把"近5个交易日"这类时段词当成票名。
+SECURITY_NAME_SUFFIXES = (
+    "银行", "证券", "保险", "信托", "期货",
+    "科技", "软件", "网络", "信息", "数据", "智能", "通信", "电子", "半导体", "光电",
+    "医药", "生物", "制药", "医疗", "健康", "器械",
+    "能源", "电力", "石油", "石化", "化工", "燃气", "水务", "环保", "光伏", "风电", "锂业", "稀土",
+    "煤业", "矿业", "有色", "钢铁", "水泥", "建材", "建筑", "地产", "置业",
+    "汽车", "重工", "机械", "电气", "电器", "家电", "装备",
+    "食品", "乳业", "酒业", "饮料", "农业", "种业", "牧业", "渔业", "纺织", "服装", "纸业", "包装",
+    "物流", "航运", "航空", "机场", "港口", "高速", "公路", "铁路", "旅游", "酒店", "餐饮",
+)
+_CLAIM_WORDS = ("收盘", "开盘", "最高", "最低", "报收", "涨", "跌", "价格", "成交", "换手", "市值", "估值")
+
+
+# T11：陈述主体识别的词表。先把时间/量词从**紧贴陈述之前**的中文词里剥掉，再用通用词过滤；
+# 只有剥完还剩下的短中文词才算"像证券简称的主体"。不靠后缀表，也不给某只票开特例。
+_SUBJECT_TIME_WORDS = (
+    "今天", "今日", "当日", "当天", "昨天", "昨日", "前天", "近期", "最近", "目前", "现在",
+    "明天", "明日", "后天", "次日", "往后", "未来", "本周", "上周", "本月", "上月", "今年",
+    "去年", "以来", "至今", "此前", "之后", "随后", "早前", "上午", "下午", "盘中", "当晚",
+)
+_SUBJECT_PERIOD_WORDS = ("个交易日", "交易日", "季度", "小时", "分钟", "个月", "个", "只", "款", "家")
+_SUBJECT_GENERIC_WORDS = (
+    "股票", "个股", "板块", "市场", "两市", "大盘", "指数", "行业", "概念", "题材", "龙头",
+    "多只", "多数", "部分", "个别", "该股", "本票", "标的", "组合", "持仓", "仓位", "账户",
+    "现金", "资金", "情绪", "趋势", "位置", "区间", "均价", "成交", "换手", "市值", "估值",
+    "涨跌", "涨幅", "跌幅", "价格", "走势", "形态", "结构", "风险", "机会", "建议", "观察",
+    "关注", "研究", "记录", "理由", "逻辑", "观点", "判断", "计划", "目标", "策略", "交易",
+    "票", "股", "整体", "全部", "所有", "上述", "以上", "此类", "其余", "收盘", "开盘",
+)
+
+
+def _subject_like_token(prefix: str) -> str:
+    """紧贴陈述之前的主体词；剥掉时间/量词，通用词不算主体，长度 2–6 才算。
+
+    在**原文**上操作（不先切成纯中文串），所以「万科A」「ST海航」这类带字母的主体也能取到。
+    """
+    text = (prefix or "").strip()
+    changed = True
+    while text and changed:
+        changed = False
+        for word in _SUBJECT_TIME_WORDS + _SUBJECT_PERIOD_WORDS:
+            if text.endswith(word) and len(text) > len(word):
+                text = text[: -len(word)]
+                changed = True
+        trimmed = text.rstrip("0123456789.%-（）() ")
+        if trimmed != text:
+            text = trimmed
+            changed = True
+    match = re.search(r"([A-Za-z0-9\u4e00-\u9fff]+)$", text)
+    chunk = match.group(1) if match else ""
+    if not (2 <= len(chunk) <= 6) or chunk[0].isdigit():
+        return ""
+    if chunk in set(_SUBJECT_TIME_WORDS) | set(_SUBJECT_PERIOD_WORDS):
+        return ""
+    if any(word in chunk for word in _SUBJECT_GENERIC_WORDS + _SUBJECT_TIME_WORDS + _SUBJECT_PERIOD_WORDS):
+        return ""
+    if not re.search(r"[\u4e00-\u9fff]", chunk):
+        return ""
+    return chunk
+
+
+def _unresolved_subject_in(prefix: str, following: str = "") -> str:
+    """句子里"像证券简称"却绑定不到代码的中文主体；没有则空串。
+
+    只在清单绑定失败后才调用：能绑上清单的主体根本走不到这里。两道判据互为补充：
+    ① ``_subject_like_token``：紧贴陈述之前的中文主体词（不依赖后缀表，因此不限某几只票）；
+    ② 后缀形态扫描：长句里出现的证券简称（如"浦发银行今天缩量"这种带别的话的句子）。
+    """
+    token = _subject_like_token(prefix)
+    if token:
+        return token
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", prefix or ""):
+        for size in (5, 4, 3, 2):
+            for start in range(0, len(run) - size + 1):
+                token = run[start : start + size]
+                tail = run[start + size :] + (following or "")
+                if not tail or not any(word in tail for word in _CLAIM_WORDS):
+                    continue  # 主体后面必须紧跟一句价格/涨跌陈述，才算在说证券
+                if len(token) > 2 and any(
+                    token.endswith(suffix) and len(token) > len(suffix)
+                    for suffix in SECURITY_NAME_SUFFIXES
+                ):
+                    return token
+    return ""
+
+
+
+def _verify_fact_text(
+    text: str, *, decision_date: str, daily_dir: Path,
+    default_symbol: str = "", name_to_symbol: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """One recognizer for both market notes and per-intent factual prose.
+
+    Only explicit subjects (or the intent's own subject) bind evidence. No
+    recognized historical facts means unverified, not a successful comparison.
+    """
+    claims: list[tuple[int, int, str, float]] = []
+    tagged = list(_SYMBOL_PCT.finditer(text))
+    for match in tagged:
+        claims.append((match.start(2), match.end(2), "pct", float(match.group(2))))
+    for match in _UNTAGGED_PCT.finditer(text):
+        if not any(start <= match.start("pct") < end for start, end, _, _ in claims):
+            claims.append((match.start(), match.end(), "pct_untagged", _signed_pct_claim(match.group("verb"), match.group("pct"))))
+    for pattern, field_name in ((_CLOSE_PRICE, "close"), (_OPEN_PRICE, "open")):
+        for match in pattern.finditer(text):
+            claims.append((match.start(), match.end(), field_name, float(match.group(1))))
+    hits: list[dict[str, Any]] = []
+    checked = 0
+    for start, end, kind, claimed in sorted(claims):
+        scope = _claim_scope(text, start, decision_date)
+        if scope.forecast:
+            continue
+        checked += 1
+        prefix = _CLAUSE_BOUNDARY.split(text[:start])[-1]
+        subjects = [(m.start(), m.group()) for m in re.finditer(r"(?<!\d)\d{6}(?!\d)", prefix)]
+        for name, symbol in (name_to_symbol or {}).items():
+            if name and re.fullmatch(r"\d{6}", str(symbol)):
+                subjects.extend((m.start(), str(symbol)) for m in re.finditer(re.escape(name), prefix))
+        # 主体绑定保持既有语义：显式代码、或清单内名称优先；都没有时用提议标的自己
+        # （名称映射只从运行时清单来，见 ``load_name_to_symbol``；不替它猜别的票）。
+        # 主体绑定保持既有语义：显式代码、或清单内名称优先；都没有时，若句子里出现了
+        # "像证券简称"的中文主体却绑不上（清单缺这条或重名），就明确缺证——**不退回提议
+        # 标的**拿它的日线把这句话核成"已核对"（T11；清单只来自 ``load_name_to_symbol``）。
+        symbol = max(subjects, key=lambda item: item[0])[1] if subjects else ""
+        if not symbol:
+            unresolved = _unresolved_subject_in(prefix, text[start:])
+            if unresolved:
+                hits.append(_mismatch(
+                    "claimed_subject_unresolved",
+                    f"陈述出现“{unresolved}”，运行时证券清单绑定不到唯一代码，未核验。",
+                    claimed=claimed,
+                    subject_text=unresolved,
+                    evidence_status="unverified",
+                    claim_indeterminate=True,
+                    evidence_date=scope.evidence_date,
+                ))
+                continue
+            symbol = default_symbol
+        if not symbol:
+            hits.append(_mismatch("claimed_subject_unresolved", "陈述主体无法绑定日线，未核验。",
+                                  claimed=claimed, evidence_status="unverified",
+                                  claim_indeterminate=True, evidence_date=scope.evidence_date))
+            continue
+        rows = iter_daily_rows(symbol, daily_dir)
+        if kind.startswith("pct"):
+            hits.extend(_pct_claim_hits(claimed, scope, rows, kind="claimed_" + kind, symbol=symbol))
+            continue
+        label = "收盘" if kind == "close" else "开盘"
+        extra = {"claimed": claimed, "symbol": symbol, "evidence_date": scope.evidence_date}
+        if scope.ambiguous or _scope_period_unspecified(scope):
+            hits.append(_mismatch(f"claimed_{kind}_ambiguous_period", f"{label}价对应的时段不明确，不能核对。",
+                                  claim_indeterminate=True,
+                                  evidence_status="unverified", **extra))
+            continue
+        bar = next((r for r in rows if r["date"] == scope.evidence_date), None)
+        blocked = _basis_untrusted(rows[0]) if rows else ""
+        if blocked:
+            hits.append(_mismatch("claimed_price_basis_untrusted", f"{symbol} 日线价格口径不可用作原始核对（{blocked}）",
+                                  evidence_status="unverified", reason_code=blocked, **extra))
+            continue
+        actual = None if bar is None else bar.get(kind)
+        if actual is None or not _price_close_enough(claimed, float(actual)):
+            hits.append(_mismatch(f"claimed_{kind}", f"陈述{scope.evidence_date}{label}{claimed}，日线{label}{actual}",
+                                  actual=actual, **extra, **({"evidence_status": "unverified"} if actual is None else {})))
+    return hits, checked
+
+
 def verify_intent_against_daily(
     intent: dict[str, Any],
     *,
     decision_date: str,
     daily_dir: Path,
     market_note: str = "",
+    name_to_symbol: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     symbol = str(intent.get("symbol") or "").strip()
     if not symbol:
@@ -617,22 +796,86 @@ def verify_intent_against_daily(
             )
         )
     for fact in _intent_fact_texts(intent):
-        hits.extend(_check_price_claims(fact, bar, rows=rows))
-        hits.extend(_check_untagged_pct(fact, bar, rows, decision_date))
-        hits.extend(_check_symbol_pct_claims(fact, decision_date, daily_dir))
-    hits.extend(_check_symbol_pct_claims(market_note, decision_date, daily_dir))
+        hits.extend(_verify_fact_text(fact, decision_date=decision_date, daily_dir=daily_dir,
+                                      default_symbol=symbol, name_to_symbol=name_to_symbol)[0])
+    hits.extend(verify_market_note(market_note, decision_date=decision_date, daily_dir=daily_dir,
+                                   name_to_symbol=name_to_symbol))
     return hits
 
 
-def verify_market_note(market_note: str, *, decision_date: str, daily_dir: Path) -> list[dict[str, Any]]:
-    return _check_symbol_pct_claims(market_note, decision_date, daily_dir)
+def verify_market_note(market_note: str, *, decision_date: str, daily_dir: Path,
+                       name_to_symbol: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    return _verify_fact_text(market_note, decision_date=decision_date, daily_dir=daily_dir,
+                             name_to_symbol=name_to_symbol)[0]
 
 
-def gate_plan_statements(plan: dict[str, Any], *, daily_dir: Path) -> StatementGateResult:
+NAME_COLUMN_ALIASES = ("name", "名称", "证券名称", "stock_name", "security_name")
+SYMBOL_COLUMN_ALIASES = ("symbol", "code", "代码", "证券代码", "ts_code", "stock_code")
+# 运行时**自己的**可信证券清单（只读；缺失即视为缺证，绝不联网猜票）。
+NAME_MAP_SOURCES = (
+    Path("data") / "metadata" / "security_master.csv",
+    Path("data") / "universe" / "a_share_symbols.csv",
+    Path("data") / "universe" / "universe.csv",
+    Path("data") / "universe" / "low_price_learning_symbols.csv",
+)
+
+
+def _project_root_for(*, root: str | Path | None = None, daily_dir: Path | None = None) -> Path | None:
+    """定位项目根：给了 root 就用它；否则从 daily_dir 往上找带 ``data/`` 的那一层。"""
+
+    if root is not None:
+        return Path(root)
+    if daily_dir is None:
+        return None
+    resolved = Path(daily_dir).resolve()
+    for candidate in resolved.parents:
+        if (candidate / "data").is_dir():
+            return candidate
+    return None
+
+
+def load_name_to_symbol(*, root: str | Path | None = None,
+                        daily_dir: Path | None = None) -> dict[str, str]:
+    """从运行时自己的可信证券清单建立 名称→代码 映射（只读，缺证即空映射）。
+
+    - 只读 ``data/metadata``、``data/universe`` 下的清单；不联网、不打网络补丁；
+    - **重名不入表**：同一个名称映射到多个代码时宁可让那句话保持未核验，也不替它挑一只票；
+    - 清单缺失/无名称列时返回空映射，调用方据此把 unknown 保持 unverified（缺证明确）。
+    """
+
+    base = _project_root_for(root=root, daily_dir=daily_dir)
+    if base is None:
+        return {}
+    candidates: dict[str, set[str]] = {}
+    for relative in NAME_MAP_SOURCES:
+        path = base / relative
+        if not path.is_file():
+            continue
+        try:
+            with path.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
+                reader = csv.DictReader(handle)
+                fields = {str(name).strip().lower(): name for name in (reader.fieldnames or [])}
+                name_key = next((fields[alias] for alias in NAME_COLUMN_ALIASES if alias in fields), None)
+                symbol_key = next((fields[alias] for alias in SYMBOL_COLUMN_ALIASES if alias in fields), None)
+                if not name_key or not symbol_key:
+                    continue
+                for row in reader:
+                    name = str(row.get(name_key) or "").strip()
+                    digits = re.sub(r"\D", "", str(row.get(symbol_key) or ""))
+                    if name and len(digits) == 6:
+                        candidates.setdefault(name, set()).add(digits)
+        except OSError:
+            continue
+    return {name: next(iter(symbols)) for name, symbols in candidates.items() if len(symbols) == 1}
+
+
+def gate_plan_statements(plan: dict[str, Any], *, daily_dir: Path,
+                         name_to_symbol: dict[str, str] | None = None) -> StatementGateResult:
     decision_date = _as_day(plan.get("decision_date") or plan.get("as_of"))
     llm = plan.get("llm") if isinstance(plan.get("llm"), dict) else {}
     market_note = str(llm.get("market_note") or "")
-    note_hits = verify_market_note(market_note, decision_date=decision_date, daily_dir=daily_dir)
+    note_hits, note_fact_count = _verify_fact_text(market_note, decision_date=decision_date,
+                                                  daily_dir=daily_dir, name_to_symbol=name_to_symbol)
     accepted: list[dict[str, Any]] = []
     rejections: list[dict[str, Any]] = []
     llm_used = bool(llm.get("used"))
@@ -644,12 +887,19 @@ def gate_plan_statements(plan: dict[str, Any], *, daily_dir: Path) -> StatementG
             decision_date=decision_date,
             daily_dir=daily_dir,
             market_note="",
+            name_to_symbol=name_to_symbol,
         )
         if llm_used:
             hits.extend(note_hits)
         if hits:
+            # 既有语义：只要有一句核对不上就不放行（s2、时间语义、反编造的固定期望都钉在这里）。
+            # T11 只做**标注分层**：把"未核验"与"确定不符"的命中都随拒绝行留下，让记录与页面
+            # 能说清是"无法核验"还是"确实说错"，而不是把两者混成一句"陈述与数据不符"。
             row = dict(intent)
             row["statement_rejections"] = hits
+            row["statement_unverified"] = [
+                hit for hit in hits if hit.get("evidence_status") == "unverified"
+            ]
             rejections.append(row)
         else:
             accepted.append(intent)
@@ -659,12 +909,17 @@ def gate_plan_statements(plan: dict[str, Any], *, daily_dir: Path) -> StatementG
                 "symbol": "",
                 "side": "hold",
                 "statement_rejections": note_hits,
+                "statement_unverified": [
+                    hit for hit in note_hits if hit.get("evidence_status") == "unverified"
+                ],
             }
         )
     return StatementGateResult(
         accepted_intents=accepted,
         rejections=rejections,
-        market_note_ok=not note_hits,
+        market_note_ok=bool(note_fact_count) and not note_hits,
+        market_note_status=("陈述与数据不符" if any(h.get("evidence_status") != "unverified" for h in note_hits)
+                            else ("未核验" if note_hits or not note_fact_count else "已核对")),
         original_intents=deepcopy([row for row in (plan.get("intents") or []) if isinstance(row, dict)]),
         market_note_rejections=deepcopy(note_hits),
     )
@@ -706,7 +961,9 @@ def build_decision_record(
     trade_date = _as_day(plan.get("trade_date"))
     symbol = str(intent.get("symbol") or "").strip()
     side = str(intent.get("side") or "hold")
-    bar = load_daily_bar(symbol, decision_date, daily_dir) if symbol else None
+    # 当晚落盘的所见优先：后来的行情修正不得改写历史记录里的 seen（PRODUCT-S2-REJECTION-HISTORY）。
+    recorded_seen = intent.get("seen_at_decision") if isinstance(intent.get("seen_at_decision"), dict) else None
+    bar = None if recorded_seen is not None or not symbol else load_daily_bar(symbol, decision_date, daily_dir)
     llm = plan.get("llm") if isinstance(plan.get("llm"), dict) else {}
     stamp = pack.version_stamp()
     recorded_prompt = str(plan.get("prompt_version") or llm.get("prompt_version") or "").strip()
@@ -718,15 +975,20 @@ def build_decision_record(
         stamp["prompt_version"] = recorded_prompt or stamp["prompt_version"]
         stamp["menu_version"] = recorded_menu or stamp["menu_version"]
     mismatches = list(mismatches or [])
+    # T11：整条记录只有"主体/时段定不下来"的命中时，主结论是"未核验"而不是"已证实不符"。
+    unverified_only = bool(mismatches) and all(
+        bool(hit.get("claim_indeterminate")) for hit in mismatches if isinstance(hit, dict)
+    )
     if mismatches:
-        result = RESULT_MISMATCH
+        result = RESULT_UNVERIFIED if unverified_only else RESULT_MISMATCH
         verification = {
             "kind": "rejected",
             "source": "statement_gate",
             "n_sessions": None,
             "level": None,
             "due_date": "",
-            "text": RESULT_MISMATCH,
+            "text": RESULT_UNVERIFIED if unverified_only else RESULT_MISMATCH,
+            "unverified_only": unverified_only,
         }
     elif not symbol:
         result = RESULT_NA
@@ -741,7 +1003,7 @@ def build_decision_record(
     else:
         result = RESULT_PENDING
         verification = _verification_for_intent(intent, trade_date=trade_date or decision_date)
-    judgment = str(
+    judgment = str(intent.get("reason") or "").strip() if side == "sell" else str(
         intent.get("llm_reason")
         or intent.get("thesis")
         or intent.get("reason")
@@ -761,8 +1023,14 @@ def build_decision_record(
     )
     digest = sha1(identity.encode("utf-8")).hexdigest()[:10]
     decision_id = f"dec_{decision_date.replace('-', '')}_{symbol or 'HOLD'}_{side}_{digest}"
+    # 落盘时刻：优先用随意图/被拒项一起存下的当晚时刻，其次才是计划本身；
+    # 两者都没有就留空（历史复盘不得被重建那一刻的时钟补造，PRODUCT-S2-REJECTION-HISTORY）。
     explicit_recorded = str(
-        plan.get("recorded_at") or plan.get("created_at") or plan.get("decided_at") or ""
+        intent.get("recorded_at")
+        or plan.get("recorded_at")
+        or plan.get("created_at")
+        or plan.get("decided_at")
+        or ""
     ).strip()
     if explicit_recorded:
         recorded_at = explicit_recorded
@@ -783,29 +1051,23 @@ def build_decision_record(
         "symbol": symbol,
         "side": side,
         "judgment": judgment,
+        "entry_thesis": deepcopy(intent.get("entry_thesis")) if side == "sell" else None,
         "style": str(intent.get("style") or "") or None,
         "planned_hold_days": int(intent.get("planned_hold_days") or 0) or _hold_days(intent) if symbol else None,
-        "seen": {
-            "source": "data/daily",
-            "as_of": decision_date,
-            "open": None if bar is None else bar.get("open"),
-            "high": None if bar is None else bar.get("high"),
-            "low": None if bar is None else bar.get("low"),
-            "close": None if bar is None else bar.get("close"),
-            "pct_chg": None if bar is None else bar.get("pct_chg"),
-            "ref_close": _f(intent.get("ref_close")),
-        },
+        "seen": _seen_field(intent, recorded=recorded_seen, bar=bar, decision_date=decision_date),
         "verification": verification,
         "result": result,
         "result_as_of": "",
         "result_evidence": mismatches,
+        # 未核验（主体/事实无法绑定日线）随记录保留：既不算已核对，也不算确定矛盾（T11）。
+        "statement_unverified": deepcopy(intent.get("statement_unverified") or []),
         "prompt_id": stamp["prompt_id"],
         "prompt_version": stamp["prompt_version"],
         "menu_id": stamp["menu_id"],
         "menu_version": stamp["menu_version"],
         "llm_used": bool(llm.get("used")),
         "llm_model": str(llm.get("model") or ""),
-        "committed": bool(plan.get("committed", True)) and result != RESULT_MISMATCH,
+        "committed": bool(plan.get("committed", True)) and result not in {RESULT_MISMATCH, RESULT_UNVERIFIED},
     }
 
 
@@ -860,7 +1122,7 @@ def upsert_decision_records(path: Path, incoming: Iterable[dict[str, Any]]) -> l
             incoming_row["decision_id"] = f"{key}_rev_{sha1(str(incoming_row.get('structured_at') or _now_iso()).encode('utf-8')).hexdigest()[:8]}"
             by_id[str(incoming_row["decision_id"])] = incoming_row
             continue
-        if old and old.get("result") == RESULT_MISMATCH:
+        if old and old.get("result") in {RESULT_MISMATCH, RESULT_UNVERIFIED}:
             continue
         if old and old.get("result") in {RESULT_RIGHT, RESULT_WRONG} and incoming_row.get("result") == RESULT_PENDING:
             incoming_row["result"] = old["result"]
@@ -880,36 +1142,76 @@ def upsert_decision_records(path: Path, incoming: Iterable[dict[str, Any]]) -> l
     return records
 
 
+def _apply_verdict(
+    record: dict[str, Any],
+    verdict: str,
+    as_of: str,
+    evidence: list[dict[str, Any]],
+    *,
+    recheck_only: bool,
+) -> dict[str, Any]:
+    """把这次核对落到记录上。
+
+    普通记录照旧写 ``result``/``result_as_of``/``result_evidence``；**到期缺证**的记录
+    只另加 ``recheck``（补证后的关联评价），原判定与原有证据一个字节都不动（T21）。
+    """
+
+    if not recheck_only:
+        record["result"] = verdict
+        record["result_as_of"] = as_of
+        record["result_evidence"] = evidence
+        return record
+    detail = dict(evidence[0]) if evidence else {}
+    if verdict in {RESULT_RIGHT, RESULT_WRONG}:
+        record["recheck"] = {"as_of": as_of, "result": verdict, "evidence_status": "verified", **detail}
+    else:
+        record["recheck"] = {
+            "as_of": as_of,
+            "result": None,
+            "evidence_status": "unverified",
+            "reason": "补证后仍不足以判定，未知不计成绩",
+            **detail,
+        }
+    return record
+
+
 def score_decision(record: dict[str, Any], *, daily_dir: Path, as_of: str) -> dict[str, Any]:
     updated = dict(record)
     result = str(updated.get("result") or "")
-    if result in {RESULT_MISMATCH, RESULT_RIGHT, RESULT_WRONG, RESULT_NA, RESULT_EXPIRED_NO_EVIDENCE}:
+    if result in {RESULT_MISMATCH, RESULT_UNVERIFIED, RESULT_RIGHT, RESULT_WRONG, RESULT_NA}:
         return updated
+    # T21：到期缺证不是终局。补证后允许**另加**一次评价（``recheck``），但原判定、原预测、
+    # 原编号、原证据一律不改；仍缺证就标 unverified —— 未知既不算成功也不算失败。
+    recheck_only = result == RESULT_EXPIRED_NO_EVIDENCE
     verification = dict(updated.get("verification") or {})
     symbol = str(updated.get("symbol") or "")
     n_days = int(verification.get("n_sessions") or 0)
     level = _f(verification.get("level"))
     start = _as_day(updated.get("trade_date") or updated.get("decision_date"))
     if not symbol or n_days <= 0 or level is None or not start:
-        updated["result"] = RESULT_NA
+        if not recheck_only:
+            updated["result"] = RESULT_NA
         return updated
     window = trade_days_from(start, n_days)
     due = str(verification.get("due_date") or (window[-1] if window else ""))
     rows = iter_daily_rows(symbol, daily_dir)
     blocked = _basis_untrusted(rows[0]) if rows else ""
     if blocked:
-        updated["result"] = RESULT_EXPIRED_NO_EVIDENCE if due and as_of >= due else RESULT_PENDING
-        updated["result_as_of"] = as_of
-        updated["result_evidence"] = [{
-            "kind": "price_basis_untrusted",
-            "evidence_status": "unverified",
-            "symbol": symbol,
-            "price_basis": rows[0].get("price_basis"),
-            "reason_code": blocked,
-            "consumer": _DAILY_PRICE_CONSUMER,
-            "due_date": due,
-        }]
-        return updated
+        return _apply_verdict(
+            updated,
+            RESULT_EXPIRED_NO_EVIDENCE if due and as_of >= due else RESULT_PENDING,
+            as_of,
+            [{
+                "kind": "price_basis_untrusted",
+                "evidence_status": "unverified",
+                "symbol": symbol,
+                "price_basis": rows[0].get("price_basis"),
+                "reason_code": blocked,
+                "consumer": _DAILY_PRICE_CONSUMER,
+                "due_date": due,
+            }],
+            recheck_only=recheck_only,
+        )
     closes = dict(_closes_from(symbol, start, daily_dir, n_days + 5))
     observed: list[tuple[str, float]] = []
     for day in window:
@@ -928,27 +1230,29 @@ def score_decision(record: dict[str, Any], *, daily_dir: Path, as_of: str) -> di
             hit = True
             break
     if hit:
-        updated["result"] = RESULT_RIGHT
-        updated["result_as_of"] = as_of
-        updated["result_evidence"] = [{"kind": "window_hit", "level": level, "observed": observed[: n_days]}]
-        return updated
+        return _apply_verdict(
+            updated, RESULT_RIGHT, as_of,
+            [{"kind": "window_hit", "level": level, "observed": observed[: n_days]}],
+            recheck_only=recheck_only,
+        )
     due_passed = bool(due) and as_of >= due
     if len(observed) < n_days:
         if due_passed:
-            updated["result"] = RESULT_EXPIRED_NO_EVIDENCE
-            updated["result_as_of"] = as_of
-            updated["result_evidence"] = [
-                {"kind": "expired_missing_bars", "have": len(observed), "need": n_days, "due_date": due}
-            ]
-            return updated
-        updated["result"] = RESULT_PENDING
-        updated["result_as_of"] = as_of
-        updated["result_evidence"] = [{"kind": "window_open", "have": len(observed), "need": n_days}]
-        return updated
-    updated["result"] = RESULT_WRONG
-    updated["result_as_of"] = as_of
-    updated["result_evidence"] = [{"kind": "window_miss", "level": level, "observed": observed}]
-    return updated
+            return _apply_verdict(
+                updated, RESULT_EXPIRED_NO_EVIDENCE, as_of,
+                [{"kind": "expired_missing_bars", "have": len(observed), "need": n_days, "due_date": due}],
+                recheck_only=recheck_only,
+            )
+        return _apply_verdict(
+            updated, RESULT_PENDING, as_of,
+            [{"kind": "window_open", "have": len(observed), "need": n_days}],
+            recheck_only=recheck_only,
+        )
+    return _apply_verdict(
+        updated, RESULT_WRONG, as_of,
+        [{"kind": "window_miss", "level": level, "observed": observed}],
+        recheck_only=recheck_only,
+    )
 
 
 def score_decision_log(records: list[dict[str, Any]], *, daily_dir: Path, as_of: str) -> list[dict[str, Any]]:
@@ -1001,6 +1305,8 @@ def decision_review_summary(records: list[dict[str, Any]], *, as_of: Any) -> dic
             "early_hits": 0 if cutoff else None, "pending": 0 if cutoff else None,
             "due_evidence_gap": 0, "maturity_unknown": 0, "unaccepted": 0,
             "not_applicable": 0, "statement_mismatch": 0, "accuracy": None,
+            # T21：补证后的重评单独计数（原观察期样本不受影响，分母真实）。
+            "rechecked": 0, "rechecked_correct": 0, "rechecked_wrong": 0, "recheck_gap": 0,
         }
     contexts: dict[str, dict[str, Any]] = {}
     historical = 0
@@ -1042,6 +1348,16 @@ def decision_review_summary(records: list[dict[str, Any]], *, as_of: Any) -> dic
             else:
                 phase, note = "due_evidence_gap", "观察期已结束，结果或证据尚未齐全"
                 group[phase] += 1
+                # T21：补证后的重评另算一档——成功/失败进重评分母，仍缺证只记 gap。
+                recheck = row.get("recheck") if isinstance(row.get("recheck"), dict) else None
+                if recheck:
+                    verdict = recheck.get("result")
+                    if verdict in (RESULT_RIGHT, RESULT_WRONG):
+                        group["rechecked"] += 1
+                        group["rechecked_correct" if verdict == RESULT_RIGHT else "rechecked_wrong"] += 1
+                        phase, note = "rechecked", "补证后重评；原判定与原编号不变"
+                    elif verdict is None:
+                        group["recheck_gap"] += 1
         decision_id = row.get("decision_id")
         if isinstance(decision_id, str) and decision_id:
             contexts[decision_id] = {
@@ -1062,6 +1378,7 @@ def _result_names() -> tuple[str, ...]:
     return (
         RESULT_WRONG,
         RESULT_MISMATCH,
+        RESULT_UNVERIFIED,
         RESULT_EXPIRED_NO_EVIDENCE,
         RESULT_PENDING,
         RESULT_RIGHT,
@@ -1115,6 +1432,7 @@ def render_owner_page(
         color = {
             RESULT_WRONG: "#8b1e1e",
             RESULT_MISMATCH: "#8b4513",
+            RESULT_UNVERIFIED: "#5c4b1d",
             RESULT_EXPIRED_NO_EVIDENCE: "#5c4b1d",
             RESULT_PENDING: "#5c4b1d",
             RESULT_RIGHT: "#1e4d2b",
@@ -1219,6 +1537,7 @@ def records_from_plan(
     daily_dir: Path,
     rejections: list[dict[str, Any]] | None = None,
     backfill: bool = False,
+    name_to_symbol: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for intent in plan.get("intents") or []:
@@ -1232,7 +1551,21 @@ def records_from_plan(
                 backfill=backfill,
             )
         )
-    for intent in rejections or []:
+    # 当晚被拒的原提议**始终**并入：调用方给的 rejections 只是这一轮按当前日线重算
+    # 的结果，不能因为它在场就把计划/日记里存着的当晚原拒绝丢掉
+    # （R10-0928-REJECTION-MERGE）。同一个 (symbol, side) 只算一次，先出现的当晚原件
+    # 优先，既不会丢历史，也不会把同一拒绝算两遍。
+    merged_rejections: list[dict[str, Any]] = []
+    merged_keys: set[tuple[str, str]] = set()
+    for intent in [*_plan_rejections(plan), *(rejections or [])]:
+        if not isinstance(intent, dict):
+            continue
+        merged_key = (str(intent.get("symbol") or ""), str(intent.get("side") or ""))
+        if merged_key in merged_keys:
+            continue
+        merged_keys.add(merged_key)
+        merged_rejections.append(intent)
+    for intent in merged_rejections:
         if not isinstance(intent, dict):
             continue
         out.append(
@@ -1252,7 +1585,7 @@ def records_from_plan(
             "style": "",
             "planned_hold_days": 0,
         }
-        mismatches = [] if gate_plan_statements(plan, daily_dir=daily_dir).market_note_ok else [
+        mismatches = [] if gate_plan_statements(plan, daily_dir=daily_dir, name_to_symbol=name_to_symbol).market_note_ok else [
             item
             for row in (rejections or [])
             for item in (row.get("statement_rejections") or [])
@@ -1262,6 +1595,7 @@ def records_from_plan(
                 str(((plan.get("llm") or {}) if isinstance(plan.get("llm"), dict) else {}).get("market_note") or ""),
                 decision_date=_as_day(plan.get("decision_date")),
                 daily_dir=daily_dir,
+                name_to_symbol=name_to_symbol,
             )
         out.append(
             build_decision_record(
@@ -1314,15 +1648,52 @@ def latest_journal_by_date(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def plan_from_journal_row(row: dict[str, Any]) -> dict[str, Any]:
     tomorrow = row.get("tomorrow_plan") if isinstance(row.get("tomorrow_plan"), dict) else {}
     llm = row.get("llm") if isinstance(row.get("llm"), dict) else {}
+    rejected = tomorrow.get("statement_rejections") or row.get("statement_rejections") or []
     return {
         "decision_date": _as_day(row.get("as_of")),
         "trade_date": _as_day(tomorrow.get("trade_date") or row.get("trade_date")),
         "intents": list(tomorrow.get("intents") or []),
+        # 当晚被拒的原提议随日记一起回放：最新计划隔天就被覆盖，只剩日记时也要还原。
+        "statement_rejections": [dict(item) for item in rejected if isinstance(item, dict)],
+        # 当晚落盘时刻随日记保存；没有就留空（标缺失，不用读日记那一刻的时钟补造）。
+        "recorded_at": str(
+            tomorrow.get("recorded_at") or row.get("recorded_at") or row.get("generated_at") or ""
+        ).strip(),
         "llm": llm,
         "committed": True,
         "prompt_version": row.get("prompt_version") or llm.get("prompt_version"),
         "menu_version": row.get("menu_version") or llm.get("menu_version"),
     }
+
+
+def _plan_rejections(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """当晚被拒的原提议（``apply_gate_to_plan`` 存下的 ``statement_rejections`` 形状）。
+
+    存的是 ``hits``，回放时还原成 ``statement_rejections`` 走原来的落库路径；只搬键，
+    不造 ``reason``/``judgment`` 等会改变 identity 的字段。
+    """
+
+    out: list[dict[str, Any]] = []
+    for row in plan.get("statement_rejections") or []:
+        if not isinstance(row, dict):
+            continue
+        # 以原提议整体为基底回放（reason/style/planned_hold_days/ref_close 都要在），
+        # 这样重建出的记录与当晚落库时字段一致、identity 与 decision_id 不变；
+        # 只把命中明细按原样带上。
+        base = row.get("original_intent") if isinstance(row.get("original_intent"), dict) else {}
+        item = dict(base)
+        item["symbol"] = row.get("symbol", item.get("symbol"))
+        item["side"] = row.get("side", item.get("side"))
+        item["statement_rejections"] = list(row.get("statement_rejections") or row.get("hits") or [])
+        # 当晚落盘的所见与落盘时刻随原提议一起回放（旧记录没有这些键，就按缺失处理）。
+        seen = row.get("seen_at_decision")
+        if isinstance(seen, dict):
+            item["seen_at_decision"] = dict(seen)
+        recorded = str(row.get("recorded_at") or "").strip()
+        if recorded and not str(item.get("recorded_at") or "").strip():
+            item["recorded_at"] = recorded
+        out.append(item)
+    return out
 
 
 def git_run_manifest(root: Path | None = None) -> dict[str, Any]:
@@ -1443,6 +1814,41 @@ def record_evening_and_refresh_page(
     return refresh_owner_outputs(merged, paths=paths, daily_dir=daily_dir, as_of=as_of, intents=intents)
 
 
+def _attach_post_night_recheck(
+    rows: list[dict[str, Any]],
+    rejections: list[dict[str, Any]],
+    *,
+    as_of: str,
+) -> list[dict[str, Any]]:
+    """把"事后按当前日线复核"的结果挂在记录上，不改当晚裁定。
+
+    记录保留当晚的 judgment / committed / identity / decision_id，只加一个独立状态键
+    ``post_night_recheck``（``as_of`` ＝ 被复核的那个计划日）：现在的日线已经和当时那句
+    话对不上，这件事要看得见；但反编造检查是"当时的陈述对当时的数据"，不拿后来的行情
+    回写历史（R10-0928-HISTORY-REGATE）。该键不参与 judgment/identity/decision_id。
+    """
+
+    hits_by_symbol: dict[str, list[Any]] = {}
+    for row in rejections or []:
+        if not isinstance(row, dict):
+            continue
+        hits = list(row.get("statement_rejections") or [])
+        symbol = str(row.get("symbol") or "")
+        if symbol and hits:
+            hits_by_symbol.setdefault(symbol, []).extend(hits)
+    for row in rows:
+        hits = hits_by_symbol.get(str(row.get("symbol") or ""))
+        if not hits or not isinstance(row, dict):
+            continue
+        row["post_night_recheck"] = {
+            "as_of": as_of,
+            "verdict": RESULT_MISMATCH,
+            "note": "事后按当前日线复核与当晚陈述不符；当晚裁定与编号保持不变",
+            "hits": hits,
+        }
+    return rows
+
+
 def ingest_state(
     *,
     daily_dir: Path,
@@ -1462,17 +1868,35 @@ def ingest_state(
         plans.append(latest_plan)
     incoming: list[dict[str, Any]] = []
     all_rejections: list[dict[str, Any]] = []
+    name_map = load_name_to_symbol(daily_dir=daily_dir)
     for plan in plans:
         if not plan.get("decision_date"):
             continue
-        gated = gate_plan_statements(plan, daily_dir=daily_dir)
+        gated = gate_plan_statements(plan, daily_dir=daily_dir, name_to_symbol=name_map)
         all_rejections.extend(gated.rejections)
+        # 重建历史以**当晚已存下的裁定**为准：计划/日记里的 intents 就是当晚通过的、
+        # statement_rejections 就是当晚被拒的。事后修正过的日线不得回写当晚的判断与
+        # identity/decision_id（R10-0928-HISTORY-REGATE）。
+        stored_intents = [dict(item) for item in (plan.get("intents") or []) if isinstance(item, dict)]
+        if not stored_intents:
+            # 旧计划没存 intents（或当晚全被拒）时退回原重算口径，不改既有行为。
+            stored_intents = list(gated.accepted_intents)
+        accepted_symbols = {str(item.get("symbol") or "") for item in stored_intents}
+        # 当晚已通过的提议事后与日线不符：只记复核状态，不另生成一条"新拒绝"顶掉原判。
+        recheck = [row for row in gated.rejections if str(row.get("symbol") or "") in accepted_symbols]
+        extra_rejections = [row for row in gated.rejections
+                            if str(row.get("symbol") or "") not in accepted_symbols]
         incoming.extend(
-            records_from_plan(
-                {**plan, "intents": gated.accepted_intents},
-                daily_dir=daily_dir,
-                rejections=gated.rejections,
-                backfill=True,
+            _attach_post_night_recheck(
+                records_from_plan(
+                    {**plan, "intents": stored_intents},
+                    daily_dir=daily_dir,
+                    rejections=extra_rejections,
+                    backfill=True,
+                    name_to_symbol=name_map,
+                ),
+                recheck,
+                as_of=_as_day(plan.get("decision_date")),
             )
         )
     if as_of:
@@ -1499,20 +1923,65 @@ def ingest_state(
     return payload
 
 
-def apply_gate_to_plan(plan: dict[str, Any], *, daily_dir: Path) -> StatementGateResult:
-    gated = gate_plan_statements(plan, daily_dir=daily_dir)
+def apply_gate_to_plan(plan: dict[str, Any], *, daily_dir: Path,
+                       name_to_symbol: dict[str, str] | None = None) -> StatementGateResult:
+    gated = gate_plan_statements(plan, daily_dir=daily_dir, name_to_symbol=name_to_symbol)
     plan["statement_review"] = statement_gate_summary(gated)
     plan["intents"] = gated.accepted_intents
+    decision_date = _as_day(plan.get("decision_date") or plan.get("as_of"))
+    # 落盘时刻在决策当晚取一次：写进计划、每个通过项与被拒项，日记也会带上。
+    # 重建历史时只读这份；旧记录没有这个键就只能留空，绝不拿重建那一刻的时钟补造。
+    night_recorded = str(
+        plan.get("recorded_at") or plan.get("created_at") or plan.get("decided_at") or ""
+    ).strip() or _now_iso()
+    plan["recorded_at"] = night_recorded
+    for intent in plan["intents"]:
+        if not isinstance(intent, dict):
+            continue
+        # 通过的提议也要存当晚所见（PRODUCT-S2-REJECTION-HISTORY）：已经存过的不覆盖，
+        # 免得同一晚的补跑把当时所见换成后来修正过的日线。
+        if not isinstance(intent.get("seen_at_decision"), dict):
+            intent["seen_at_decision"] = _seen_snapshot(str(intent.get("symbol") or ""), decision_date, daily_dir)
+        if not str(intent.get("recorded_at") or "").strip():
+            intent["recorded_at"] = night_recorded
     if gated.rejections:
-        plan["statement_rejections"] = [
-            {
-                "symbol": row.get("symbol"),
-                "side": row.get("side"),
-                "label": RESULT_MISMATCH,
-                "hits": row.get("statement_rejections"),
-            }
-            for row in gated.rejections
-        ]
+        previous = {
+            (str(row.get("symbol") or ""), str(row.get("side") or "")): row.get("seen_at_decision")
+            for row in (plan.get("statement_rejections") or [])
+            if isinstance(row, dict) and isinstance(row.get("seen_at_decision"), dict)
+        }
+        saved: list[dict[str, Any]] = []
+        for row in gated.rejections:
+            # 当晚真正看到的行情：计划/日记落盘用一份，同时挂在被拒提议本身上，
+            # 让“立即记录”那条路径（records_from_plan(rejections=...)）用同一份快照，
+            # 同一晚的拒绝不会因为走哪条路而换一个 seen 来源，也不会被事后修正的日线改写。
+            key = (str(row.get("symbol") or ""), str(row.get("side") or ""))
+            seen = previous.get(key) or _seen_snapshot(key[0], decision_date, daily_dir)
+            original = deepcopy(row)
+            original.pop("seen_at_decision", None)
+            original.pop("recorded_at", None)
+            row["seen_at_decision"] = dict(seen)
+            row["recorded_at"] = night_recorded
+            saved.append(
+                {
+                    "symbol": row.get("symbol"),
+                    "side": row.get("side"),
+                    "label": RESULT_UNVERIFIED if (row.get("statement_rejections") or []) and all(
+                        hit.get("claim_indeterminate") for hit in (row.get("statement_rejections") or [])
+                    ) else RESULT_MISMATCH,
+                    "hits": row.get("statement_rejections"),
+                    # 原提议另存于**新键**：重建历史时按原样还原理由与当时所见。
+                    # 新键不参与 judgment/identity/decision_id（r6 的回归就是让原理由
+                    # 走了 reason 键、把已有拒绝的 decision_id 改掉）。
+                    "original_reason": (row.get("llm_reason") or row.get("thesis")
+                                        or row.get("reason") or ""),
+                    "original_intent": original,
+                    "seen_at_decision": dict(seen),
+                    # 被拒项自带当晚落盘时刻，重建时不必依赖日志行里的时间。
+                    "recorded_at": night_recorded,
+                }
+            )
+        plan["statement_rejections"] = saved
     return gated
 
 
@@ -1521,6 +1990,7 @@ __all__ = [
     "VERIFICATION_DERIVED_NOTE",
     "RESULT_EXPIRED_NO_EVIDENCE",
     "RESULT_MISMATCH",
+    "RESULT_UNVERIFIED",
     "RESULT_PENDING",
     "RESULT_RIGHT",
     "RESULT_WRONG",

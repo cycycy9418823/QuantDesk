@@ -344,7 +344,10 @@ def audit_intraday_file(
     price_basis: str = "",
 ) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
-    path = Path(intraday_dir or INTRADAY_1M_DIR) / f"{symbol}.csv"
+    from quantdesk.intraday.minute_storage import resolve_minute_read_path
+
+    requested_path = Path(intraday_dir or INTRADAY_1M_DIR) / f"{symbol}.csv"
+    path = resolve_minute_read_path(requested_path)
     if not path.exists():
         return {
             "symbol": symbol,
@@ -362,7 +365,7 @@ def audit_intraday_file(
             "next_action": "请尝试 provider，或导入目标日期的 1 分钟线 CSV。",
             "disclaimer": DISCLAIMER,
         }
-    payload = read_intraday_csv(path, default_symbol=symbol, target_date=target_date, encoding=encoding)
+    payload = read_intraday_csv(requested_path, default_symbol=symbol, target_date=target_date, encoding=encoding)
     frame = payload.get("frame")
     if not isinstance(frame, pd.DataFrame):
         frame = pd.DataFrame()
@@ -376,7 +379,7 @@ def audit_intraday_file(
     return {
         "symbol": symbol,
         "target_date": target_date[:10],
-        "path": _display_path(path),
+        "path": _display_path(Path(payload.get("path") or path)),
         "exists": True,
         "encoding": payload.get("encoding") or "",
         "price_only_intraday": bool(payload.get("price_only_intraday")),

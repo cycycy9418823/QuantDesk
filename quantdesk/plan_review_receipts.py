@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 
 from quantdesk.csv_io import read_csv_frame
 from quantdesk.interprocess_lock import interprocess_file_lock
+from quantdesk.intraday.minute_storage import minute_write_path, resolve_minute_read_path
 from quantdesk.price_basis import classify_frame_price_basis
 from quantdesk.shared import normalize_symbol
 
@@ -90,7 +91,8 @@ def inspect_plan_minute_inputs(
     trade_date = _day(plan.get("trade_date"))
     records: list[dict[str, Any]] = []
     for symbol in _symbols(plan):
-        path = (base / f"{symbol}.csv").resolve()
+        requested_path = (base / f"{symbol}.csv").resolve()
+        path = resolve_minute_read_path(requested_path).resolve()
         try:
             relative = path.relative_to(root).as_posix()
         except ValueError:
@@ -131,6 +133,8 @@ def inspect_plan_minute_inputs(
             "complete_session": audit.get("formal_execution_eligible") is True and not reasons,
             "reason_codes": sorted(set(reasons)),
         })
+        if path != requested_path:
+            records[-1]["requested_path"] = requested_path.relative_to(root).as_posix()
     return records
 
 
@@ -291,7 +295,12 @@ def verify_plan_review_receipt(
             elif path.name != f"{item.get('symbol')}.csv":
                 errors.append("receipt_input_path_invalid")
             else:
-                input_parents.add(path.parent)
+                requested = _input_path(root, item.get("requested_path")) if item.get("requested_path") else path
+                if (requested is None or requested.name != path.name
+                        or (requested != path and minute_write_path(requested).resolve() != path)):
+                    errors.append("receipt_input_path_invalid")
+                else:
+                    input_parents.add(requested.parent)
     if status == "passed" and (
         not receipt.get("review_completed") or not inputs or receipt.get("reason_codes")
         or any(item.get("status") != "passed" for item in inputs)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from ai_trader.ledger import mark_to_market, position_map, session_days_held
@@ -13,8 +14,82 @@ from quantdesk.paper.trade_costs import TradeCostConfig, buy_cash_outflow, sell_
 COST_CONFIG = TradeCostConfig.cn_current()
 
 
-def _limit_blocked(symbol: str, pct_chg: float | None, side: str) -> str | None:
-    return next_open_limit_blocked(symbol, pct_chg, side)
+def _limit_blocked(
+    symbol: str, pct_chg: float | None, side: str, *, is_st: bool = False
+) -> str | None:
+    return next_open_limit_blocked(symbol, pct_chg, side, is_st=is_st)
+
+
+ST_UNKNOWN_NOTE = "ST 未知，按 10% 判断"
+
+
+def _listing_snapshot(symbol: str, daily_dir: Any) -> tuple[str, str]:
+    """运行时清单里**目标证券自己那一行**的 ``(名称, 快照日期)``。
+
+    名字与日期必须来自同一条证据；拿别的证券的日期来证明本证券的身份是不允许的，
+    所以这里按 symbol 精确匹配行，找不到就返回空（缺证 → 未知）。
+    """
+
+    if daily_dir is None or not symbol:
+        return "", ""
+    root = Path(daily_dir).parent
+    for candidate in (
+        root / "metadata" / "security_master.csv",
+        root / "universe" / "a_share_symbols.csv",
+        root.parent / "metadata" / "security_master.csv",
+    ):
+        if not candidate.is_file():
+            continue
+        try:
+            lines = candidate.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        if len(lines) < 2:
+            continue
+        header = [part.strip().lower() for part in lines[0].split(",")]
+        if "symbol" not in header:
+            continue
+        symbol_idx = header.index("symbol")
+        name_idx = next((header.index(key) for key in ("name", "名称", "证券名称") if key in header), None)
+        as_of_idx = header.index("as_of") if "as_of" in header else None
+        for line in lines[1:]:
+            values = [part.strip() for part in line.split(",")]
+            if len(values) <= symbol_idx or values[symbol_idx] != symbol:
+                continue
+            name = values[name_idx] if name_idx is not None and len(values) > name_idx else ""
+            as_of = values[as_of_idx][:10] if as_of_idx is not None and len(values) > as_of_idx else ""
+            return name, as_of
+    return "", ""
+
+
+def trusted_st_identity(
+    symbol: str,
+    *,
+    row: dict[str, Any] | None = None,
+    daily_dir: Any = None,
+    as_of: str = "",
+) -> tuple[bool, bool]:
+    """``(is_st, st_unknown)`` —— 只用**当时**可验证的证据，绝不按历史或价格推断。
+
+    顺序：① 该交易日的行情行 ``is_st`` 列；② 运行时清单名字，且清单自己的快照日期
+    **必须等于**该交易日（今天的名单证明不了 9/5 的身份）；③ 其余一律未知。
+    """
+
+    raw = (row or {}).get("is_st") if isinstance(row, dict) else None
+    if isinstance(raw, bool):
+        return raw, False
+    if raw is not None:
+        text = str(raw).strip().lower()
+        if text in {"1", "true", "yes", "y", "st"}:
+            return True, False
+        if text in {"0", "false", "no", "n"}:
+            return False, False
+    bar_day = str(as_of or (row or {}).get("date") or (row or {}).get("as_of") or "")[:10]
+    name, snapshot_day = _listing_snapshot(symbol, daily_dir)
+    cleaned = name.replace(" ", "").upper()
+    if cleaned and snapshot_day and bar_day and snapshot_day == bar_day:
+        return cleaned.startswith("ST") or cleaned.startswith("*ST"), False
+    return False, True
 
 
 def pd_finite(value: float) -> bool:
@@ -227,8 +302,19 @@ def execute_intents(
     mark_prices: dict[str, float] | None = None,
     live_id: str | None,
     mandate: TraderMandate = DEFAULT_MANDATE,
+    st_identity: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Fill pending overnight intents at next-session open only."""
+
+    def _identity(symbol: str) -> tuple[bool, bool]:
+        """当晚这条代码的可信身份；没传就按"未知"处理，不改既有限制。"""
+
+        entry = (st_identity or {}).get(symbol)
+        if isinstance(entry, dict):
+            return bool(entry.get("is_st")), bool(entry.get("st_unknown"))
+        if isinstance(entry, (tuple, list)) and len(entry) == 2:
+            return bool(entry[0]), bool(entry[1])
+        return False, True
 
     marks = mark_prices or open_prices
     marked = mark_to_market(ledger, marks, as_of=as_of)
@@ -270,9 +356,15 @@ def execute_intents(
             if blocked:
                 actions.append({"action": "sell", "symbol": symbol, "status": "rejected", "reason": blocked, "fill_model": "next_open_only"})
                 continue
-            limit = _limit_blocked(symbol, gap_pct, "sell")
+            is_st, st_unknown = _identity(symbol)
+            limit = _limit_blocked(symbol, gap_pct, "sell", is_st=is_st)
             if limit:
-                actions.append({"action": "sell", "symbol": symbol, "status": "rejected", "reason": limit, "fill_model": "next_open_only"})
+                actions.append({
+                    "action": "sell", "symbol": symbol, "status": "rejected", "reason": limit,
+                    "fill_model": "next_open_only",
+                    "is_st": is_st, "st_unknown": st_unknown,
+                    "st_note": ST_UNKNOWN_NOTE if st_unknown else "",
+                })
                 continue
             if not open_px or qty <= 0:
                 actions.append({"action": "sell", "symbol": symbol, "status": "rejected", "reason": "missing_open", "fill_model": "next_open_only"})
@@ -305,6 +397,9 @@ def execute_intents(
                 "hypothesis_id": live_id or intent.get("hypothesis_id"),
                 "reason": str(intent.get("reason") or "昨夜计划，今开成交。"),
                 "fill_model": "next_open_only",
+                "is_st": is_st,
+                "st_unknown": st_unknown,
+                "st_note": ST_UNKNOWN_NOTE if st_unknown else "",
                 "style": pos.get("style") or intent.get("style") or None,
                 "held_days": session_days_held(str(pos.get("acquired_on") or "")[:10], as_of),
                 "net_return": _net_return_on_cost(fill, pos, qty),
@@ -322,9 +417,15 @@ def execute_intents(
         if len(positions) >= mandate.max_holdings:
             actions.append({"action": "buy", "symbol": symbol, "status": "rejected", "reason": "持仓只数已满。", "fill_model": "next_open_only"})
             continue
-        limit = _limit_blocked(symbol, gap_pct, "buy")
+        is_st, st_unknown = _identity(symbol)
+        limit = _limit_blocked(symbol, gap_pct, "buy", is_st=is_st)
         if limit:
-            actions.append({"action": "buy", "symbol": symbol, "status": "rejected", "reason": limit, "fill_model": "next_open_only"})
+            actions.append({
+                "action": "buy", "symbol": symbol, "status": "rejected", "reason": limit,
+                "fill_model": "next_open_only",
+                "is_st": is_st, "st_unknown": st_unknown,
+                "st_note": ST_UNKNOWN_NOTE if st_unknown else "",
+            })
             continue
         # An explicit None means the declared style does not treat an opening
         # gap-up as a reason to walk away (打板 chases it; 长期 does not care).
@@ -380,6 +481,9 @@ def execute_intents(
             "hypothesis_id": live_id or intent.get("hypothesis_id"),
             "reason": str(intent.get("reason") or "昨夜计划，今开成交。"),
             "fill_model": "next_open_only",
+            "is_st": is_st,
+            "st_unknown": st_unknown,
+            "st_note": ST_UNKNOWN_NOTE if st_unknown else "",
         }
         actions.append({**trade, "action": "buy", "status": "filled"})
         marked.setdefault("trades", []).append(trade)

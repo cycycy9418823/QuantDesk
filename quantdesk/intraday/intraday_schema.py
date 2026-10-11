@@ -13,6 +13,7 @@ from typing import Any
 import pandas as pd
 
 from quantdesk.csv_io import read_csv_frame
+from quantdesk.intraday.minute_storage import resolve_minute_read_path
 from quantdesk.shared import normalize_symbol, now_text, safe_float
 
 STANDARD_COLUMNS = [
@@ -413,6 +414,8 @@ def read_intraday_csv(
     target_date: str = "",
     encoding: str = "auto",
 ) -> dict[str, Any]:
+    requested_path = Path(path)
+    path = resolve_minute_read_path(requested_path)
     if not path.exists():
         return {"ok": False, "exists": False, "frame": pd.DataFrame(columns=STANDARD_COLUMNS), "warnings": [], "errors": ["文件不存在。"], "path": str(path)}
     encodings = SUPPORTED_ENCODINGS if not encoding or encoding == "auto" else (encoding,)
@@ -440,6 +443,9 @@ def read_intraday_csv(
         "price_basis" in normalized_input_columns
     )
     payload["warnings"] = read_warnings + list(payload.get("warnings") or [])
+    if path != requested_path:
+        payload["requested_path"] = str(requested_path)
+        payload["warnings"].append(f"legacy_price_basis_unknown:{requested_path.name}; legacy rows not merged")
     payload["exists"] = True
     payload["path"] = str(path)
     payload["encoding"] = used_encoding
@@ -499,7 +505,7 @@ def intraday_status_for_file(path: Path, *, symbol: str, target_date: str = "") 
     return {
         **status,
         "symbol": normalize_symbol(symbol),
-        "path": str(path),
+        "path": payload.get("path") or str(path),
         "exists": bool(payload.get("exists")),
     }
 

@@ -6,8 +6,11 @@ session ends, to check whether a preset level was traded through.
 
 from __future__ import annotations
 
+from ai_trader.llm_transport import capture_requests
+
 import json
 import math
+import os
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -15,7 +18,7 @@ from typing import Any
 
 import pandas as pd
 
-from ai_trader.decision_log import apply_gate_to_plan, record_evening_and_refresh_page
+from ai_trader.decision_log import apply_gate_to_plan, load_name_to_symbol, record_evening_and_refresh_page
 from ai_trader.execution_evidence import capture_execution_evidence
 from ai_trader.ledger_audit import audit_ledger
 from ai_trader.hypotheses import load_hypotheses, save_hypotheses
@@ -28,7 +31,7 @@ from ai_trader.ledger import (
     save_ledger,
 )
 from ai_trader.ledger import session_days_held as _session_days_held
-from ai_trader.llm import persistable_transport_diagnostics, propose_picks
+from ai_trader.llm import persistable_response_evidence, persistable_transport_diagnostics, propose_picks
 from ai_trader.mandate import BOUNDARY, DEFAULT_MANDATE, max_open_gap_for_style
 from ai_trader.market import (
     focus_universe,
@@ -58,7 +61,7 @@ from ai_trader.recovery import (
     plan_cycle_recovery,
 )
 from ai_trader.researcher import rank_today, research_ideas, template_by_id
-from ai_trader.trader import execute_intents
+from ai_trader.trader import execute_intents, trusted_st_identity
 from ai_trader.watchlist import load_watchlist, save_watchlist, touch_watchlist, watch_names
 from quantdesk.paper.market_rules import lot_size_for_symbol, round_notional_down_to_lot_quantity
 from quantdesk.paper.matching import evaluate_next_open_fill
@@ -95,6 +98,23 @@ def save_plan(plan: dict[str, Any], path: Any = None) -> None:
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _append_llm_response_evidence(evidence: dict[str, Any], ledger_path: Path) -> None:
+    """One append-only history per AI book, independent of daily-note reuse."""
+
+    target = assert_not_quantdesk_ledger(ledger_path.parent / "llm_response_evidence.jsonl")
+    line = json.dumps(evidence, ensure_ascii=True, allow_nan=False) + "\n"
+    with target.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell():
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                # Preserve an interrupted tail verbatim, then start a new row.
+                handle.write(b"\n")
+        handle.write(line.encode("utf-8"))
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _cycle_recovery_for_plan(existing: dict[str, Any] | None, as_of: str) -> dict[str, Any]:
@@ -577,7 +597,12 @@ def build_plan(
                     "preset_meaning": "预测次日最高价会触及此卖点（只验收，不按此价成交）",
                     "hypothesis_id": live_id,
                     "conviction": conviction,
-                    "thesis": pos.get("thesis") or why,
+                    "thesis": why,
+                    # Legacy positions do not retain the original decision date.
+                    # Never substitute the later fill date for that unknown date.
+                    "entry_thesis": dict(pos["entry_thesis"]) if isinstance(pos.get("entry_thesis"), dict) else {
+                        "text": str(pos.get("thesis") or ""), "date": None,
+                    },
                     "planned_hold_days": planned,
                     "reason": f"{session.get('path_comment')} {why}",
                     "news": news,
@@ -936,6 +961,15 @@ def settle_plan(
         open_prices[symbol] = float(decision["price"])
     prior_trade_count = len(ledger.get("trades") or [])
     execution_ledger = {**ledger, "warnings": list(ledger.get("warnings") or []) + mark_warnings}
+    # T09：把**可信身份**（行情行 is_st 列 / 运行时清单名字）送进真实成交入口，让 ST 的
+    # ±5% 涨跌停规则真的生效；两处都没证据就按"未知"显式带出，不按历史或价格推断。
+    st_identity: dict[str, tuple[bool, bool]] = {}
+    for intent in allowed:
+        symbol = str(intent.get("symbol") or "")
+        if symbol and symbol not in st_identity:
+            st_identity[symbol] = trusted_st_identity(
+                symbol, row=_cache_row(symbol), daily_dir=daily_dir
+            )
     ledger, actions = execute_intents(
         execution_ledger,
         as_of=as_of,
@@ -944,6 +978,7 @@ def settle_plan(
         prev_closes=prev_closes,
         mark_prices=open_marks,
         live_id=live_id,
+        st_identity=st_identity,
     )
     actions = rejected + list(actions)
     for row in actions:
@@ -1158,6 +1193,17 @@ def run_evening(
     proposal: dict[str, Any] | None = None
     cycle_recovery = _cycle_recovery_for_plan(existing, as_of)
     llm_recovery_status = str(cycle_recovery.get("status") or "")
+    # T15：这个周期已经提交过判断，而原模型回复没落盘 → 保持原样恢复：不重算、不重新裁定、
+    # 不覆盖计划文件，把当时的意图、原落盘时间与原模型异常原封不动留给重启后的记录。
+    # T14/T15：同一周期已提交的判断一律原样恢复——包括**没有买卖动作的持币计划**
+    # （`intents` 为空也必须保护），所以这里不能只看 intents/rejections 是否非空。
+    # 已结算的计划是上一轮的完成态，今晚属于新一轮，不走保留分支。
+    preserve_existing_plan = bool(
+        llm_recovery_status in {MISSING_ORIGINAL_MODEL_OUTPUT, REUSABLE_ORIGINAL_OUTPUT}
+        and isinstance(existing, dict)
+        and existing
+        and str(existing.get("status") or "") != "settled"
+    )
     if llm_recovery_status == MISSING_ORIGINAL_MODEL_OUTPUT:
         # A2: the cycle was interrupted after its input was frozen but before the
         # original model reply was persisted.  Stay interrupted: never call the
@@ -1173,20 +1219,21 @@ def run_evening(
             if llm_recovery_status == REUSABLE_ORIGINAL_OUTPUT
             else {}
         )
-        proposal = propose_picks(
-            _build_llm_context(
-                as_of=as_of,
-                trade_date=trade_date,
-                ledger=ledger,
-                panel=panel,
-                recommended=recommended_names,
-                research=research,
-                daily_dir=runtime.daily_dir,
-                philosophy=philosophy,
-            ),
-            llm_diag,
-            **reuse_kwargs,
-        )
+        with capture_requests(runtime.ledger.parent / "llm_requests"):
+            proposal = propose_picks(
+                _build_llm_context(
+                    as_of=as_of,
+                    trade_date=trade_date,
+                    ledger=ledger,
+                    panel=panel,
+                    recommended=recommended_names,
+                    research=research,
+                    daily_dir=runtime.daily_dir,
+                    philosophy=philosophy,
+                ),
+                llm_diag,
+                **reuse_kwargs,
+            )
         if proposal is not None:
             llm_used = True
             llm_model = str(proposal.get("model") or "")
@@ -1285,6 +1332,23 @@ def run_evening(
             else None
         ),
     }
+    response_evidence = persistable_response_evidence(llm_diag)
+    if response_evidence:
+        response_evidence["cycle"] = {
+            "ledger_id": ledger.get("ledger_id"),
+            "plan_id": plan.get("plan_id"),
+            "decision_date": as_of,
+            "trade_date": trade_date,
+        }
+        if response_evidence.get("call_state") == "attempted":
+            try:
+                _append_llm_response_evidence(response_evidence, runtime.ledger)
+            except OSError as exc:
+                response_evidence["history_status"] = "write_failed"
+                warnings.append("llm_response_history_write_failed:" + type(exc).__name__)
+            else:
+                response_evidence["history_status"] = "written"
+        plan["llm"]["response_evidence"] = response_evidence
     pack = load_prompt_pack()
     plan["prompt_version"] = pack.prompt_version
     plan["menu_version"] = pack.menu_version
@@ -1324,8 +1388,42 @@ def run_evening(
         "advisory_only": True,
     }
     warnings.extend(list(recommendations.get("warnings") or []))
-    statement_gate = apply_gate_to_plan(plan, daily_dir=runtime.daily_dir)
-    if statement_gate.rejections:
+    if preserve_existing_plan:
+        # 保留当晚的裁定与意图：把既有计划的原字段搬进今晚的计划对象（不重新核对、不改内容），
+        # 并连原模型异常一起留下——重启后的记录不得变成另一份、也不得丢掉原来的错误原因。
+        plan["intents"] = deepcopy(list(existing.get("intents") or []))
+        plan["statement_rejections"] = deepcopy(existing.get("statement_rejections"))
+        plan["statement_review"] = deepcopy(existing.get("statement_review"))
+        kept_time = str(existing.get("recorded_at") or "").strip()
+        if kept_time:
+            plan["recorded_at"] = kept_time
+        original_llm = dict(existing.get("llm") or {})
+        # Old plans without response evidence must stay without it; a replay
+        # timestamp cannot stand in for the original response observation.
+        plan["llm"].pop("response_evidence", None)
+        for key in (
+            "used", "model", "market_note", "picked", "styles", "sells_requested",
+            "unavailable_reason", "diagnostics", "raw_response", "response_evidence", "stance", "lesson",
+        ):
+            if key in original_llm:
+                plan["llm"][key] = deepcopy(original_llm[key])
+        plan["llm"]["recovery_status"] = llm_recovery_status
+        if llm_recovery_status == REUSABLE_ORIGINAL_OUTPUT:
+            # 这一轮确实是在重放已存回复：把这件事标在回复本身上（原字段不动，只加这一个标记）。
+            raw = plan["llm"].get("raw_response")
+            if isinstance(raw, dict):
+                plan["llm"]["raw_response"] = {**raw, "reused": True}
+        warnings.append("statement_review_preserved_from_interrupted_cycle")
+        statement_gate = None
+    else:
+        statement_gate = apply_gate_to_plan(
+            plan,
+            daily_dir=runtime.daily_dir,
+            # 名称→代码映射只从运行时自己的证券清单读（缺清单即空映射：中文名称保持未核验，
+            # 不替模型猜票，也不把"没核对上"记成"确定说错"）。
+            name_to_symbol=load_name_to_symbol(daily_dir=runtime.daily_dir),
+        )
+    if statement_gate is not None and statement_gate.rejections:
         rejected_names = [
             str(row.get("symbol") or "HOLD") for row in statement_gate.rejections
         ]
@@ -1349,6 +1447,9 @@ def run_evening(
         )
         warnings.append("tonight_plan_not_committed_pending_deferred_settlement")
         save_plan(deferred_plan, runtime.plan_latest)
+    elif preserve_existing_plan:
+        # 原计划文件保持原字节：重启恢复不得把它换成另一份记录。
+        warnings.append("plan_latest_preserved_after_interrupted_recovery")
     else:
         plan["committed"] = True
         save_plan(plan, runtime.plan_latest)
@@ -1391,7 +1492,10 @@ def run_evening(
             committed_buy_symbols=committed_buy_symbols_from_plan(plan),
             plan_committed=bool(plan.get("committed", True)),
             held_count=len(position_map(ledger)),
-            gate_rejected=bool(statement_gate.rejections),
+            gate_rejected=bool(
+                (statement_gate.rejections if statement_gate is not None else [])
+                or (plan.get("statement_rejections") or [])
+            ),
             committed_sell_symbols=[
                 str(item.get("symbol")) for item in (plan.get("intents") or [])
                 if item.get("side") == "sell" and item.get("symbol")
@@ -1425,6 +1529,8 @@ def run_evening(
             else []
         ),
     )
+    if "response_evidence" in plan["llm"]:
+        note["llm"]["response_evidence"] = deepcopy(plan["llm"]["response_evidence"])
     if conviction == "probation" and method:
         note["lessons"] = [
             f"【观察仓·未验证】{method.get('title')}：{method.get('reason')}"
@@ -1436,6 +1542,11 @@ def run_evening(
     note["tomorrow_plan"] = {
         "trade_date": trade_date,
         "intents": plan.get("intents"),
+        # 被拒的原提议随计划一起写进日记：最新计划隔天会被覆盖，只剩日记时仍要能还原
+        # 当晚说错了什么、原裁定是什么（PRODUCT-S2-REJECTION-HISTORY）。
+        "statement_rejections": plan.get("statement_rejections"),
+        # 计划的落盘时刻也随日记保存：重建历史时用它；没有就留空，不拿重建时的时钟补造。
+        "recorded_at": plan.get("recorded_at"),
         "conviction": conviction,
         "prediction_note": PREDICTION_NOTE,
     }
@@ -1481,13 +1592,62 @@ def run_evening(
         )
         if intent_digest:
             note["thought"] = f"{thought} 白天盘中意图（未成交，仅记录）：{intent_digest}"
-    append_journal(note, latest_path=runtime.journal_latest, log_path=runtime.journal_log)
+    # Same book, second column: the daytime AI's own fills and its mandate blocks.
+    # Read-only here; the ledger was already written by the intraday fill stage.
+    from ai_trader.daytime_fill import load_daytime_fills_for, load_daytime_journal_for
+
+    intraday_state_dir = runtime.daytime_notes.parent
+    intraday_fills = load_daytime_fills_for(as_of, state_dir=intraday_state_dir)
+    intraday_journal = load_daytime_journal_for(as_of, state_dir=intraday_state_dir)
+    mandate_blocks = [row for row in intraday_journal
+                      if str(row.get("status") or "") == "mandate_blocked"]
+    market_blocks = [row for row in intraday_journal
+                     if str(row.get("status") or "") == "blocked"]
+    blocked_by: dict[str, int] = {}
+    for row in mandate_blocks:
+        token = str(row.get("blocked_by") or "unknown")
+        blocked_by[token] = blocked_by.get(token, 0) + 1
+    note["daytime_fills"] = [
+        {"slot": item.get("slot"), "intent_slot": item.get("intent_slot"),
+         "symbol": item.get("symbol"), "side": item.get("side"), "quantity": item.get("quantity"),
+         "price": item.get("price"), "price_source": item.get("price_source"),
+         "price_timestamp": item.get("price_timestamp"), "reason": item.get("ai_reason"),
+         "model_used": item.get("model_used"), "elapsed_ms": item.get("elapsed_ms"),
+         "dry_run": item.get("dry_run")}
+        for item in intraday_fills
+    ]
+    note["daytime_mandate_blocks"] = [
+        {"slot": item.get("slot"), "symbol": item.get("symbol"), "side": item.get("side"),
+         "qty": item.get("qty"), "blocked_by": item.get("blocked_by"),
+         "ai_reason": item.get("ai_reason"), "detail": item.get("detail"),
+         "model_used": item.get("model_used"), "elapsed_ms": item.get("elapsed_ms")}
+        for item in mandate_blocks
+    ]
+    note["daytime_intraday_column"] = {
+        "fills": sum(1 for item in intraday_fills if not item.get("dry_run")),
+        "dry_fills": sum(1 for item in intraday_fills if item.get("dry_run")),
+        "market_blocks": len(market_blocks),
+        "mandate_blocked": len(mandate_blocks),
+        "mandate_blocked_by": blocked_by,
+        "models": sorted({str(item.get("model")) for item in intraday_fills if item.get("model")}),
+        "ledger_written": any(bool(item.get("ledger_written")) for item in intraday_fills),
+    }
+    if intraday_fills or mandate_blocks:
+        headline = (f"白天盘中 AI 一栏：成交 {note['daytime_intraday_column']['fills']} 笔、"
+                    f"被家规拦下 {len(mandate_blocks)} 次")
+        if blocked_by:
+            headline += "（" + "、".join(f"{token} {count} 次"
+                                         for token, count in sorted(blocked_by.items())) + "）"
+        note["thought"] = f"{thought} {headline}。"
+    note = append_journal(note, latest_path=runtime.journal_latest, log_path=runtime.journal_log) or note
     record_evening_and_refresh_page(
         plan,
         daily_dir=runtime.daily_dir,
         runtime=runtime,
         as_of=as_of,
-        rejections=statement_gate.rejections,
+        # 保留态（T15）：本轮没有重算门，当晚原拒绝由 records_from_plan 从计划里回放，
+        # 这里不额外塞一份重算结果（避免同一拒绝被算两次／被后来的日线改写）。
+        rejections=(statement_gate.rejections if statement_gate is not None else None),
     )
     snapshot = {
         "ok": True,

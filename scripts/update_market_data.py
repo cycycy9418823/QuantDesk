@@ -40,7 +40,13 @@ from quantdesk.data_quality import (  # noqa: E402
     failed_by_market_summary,
     grade_distribution,
 )
-from quantdesk.daily_price_providers import STANDARD_DAILY_COLUMNS  # noqa: E402
+from quantdesk.daily_price_providers import (  # noqa: E402
+    DAILY_COLUMN_ALIASES,
+    STANDARD_DAILY_COLUMNS,
+    _with_fetch_metadata,
+    merge_daily_frames as merge_price_frames,
+    normalize_daily_df,
+)
 from quantdesk.manual_confirmation_queue import list_manual_confirmation_items  # noqa: E402
 from quantdesk.market_clock import (  # noqa: E402
     AFTERNOON_END,
@@ -50,6 +56,7 @@ from quantdesk.market_clock import (  # noqa: E402
     to_shanghai_datetime,
 )
 from quantdesk.paper.paper_trading import load_paper_portfolio  # noqa: E402
+from quantdesk.price_basis import classify_frame_price_basis  # noqa: E402
 from quantdesk.update_task_lock import (  # noqa: E402
     DEFAULT_LOCK_FILENAME,
     UpdateLockHeld,
@@ -173,6 +180,15 @@ def parse_symbol_text(value: object) -> list[str]:
     return result
 
 
+def _daily_evidence_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Translate names without filtering rows or discarding preflight evidence."""
+    aliases = {key: DAILY_COLUMN_ALIASES.get(value, value) for key, value in COLUMN_ALIASES.items()}
+    aliases.update(DAILY_COLUMN_ALIASES)
+    aliases["price_basis"] = "adjust"
+    return frame.rename(columns={column: aliases.get(str(column).strip().lower(), str(column).strip())
+                                 for column in frame.columns}).copy()
+
+
 def normalize_daily_bars(
     df: pd.DataFrame,
     symbol: str,
@@ -180,62 +196,26 @@ def normalize_daily_bars(
     *,
     adjust_mode: str | None = None,
 ) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    result = df.copy()
-    rename_map: dict[str, str] = {}
-    for column in result.columns:
-        text = str(column).strip()
-        lowered = text.lower()
-        if lowered in COLUMN_ALIASES:
-            rename_map[column] = COLUMN_ALIASES[lowered]
-    if rename_map:
-        result = result.rename(columns=rename_map)
-    if COL_DATE not in result.columns:
-        return pd.DataFrame()
-    result[COL_DATE] = pd.to_datetime(result[COL_DATE], errors="coerce")
-    for column in NUMERIC_COLUMNS:
-        if column in result.columns:
-            result[column] = pd.to_numeric(result[column], errors="coerce")
-    result = result.dropna(subset=[column for column in [COL_DATE, COL_CLOSE] if column in result.columns])
-    if COL_CLOSE in result.columns:
-        result = result[pd.to_numeric(result[COL_CLOSE], errors="coerce").fillna(-1) > 0]
-    result = result.sort_values(COL_DATE).drop_duplicates(COL_DATE, keep="last")
-    if "adjust" in result.columns:
-        adjust_values: object = result["adjust"].astype("string").str.strip().str.lower()
-    elif adjust_mode is not None:
+    """Preserve original evidence before cleaning; a caller label is not provenance.
+
+    ``adjust_mode`` represents an explicit request, only when the response has no
+    basis column. Acquisition metadata belongs to the actual fetch boundary.
+    """
+    result = _daily_evidence_columns(df) if df is not None else pd.DataFrame()
+    if adjust_mode is not None and "adjust" not in result.columns:
         adjust_token = str(adjust_mode).strip().lower()
-        adjust_values = "raw" if adjust_token in {"", "none", "raw", "不复权"} else adjust_token
-    else:
-        adjust_values = pd.NA
-    if source:
-        source_values: object = source
-    elif "source" in result.columns:
-        source_values = result["source"]
-    else:
-        source_values = "local_daily_cache"
-    updated_at_values: object = result["updated_at"] if "updated_at" in result.columns else now_text()
-    output = pd.DataFrame(
-        {
-            "date": result[COL_DATE],
-            "symbol": symbol,
-            "open": result[COL_OPEN] if COL_OPEN in result.columns else pd.NA,
-            "high": result[COL_HIGH] if COL_HIGH in result.columns else pd.NA,
-            "low": result[COL_LOW] if COL_LOW in result.columns else pd.NA,
-            "close": result[COL_CLOSE] if COL_CLOSE in result.columns else pd.NA,
-            "volume": result[COL_VOLUME] if COL_VOLUME in result.columns else pd.NA,
-            "amount": result[COL_AMOUNT] if COL_AMOUNT in result.columns else pd.NA,
-            "change": result[COL_CHG] if COL_CHG in result.columns else pd.NA,
-            "pct_chg": result[COL_PCT_CHG] if COL_PCT_CHG in result.columns else pd.NA,
-            "adjust": adjust_values,
-            "source": source_values,
-            "updated_at": updated_at_values,
-        }
-    )
-    for column in ["open", "high", "low", "close", "volume", "amount", "change", "pct_chg"]:
-        output[column] = pd.to_numeric(output[column], errors="coerce")
-    output = output.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date", keep="last")
-    return output[STANDARD_DAILY_COLUMNS].reset_index(drop=True)
+        result["adjust"] = "raw" if adjust_token in {"", "none", "raw", "不复权"} else adjust_token
+    output, warnings = normalize_daily_df(result, symbol)
+    output.attrs["warnings"] = list(dict.fromkeys([*result.attrs.get("warnings", []), *warnings]))
+    return output
+
+
+def _normalize_fetched_daily_bars(
+    frame: pd.DataFrame, symbol: str, *, source: str, adjust_mode: str,
+) -> pd.DataFrame:
+    prepared = _daily_evidence_columns(frame)
+    prepared = _with_fetch_metadata(prepared, source=source, captured_at=now_text())
+    return normalize_daily_bars(prepared, symbol, adjust_mode=adjust_mode)
 
 
 def normalize_daily_frame(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -248,17 +228,38 @@ def read_daily_cache(path: Path, symbol: str) -> pd.DataFrame:
     try:
         raw = read_csv_frame(path)
         warnings = [str(item) for item in raw.attrs.get("warnings", []) if item]
+        # A lossy read is not an absent cache: merging only the surviving rows
+        # could erase history or a skipped row's conflicting price evidence.
+        if raw.empty or any(item.startswith(("csv_parse_failed:", "csv_bad_lines_skipped:",
+                                             "csv_read_failed:", "csv_missing:", "csv_empty:"))
+                            for item in warnings):
+            raise ValueError("daily_cache_incomplete_read:" + "|".join(warnings))
         normalized = normalize_daily_bars(raw, symbol)
-        normalized.attrs["warnings"] = warnings
+        if normalized.empty:
+            raise ValueError("daily_cache_no_valid_rows")
+        normalized.attrs["warnings"] = list(dict.fromkeys([*warnings, *normalized.attrs.get("warnings", [])]))
         return normalized
     except Exception as exc:
         LOG.warning("read_daily_cache failed for %s: %s", symbol, exc)
-        return pd.DataFrame()
+        rejected = pd.DataFrame(columns=STANDARD_DAILY_COLUMNS)
+        rejected.attrs.update(
+            observed_price_basis="mixed_or_unknown", price_basis_reason="unknown_price_basis",
+            warnings=[f"daily_cache_read_failed:{symbol}:{type(exc).__name__}:{exc}"],
+        )
+        return rejected
 
 
 def write_daily_cache(path: Path, df: pd.DataFrame) -> None:
+    evidence = _daily_evidence_columns(df)
+    if list(evidence.columns).count("adjust") > 1:
+        raise ValueError("ambiguous_daily_adjust_columns")
+    _basis, reason = classify_frame_price_basis(evidence)
+    if reason:
+        # CSV cannot retain attrs. Never persist apparently clean surviving rows
+        # after the original response has failed its price-basis check.
+        raise ValueError(f"daily_cache_write_price_basis:{reason}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    output = df.copy()
+    output = evidence.copy()
     date_col = "date" if "date" in output.columns else COL_DATE
     if date_col in output.columns:
         output[date_col] = pd.to_datetime(output[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
@@ -272,15 +273,10 @@ def write_daily_cache(path: Path, df: pd.DataFrame) -> None:
 
 
 def merge_daily_frames(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
-    frames = [frame for frame in [existing, fresh] if frame is not None and not frame.empty]
-    if not frames:
-        return pd.DataFrame()
-    merged = pd.concat(frames, ignore_index=True)
-    date_col = "date" if "date" in merged.columns else COL_DATE
-    if date_col in merged.columns:
-        merged[date_col] = pd.to_datetime(merged[date_col], errors="coerce")
-        merged = merged.sort_values(date_col).drop_duplicates(date_col, keep="last")
-    return merged.reset_index(drop=True)
+    return merge_price_frames(
+        _daily_evidence_columns(existing) if existing is not None else None,
+        _daily_evidence_columns(fresh) if fresh is not None else None,
+    )
 
 
 def load_symbols_file(path: str | Path | None) -> list[str]:
@@ -718,7 +714,7 @@ def fetch_daily_provider_chain(
     extra: dict[str, str] = {}
     try:
         frame = fetch_hist_daily(symbol, start_date, end_date, adjust)
-        normalized = normalize_daily_bars(frame, symbol, source="eastmoney_hist", adjust_mode=adjust)
+        normalized = _normalize_fetched_daily_bars(frame, symbol, source="eastmoney_hist", adjust_mode=adjust)
         if normalized.empty:
             raise ValueError("eastmoney_hist returned empty daily data")
         return normalized, "eastmoney_hist", provider_errors, extra
@@ -727,7 +723,7 @@ def fetch_daily_provider_chain(
 
     try:
         frame = fetch_sina_daily(symbol, start_date, end_date, adjust)
-        normalized = normalize_daily_bars(frame, symbol, source="sina_daily", adjust_mode=adjust)
+        normalized = _normalize_fetched_daily_bars(frame, symbol, source="sina_daily", adjust_mode=adjust)
         if normalized.empty:
             raise ValueError("sina_daily returned empty daily data")
         return normalized, "sina_daily", provider_errors, extra
@@ -738,7 +734,7 @@ def fetch_daily_provider_chain(
     if retry_end and retry_end != end_date:
         try:
             frame = fetch_sina_daily(symbol, start_date, retry_end, adjust)
-            normalized = normalize_daily_bars(frame, symbol, source="sina_daily", adjust_mode=adjust)
+            normalized = _normalize_fetched_daily_bars(frame, symbol, source="sina_daily", adjust_mode=adjust)
             if normalized.empty:
                 raise ValueError("sina_daily returned empty daily data")
             extra["retry_end_date_used"] = retry_end
@@ -756,7 +752,7 @@ def fetch_daily_provider_chain(
         ):
             try:
                 frame = fetcher(symbol, start_date, end_date)
-                normalized = normalize_daily_bars(
+                normalized = _normalize_fetched_daily_bars(
                     frame,
                     symbol,
                     source=provider_name,

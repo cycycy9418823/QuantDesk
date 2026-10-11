@@ -175,6 +175,7 @@ def _cycle_fixture() -> dict:
 def _write_state(tmp_path: Path, *, plan: dict | None = None) -> Path:
     state = tmp_path / "state"
     state.mkdir()
+    (state / "decision_latest.json").write_text('{"records": []}', encoding="utf-8")
     (state / "ledger.json").write_text(
         json.dumps(_ledger_fixture(), ensure_ascii=False), encoding="utf-8"
     )

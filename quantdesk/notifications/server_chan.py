@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
+from http.client import HTTPException
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Any, Protocol
@@ -105,8 +106,11 @@ def _urllib_transport(
         method="POST",
     )
     opener = build_opener(_NoRedirectHandler())
+    response_received = False
     try:
-        with opener.open(request, timeout=float(timeout_seconds)) as response:
+        response = opener.open(request, timeout=float(timeout_seconds))
+        response_received = True
+        with response:
             body = response.read(MAX_RESPONSE_BYTES + 1)
             if len(body) > MAX_RESPONSE_BYTES:
                 body = b""
@@ -126,11 +130,15 @@ def _urllib_transport(
     except (socket.timeout, TimeoutError) as exc:
         raise AmbiguousDeliveryError("server_chan_response_timeout") from exc
     except URLError as exc:
+        if response_received:
+            raise AmbiguousDeliveryError("server_chan_response_interrupted") from exc
         reason = getattr(exc, "reason", None)
         if isinstance(reason, (socket.timeout, TimeoutError)):
             raise AmbiguousDeliveryError("server_chan_response_timeout") from exc
         raise ConnectionError("server_chan_transport_failed") from exc
-    except OSError as exc:
+    except (OSError, HTTPException) as exc:
+        if response_received:
+            raise AmbiguousDeliveryError("server_chan_response_interrupted") from exc
         raise ConnectionError("server_chan_transport_failed") from exc
 
 

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
@@ -22,6 +25,37 @@ from scripts.server.helpers.util import clean_payload, finite_float, read_json_f
 
 
 CandidateRowsFunc = Callable[[int], list[dict[str, Any]]]
+
+
+class BacktestSymbolInputError(ValueError):
+    """The requested local-history universe violates symbol/path boundaries."""
+
+
+def _validated_backtest_symbols(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        raise BacktestSymbolInputError("symbols 必须是六位股票代码的列表。")
+    result: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or re.fullmatch(r"[0-9]{6}", value.strip()) is None:
+            raise BacktestSymbolInputError("股票代码必须是六位数字（例如600000），不能包含路径或交易所前后缀。")
+        symbol = value.strip()
+        if symbol not in result:
+            result.append(symbol)
+    return result
+
+
+def _validated_history_paths(daily_dir: Path, symbols: list[str]) -> list[tuple[str, Path]]:
+    """Resolve all selected paths before any reader opens a CSV."""
+    expected = Path(os.path.abspath(daily_dir))
+    if expected.resolve() != expected:
+        raise BacktestSymbolInputError("日线目录存在路径重定向，无法安全读取回测输入。")
+    paths = []
+    for symbol in symbols:
+        path = expected / f"{symbol}.csv"
+        if path.resolve() != path or path.is_symlink():
+            raise BacktestSymbolInputError("回测CSV存在路径重定向，只能读取指定日线目录内的原文件。")
+        paths.append((symbol, path))
+    return paths
 
 
 def _research_paper_boundary_fields() -> dict[str, Any]:
@@ -78,8 +112,8 @@ def _strategy_screening_backtest_handoff(max_symbols: int) -> tuple[list[str], d
     handoff = latest.get("backtest_handoff") if isinstance(latest.get("backtest_handoff"), dict) else {}
     if handoff.get("status") != "ready":
         return [], handoff if isinstance(handoff, dict) else {}
-    symbols = [str(item).strip() for item in (handoff.get("symbols") or []) if str(item).strip()]
-    return list(dict.fromkeys(symbols))[:max_symbols], handoff
+    symbols = _validated_backtest_symbols(handoff.get("symbols", []))
+    return symbols[:max_symbols], handoff
 
 
 def _load_backtest_histories(
@@ -93,25 +127,27 @@ def _load_backtest_histories(
     supplied; otherwise the loader pads from ``data/daily``.
     """
     daily_dir = project_root / "data" / "daily"
-    selected_symbols: list[str] = list(dict.fromkeys(str(item).strip() for item in (symbols or []) if str(item).strip()))
+    selected_symbols = _validated_backtest_symbols(symbols) if symbols is not None else []
     if not selected_symbols and candidate_rows_func is not None:
         try:
-            for row in candidate_rows_func(18):
-                sym = str(row.get("symbol") or "").strip()
-                if sym and sym not in selected_symbols:
-                    selected_symbols.append(sym)
+            candidates = candidate_rows_func(18)
         except Exception:  # noqa: BLE001
-            selected_symbols = []
+            candidates = []
+        # Only provider execution errors retain the historical fallback. Invalid
+        # returned identities must not be swallowed and replaced by other files.
+        if not isinstance(candidates, list) or any(not isinstance(row, dict) for row in candidates):
+            raise BacktestSymbolInputError("候选列表必须包含有效股票代码对象。")
+        selected_symbols = _validated_backtest_symbols([row.get("symbol") for row in candidates])
     if not symbols and len(selected_symbols) < max_symbols and daily_dir.exists():
         for path in sorted(daily_dir.glob("*.csv")):
             sym = path.stem
-            if sym.isdigit() and sym not in selected_symbols:
+            if re.fullmatch(r"[0-9]{6}", sym) and sym not in selected_symbols:
                 selected_symbols.append(sym)
             if len(selected_symbols) >= max_symbols:
                 break
     histories: dict[str, pd.DataFrame] = {}
-    for sym in selected_symbols[:max_symbols]:
-        path = daily_dir / f"{sym}.csv"
+    paths = _validated_history_paths(daily_dir, selected_symbols[:max_symbols])
+    for sym, path in paths:
         if not path.exists():
             continue
         try:
@@ -208,11 +244,7 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                     handoff_symbols, handoff = _strategy_screening_backtest_handoff(max_symbols)
                     if handoff.get("strategy"):
                         strategy = str(handoff.get("strategy") or strategy)
-                requested_symbols = (
-                    [str(item).strip() for item in body.get("symbols", []) if str(item).strip()]
-                    if isinstance(body.get("symbols"), list)
-                    else []
-                )
+                requested_symbols = _validated_backtest_symbols(body["symbols"]) if "symbols" in body else []
                 histories = _load_backtest_histories(
                     max_symbols,
                     symbols=requested_symbols or handoff_symbols or None,
@@ -315,6 +347,9 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                     encoding="utf-8",
                 )
                 status = 200
+            except BacktestSymbolInputError as exc:
+                payload = {"ok": False, "status": "bad_backtest_symbols", "message_for_ui": str(exc)}
+                status = 400
             except Exception as exc:  # noqa: BLE001
                 payload = {"ok": False, "message_for_ui": f"回测运行失败：{exc}", "error": str(exc)}
                 status = 500

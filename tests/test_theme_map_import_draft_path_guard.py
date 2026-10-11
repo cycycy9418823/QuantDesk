@@ -43,7 +43,7 @@ class ThemeMapImportDraftDirectCallPathGuardTests(unittest.TestCase):
             _resolve_project_csv_path,
         )
 
-        resolved = _resolve_project_csv_path("results/research/draft.csv", STOCK_THEME_MAP_IMPORT_CSV)
+        resolved = _resolve_project_csv_path("results/theme_map_drafts/draft.csv", STOCK_THEME_MAP_IMPORT_CSV)
         self.assertEqual(resolved.suffix.lower(), ".csv")
         resolved.relative_to(PROJECT_ROOT.resolve())  # raises if outside project
 
@@ -67,14 +67,20 @@ class ThemeMapImportDraftPathGuardTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        sandbox_parent = Path(__file__).resolve().parents[1] / ".tmp_tests"
-        sandbox_parent.mkdir(parents=True, exist_ok=True)
         self._temp_dir = tempfile.TemporaryDirectory(
             prefix="theme-map-path-guard-",
-            dir=sandbox_parent,
         )
         self.addCleanup(self._temp_dir.cleanup)
-        self.import_csv = Path(self._temp_dir.name) / "stock_theme_map_import.csv"
+        from quantdesk import theme_map_import_draft as draft
+        root = Path(self._temp_dir.name)
+        original_root = draft.PROJECT_ROOT
+        for name, value in vars(draft).copy().items():
+            if name.isupper() and isinstance(value, Path):
+                relative = value.relative_to(original_root) if value.is_relative_to(original_root) else Path(value.name)
+                patcher = mock.patch.object(draft, name, root / relative)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+        self.import_csv = draft.STOCK_THEME_MAP_IMPORT_CSV
         self._import_path_patch = mock.patch.object(
             quant_api_server,
             "STOCK_THEME_MAP_IMPORT_CSV",

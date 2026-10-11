@@ -18,6 +18,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from quantdesk.pipeline_process_guard import market_writer_subprocess_kwargs  # noqa: E402
+
 
 def _sha(path: Path) -> str:
     digest = hashlib.sha256()
@@ -84,6 +90,9 @@ def run_refresh(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     root = Path(project_root).resolve()
+    # Validate the active owned context before any preparation writes. Recheck
+    # immediately at spawn so revoked or closed leases never reach the updater.
+    market_writer_subprocess_kwargs(root)
     universe = root / "data" / "universe" / "a_share_symbols.csv"
     spec = root / "config" / "weekly_daily_wide_pool_contract.json"
     update_script = root / "scripts" / "update_a_share_universe.py"
@@ -131,6 +140,7 @@ def run_refresh(
         capture_output=True,
         text=True,
         check=False,
+        **market_writer_subprocess_kwargs(root),
     )
     tail = [line for line in process.stdout.splitlines() if line.strip()][-4:]
     problems: list[str] = []

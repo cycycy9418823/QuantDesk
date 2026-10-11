@@ -76,6 +76,8 @@ def _bars(symbol: str, prices: list[float], date: str = "2026-05-18") -> pd.Data
                 "close": price,
                 "volume": 1000,
                 "amount": price * 1000,
+                # T08：合成分钟帧是未复权原始报价，显式声明口径（不再依赖"没说"）。
+                "adjust": "raw",
             }
             for i, price in enumerate(prices)
         ]
@@ -416,9 +418,9 @@ class V293IntradayImportAndExecutionClosureTests(unittest.TestCase):
             intraday = root / "data" / "intraday"
             (intraday / "1m").mkdir(parents=True)
             (intraday / "1m" / "002115.csv").write_text(
-                "symbol,datetime,open,high,low,close,volume,amount\n"
-                "002115,2026-05-18 09:31:00,10.2,10.2,10.2,10.2,1000,10200\n"
-                "002115,2026-05-18 09:32:00,10.3,10.3,10.3,10.3,1000,10300,unexpected_extra_field\n",
+                "symbol,datetime,open,high,low,close,volume,amount,adjust\n"
+                "002115,2026-05-18 09:31:00,10.2,10.2,10.2,10.2,1000,10200,raw\n"
+                "002115,2026-05-18 09:32:00,10.3,10.3,10.3,10.3,1000,10300,raw,unexpected_extra_field\n",
                 encoding="utf-8",
             )
 

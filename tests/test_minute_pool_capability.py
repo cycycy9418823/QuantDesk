@@ -23,6 +23,8 @@ def _write_intraday(path: Path, symbol: str, prices: list[float], date: str = "2
                 "close": price,
                 "volume": 1000,
                 "amount": price * 1000,
+                # T08：合成分钟库是未复权原始报价，显式声明口径。
+                "adjust": "raw",
             }
         )
     pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")

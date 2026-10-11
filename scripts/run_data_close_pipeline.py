@@ -34,11 +34,11 @@ import csv
 import errno
 import hashlib
 import json
-import msvcrt
 import os
 import re
 import runpy
 import secrets
+import signal
 import stat
 import subprocess
 import sys
@@ -51,6 +51,19 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from quantdesk.pipeline_process_guard import (  # noqa: E402
+    acquire_linux_ofd_lock,
+    activate_market_writer_lease,
+    require_linux_ofd_support,
+    reset_market_writer_lease,
+)
+
+if os.name == "nt":
+    import msvcrt
+
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 SCHEMA_VERSION = "data_close_pipeline_v1"
@@ -187,7 +200,7 @@ class _LockContended(OSError):
 
 
 class _OSLockHandle:
-    """Real OS-level file lock (msvcrt.locking) held for the whole critical
+    """Real byte lock (Windows msvcrt or Linux OFD) held for the whole critical
     section. The JSON metadata lives in a SEPARATE file. On acquire failure
     the half-open handle is closed BEFORE raising (Round-2 P2 fix: no fd
     leaks on lock contention)."""
@@ -200,9 +213,12 @@ class _OSLockHandle:
 
     def acquire(self) -> None:
         self._fh = open(self._path, "r+b" if self._existing else "a+b")
-        self._fh.seek(self._offset)
         try:
-            msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+            self._fh.seek(self._offset)
+            if os.name == "nt":
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                acquire_linux_ofd_lock(self._fh.fileno(), self._offset)
         except OSError as exc:
             # contention: close OUR half-open handle before propagating
             try:
@@ -217,8 +233,11 @@ class _OSLockHandle:
         if self._fh is None:
             return
         try:
-            self._fh.seek(self._offset)
-            msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            if os.name == "nt":
+                self._fh.seek(self._offset)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            # Linux F_UNLCK would unlock every inherited reference to this OFD.
+            # Closing only our fd retains the lease until the last writer exits.
         finally:
             self._fh.close()
             self._fh = None
@@ -322,6 +341,7 @@ class MarketWriterLease:
         self.scope = scope
         self._token = os.environ.pop(MARKET_WRITER_TOKEN_ENV, "")
         self._handle = _OSLockHandle(self.root / LOCK_RELATIVE, offset=1, existing=True)
+        self._context_token = None
 
     def __enter__(self) -> "MarketWriterLease":
         if not self._token or validate_run_id(self.run_id) is None or self.scope not in STAGE_ORDER:
@@ -329,13 +349,17 @@ class MarketWriterLease:
         try:
             self._handle.acquire()
             self.assert_active()
+            if sys.platform == "linux":
+                self._context_token = activate_market_writer_lease(
+                    self._handle._fh.fileno(), self._handle._path, self.assert_active,
+                )
         except BaseException:
             self._handle.release()
             raise
         return self
 
     def assert_active(self) -> None:
-        if self._handle._fh is None:
+        if self._handle._fh is None or self._handle._fh.closed:
             raise MarketWriterUnauthorized("pipeline_writer_lease_not_held")
         try:
             meta = json.loads((self.root / LOCK_RELATIVE).with_suffix(".meta.json").read_text(encoding="utf-8"))
@@ -361,7 +385,12 @@ class MarketWriterLease:
             raise MarketWriterUnauthorized("pipeline_writer_owner_not_running")
 
     def __exit__(self, *_args: Any) -> None:
-        self._handle.release()
+        try:
+            if self._context_token is not None:
+                reset_market_writer_lease(self._context_token)
+                self._context_token = None
+        finally:
+            self._handle.release()
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +419,39 @@ class StageResult:
         return asdict(self)
 
 
+def _writer_lease_evidence(root: Path) -> tuple[list[str], dict[str, Any]]:
+    """A direct child's exit says nothing about a surviving inherited writer."""
+
+    probe = _OSLockHandle(root / LOCK_RELATIVE, offset=1, existing=True)
+    try:
+        probe.acquire()
+    except _LockContended:
+        return ["stage_writer_lease_still_alive"], {
+            "writer_lease_alive": True, "writer_lease_check_failed": False,
+            "orphan_alive": True,
+        }
+    except OSError:
+        return ["stage_writer_lease_unverifiable"], {
+            "writer_lease_alive": None, "writer_lease_check_failed": True,
+            "orphan_alive": True,
+        }
+    finally:
+        probe.release()
+    return [], {
+        "writer_lease_alive": False, "writer_lease_check_failed": False,
+        "orphan_alive": False,
+    }
+
+
+def _safe_process_tail(value: str | bytes | None, known_secrets: tuple[str, ...]) -> list[str]:
+    from quantdesk.notifications.redaction import redact_text
+
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value or "")
+    text = re.sub(r"(?i)\bBearer\s+[^\s\"']+", "Bearer [REDACTED]", text)
+    text = redact_text(text, known_secrets=known_secrets)
+    return text[-8192:].strip().splitlines()[-20:]
+
+
 def _run_stage_subprocess(
     root: Path,
     stage: str,
@@ -406,6 +468,9 @@ def _run_stage_subprocess(
     child_env = dict(os.environ)
     child_env.pop(MARKET_WRITER_TOKEN_ENV, None)
     child_env.update(env_overrides or {})
+    process_options: dict[str, Any] = {}
+    if sys.platform == "linux":
+        process_options["start_new_session"] = True
     try:
         proc = subprocess.Popen(
             command,
@@ -417,13 +482,15 @@ def _run_stage_subprocess(
             errors="replace",
             creationflags=creationflags,
             env=child_env,
+            **process_options,
         )
     except OSError as exc:
         return "failed", [f"stage_spawn_failed:{stage}:{type(exc).__name__}"], {}
     try:
         stdout, stderr = proc.communicate(timeout=timeout_seconds)
         elapsed = round(time.monotonic() - started, 1)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as timeout_exc:
+        stdout, stderr = timeout_exc.output, timeout_exc.stderr
         reasons = [f"stage_timeout:{stage}:limit={timeout_seconds}s:pid={proc.pid}"]
         if on_timeout is not None:
             try:
@@ -439,6 +506,13 @@ def _run_stage_subprocess(
                 if killed.returncode != 0:
                     reasons.append(f"stage_tree_kill_failed:{killed.returncode}")
                     proc.kill()
+            elif sys.platform == "linux":
+                # start_new_session above makes this Popen's pid its group id.
+                # No unrelated group, process search, or shared lock is targeted.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             else:
                 proc.kill()
         except (OSError, subprocess.SubprocessError):
@@ -448,16 +522,32 @@ def _run_stage_subprocess(
             except OSError:
                 reasons.append("stage_process_kill_error")
         try:
-            proc.communicate(timeout=15)
+            final_stdout, final_stderr = proc.communicate(timeout=15)
+            stdout = final_stdout if final_stdout is not None else stdout
+            stderr = final_stderr if final_stderr is not None else stderr
         except (OSError, subprocess.SubprocessError):
             reasons.append("stage_exit_unconfirmed")
         orphan_alive = proc.poll() is None
         if orphan_alive:
             reasons.append("stage_process_still_alive")
+        known_secrets = tuple(value for key, value in child_env.items() if value and re.search(
+            r"token|secret|password|api.?key|authorization|cookie", key, re.IGNORECASE,
+        ))
+        payload = {
+            "timeout": True, "child_pid": proc.pid, "orphan_alive": orphan_alive,
+            "elapsed_seconds": round(time.monotonic() - started, 1),
+            "stdout_tail": _safe_process_tail(stdout, known_secrets),
+            "stderr_tail": _safe_process_tail(stderr, known_secrets),
+        }
+        if sys.platform == "linux":
+            lease_reasons, lease_evidence = _writer_lease_evidence(root)
+            reasons.extend(lease_reasons)
+            payload.update(lease_evidence)
+            payload["orphan_alive"] = orphan_alive or lease_evidence["orphan_alive"]
         return (
             "failed",
             reasons,
-            {"timeout": True, "child_pid": proc.pid, "orphan_alive": orphan_alive},
+            payload,
         )
     rc = proc.returncode
     reason: list[str] = []
@@ -471,6 +561,12 @@ def _run_stage_subprocess(
     tail = (stderr or "").strip().splitlines()[-3:]
     if tail:
         payload["stderr_tail"] = tail
+    if sys.platform == "linux":
+        lease_reasons, lease_evidence = _writer_lease_evidence(root)
+        reason.extend(lease_reasons)
+        payload.update(lease_evidence)
+        if lease_evidence["orphan_alive"]:
+            status = "failed"
     return status, reason, payload
 
 
@@ -490,13 +586,21 @@ _CHILD_JOB_HANDLE: Any = None
 
 
 def _protect_child_process_tree() -> None:
-    """Own descendants until this child exits, including a universe updater.
+    """Establish the platform's supported protection before running stage code.
 
     A non-inheritable Job handle with KILL_ON_JOB_CLOSE prevents a killed
     wrapper from releasing byte 1 while its writer grandchildren survive.
     Assignment failure rejects the child before any stage code runs.
     The OS closes the handle at process exit; never close it mid-stage.
+    Linux isolates timeout cleanup to this session; explicitly inherited OFD
+    leases prevent overlap even after parent death or an escaped descendant.
+    Linux does not promise that parent death immediately kills every descendant.
     """
+    if os.name != "nt":
+        require_linux_ofd_support()
+        if os.getsid(0) != os.getpid() or os.getpgrp() != os.getpid():
+            raise OSError(errno.EPERM, "pipeline_child_session_not_isolated")
+        return
     import ctypes
     from ctypes import wintypes
 
@@ -822,6 +926,39 @@ def stage_universe(
     )
 
 
+def _market_refresh_progress_path(results_dir: Path, run_id: str) -> Path:
+    # The supplied run id never becomes an unchecked path component.
+    run_key = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24]
+    return results_dir / "runs" / run_key / "progress.json"
+
+
+def _read_market_refresh_progress(
+    root: Path, *, run_id: str, target: str, attempt_id: str,
+) -> dict[str, Any] | None:
+    """Diagnostic only: never a substitute for the child's final bound artifact."""
+    results_dir = root / "results" / "data_refresh"
+    path = _market_refresh_progress_path(results_dir, run_id)
+    try:
+        path.resolve().relative_to(root.resolve())
+        with path.open("rb") as handle:
+            raw = handle.read(512 * 1024 + 1)
+        if len(raw) > 512 * 1024:
+            return None
+        doc = json.loads(raw)
+        if not isinstance(doc, dict) or (
+            doc.get("schema_version") != "daily_refresh_progress_v1"
+            or doc.get("pipeline_run_id") != run_id
+            or doc.get("target_date") != target
+            or doc.get("refresh_attempt_id") != attempt_id
+            or not isinstance(doc.get("families"), dict)
+            or any(not isinstance(value, dict) for value in doc["families"].values())
+        ):
+            return None
+        return doc
+    except (OSError, ValueError):
+        return None
+
+
 def stage_market_refresh(
     root: Path,
     *,
@@ -833,9 +970,14 @@ def stage_market_refresh(
     **_kw: Any,
 ) -> StageResult:
     started = _now_iso()
+    attempt_id = secrets.token_hex(12)
+    # Keep the existing parent limit; reserve time for worker termination,
+    # lease-checked publication and the final stdout-bound artifact.
+    inner_budget = max(0.0, float(timeout) - min(30.0, float(timeout) / 2))
     command = [
         sys.executable, "-B", str(root / "scripts" / "run_daily_data_refresh.py"),
         "--target-date", target, "--json", "true",
+        "--max-refresh-seconds", str(inner_budget), "--refresh-attempt-id", attempt_id,
     ]
     if pipeline_run_id:
         command.extend(["--pipeline-run-id", pipeline_run_id])
@@ -846,11 +988,28 @@ def stage_market_refresh(
         pipeline_lock=pipeline_lock, target=target,
     )
     doc = payload.get("stdout_json") or {}
+    progress = _read_market_refresh_progress(root, run_id=pipeline_run_id, target=target, attempt_id=attempt_id)
+    if progress is not None:
+        payload["progress_evidence"] = progress
     benchmark = doc.get("benchmark_evidence") or (doc.get("families") or {}).get("benchmarks") or {}
+    if not benchmark and progress is not None:
+        benchmark = progress["families"].get("benchmarks") or {}
+        if benchmark.get("status") == "running":
+            benchmark = {
+                "status": "interrupted", "target_date": target, "target_covered": None,
+                "freshness_status": "assessment_incomplete", "reason_codes": ["benchmark_assessment_interrupted"],
+            }
     evidence = {key: benchmark.get(key) for key in (
         "status", "target_date", "target_covered", "freshness_status", "coverage", "reason_codes"
     )}
-    if evidence["target_date"] != target:
+    if not benchmark:
+        # The child may exit before running any benchmark check. No assessment
+        # is not evidence that the target day is absent from the local files.
+        evidence.update(
+            target_covered=None, freshness_status="not_assessed",
+            reason_codes=["benchmark_not_assessed"],
+        )
+    elif evidence["target_date"] != target:
         evidence.update(target_covered=False, freshness_status="target_unverified")
         evidence["reason_codes"] = [*(evidence.get("reason_codes") or []), "benchmark_target_unverified"]
     payload["benchmark_evidence"] = evidence
@@ -1023,7 +1182,7 @@ def stage_health_alert(
 
 
 def _stage_version(stage: str) -> str:
-    revision = 4 if stage in {"universe", "market_refresh"} else 3 if stage in {"research_chain", "reconcile"} else 2
+    revision = 5 if stage == "market_refresh" else 4 if stage == "universe" else 3 if stage in {"research_chain", "reconcile"} else 2
     return f"{SCHEMA_VERSION}:{stage}:{revision}"
 
 
@@ -1759,6 +1918,7 @@ def run_pipeline(
                 "alert_network": alert_network,
                 "alert_push": alert_push,
             }
+            stage_started = time.monotonic()
             if name in ("market_refresh", "reconcile"):
                 result = runner(root, target=target, **stage_kwargs)
             elif name == "research_chain":
@@ -1779,6 +1939,9 @@ def run_pipeline(
                 result = runner(root, push=alert_push, target=target, **stage_kwargs)
             else:
                 result = runner(root, target=target, **stage_kwargs)
+            if not result.completed_at:
+                result.completed_at = _now_iso()
+                result.elapsed_seconds = round(max(0.0, time.monotonic() - stage_started), 3)
             stage_dict = result.to_dict()
             if name == "market_refresh" and result.payload.get("benchmark_evidence"):
                 report["benchmark_evidence"] = dict(result.payload["benchmark_evidence"])

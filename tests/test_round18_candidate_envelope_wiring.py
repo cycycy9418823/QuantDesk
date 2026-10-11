@@ -716,6 +716,8 @@ def test_execution_event_preserves_candidate_envelope_exactly(tmp_path: Path) ->
                 "close": [15.5],
                 "volume": [1_000],
                 "amount": [15_500.0],
+                # T08：合成分钟帧是未复权原始报价，显式声明口径。
+                "adjust": ["raw"],
             }
         ),
     )
@@ -778,6 +780,8 @@ def test_shadow_evaluator_uses_envelope_candidate_and_dated_batch_source(
                 "close": [15.5],
                 "volume": [1_000],
                 "amount": [15_500.0],
+                # T08：合成分钟帧是未复权原始报价，显式声明口径。
+                "adjust": ["raw"],
             }
         ),
     )
@@ -860,6 +864,8 @@ def test_missing_or_tampered_candidate_envelope_fails_shadow_closed_but_keeps_le
                 "close": [15.5],
                 "volume": [1_000],
                 "amount": [15_500.0],
+                # T08：合成分钟帧是未复权原始报价，显式声明口径。
+                "adjust": ["raw"],
             }
         ),
     )

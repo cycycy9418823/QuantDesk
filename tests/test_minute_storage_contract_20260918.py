@@ -64,7 +64,9 @@ def test_late_historical_append_does_not_hide_newer_existing_bar(tmp_path: Path)
 
 
 @pytest.mark.parametrize("columns", [
-    [name for name in collector.MINUTE_COLUMNS if name != "price_basis"],
+    # Only the exact old schema missing price_basis has a separate-file route.
+    # Other missing columns still block; keep all failure assertions below.
+    [name for name in collector.MINUTE_COLUMNS if name != "source"],
     [*collector.MINUTE_COLUMNS, "datetime"],
 ])
 def test_invalid_schema_is_visible_in_round_terminal(tmp_path: Path, monkeypatch, columns) -> None:

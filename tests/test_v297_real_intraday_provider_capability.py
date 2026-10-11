@@ -20,6 +20,26 @@ import scripts.check_intraday_provider_capability as capability_cli  # noqa: E40
 import scripts.run_real_intraday_sample_validation as sample_cli  # noqa: E402
 
 
+def _redirect_sample_validation_outputs(root: Path):
+    """把样例验证的**落盘出口**（结果 JSON 与报告目录）重定向到测试临时目录。
+
+    报告路径用的是模块级 ``REPORTS_DIR``（项目 ``reports/``）：不重定向就会写到源码树里，
+    被 outside_write 围栏拦下（T08-ADJACENT-REPORT-ISOLATION-20260930）。这里只改目录，
+    **不 mock 报告生成本身**，原断言不变。
+    """
+
+    return mock.patch.multiple(
+        sample_validation,
+        RESULTS_DIR=root / "results",
+        REPORTS_DIR=root / "reports",
+        CONDITIONAL_TRADE_PLANS_LATEST_JSON=root / "results" / "conditional_trade_plans_latest.json",
+        REAL_SAMPLE_VALIDATION_LATEST_JSON=root / "results" / "real_intraday_sample_validation_latest.json",
+        REAL_SAMPLE_EXECUTION_JSON=root / "results" / "real_intraday_sample_execution.json",
+        REAL_SAMPLE_UPDATE_JSON=root / "results" / "real_intraday_sample_update_latest.json",
+        AUTO_PAPER_PORTFOLIO_STATE_JSON=root / "state" / "auto_paper_portfolio.json",
+    )
+
+
 def _mock_frame(symbol: str = "600744", target_date: str = "2026-05-15") -> pd.DataFrame:
     # A full, valid 2-row OHLCV frame (real intrabar range, in-session times) so it
     # passes the unified quality gate. The 10:23:00 / close 8.45 row is preserved as
@@ -34,6 +54,8 @@ def _mock_frame(symbol: str = "600744", target_date: str = "2026-05-15") -> pd.D
             "close": 8.45,
             "volume": 1000,
             "amount": 8450,
+            # T08：合成分钟帧是未复权原始报价，显式声明口径。
+            "adjust": "raw",
         },
         {
             "symbol": symbol,
@@ -44,11 +66,21 @@ def _mock_frame(symbol: str = "600744", target_date: str = "2026-05-15") -> pd.D
             "close": 8.46,
             "volume": 1100,
             "amount": 9306,
+            "adjust": "raw",
         },
     ])
 
 
 class RealIntradayProviderCapabilityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # T08-ADJACENT-REPORT-ISOLATION-20260930：把样例验证的落盘出口改到独立临时目录。
+        # 报告照旧真实生成，只是不再写到源码树的 reports/ 下（那会被 outside_write 围栏拦）。
+        self._outputs_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._outputs_tmp.cleanup)
+        patcher = _redirect_sample_validation_outputs(Path(self._outputs_tmp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_capability_defaults_to_offline_provider_calls(self) -> None:
         calls: list[bool] = []
 

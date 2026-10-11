@@ -848,8 +848,11 @@ def test_an_aborted_stage_is_named_in_this_rounds_manifest(tmp_path):
     assert "SECRET123" not in json.dumps(written)
 
 
-def test_the_snapshot_stage_spends_what_is_left_of_the_round(tmp_path, monkeypatch):
-    """DSR-07: the snapshot is bounded by the round, not only checked after it."""
+@pytest.mark.parametrize(("round_seconds", "snapshot_seconds"), [(480.0, 60.0), (60.0, 60.0), (40.0, 40.0)])
+def test_snapshot_stage_reserves_minute_time_and_respects_remaining_budget(
+    tmp_path, monkeypatch, round_seconds, snapshot_seconds,
+):
+    """Keep the DSR-07 bound while reserving the rest for minute requests."""
 
     root = _root(tmp_path, symbols=["600000"])
     seen: dict[str, object] = {}
@@ -866,11 +869,11 @@ def test_the_snapshot_stage_spends_what_is_left_of_the_round(tmp_path, monkeypat
         now=_now(10, 0),
         fetcher=lambda symbol, offset: ([_bar(symbol)], ""),
         snapshot_fetcher=lambda: ([], ""),
-        max_round_seconds=480.0,
+        max_round_seconds=round_seconds,
         monotonic=lambda: 0.0,
     )
 
-    assert seen["budget_seconds"] == 480.0
+    assert seen["budget_seconds"] == snapshot_seconds
 
 
 def test_a_sina_page_that_cannot_fit_the_window_is_never_started(monkeypatch):

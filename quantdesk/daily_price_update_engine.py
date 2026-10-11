@@ -26,6 +26,7 @@ from quantdesk.daily_price_providers import (
     fetch_daily,
     latest_date_for_symbol,
     merge_daily_frames,
+    normalize_daily_df,
     provider_availability,
     read_local_daily,
     read_local_daily_status_dates_with_warnings,
@@ -838,7 +839,8 @@ def _fetch_merge_write_symbol_unlocked(
         }
     try:
         existing = read_local_daily(symbol, daily_dir=daily_dir)
-        if not existing.empty:
+        warnings.extend(str(item) for item in existing.attrs.get("warnings", []) if item)
+        if not existing.empty or existing.attrs.get("observed_price_basis") or existing.attrs.get("price_basis_reason"):
             existing_basis, existing_basis_reason = classify_frame_price_basis(existing)
             if existing_basis != PRICE_BASIS_RAW or existing_basis_reason:
                 return {
@@ -859,6 +861,23 @@ def _fetch_merge_write_symbol_unlocked(
             network=network,
         )
         warnings.extend(fetch_warnings)
+        if not fresh.empty or fresh.attrs.get("observed_price_basis") or fresh.attrs.get("price_basis_reason"):
+            fresh_basis, fresh_basis_reason = classify_frame_price_basis(fresh)
+            if fresh_basis != PRICE_BASIS_RAW or fresh_basis_reason:
+                return {
+                    "symbol": symbol,
+                    "updated": False,
+                    "latest_date": current_latest,
+                    "warnings": warnings,
+                    "reason": (
+                        "provider_price_basis_not_raw:"
+                        f"{symbol}:{fresh_basis_reason or fresh_basis}"
+                    ),
+                }
+        # Complete the standard columns without inventing missing O/H/L values.
+        # The validity filter otherwise leaves frames with missing columns intact.
+        fresh, normalize_warnings = normalize_daily_df(fresh, symbol)
+        warnings.extend(normalize_warnings)
         # Shared validity gate (quantdesk.data_truth.daily_bar_validity):
         # the fast snapshot path and this slow path must reject the same rows.
         # Vendors encode "suspended today" as zero-volume flat rows; those must
@@ -920,24 +939,6 @@ def _fetch_merge_write_symbol_unlocked(
                 ),
             }
         if not fresh.empty:
-            fresh_basis, fresh_basis_reason = classify_frame_price_basis(fresh)
-            if fresh_basis != PRICE_BASIS_RAW or fresh_basis_reason:
-                audit_merge = merge_daily_frames(existing, fresh)
-                warnings.extend(
-                    str(item)
-                    for item in (audit_merge.attrs.get("warnings") or [])
-                    if item
-                )
-                return {
-                    "symbol": symbol,
-                    "updated": False,
-                    "latest_date": fresh_latest,
-                    "warnings": warnings,
-                    "reason": (
-                        "provider_price_basis_not_raw:"
-                        f"{symbol}:{fresh_basis_reason or fresh_basis}"
-                    ),
-                }
             merged = merge_daily_frames(existing, fresh)
         else:
             merged = existing.copy()

@@ -30,8 +30,10 @@ _EXPANSION_PARAM_BUDGET = 900
 _MAX_GROUPS_PER_BATCH = 100
 
 
-def _parse_value(text: str) -> Any:
+def _parse_value(text: str, field: str | None = None) -> Any:
     text = text.strip().strip("'").strip('"')
+    if field == "symbol":
+        return text
     try:
         return float(text)
     except ValueError:
@@ -56,14 +58,14 @@ def parse_where_clauses(where: str, table_kind: str) -> list[dict[str, Any]]:
             field = m.group(1)
             if field not in fields:
                 raise ValueError(f"field not allowed: {field}")
-            clauses.append({"field": field, "op": "BETWEEN", "values": [_parse_value(m.group(2)), _parse_value(m.group(3))]})
+            clauses.append({"field": field, "op": "BETWEEN", "values": [_parse_value(m.group(2), field), _parse_value(m.group(3), field)]})
             continue
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+IN\s*\((.+)\)$", clause, re.I)
         if m:
             field = m.group(1)
             if field not in fields:
                 raise ValueError(f"field not allowed: {field}")
-            clauses.append({"field": field, "op": "IN", "values": [_parse_value(v) for v in m.group(2).split(",")]})
+            clauses.append({"field": field, "op": "IN", "values": [_parse_value(v, field) for v in m.group(2).split(",")]})
             continue
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|!=|=|>|<|LIKE)\s*(.+)$", clause, re.I)
         if not m:
@@ -73,7 +75,7 @@ def parse_where_clauses(where: str, table_kind: str) -> list[dict[str, Any]]:
             raise ValueError(f"field not allowed: {field}")
         if op not in QUERY_WHITELIST_OPS:
             raise ValueError(f"operator not allowed: {op}")
-        clauses.append({"field": field, "op": op, "values": [_parse_value(value)]})
+        clauses.append({"field": field, "op": op, "values": [_parse_value(value, field)]})
     return clauses
 
 

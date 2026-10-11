@@ -32,7 +32,8 @@ import math
 import os
 import sys
 import time
-from datetime import datetime
+from contextvars import ContextVar
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -44,7 +45,10 @@ import requests  # noqa: E402
 
 from quantdesk.data_truth.daily_bar_validity import daily_bar_validity_from_row  # noqa: E402
 from quantdesk.interprocess_lock import interprocess_file_lock  # noqa: E402
-from scripts.run_data_close_pipeline import MarketWriterLease, MarketWriterUnauthorized  # noqa: E402
+from quantdesk.process_deadline import ProcessDeadlineResult, run_process_tasks_until_deadline  # noqa: E402
+from scripts.run_data_close_pipeline import (  # noqa: E402
+    MarketWriterLease, MarketWriterUnauthorized, _market_refresh_progress_path,
+)
 
 DAILY_DIR = PROJECT_ROOT / "data" / "daily"
 META_DIR = PROJECT_ROOT / "data" / "metadata"
@@ -66,10 +70,89 @@ UNIVERSE_MISMATCH_WARN_THRESHOLD = 30
 # attempted instead of being skipped without a trace.
 UNIVERSE_DIFF_REQUERY_LIMIT = 50
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+_OPTIONAL_DEADLINE: ContextVar[float | None] = ContextVar("daily_refresh_deadline", default=None)
 
 
 def _now_iso() -> str:
     return datetime.now(SHANGHAI).isoformat(timespec="seconds")
+
+
+def _remaining_refresh_seconds() -> float | None:
+    deadline = _OPTIONAL_DEADLINE.get()
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+
+def _optional_fetch_worker(task: dict[str, Any], context: dict[str, Any]) -> Any:
+    """Fetch in a killable process; only the parent owns canonical publication."""
+    if task.get("delay_seconds"):
+        time.sleep(float(task["delay_seconds"]))
+    kind = task["kind"]
+    if kind == "news":
+        from quantdesk.providers.news_provider import _fetch_announce_eastmoney
+
+        return _fetch_announce_eastmoney(task["symbol"], 50)
+    if kind == "benchmarks":
+        from quantdesk.data_truth.benchmark_incremental_update import default_index_fetcher, update_benchmark_files
+
+        # This updater writes only inside the parent's disposable staged root.
+        return update_benchmark_files(Path(task["staged_root"]), fetcher=default_index_fetcher, target_date=task["target"])
+    import akshare as ak
+
+    year = task["year"]
+    if kind == "earnings":
+        errors = []
+        for period in (f"{year}0630", f"{year}0331", f"{year - 1}1231"):
+            try:
+                frame = ak.stock_yjbb_em(date=period)
+                if frame is not None and len(frame) > 0:
+                    return {
+                        "rows": len(frame), "content": frame.to_csv(index=False).encode("utf-8-sig"),
+                        "filename": f"earnings_report_{period[:4]}Q{((int(period[4:6]) - 1) // 3) + 1}.csv",
+                    }
+            except Exception as exc:  # each pre-existing period is attempted at most once
+                errors.append({"period": period, "error_type": type(exc).__name__})
+        return {"rows": 0, "status": "no_fresh_earnings_rows", "errors": errors}
+    if kind == "disclosure":
+        frame = ak.stock_report_disclosure(market="沪深京", period=f"{year}半年报")
+        if frame is not None and len(frame) > 0:
+            return {"rows": len(frame), "content": frame.to_csv(index=False).encode("utf-8-sig"),
+                    "filename": f"disclosure_schedule_{year}H1.csv"}
+        return {"rows": 0, "status": "no_fresh_disclosure_rows"}
+    raise ValueError("unknown_optional_family")
+
+
+def _run_optional_fetches(tasks: list[dict[str, Any]]) -> ProcessDeadlineResult:
+    remaining = _remaining_refresh_seconds()
+    if remaining is None:
+        raise RuntimeError("optional_fetch_requires_deadline")
+    return run_process_tasks_until_deadline(
+        _optional_fetch_worker, tasks, context={}, max_workers=1, timeout_seconds=remaining,
+    )
+
+
+def _optional_fetch_evidence(batch: ProcessDeadlineResult, names: list[str]) -> dict[str, Any]:
+    unfinished = [names[index] for index in batch.unfinished_indices]
+    return {
+        "timed_out": batch.timed_out, "unfinished": unfinished,
+        # Once a worker starts, the pool cannot prove whether an unfinished
+        # request was in flight or still queued. Never label all as unattempted.
+        "not_attempted": unfinished if not batch.worker_pids else [],
+        "unfinished_attempt_state": "unknown" if unfinished and batch.worker_pids else "not_started",
+        "fetch_errors": {names[index]: error.split(":", 1)[0] for index, error in batch.failures.items()},
+        "reason_codes": ["optional_fetch_deadline_exhausted"] if batch.timed_out else
+                        ["optional_fetch_worker_incomplete"] if unfinished else [],
+    }
+
+
+def _save_refresh_progress(report: dict[str, Any], *, lease: MarketWriterLease, current_family: str | None) -> None:
+    progress = {
+        **report, "schema_version": "daily_refresh_progress_v1", "current_family": current_family,
+        "progress_recorded_at": _now_iso(), "finished_at": report.get("finished_at"),
+    }
+    _atomic_bytes(
+        _market_refresh_progress_path(RESULTS_DIR, report["pipeline_run_id"]),
+        json.dumps(progress, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8"), lease=lease,
+    )
 
 
 def _complete_live_session(target: str, now: datetime | None = None) -> bool:
@@ -368,7 +451,7 @@ def _append_daily_row(
     incoming = dict(zip(columns, parsed))
     target = incoming["date"]
     try:
-        if datetime.strptime(target, "%Y-%m-%d").date().isoformat() != target:
+        if date.fromisoformat(target).isoformat() != target:
             raise ValueError(target)
     except ValueError:
         return False, f"daily_target_invalid:{path.name}"
@@ -394,7 +477,7 @@ def _append_daily_row(
         # No filtering, sorting or deduplication may hide a bad original row.
         dates = frame["date"].tolist()
         try:
-            if any(datetime.strptime(day, "%Y-%m-%d").date().isoformat() != day for day in dates):
+            if any(date.fromisoformat(day).isoformat() != day for day in dates):
                 raise ValueError("noncanonical date")
         except ValueError:
             return False, f"daily_history_date_invalid:{path.name}"
@@ -666,9 +749,23 @@ def family_benchmarks(
                 if source.is_file():
                     (staged_dir / spec.filename).write_bytes(source.read_bytes())
             target = target_date or lease.target
-            result = update_benchmark_files(
-                staged_root, fetcher=default_index_fetcher, target_date=target,
-            )
+            if _OPTIONAL_DEADLINE.get() is None:
+                result = update_benchmark_files(
+                    staged_root, fetcher=default_index_fetcher, target_date=target,
+                )
+            else:
+                batch = _run_optional_fetches([{"kind": "benchmarks", "staged_root": str(staged_root), "target": target}])
+                lease.assert_active()
+                if 0 not in batch.results:
+                    error_type = batch.failures.get(0, "").split(":", 1)[0]
+                    return {
+                        "ok": False, "status": "error" if error_type else "skipped" if batch.timed_out and not batch.worker_pids else "incomplete",
+                        "error_type": error_type,
+                        "target_date": target, "target_covered": None,
+                        "freshness_status": "assessment_incomplete" if batch.worker_pids else "not_assessed",
+                        "indices": [], **_optional_fetch_evidence(batch, ["benchmarks"]),
+                    }
+                result = batch.results[0]
             lease.assert_active()
             for item in result.get("results", []):
                 if item.get("status") == "appended":
@@ -726,10 +823,23 @@ def family_news(network: bool, *, lease: MarketWriterLease) -> dict[str, Any]:
     refreshed = 0
     failures: list[str] = []
     details: list[dict[str, str]] = []
-    for sym in symbols:
+    batch = None
+    if _OPTIONAL_DEADLINE.get() is not None:
+        batch = _run_optional_fetches([
+            {"kind": "news", "symbol": sym, "delay_seconds": 2.0 if index else 0.0}
+            for index, sym in enumerate(symbols)
+        ])
         lease.assert_active()
+    for index, sym in enumerate(symbols):
+        lease.assert_active()
+        if batch is not None and index in batch.unfinished_indices:
+            continue
+        if batch is not None and index in batch.failures:
+            failures.append(sym)
+            details.append({"symbol": sym, "reason": batch.failures[index].split(":", 1)[0]})
+            continue
         try:
-            items = _fetch_announce_eastmoney(sym, 50)
+            items = batch.results[index] if batch is not None else _fetch_announce_eastmoney(sym, 50)
             lease.assert_active()
             if items:
                 content = io.StringIO(newline="")
@@ -747,10 +857,14 @@ def family_news(network: bool, *, lease: MarketWriterLease) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             failures.append(sym)
             details.append({"symbol": sym, "reason": type(exc).__name__})
-        time.sleep(2.0)
-    return {"ok": not failures, "status": "partial" if failures else "completed",
+        if batch is None:
+            time.sleep(2.0)
+    evidence = _optional_fetch_evidence(batch, symbols) if batch is not None else {}
+    complete = not failures and not evidence.get("unfinished")
+    status = "completed" if complete else "skipped" if batch is not None and batch.timed_out and not batch.worker_pids else "partial"
+    return {"ok": complete, "status": status,
             "pool_size": len(symbols), "refreshed": refreshed, "failures": failures[:10],
-            "failure_details": details, "existing_cache_preserved": True}
+            "failure_details": details, "existing_cache_preserved": True, **evidence}
 
 
 def family_quarterly(network: bool, force: bool, *, lease: MarketWriterLease) -> dict[str, Any]:
@@ -759,6 +873,32 @@ def family_quarterly(network: bool, force: bool, *, lease: MarketWriterLease) ->
     lease.assert_active()
     if not force and datetime.now(SHANGHAI).month not in DISCLOSURE_MONTHS:
         return {"ok": True, "status": "skipped_offseason"}
+    if _OPTIONAL_DEADLINE.get() is not None:
+        year = datetime.now(SHANGHAI).year
+        names = ["earnings", "disclosure"]
+        batch = _run_optional_fetches([
+            {"kind": "earnings", "year": year},
+            {"kind": "disclosure", "year": year, "delay_seconds": 2.0},
+        ])
+        lease.assert_active()
+        out = {"ok": False, "status": "skipped" if batch.timed_out and not batch.worker_pids else "partial_or_missing",
+               **_optional_fetch_evidence(batch, names)}
+        allowed = {f"earnings_report_{year}Q2.csv", f"earnings_report_{year}Q1.csv",
+                   f"earnings_report_{year - 1}Q4.csv", f"disclosure_schedule_{year}H1.csv"}
+        for index, result in batch.results.items():
+            if result.get("rows", 0) > 0:
+                filename = result["filename"]
+                if filename not in allowed:
+                    raise ValueError("unexpected_quarterly_filename")
+                dest = META_DIR / filename
+                _atomic_bytes(dest, result["content"], lease=lease)
+                out[names[index]] = {"rows": result["rows"], "file": str(dest.relative_to(PROJECT_ROOT))}
+            else:
+                out[names[index]] = result
+        out["ok"] = all(out.get(name, {}).get("rows", 0) > 0 for name in names)
+        if out["ok"]:
+            out["status"] = "completed"
+        return out
     try:
         import akshare as ak
     except ImportError:
@@ -811,7 +951,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-alerts", action="store_true")
     parser.add_argument("--json", default="true")
     parser.add_argument("--pipeline-run-id", default="")
+    parser.add_argument("--max-refresh-seconds", type=float, default=None)
+    parser.add_argument("--refresh-attempt-id", default="")
     args = parser.parse_args(argv)
+    if args.max_refresh_seconds is not None and (not math.isfinite(args.max_refresh_seconds) or args.max_refresh_seconds < 0):
+        parser.error("--max-refresh-seconds must be finite and nonnegative")
     from quantdesk.shared import truthy
 
     network = bool(args.enable_network or truthy(args.network))
@@ -819,6 +963,7 @@ def main(argv: list[str] | None = None) -> int:
     report: dict[str, Any] = {
         "task_id": "daily_data_refresh", "run_at": _now_iso(), "target_date": target,
         "pipeline_run_id": str(args.pipeline_run_id or "").strip(), "network": network,
+        "refresh_attempt_id": args.refresh_attempt_id, "max_refresh_seconds": args.max_refresh_seconds,
         "research_only": True, "no_broker": True, "families": {}, "overall_ok": False,
         "status": "planned_offline" if not network else "blocked", "canonical_write": False,
         "notes": ["already_had_bar counts pre-existing target bars, not this run's downloads"],
@@ -829,6 +974,7 @@ def main(argv: list[str] | None = None) -> int:
         printed = dict(report)
     else:
         started = time.monotonic()
+        deadline_token = _OPTIONAL_DEADLINE.set(None if args.max_refresh_seconds is None else started + args.max_refresh_seconds)
         try:
             with MarketWriterLease(PROJECT_ROOT, run_id=report["pipeline_run_id"], target=target) as lease:
                 if not _complete_live_session(target):
@@ -839,20 +985,41 @@ def main(argv: list[str] | None = None) -> int:
                     "news": lambda: family_news(True, lease=lease),
                     "quarterly": lambda: family_quarterly(True, args.force_quarterly, lease=lease),
                 }
+                report["status"] = "running"
                 for name, run in families.items():
                     lease.assert_active()
+                    remaining = _remaining_refresh_seconds()
+                    if remaining is not None and remaining <= 0:
+                        report["families"][name] = {
+                            "ok": False, "status": "skipped", "attempted": False,
+                            "started_at": None, "finished_at": None, "reason_codes": ["refresh_budget_exhausted"],
+                        }
+                        if name == "benchmarks":
+                            report["families"][name].update(target_date=target, target_covered=None, freshness_status="not_assessed")
+                        _save_refresh_progress(report, lease=lease, current_family=None)
+                        continue
+                    family_started = _now_iso()
+                    report["families"][name] = {"ok": False, "status": "running", "started_at": family_started, "finished_at": None}
+                    _save_refresh_progress(report, lease=lease, current_family=name)
                     try:
                         report["families"][name] = run()
                     except MarketWriterUnauthorized:
                         raise
                     except Exception as exc:  # family failure is visible, never fabricated
                         report["families"][name] = {"ok": False, "status": "failed", "error_type": type(exc).__name__}
+                    family = report["families"][name]
+                    skipped = str(family.get("status", "")).startswith("skipped")
+                    family.update(attempted=not skipped, started_at=None if skipped else family_started,
+                                  finished_at=None if skipped else _now_iso())
+                    _save_refresh_progress(report, lease=lease, current_family=None)
                 bars = report["families"]["bars_and_valuation"]
                 all_ok = all(v.get("ok") for v in report["families"].values())
+                skipped_families = [name for name, family in report["families"].items() if str(family.get("status", "")).startswith("skipped")]
                 report.update({
-                    "overall_ok": all_ok, "canonical_write": True,
+                    "overall_ok": all_ok and not skipped_families, "canonical_write": True,
+                    "skipped_families": skipped_families, "finished_at": _now_iso(),
                     "elapsed_seconds": round(time.monotonic() - started, 1),
-                    "status": "failed" if not bars.get("ok") else "completed" if all_ok and not bars.get("warnings") else "completed_with_warnings",
+                    "status": "failed" if not bars.get("ok") else "completed" if all_ok and not skipped_families and not bars.get("warnings") else "completed_with_warnings",
                 })
                 benchmark = report["families"]["benchmarks"]
                 report["benchmark_evidence"] = {
@@ -861,18 +1028,24 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 }
                 report["reason_codes"] = [f"benchmarks:{code}" for code in benchmark.get("reason_codes", [])]
+                for name, family in report["families"].items():
+                    if name != "benchmarks":
+                        report["reason_codes"].extend(f"{name}:{code}" for code in family.get("reason_codes", []))
                 if args.enable_alert_network or args.alert_push or not truthy(args.alert_dry_run):
                     report["notes"].append("notification_flags_ignored:use_pipeline_health_alert")
                 content = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
                 latest = RESULTS_DIR / "data_refresh_latest.json"
                 _atomic_bytes(RESULTS_DIR / f"data_refresh_{target}.json", content, lease=lease)
                 _atomic_bytes(latest, content, lease=lease)
+                _save_refresh_progress(report, lease=lease, current_family=None)
                 printed = {**report, "artifact_path": _display_path(latest),
                            "artifact_sha256": "sha256:" + hashlib.sha256(content).hexdigest()}
         except (MarketWriterUnauthorized, OSError) as exc:
             report.update({"status": "blocked", "overall_ok": False,
                            "reason_codes": [str(exc) if isinstance(exc, MarketWriterUnauthorized) else "writer_io_failure"]})
             printed = dict(report)
+        finally:
+            _OPTIONAL_DEADLINE.reset(deadline_token)
     if truthy(args.json):
         print(json.dumps(printed, ensure_ascii=False, indent=2, allow_nan=False))
     return 0 if report["status"] in {"completed", "completed_with_warnings", "planned_offline"} else 5 if report["status"] == "blocked" else 1

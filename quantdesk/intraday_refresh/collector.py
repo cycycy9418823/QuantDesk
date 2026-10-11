@@ -32,6 +32,7 @@ from typing import Any, Callable, Iterator
 from zoneinfo import ZoneInfo
 
 from quantdesk.interprocess_lock import interprocess_file_lock
+from quantdesk.intraday.minute_storage import minute_write_path
 from quantdesk.intraday_refresh.scope import build_dynamic_scope  # noqa: E402
 from quantdesk.intraday_refresh.snapshot import refresh_full_market_snapshot  # noqa: E402
 
@@ -55,7 +56,7 @@ DEFAULT_MAX_ROUND_SECONDS = 480.0
 DEFAULT_MAX_SYMBOL_SECONDS = 20.0
 PROGRESS_EVERY_SYMBOLS = 10
 PROVIDER_TIMEOUT_SECONDS = 8
-MINUTE_OFFSET = 60
+MINUTE_OFFSET = 240  # One existing provider page, enough for the current session.
 CURRENT_RUN_RELATIVE = Path("results/intraday/intraday_refresh_current.json")
 
 MORNING_START = (9, 35)
@@ -86,30 +87,20 @@ def _collector_source_fingerprint() -> str:
 
 
 def _load_trading_days(project_root: Path) -> set[str]:
+    from quantdesk.trading_calendar import load_a_share_trading_calendar
+
     calendar = project_root / "data" / "calendar" / "a_share_trading_calendar.csv"
-    days: set[str] = set()
-    if not calendar.is_file():
-        return days
-    try:
-        for line in calendar.read_text(encoding="utf-8-sig").splitlines()[1:]:
-            token = line.split(",")[0].strip()
-            digits = "".join(ch for ch in token if ch.isdigit())
-            if len(digits) == 8:
-                days.add(f"{digits[:4]}-{digits[4:6]}-{digits[6:]}")
-    except OSError:
-        return days
-    return days
+    lookup = load_a_share_trading_calendar(calendar).get("is_open_by_date") or {}
+    return {day for day, is_open in lookup.items() if is_open}
 
 
 def trading_day_today(project_root: Path | None = None, *, now: datetime | None = None) -> bool:
+    from quantdesk.trading_calendar import is_trade_day
+
     root = Path(project_root or PROJECT_ROOT)
     current = _now_shanghai(now)
-    if current.weekday() >= 5:
-        return False
-    days = _load_trading_days(root)
-    if days:
-        return current.strftime("%Y-%m-%d") in days
-    return True  # calendar unavailable: fall open to weekday check with warning
+    calendar = root / "data/calendar/a_share_trading_calendar.csv"
+    return is_trade_day(current.date(), calendar_path=calendar)
 
 
 def market_session_for(now: datetime | None = None) -> str:
@@ -183,7 +174,7 @@ def validate_minute_bar(row: dict[str, Any], *, now: datetime, symbol: str) -> t
             val = float(row.get(name))
         except (TypeError, ValueError):
             return None
-        if val != val:
+        if not math.isfinite(val):
             return None
         return val
 
@@ -198,14 +189,12 @@ def validate_minute_bar(row: dict[str, Any], *, now: datetime, symbol: str) -> t
         _num("close"),
     )
     if None not in (open_price, high, low, close):
-        # Disambiguate by comparing each extreme against the BODY (the
-        # open/close range): a low above the body top is "low above", a high
-        # below the body bottom is "high below", and a pure high<low cross
-        # falls back to high-below (the high failed to cover the session).
+        # Both open and close must lie inside [low, high]. Keep the existing
+        # reason priority when more than one envelope constraint fails.
         body_top = max(open_price, close)
         body_bottom = min(open_price, close)
-        low_above = low > body_top
-        high_below = high < body_bottom or high < low
+        low_above = low > body_bottom
+        high_below = high < body_top or high < low
         if low_above or high_below:
             code = "low_above_body" if low_above else "high_below_body"
             return False, f"invalid_minute_bar:{symbol}:{code}"
@@ -326,6 +315,8 @@ def _append_rows_with_latest(
 ) -> tuple[int, list[str], str]:
     """Share one archive scan between deduplication and freshness reporting."""
 
+    requested_path = path
+    path = minute_write_path(path, history_now=datetime.fromisoformat(now_iso.replace("Z", "+00:00")))
     exists_with_data = path.is_file() and path.stat().st_size > 0
     needs_newline = False
     fieldnames = list(MINUTE_COLUMNS)
@@ -339,12 +330,43 @@ def _append_rows_with_latest(
             handle.seek(-1, os.SEEK_END)
             needs_newline = handle.read(1) not in {b"\n", b"\r"}
 
-    seen = set(_stored_minute_datetimes(path))
+    seen: set[str] = set()
+    if exists_with_data:
+        checked_at = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle)
+            next(reader, None)
+            for line_number, values in enumerate(reader, 2):
+                if not values:
+                    continue
+                reason = ""
+                stored = dict(zip(fieldnames, values))
+                if len(values) != len(fieldnames):
+                    reason = "column_count"
+                elif str(stored.get("price_basis") or "").strip().lower() != "raw":
+                    reason = "price_basis_not_raw"
+                elif stored.get("symbol") != path.stem:
+                    reason = "symbol_mismatch"
+                else:
+                    ok, reason = validate_minute_bar(stored, now=checked_at, symbol=path.stem)
+                if reason:
+                    return 0, [f"minute_stored_row_invalid:{path.name}:{line_number}:{reason}"], ""
+                seen.add(_minute_datetime_key(stored.get("datetime")))
     latest = max(seen, default="")
-    reject_reasons: list[str] = []
+    reject_reasons: list[str] = ([f"legacy_price_basis_unknown:{requested_path.name}"]
+                                 if path != requested_path else [])
     accepted: list[dict[str, Any]] = []
     for row in rows:
+        if str(row.get("price_basis") or "").strip().lower() != "raw":
+            reject_reasons.append(f"minute_price_basis_not_raw:{row.get('symbol')}")
+            continue
+        if "adjust" in row and str(row["adjust"]).strip().lower() != "raw":
+            reject_reasons.append(f"minute_price_basis_conflict:{row.get('symbol')}")
+            continue
         dt = _minute_datetime_key(row.get("datetime"))
+        if not dt:
+            reject_reasons.append(f"invalid_minute_datetime:{row.get('symbol')}")
+            continue
         if dt in seen:
             reject_reasons.append(f"duplicate_minute_bar:{row.get('symbol')}:{dt}")
             continue
@@ -379,9 +401,9 @@ def _append_rows_with_latest(
                     "close": repr(float(row.get("close"))),
                     "volume": "%.1f" % float(row.get("volume") or 0),
                     "amount": "%.1f" % float(row.get("amount") or 0),
-                    "source": str(row.get("source") or "mootdx_minute"),
+                    "source": str(row.get("source") or ""),
                     "updated_at": now_iso,
-                    "price_basis": str(row.get("price_basis") or "raw"),
+                    "price_basis": str(row["price_basis"]).strip().lower(),
                 }
             )
         handle.flush()
@@ -1204,7 +1226,9 @@ def collect_intraday_refresh(
             network=wants_provider_work,
             now=current,
             fetcher=snapshot_fetcher,
-            budget_seconds=_remaining_round_seconds(round_deadline, monotonic),
+            # Scope expansion must leave most of the round for its actual
+            # minute targets. A valid synced A0 slot avoids this fetch entirely.
+            budget_seconds=min(60.0, _remaining_round_seconds(round_deadline, monotonic)),
             clock=monotonic,
         )
         snapshot_finished = monotonic()
@@ -1223,6 +1247,11 @@ def collect_intraday_refresh(
             "reason_codes": list(snapshot_payload.get("reason_codes") or []),
             "error": snapshot_payload.get("error") or "",
         }
+        for key in ("published", "pagination", "reused", "reused_at", "archive_path", "archive_sha256",
+                    "archive_slot", "archive_row_count", "archive_quality", "source_fetched_at",
+                    "capture_age_seconds", "max_quote_age_seconds", "excluded_quote_count"):
+            if key in snapshot_payload:
+                manifest["snapshot"][key] = snapshot_payload[key]
         if wants_provider_work and snapshot_finished > round_deadline:
             # The snapshot spent the whole round: scope and the provider loop
             # must not start on a budget that is already gone.
@@ -1327,26 +1356,57 @@ def collect_intraday_refresh(
                         )
                 else:
                     valid_rows = []
+                    validation_reason = ""
+                    ignored_other_day_rows = 0
                     for row in rows:
                         ok, reason = validate_minute_bar(row, now=current, symbol=symbol)
+                        if ok and str(row.get("price_basis") or "").strip().lower() != "raw":
+                            ok, reason = False, f"minute_price_basis_not_raw:{symbol}"
+                        if ok and "adjust" in row and str(row["adjust"]).strip().lower() != "raw":
+                            ok, reason = False, f"minute_price_basis_conflict:{symbol}"
+                        if ok and _minute_datetime_key(row.get("datetime"))[:10] != current.strftime("%Y-%m-%d"):
+                            ignored_other_day_rows += 1
+                            continue
                         if ok:
                             valid_rows.append(row)
                         else:
                             manifest["reason_codes"].append(reason)
+                            validation_reason = validation_reason or reason
                     accepted, rejects, newest = _append_rows_with_latest(path, valid_rows, now_iso=now_iso)
+                    actual_path = minute_write_path(path, history_now=current)
                     manifest["appended_rows"] += accepted
                     manifest["reason_codes"].extend(rejects[:3])
                     storage_reason = next(
-                        (reason for reason in rejects if reason.startswith("minute_header_mismatch:")), ""
+                        (reason for reason in rejects if reason.startswith(("minute_header_mismatch:", "minute_stored_row_invalid:"))), ""
                     )
+                    receipt_status = "ok"
+                    receipt_reason = ""
+                    error_stage = diagnostics.get("error_stage") or ""
+                    error_type = ""
+                    if storage_reason:
+                        receipt_status, receipt_reason = "storage_blocked", storage_reason
+                        error_stage, error_type = "storage", storage_reason.split(":", 1)[0]
+                    elif not valid_rows:
+                        # A successful request is not proof of usable data, even
+                        # when an older archive supplies a recent timestamp.
+                        receipt_status = "validation_failed" if rows else "empty"
+                        receipt_reason = validation_reason or f"provider_no_rows:{symbol}"
+                        error_stage = "validation" if rows else "empty"
+                        error_type = "NoValidMinuteBars" if rows else "EmptyResponse"
+                        if not validation_reason:
+                            manifest["reason_codes"].append(receipt_reason)
                     manifest["provider_status"].append({
                         "symbol": symbol,
-                        "status": "storage_blocked" if storage_reason else "ok",
-                        "reason": storage_reason,
+                        "status": receipt_status,
+                        "reason": receipt_reason,
                         "appended": accepted,
                         "latest_bar_time": newest,
-                        "error_stage": "storage" if storage_reason else diagnostics.get("error_stage") or "",
-                        "error_type": "minute_header_mismatch" if storage_reason else "",
+                        "storage_path": str(actual_path.relative_to(root)),
+                        "legacy_price_basis_unknown": actual_path != path,
+                        "requested_bar_limit": MINUTE_OFFSET,
+                        "ignored_other_day_rows": ignored_other_day_rows,
+                        "error_stage": error_stage,
+                        "error_type": error_type,
                         "stages": list(diagnostics.get("stages") or []),
                         "diagnostics": diagnostics,
                         "duration_ms": duration_ms,

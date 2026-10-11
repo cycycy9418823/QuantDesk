@@ -2611,7 +2611,7 @@ def test_theme_map_import_uses_import_symbols_and_keeps_pending_unknown(monkeypa
 def test_theme_map_draft_collects_visible_candidate_ledger_and_cache(monkeypatch, tmp_path) -> None:
     ledger_csv = tmp_path / "candidate_ledger.csv"
     cache_json = tmp_path / "limit_up_review_latest.json"
-    output_csv = tmp_path / "stock_theme_map_import.csv"
+    output_csv = tmp_path / "results" / "theme_map_drafts" / "stock_theme_map_import.csv"
     empty_csv = tmp_path / "missing.csv"
     missing_json = tmp_path / "missing.json"
     ledger_csv.write_text(
@@ -3355,6 +3355,7 @@ def test_merge_daily_frames_preserves_existing_amount_when_fresh_is_blank() -> N
                 "close": 4.45,
                 "volume": 60594609,
                 "amount": 268027339,
+                "adjust": "raw",
                 "source": "sina_daily",
                 "updated_at": "old",
             }
@@ -3371,6 +3372,7 @@ def test_merge_daily_frames_preserves_existing_amount_when_fresh_is_blank() -> N
                 "close": 4.45,
                 "volume": 60594600,
                 "amount": None,
+                "adjust": "raw",
                 "source": "tencent_daily",
                 "updated_at": "new",
             }
@@ -3389,8 +3391,8 @@ def test_target_amount_backfill_uses_same_day_spot_snapshot(monkeypatch, tmp_pat
     daily_dir.mkdir(parents=True)
     cache_dir.mkdir(parents=True)
     (daily_dir / "000802.csv").write_text(
-        "date,symbol,open,high,low,close,volume,amount,source,updated_at\n"
-        "2026-06-15,000802,4.31,4.63,4.31,4.42,418214,,tencent_daily,test\n",
+        "date,symbol,open,high,low,close,volume,amount,source,updated_at,adjust\n"
+        "2026-06-15,000802,4.31,4.63,4.31,4.42,418214,,tencent_daily,test,raw\n",
         encoding="utf-8",
     )
     (cache_dir / "spot_snapshot_latest.csv").write_text(
@@ -3416,8 +3418,8 @@ def test_target_amount_backfill_skips_bad_spot_snapshot_rows(monkeypatch, tmp_pa
     daily_dir.mkdir(parents=True)
     cache_dir.mkdir(parents=True)
     (daily_dir / "000802.csv").write_text(
-        "date,symbol,open,high,low,close,volume,amount,source,updated_at\n"
-        "2026-06-15,000802,4.31,4.63,4.31,4.42,418214,,tencent_daily,test\n",
+        "date,symbol,open,high,low,close,volume,amount,source,updated_at,adjust\n"
+        "2026-06-15,000802,4.31,4.63,4.31,4.42,418214,,tencent_daily,test,raw\n",
         encoding="utf-8",
     )
     (cache_dir / "spot_snapshot_latest.csv").write_text(

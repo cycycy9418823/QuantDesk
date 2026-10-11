@@ -67,6 +67,7 @@ def ledger_fixture(root: Path, rel: str, as_of: str, dates: list[str], extra: di
     if extra:
         payload.update(extra)
     write_json(root / rel, payload)
+    write_json((root / rel).with_name("journal_latest.json"), {"as_of": as_of, "llm": {"used": True}})
 
 
 def decision_fixture(root: Path, rel: str, as_of: str, rows: list[tuple[str, str]]) -> None:
@@ -232,6 +233,7 @@ def health_scenario(root: Path, *, daily: int, benchmark: str, slots: int, colle
     strategy_fixture(root, TARGET_DATE, generated=f"{TARGET_DATE}T20:03:44")
     for rel in ("state/ai_trader/ledger.json", "state/ai_trader_glm/ledger.json"):
         write_json(root / rel, {"as_of": TARGET_DATE, "trades": []})
+        write_json((root / rel).with_name("journal_latest.json"), {"as_of": TARGET_DATE, "llm": {"used": True}})
     for rel in ("state/ai_trader/decision_latest.json", "state/ai_trader_glm/decision_latest.json"):
         write_json(root / rel, {"as_of": TARGET_DATE, "records": []})
     log = root / "logs" / "ops" / "backup_push.log"
@@ -295,3 +297,231 @@ def test_t12_snapshot_partial_and_blocked_minute_are_visible(tmp_path: Path) -> 
     text = " ".join(payload["explains"])
     assert "快照未拉回 2026-09-18" in text
     assert "缺8，拒写2" in text
+
+
+def write_pull_log(root: Path, rows: list[dict]) -> None:
+    path = root / "logs" / "ops" / "snapshot_pull.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+                    encoding="utf-8")
+
+
+def pull_log_row(root: Path, target: str, **extra: object) -> dict:
+    """一条和拉取程序写法一致的到达记录：绑定当时那一版数据的清单指纹。"""
+
+    manifest = root / "data" / "snapshots" / target / "manifest.json"
+    row: dict = {"date": target, "quote_date": target, "published": True,
+                 "manifest_sha256": sha(manifest), "manifest_revision": None}
+    row.update(extra)
+    return row
+
+
+def test_t13_yesterday_quote_received_today_keeps_its_own_date(tmp_path: Path) -> None:
+    """S1 反例：昨天的行情今天才在本地完整可用，行情日期仍是昨天，收到时间单独显示。"""
+
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute=GOOD_MINUTE)
+    write_pull_log(tmp_path, [pull_log_row(
+        tmp_path, TARGET_DATE, files=49, collected_slot_count=48, updated=True, ok=True,
+        started_at="2026-09-19T10:11:15+08:00",
+        download_finished_at="2026-09-19T10:12:00+08:00",
+        pulled_at="2026-09-19T10:12:02+08:00",
+    )])
+
+    payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
+
+    assert "快照 ✓48张/完成 48（本地 09-19 10:12 收到）" in payload["line"]
+    text = " ".join(payload["explains"])
+    assert f"行情日期仍是 {TARGET_DATE}" in text
+    assert "上游发布 未知" in text
+
+
+def test_t14_failed_pull_attempt_reports_arrival_unknown(tmp_path: Path) -> None:
+    """S1 反例：只有失败记录时不能显示“已收到”，本地到达时间标未知。"""
+
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute=GOOD_MINUTE)
+    write_pull_log(tmp_path, [{
+        "date": TARGET_DATE, "stage": "tar", "ok": False, "published": False,
+        "started_at": "2026-09-19T10:00:00+08:00",
+        "download_finished_at": None, "pulled_at": None,
+    }])
+
+    payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
+
+    assert "收到）" not in payload["line"]
+    text = " ".join(payload["explains"])
+    assert f"快照 {TARGET_DATE} 有拉取记录但没有一次发布完成，本地到达时间未知" in text
+
+
+def test_t15_upstream_publish_stamp_is_shown_when_present(tmp_path: Path) -> None:
+    """S1：清单里有上游发布时间就照实显示，没有才写未知。"""
+
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute=GOOD_MINUTE)
+    write_json(tmp_path / "data" / "snapshots" / TARGET_DATE / "manifest.json",
+               {"collected_slot_count": 48, "upstream_published_at": f"{TARGET_DATE}T15:05:00"})
+    write_pull_log(tmp_path, [pull_log_row(
+        tmp_path, TARGET_DATE, ok=True,
+        started_at="2026-09-19T10:11:15+08:00",
+        download_finished_at="2026-09-19T10:12:00+08:00",
+        pulled_at="2026-09-19T10:12:02+08:00",
+    )])
+
+    payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
+
+    assert f"上游发布 {TARGET_DATE}T15:05:00" in " ".join(payload["explains"])
+
+
+def test_t16_other_version_receipt_is_not_borrowed(tmp_path: Path) -> None:
+    """S1 反例：新数据已换版但它的成功记录没写成 → 不借上一版到达时间，写未知。"""
+
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute=GOOD_MINUTE)
+    old_stamp = "2026-09-19T10:12:02+08:00"
+    write_pull_log(tmp_path, [pull_log_row(
+        tmp_path, TARGET_DATE, files=49, collected_slot_count=48, updated=True, ok=True,
+        started_at="2026-09-19T10:11:15+08:00",
+        download_finished_at="2026-09-19T10:12:00+08:00",
+        pulled_at=old_stamp,
+        manifest_sha256="a" * 64,          # 上一版（A）的指纹
+    )])
+    # 当前数据已经是另一版：清单里带 revision=2，指纹与 A 的记录不同。
+    write_json(tmp_path / "data" / "snapshots" / TARGET_DATE / "manifest.json",
+               {"collected_slot_count": 48, "revision": 2})
+
+    payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
+
+    assert old_stamp[:16] not in payload["line"]
+    assert f"本地 {old_stamp[5:10]} {old_stamp[11:16]} 收到" not in payload["line"]
+    text = " ".join(payload["explains"])
+    assert f"快照 {TARGET_DATE} 的当前数据版本没有对应的到达记录" in text
+    assert "本地到达时间未知" in text
+    assert old_stamp[11:16] not in text, "A 版的时间不能出现在当前数据的说明里"
+
+
+def test_t17_receipt_without_version_evidence_is_unknown(tmp_path: Path) -> None:
+    """S1 反例：旧记录没有数据版本凭证时如实标未知，不改写历史也不冒认。"""
+
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute=GOOD_MINUTE)
+    write_pull_log(tmp_path, [{
+        "date": TARGET_DATE, "ok": True, "published": True,
+        "pulled_at": "2026-09-19T10:12:02+08:00",
+    }])
+
+    payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
+
+    assert "收到）" not in payload["line"]
+    text = " ".join(payload["explains"])
+    assert f"快照 {TARGET_DATE} 的到达记录没有数据版本凭证" in text
+    assert "本地到达时间未知" in text
+
+
+@pytest.mark.parametrize("field", ["collected_at", "generated_at"])
+def test_t18_collection_and_generation_are_not_publication(tmp_path: Path, field: str) -> None:
+    """S1 反例：清单只有采集/生成时间时不能改称上游发布时间（同一问题的两个变体）。"""
+
+    ok_day = f"{PREV_DATE}T10:12:02+08:00"
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute=GOOD_MINUTE)
+    write_json(tmp_path / "data" / "snapshots" / TARGET_DATE / "manifest.json",
+               {"collected_slot_count": 48, field: ok_day})
+    write_pull_log(tmp_path, [pull_log_row(
+        tmp_path, TARGET_DATE, ok=True,
+        started_at="2026-09-19T10:11:15+08:00",
+        download_finished_at="2026-09-19T10:12:00+08:00",
+        pulled_at="2026-09-19T10:12:02+08:00",
+    )])
+
+    payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
+
+    text = " ".join(payload["explains"])
+    assert "上游发布 未知" in text
+    assert f"上游发布 {ok_day}" not in text
+    assert f"上游采集/生成 {ok_day}（不是发布时间）" in text
+
+
+def test_t19_explicit_publication_field_keeps_its_name(tmp_path: Path) -> None:
+    """S1 正常对照：清单里有明确发布字段时照实显示，采集/生成字段不冒充它。"""
+
+    publish_stamp = f"{TARGET_DATE}T15:05:00+08:00"
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute=GOOD_MINUTE)
+    write_json(tmp_path / "data" / "snapshots" / TARGET_DATE / "manifest.json",
+               {"collected_slot_count": 48, "upstream_published_at": publish_stamp,
+                "generated_at": f"{TARGET_DATE}T15:01:00+08:00"})
+    write_pull_log(tmp_path, [pull_log_row(
+        tmp_path, TARGET_DATE, ok=True, pulled_at="2026-09-19T10:12:02+08:00")])
+
+    payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
+
+    text = " ".join(payload["explains"])
+    assert f"上游发布 {publish_stamp}" in text
+    assert f"上游采集/生成 {TARGET_DATE}T15:01:00+08:00（不是发布时间）" in text
+    assert "（本地 09-19 10:12 收到）" in payload["line"], "同版到达记录仍要显示"
+
+
+def set_benchmark_days(root: Path, days: dict[str, str | None]) -> None:
+    """按文件逐个设置基准日期；``None`` 表示删掉该文件（模拟缺失）。"""
+    bench_dir = root / "data" / "benchmark"
+    bench_dir.mkdir(parents=True, exist_ok=True)
+    for name, day in days.items():
+        path = bench_dir / name
+        if day is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(f"date,close\n{day},100\n", encoding="utf-8")
+
+
+def test_t20_benchmark_on_or_after_expected_day_is_not_stale(tmp_path: Path) -> None:
+    """基准已更新到目标日（或更新）不算 stale：✓，且显示三只里最旧的日期。"""
+
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute=GOOD_MINUTE)
+    set_benchmark_days(tmp_path, {"hs300.csv": TARGET_DATE, "zz500.csv": PREV_DATE,
+                                  "sh000001.csv": TARGET_DATE})
+
+    cell, extra = load_mod().benchmark_cell(tmp_path, TARGET_DATE)
+    assert cell == f"基准 ✓{PREV_DATE}", (cell, extra)
+    payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
+    assert f"基准 ✓{PREV_DATE}" in payload["line"]
+    assert "基准 ✗" not in payload["line"]
+
+
+def test_t21_only_the_late_file_is_named_stale(tmp_path: Path) -> None:
+    """一只早于 expected（其余已到目标日）→ ✗，且只点名那只。"""
+
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute=GOOD_MINUTE)
+    set_benchmark_days(tmp_path, {"hs300.csv": "2026-09-16", "zz500.csv": PREV_DATE,
+                                  "sh000001.csv": TARGET_DATE})
+
+    cell, extra = load_mod().benchmark_cell(tmp_path, TARGET_DATE)
+    assert cell == "基准 ✗"
+    assert "应有 2026-09-17" in extra and "hs300=2026-09-16" in extra, extra
+    assert "zz500" not in extra and "sh000001" not in extra, extra
+
+
+def test_t22_missing_benchmark_file_is_stale_and_named(tmp_path: Path) -> None:
+    """文件缺失也算 stale，并点名。"""
+
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute=GOOD_MINUTE)
+    set_benchmark_days(tmp_path, {"hs300.csv": None})
+
+    cell, extra = load_mod().benchmark_cell(tmp_path, TARGET_DATE)
+    assert cell == "基准 ✗"
+    assert "hs300=缺失" in extra, extra
+
+
+def test_t23_unreadable_benchmark_file_is_stale_and_named(tmp_path: Path) -> None:
+    """文件在、但读不出日期（表头以外没有数据）也算 stale，并点名。"""
+
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute=GOOD_MINUTE)
+    (tmp_path / "data" / "benchmark" / "hs300.csv").write_text("date,close\n", encoding="utf-8")
+
+    cell, extra = load_mod().benchmark_cell(tmp_path, TARGET_DATE)
+    assert cell == "基准 ✗"
+    assert "hs300=读不出" in extra, extra

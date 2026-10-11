@@ -169,14 +169,13 @@ def append_journal(
     *,
     latest_path: Path | None = None,
     log_path: Path | None = None,
-) -> None:
+) -> dict[str, Any]:
     if latest_path is None or log_path is None:
         ensure_runtime_dirs()
     latest = assert_not_quantdesk_ledger(latest_path or JOURNAL_LATEST_PATH)
     log = assert_not_quantdesk_ledger(log_path or JOURNAL_PATH)
     latest.parent.mkdir(parents=True, exist_ok=True)
     log.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(latest, note)
     identity = _journal_identity(note)
     if identity and log.is_file():
         for line in log.read_text(encoding="utf-8").splitlines():
@@ -188,8 +187,14 @@ def append_journal(
             except json.JSONDecodeError:
                 continue
             if isinstance(existing, dict) and _journal_identity(existing) == identity:
-                # Same evening/run already journalled (e.g. a crash-retry):
-                # reuse the record instead of appending a duplicate.
-                return
+                # Same evening/run already journalled (e.g. a crash-retry): reuse that
+                # record for BOTH the log and ``journal_latest``.  Otherwise a re-entry
+                # (already-settled plan → no new fills tonight) would overwrite
+                # "今晚成交 1 笔" with "0 笔", and the newest view would contradict both
+                # the history row and the ledger (T19).
+                atomic_write_json(latest, existing)
+                return existing
+    atomic_write_json(latest, note)
     with log.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(note, ensure_ascii=False) + "\n")
+    return note

@@ -104,10 +104,11 @@ def test_daily_price_provider_warns_when_ohlc_is_filled_from_close() -> None:
 
     normalized, warnings = normalize_daily_df(frame, "000001", source="akshare_daily")
 
-    assert normalized.iloc[0]["open"] == 10.0
-    assert "ohlc_filled_from_close:open:1_rows" in warnings
-    assert "ohlc_filled_from_close:high:1_rows" in warnings
-    assert "ohlc_filled_from_close:low:1_rows" in warnings
+    assert normalized[["open", "high", "low"]].isna().all().all()
+    assert normalized.iloc[0]["close"] == 10.0
+    assert "ohlc_missing:open:1_rows" in warnings
+    assert "ohlc_missing:high:1_rows" in warnings
+    assert "ohlc_missing:low:1_rows" in warnings
 
 
 def test_merge_daily_frames_preserves_input_normalize_warnings() -> None:
@@ -117,9 +118,10 @@ def test_merge_daily_frames_preserves_input_normalize_warnings() -> None:
     merged = merge_daily_frames(existing, fresh)
 
     warnings = merged.attrs.get("warnings") or []
-    assert "ohlc_filled_from_close:open:1_rows" in warnings
-    assert "ohlc_filled_from_close:high:1_rows" in warnings
-    assert "ohlc_filled_from_close:low:1_rows" in warnings
+    assert "ohlc_missing:open:1_rows" in warnings
+    assert "ohlc_missing:high:1_rows" in warnings
+    assert "ohlc_missing:low:1_rows" in warnings
+    assert merged.loc[merged["date"] == "2026-06-26", ["open", "high", "low"]].isna().all().all()
 
 
 def test_merge_daily_frames_preserves_input_frame_attrs_warnings() -> None:

@@ -404,7 +404,39 @@ def _missing_intraday_result(plan_item: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def simulate_conditional_plan(
+def _basis_proxy_result(
+    plan_item: dict[str, Any],
+    *,
+    basis: str,
+    basis_reason: str,
+) -> dict[str, Any]:
+    """分钟线口径不是纯 raw 时的结果：只能当同口径研究代理，不算可靠成交价。
+
+    前复权/后复权、口径未知、或同一天混用多种口径时，分钟收盘价与真实成交价不是
+    一回事：这里既不产出 stop_loss 之类的可执行动作，也明确标注不是真实执行价
+    （T08：复权价、未知口径不能冒充可靠成交价）。
+    """
+
+    label = basis or "unknown"
+    result = _event(
+        plan_item,
+        action="block",
+        trigger_type="price_basis_gate",
+        quantity=0,
+        fill_model="price_basis_gate",
+        is_reliable=False,
+        reason=(
+            f"分钟线口径为 {label}，只作同口径研究代理，不作为可靠成交价，本次不模拟成交。"
+            + (f"（{basis_reason}）" if basis_reason else "")
+        ),
+    )
+    result["price_basis"] = label
+    result["execution_price_label"] = "same_basis_research_proxy"
+    result["real_execution_price_claim"] = False
+    return result
+
+
+def _simulate_conditional_plan_raw(
     plan_item: dict[str, Any],
     intraday_df: pd.DataFrame | None,
     *,
@@ -415,6 +447,8 @@ def simulate_conditional_plan(
 
     The default model only uses minute close prices. It never reads strategy
     candidates or daily features during execution.
+
+    调用方必须是已判过口径的纯 raw 帧；口径判定在 ``simulate_conditional_plan``。
     """
 
     if trigger_model != "minute_close":
@@ -609,8 +643,66 @@ def simulate_conditional_plan(
     )
 
 
+def simulate_conditional_plan(
+    plan_item: dict[str, Any],
+    intraday_df: pd.DataFrame | None,
+    *,
+    allow_daily_approx: bool = False,
+    trigger_model: str = "minute_close",
+) -> dict[str, Any]:
+    """先按**原始帧**判价格口径，再决定它能不能当可靠成交价。
+
+    价格数据契约要求在任何日期过滤、排序、去重或重采样之前先判口径：只有纯 raw 的
+    分钟收盘价才进入正常模拟；前复权/后复权、未知、混合口径一律降级为同口径研究代理
+    （``is_reliable=False``、不产出可执行动作、明确不是真实执行价，T08）。
+    """
+
+    frame = intraday_df if isinstance(intraday_df, pd.DataFrame) else None
+    if frame is not None and not frame.empty:
+        # 两列口径声明（``adjust`` 与契约规范列 ``price_basis``）**都要检查**：把它们并成
+        # 一组 token 交给同一个分类器——两列一致 raw 才算 raw；任一侧写了 qfq/hfq/unknown
+        # 或两侧互相矛盾 → 分类即未知/混合 → 拦下。列顺序、只有哪一列都不改变判断
+        # （T08-BASIS-ALIAS-CONFLICT-20260930）。
+        tokens = [
+            value
+            for column in ("adjust", "price_basis")
+            if column in frame.columns
+            for value in frame[column].tolist()
+        ]
+        basis_frame = pd.DataFrame({"adjust": tokens}) if tokens else frame
+        if basis_frame is not frame:
+            # 重建分类帧只为把两列列证据合并进来；原帧**已有的负面预检状态**（
+            # ``price_basis_reason`` / ``observed_price_basis``）必须一起带上，否则
+            # unknown/mixed 的预检错误会被"只剩 raw 列"冲掉而放行
+            # （T08-PREFLIGHT-ATTRS-REGRESSION-20260930）。
+            basis_frame.attrs = dict(frame.attrs)
+        basis, basis_reason = classify_frame_price_basis(basis_frame)
+        # 只有"分出来是 raw **且**没有任何未知/混合的错误理由"才进入模拟；raw 标签绝不覆盖
+        # 错误理由，未声明口径（无列、无理由）同样拦。
+        if basis != PRICE_BASIS_RAW or basis_reason:
+            return _basis_proxy_result(plan_item, basis=basis, basis_reason=basis_reason)
+        if "adjust" in frame.columns and "price_basis" in frame.columns:
+            # 两列一致 raw：共享归一化器会把两列都映到同一个规范名（重名列会崩），这里先
+            # 去掉别名列，只留 ``adjust``（它会被归一化成规范列）。判定已经在上一步做完。
+            frame = frame.drop(columns=["price_basis"])
+    result = _simulate_conditional_plan_raw(
+        plan_item,
+        frame if frame is not None else intraday_df,
+        allow_daily_approx=allow_daily_approx,
+        trigger_model=trigger_model,
+    )
+    if isinstance(result, dict) and frame is not None and not frame.empty:
+        result.setdefault("price_basis", PRICE_BASIS_RAW)
+        result.setdefault("execution_price_label", "raw_minute_close_paper_sim")
+        result.setdefault("real_execution_price_claim", False)
+    return result
+
+
 def _read_intraday(symbol: str, intraday_dir: Path, source: str = "1m") -> pd.DataFrame | None:
+    from quantdesk.intraday.minute_storage import resolve_minute_read_path
+
     path = intraday_dir / source / f"{normalize_symbol(symbol)}.csv"
+    path = resolve_minute_read_path(path)
     if not path.exists():
         return None
     frame = read_csv_frame(path, dtype={"symbol": str})
@@ -1106,6 +1198,7 @@ def apply_conditional_execution_to_state(
         }
     positions = [normalize_position_for_t1(row, trade_date) for row in portfolio.get("positions") or [] if isinstance(row, dict)]
     closed_positions = list(portfolio.get("closed_positions") or [])
+    realized_reductions = [dict(row) for row in portfolio.get("realized_reductions") or [] if isinstance(row, dict)]
     cash = safe_float(portfolio.get("cash"), safe_float(portfolio.get("initial_cash"), 0.0)) or 0.0
     position_by_key = {_position_key(row): row for row in positions}
     actions: list[dict[str, Any]] = []
@@ -1144,8 +1237,12 @@ def apply_conditional_execution_to_state(
                 )
             except Exception:
                 pass
-    ordered_results = list(execution_payload.get("events") or []) + list(execution_payload.get("no_fill") or []) + list(execution_payload.get("blocked") or [])
-    for event_ordinal, result in enumerate(ordered_results, start=1):
+    incoming_results = list(execution_payload.get("events") or []) + list(execution_payload.get("no_fill") or []) + list(execution_payload.get("blocked") or [])
+    ordered_results = sorted(
+        enumerate(incoming_results),
+        key=lambda item: (str(item[1].get("trigger_time") or "") if isinstance(item[1], dict) else "", item[0]),
+    )
+    for event_ordinal, (_, result) in enumerate(ordered_results, start=1):
         if not isinstance(result, dict):
             continue
         action = str(result.get("action") or "")
@@ -1335,10 +1432,16 @@ def apply_conditional_execution_to_state(
             action_row = _make_action(event_for_action, cash_after=cash)
             action_row["pnl"] = round(pnl, 2)
             actions.append(action_row)
+            sale_record = _close_record(position, result, sell_qty, price, cash_info, sell_costs)
             if position["quantity"] <= 0:
-                closed_positions.append(_close_record(position, result, sell_qty, price, cash_info, sell_costs))
+                closed_positions.append(sale_record)
                 positions = [row for row in positions if _position_key(row) != key]
                 position_by_key.pop(key, None)
+            else:
+                sale_record["quantity"] = sell_qty
+                sale_record["status"] = "reduced"
+                sale_record["management_state"] = "reduced"
+                realized_reductions.append(sale_record)
         else:
             if action == "watch_exit" and position:
                 position["management_state"] = "watch_exit"
@@ -1358,7 +1461,7 @@ def apply_conditional_execution_to_state(
         latest_price = None
         latest_date = ""
         valuation_warnings: list[str] = []
-        event_prices = [safe_float(row.get("trigger_price"), None) for row in ordered_results if normalize_symbol(row.get("symbol")) == symbol and safe_float(row.get("trigger_price"), None)]
+        event_prices = [safe_float(row.get("trigger_price"), None) for _, row in ordered_results if isinstance(row, dict) and normalize_symbol(row.get("symbol")) == symbol and safe_float(row.get("trigger_price"), None)]
         if event_prices:
             latest_price = event_prices[-1]
             latest_date = trade_date
@@ -1398,6 +1501,7 @@ def apply_conditional_execution_to_state(
         "cash": round(cash, 2),
         "positions": positions,
         "closed_positions": closed_positions,
+        "realized_reductions": realized_reductions,
         "actions": actions,
         "daily_actions": actions,
         "realized_pnl": round((safe_float(portfolio.get("realized_pnl"), 0.0) or 0.0) + realized_today, 2),

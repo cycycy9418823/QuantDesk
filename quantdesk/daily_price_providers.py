@@ -16,6 +16,7 @@ from quantdesk.csv_io import read_csv_frame
 from quantdesk.daily_session_evidence import build_baostock_session_evidence
 from quantdesk.data_provider_registry import dependency_available, list_data_providers
 from quantdesk.interprocess_lock import interprocess_file_lock
+from quantdesk.price_basis import PRICE_BASIS_UNKNOWN, classify_frame_price_basis
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DAILY_DIR = PROJECT_ROOT / "data" / "daily"
@@ -212,13 +213,24 @@ def provider_availability(provider_name: str) -> dict[str, Any]:
 def normalize_daily_df(df: pd.DataFrame | None, symbol: str, *, source: str = "") -> tuple[pd.DataFrame, list[str]]:
     warnings: list[str] = []
     if df is None or df.empty:
-        return pd.DataFrame(columns=STANDARD_DAILY_COLUMNS), ["provider returned empty dataframe"]
+        empty = pd.DataFrame(columns=STANDARD_DAILY_COLUMNS)
+        empty.attrs = dict(df.attrs) if df is not None else {}
+        return empty, ["provider returned empty dataframe"]
     renamed = df.rename(columns={col: DAILY_COLUMN_ALIASES.get(str(col).strip(), str(col).strip()) for col in df.columns}).copy()
+    if list(renamed.columns).count("adjust") > 1:
+        raise ValueError("ambiguous_daily_adjust_columns")
     renamed = renamed.loc[:, ~renamed.columns.duplicated()]
-    if "date" not in renamed.columns:
-        return pd.DataFrame(columns=STANDARD_DAILY_COLUMNS), ["missing date column"]
-    if "close" not in renamed.columns:
-        return pd.DataFrame(columns=STANDARD_DAILY_COLUMNS), ["missing close column"]
+    # Classify before removing invalid dates, prices or duplicate sessions.
+    # Keep rejected rows as evidence, including when the frame is serialized.
+    observed_basis, basis_reason = classify_frame_price_basis(renamed)
+    if basis_reason:
+        warnings.append(f"price_basis:{basis_reason}")
+    missing_required = [column for column in ("date", "close") if column not in renamed.columns]
+    if missing_required:
+        empty = pd.DataFrame(columns=STANDARD_DAILY_COLUMNS)
+        empty.attrs = dict(df.attrs)
+        empty.attrs.update(observed_price_basis=observed_basis, price_basis_reason=basis_reason)
+        return empty, warnings + [f"missing {column} column" for column in missing_required]
     normalized = pd.DataFrame()
     normalized["date"] = pd.to_datetime(renamed["date"], errors="coerce")
     normalized["symbol"] = normalize_symbol(symbol)
@@ -228,38 +240,58 @@ def normalize_daily_df(df: pd.DataFrame | None, symbol: str, *, source: str = ""
         else:
             normalized[column] = pd.NA
             if column in {"open", "high", "low"}:
-                warnings.append(f"missing {column}; fallback to close where possible")
+                warnings.append(f"missing {column}; retained as missing")
             elif column in {"volume", "amount"}:
                 warnings.append(f"missing {column}")
-    close_numeric = pd.to_numeric(normalized["close"], errors="coerce")
     for column in ("open", "high", "low"):
         current = pd.to_numeric(normalized[column], errors="coerce")
-        fill_mask = current.isna() & close_numeric.notna()
-        filled_count = int(fill_mask.sum())
-        if filled_count:
-            warnings.append(f"ohlc_filled_from_close:{column}:{filled_count}_rows")
-        normalized[column] = current.where(~fill_mask, close_numeric)
+        missing_count = int(current.isna().sum())
+        if missing_count:
+            warnings.append(f"ohlc_missing:{column}:{missing_count}_rows")
+        normalized[column] = current
     if "adjust" in renamed.columns:
         normalized["adjust"] = renamed["adjust"].astype("string").str.strip().str.lower()
     else:
-        source_lower = str(source or "").lower()
-        if "akshare" in source_lower or "local_existing" in source_lower or "tushare" in source_lower:
-            normalized["adjust"] = "raw"
-        elif "tencent" in source_lower:
-            normalized["adjust"] = "qfq"
-        else:
-            normalized["adjust"] = pd.NA
-            warnings.append("missing adjust")
-    normalized["source"] = source or (renamed["source"] if "source" in renamed.columns else "")
-    normalized["updated_at"] = now_text()
-    normalized = normalized.dropna(subset=["date", "close"])
-    normalized = normalized[normalized["close"] > 0]
-    normalized = normalized.sort_values("date").drop_duplicates("date", keep="last")
+        normalized["adjust"] = pd.NA
+        warnings.append("missing adjust")
+    # `source` is a caller label, not evidence about an existing row. Acquisition
+    # adapters attach new provenance at the actual fetch boundary below.
+    for column in ("source", "updated_at"):
+        normalized[column] = renamed[column] if column in renamed.columns else pd.NA
+        if normalized[column].isna().any():
+            warnings.append(f"missing {column}; retained as missing")
+    if not basis_reason:
+        normalized = normalized.dropna(subset=["date", "close"])
+        normalized = normalized[normalized["close"] > 0]
+        normalized = normalized.sort_values("date", kind="stable").drop_duplicates("date", keep="last")
     normalized["date"] = normalized["date"].dt.strftime("%Y-%m-%d")
     for column in STANDARD_DAILY_COLUMNS:
         if column not in normalized.columns:
             normalized[column] = pd.NA
-    return normalized[STANDARD_DAILY_COLUMNS].reset_index(drop=True), warnings
+    result = normalized[STANDARD_DAILY_COLUMNS].reset_index(drop=True)
+    result.attrs = dict(df.attrs)
+    result.attrs.update(observed_price_basis=observed_basis, price_basis_reason=basis_reason)
+    return result, warnings
+
+
+def _with_fetch_metadata(
+    frame: pd.DataFrame, *, source: str, raw_requested: bool = False,
+    captured_at: str = "",
+) -> pd.DataFrame:
+    """Attach acquisition facts without replacing evidence returned by a vendor.
+
+    raw_requested is used only for APIs explicitly queried with adjust='' or
+    BaoStock adjustflag='3'. It never repairs a returned null/conflicting label.
+    """
+    result = frame.copy()
+    has_adjust = any(DAILY_COLUMN_ALIASES.get(str(c).strip(), str(c).strip()) == "adjust" for c in result.columns)
+    if raw_requested and not has_adjust:
+        result["adjust"] = "raw"
+    if "source" not in result.columns:
+        result["source"] = source
+    if "updated_at" not in result.columns:
+        result["updated_at"] = captured_at or now_text()
+    return result
 
 
 def read_local_daily(symbol: str, *, daily_dir: Path | None = None) -> pd.DataFrame:
@@ -378,11 +410,31 @@ def latest_date_for_symbol(symbol: str, *, daily_dir: Path | None = None) -> str
 
 
 def merge_daily_frames(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
-    frames = [frame for frame in (existing, fresh) if frame is not None and not frame.empty]
+    inputs = [frame for frame in (existing, fresh) if frame is not None]
+    # A normalization failure can yield an empty frame carrying negative evidence.
+    # It is not the same as an absent input and must not disappear in this filter.
+    for frame in inputs:
+        if frame.empty and (frame.attrs.get("price_basis_reason") or frame.attrs.get("observed_price_basis")):
+            raise ValueError("daily_merge_rejected_empty_evidence")
+    frames = [frame for frame in inputs if not frame.empty]
     if not frames:
         return pd.DataFrame(columns=STANDARD_DAILY_COLUMNS)
     raw_merged = pd.concat(frames, ignore_index=True)
+    # concat can discard differing attrs. Inspect each input before concatenation
+    # as well as the complete set before any same-day coalescing.
+    input_basis = [classify_frame_price_basis(frame) for frame in frames]
+    _combined_basis, combined_reason = classify_frame_price_basis(raw_merged)
+    basis_reason = next((reason for _basis, reason in input_basis if reason), combined_reason)
     symbol = str(raw_merged["symbol"].dropna().iloc[-1] if "symbol" in raw_merged.columns and not raw_merged["symbol"].dropna().empty else "")
+    if basis_reason:
+        # Do not normalize the frames independently: a bad-date qfq row could
+        # vanish from one frame before its conflict with another raw frame is kept.
+        raw_merged.attrs.update(observed_price_basis=PRICE_BASIS_UNKNOWN, price_basis_reason=basis_reason)
+        rejected, warnings = normalize_daily_df(raw_merged, symbol)
+        rejected.attrs["warnings"] = [
+            str(item) for frame in inputs for item in frame.attrs.get("warnings", []) if item
+        ] + warnings
+        return rejected
     normalized_frames: list[pd.DataFrame] = []
     input_warnings: list[str] = []
     for frame in frames:
@@ -393,7 +445,8 @@ def merge_daily_frames(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFr
             normalized_frames.append(normalized_frame)
     if not normalized_frames:
         return pd.DataFrame(columns=STANDARD_DAILY_COLUMNS)
-    normalized = pd.concat(normalized_frames, ignore_index=True).sort_values("date")
+    normalized = pd.concat(normalized_frames, ignore_index=True)
+    normalized = normalized.sort_values("date", kind="stable")
     if normalized.empty:
         return normalized
     warnings: list[str] = []
@@ -418,6 +471,9 @@ def merge_daily_frames(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFr
                 base_symbol = str(base.get("symbol") or symbol or "").strip()
                 warnings.append(f"adjust_mismatch:{base_symbol}:{_date}:{','.join(ordered_adjust)}")
         for column in STANDARD_DAILY_COLUMNS:
+            # Do not borrow another row's prices, basis or acquisition identity.
+            if column in {"open", "high", "low", "close", "adjust", "source", "updated_at"}:
+                continue
             if column not in group.columns or not _missing(base.get(column)):
                 continue
             values = group[column].dropna()
@@ -448,7 +504,18 @@ def write_daily(
     nested acquire from a caller that already holds it would deadlock.
     """
 
+    # attrs are not serialized to CSV. Reject unknown/mixed original evidence
+    # here so a caller cannot persist only its apparently-clean surviving rows.
+    # Single known qfq/hfq research frames remain supported; engine enforces raw.
+    renamed = frame.rename(columns={c: DAILY_COLUMN_ALIASES.get(str(c).strip(), str(c).strip()) for c in frame.columns})
+    if list(renamed.columns).count("adjust") > 1:
+        raise ValueError("ambiguous_daily_adjust_columns")
+    _basis, reason = classify_frame_price_basis(renamed)
+    if reason:
+        raise ValueError(f"daily_write_price_basis:{reason}")
     normalized, _warnings = normalize_daily_df(frame, symbol, source="")
+    if normalized.empty:
+        raise ValueError("daily_write_no_valid_rows")
     base_dir = daily_dir or DAILY_DIR
     normalized_symbol = normalize_symbol(symbol)
     path = base_dir / f"{normalized_symbol}.csv"
@@ -522,6 +589,7 @@ def fetch_akshare_daily(symbol: str, start_date: str, end_date: str, *, network:
             end_date=compact_date(end_date),
             adjust="",
         )
+        frame = _with_fetch_metadata(frame, source="akshare_daily", raw_requested=True)
         return normalize_daily_df(frame, symbol, source="akshare_daily")
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(str(exc)) from exc
@@ -546,9 +614,11 @@ def fetch_ashare_daily(symbol: str, start_date: str, end_date: str, *, network: 
         raise RuntimeError("Ashare module does not expose get_price")
     try:
         frame = get_price(normalize_symbol(symbol), frequency="1d", start_date=start_date, end_date=end_date)
+        frame = _with_fetch_metadata(frame, source="ashare_daily")
         return normalize_daily_df(frame, symbol, source="ashare_daily")
     except TypeError:
         frame = get_price(normalize_symbol(symbol), frequency="1d")
+        frame = _with_fetch_metadata(frame, source="ashare_daily")
         normalized, warnings = normalize_daily_df(frame, symbol, source="ashare_daily")
         if not normalized.empty:
             dates = pd.to_datetime(normalized["date"], errors="coerce")
@@ -575,6 +645,7 @@ def fetch_mootdx_daily(symbol: str, start_date: str, end_date: str, *, network: 
             )
             raise RuntimeError(str(reason))
         frame = pd.DataFrame(payload.get("data") or [])
+        frame = _with_fetch_metadata(frame, source="mootdx_daily", captured_at=str(payload.get("retrieved_at") or ""))
         normalized, warnings = normalize_daily_df(frame, symbol, source="mootdx_daily")
         warnings.extend(payload.get("warnings") or [])
         return normalized, warnings
@@ -607,6 +678,7 @@ def fetch_tencent_daily(symbol: str, start_date: str, end_date: str, *, network:
                 f"tencent_effective_adjust={effective_adjust or 'unknown'}"
             )
         frame = pd.DataFrame(payload.get("data") or [])
+        frame = _with_fetch_metadata(frame, source="tencent_daily", captured_at=str(payload.get("retrieved_at") or ""))
         normalized, warnings = normalize_daily_df(frame, symbol, source="tencent_daily")
         warnings.extend(payload.get("warnings") or [])
         return normalized, warnings
@@ -737,7 +809,7 @@ def _fetch_baostock_daily_locked(
             ],
         )
         traded = frame.loc[status == "1"].copy()
-        traded["adjust"] = "raw"
+        traded = _with_fetch_metadata(traded, source="baostock_daily", raw_requested=True)
         normalized, warnings = normalize_daily_df(
             traded,
             symbol,
@@ -831,7 +903,7 @@ def fetch_sina_daily(
                 frame = frame.rename(columns={index_name: "date"})
             elif "index" in frame.columns:
                 frame = frame.rename(columns={"index": "date"})
-        frame["adjust"] = "raw"
+        frame = _with_fetch_metadata(frame, source="sina_daily", raw_requested=True)
         normalized, warnings = normalize_daily_df(
             frame,
             symbol,

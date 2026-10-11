@@ -232,6 +232,7 @@ def _paper_state_shape_errors(state: Any) -> list[str]:
     for key, numeric_fields in (
         ("positions", _PAPER_POSITION_NUMERIC_FIELDS),
         ("closed_positions", _PAPER_CLOSED_NUMERIC_FIELDS),
+        ("realized_reductions", _PAPER_CLOSED_NUMERIC_FIELDS),
     ):
         if key not in state:
             continue
@@ -280,6 +281,10 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(raw_closed_positions, list):
         raw_closed_positions = []
     closed_positions = [dict(row) for row in raw_closed_positions if isinstance(row, dict)]
+    raw_reductions = reconciled.get("realized_reductions")
+    if not isinstance(raw_reductions, list):
+        raw_reductions = []
+    realized_reductions = [dict(row) for row in raw_reductions if isinstance(row, dict)]
     cash = safe_float(reconciled.get("cash"), 0.0) or 0.0
     market_value = sum(safe_float(row.get("market_value"), 0.0) or 0.0 for row in positions)
     unrealized_pnl = sum(safe_float(row.get("unrealized_pnl"), 0.0) or 0.0 for row in positions)
@@ -287,11 +292,16 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
         safe_float(row.get("realized_pnl"), 0.0) or 0.0
         for row in closed_positions
     )
+    partial_realized_pnl = sum(
+        safe_float(row.get("realized_pnl"), 0.0) or 0.0
+        for row in realized_reductions
+    )
+    detail_realized_pnl = closed_realized_pnl + partial_realized_pnl
     explicit_adjustment = safe_float(reconciled.get("legacy_realized_adjustment"), None)
     if explicit_adjustment is None:
         historical_realized = safe_float(reconciled.get("realized_pnl"), None)
         explicit_adjustment = (
-            historical_realized - closed_realized_pnl
+            historical_realized - detail_realized_pnl
             if historical_realized is not None
             else 0.0
         )
@@ -299,7 +309,7 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
     totals = {
         "market_value": round(market_value, 2),
         "unrealized_pnl": round(unrealized_pnl, 2),
-        "realized_pnl": round(closed_realized_pnl + explicit_adjustment, 2),
+        "realized_pnl": round(detail_realized_pnl + explicit_adjustment, 2),
         "total_equity": round(cash + market_value, 2),
     }
     drift_fields = [
@@ -332,6 +342,7 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
     reconciled["cash"] = round(cash, 2)
     reconciled["positions"] = positions
     reconciled["closed_positions"] = closed_positions
+    reconciled["realized_reductions"] = realized_reductions
     reconciled["position_count"] = len(positions)
     reconciled["legacy_realized_adjustment"] = round(explicit_adjustment, 2)
     reconciled["warnings"] = list(dict.fromkeys(warnings))
@@ -348,6 +359,7 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
         "detail_market_value": totals["market_value"],
         "detail_unrealized_pnl": totals["unrealized_pnl"],
         "closed_realized_pnl": round(closed_realized_pnl, 2),
+        "partial_realized_pnl": round(partial_realized_pnl, 2),
         "legacy_realized_adjustment": round(explicit_adjustment, 2),
         "drift_fields": drift_fields,
         "status_mismatch_symbols": sorted(set(status_mismatches)),
@@ -955,6 +967,7 @@ def _load_state(initial_cash: float) -> dict[str, Any]:
         ]))
     data.setdefault("positions", [])
     data.setdefault("closed_positions", [])
+    data.setdefault("realized_reductions", [])
     data.setdefault("actions", [])
     data.setdefault("disclaimer", DISCLAIMER)
     data.setdefault("broker_boundary", BROKER_BOUNDARY)
@@ -1433,8 +1446,10 @@ def _summary(state: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, 
     account_scale, account_scale_note = paper_account_scale(initial_cash)
     market_value = sum(safe_float(row.get("market_value"), 0.0) or 0.0 for row in positions)
     closed_realized_pnl = sum(safe_float(row.get("realized_pnl"), 0.0) or 0.0 for row in closed)
+    reductions = state.get("realized_reductions") if isinstance(state.get("realized_reductions"), list) else []
+    partial_realized_pnl = sum(safe_float(row.get("realized_pnl"), 0.0) or 0.0 for row in reductions if isinstance(row, dict))
     legacy_realized_adjustment = safe_float(state.get("legacy_realized_adjustment"), 0.0) or 0.0
-    realized_pnl = closed_realized_pnl + legacy_realized_adjustment
+    realized_pnl = closed_realized_pnl + partial_realized_pnl + legacy_realized_adjustment
     unrealized_pnl = sum(safe_float(row.get("unrealized_pnl"), 0.0) or 0.0 for row in positions)
     total_equity = cash + market_value
     counts = Counter(str(action.get("action") or "") for action in actions)
@@ -1449,6 +1464,7 @@ def _summary(state: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, 
         "daily_pnl": round(total_equity - initial_cash, 2),
         "realized_pnl": round(realized_pnl, 2),
         "closed_realized_pnl": round(closed_realized_pnl, 2),
+        "partial_realized_pnl": round(partial_realized_pnl, 2),
         "legacy_realized_adjustment": round(legacy_realized_adjustment, 2),
         "unrealized_pnl": round(unrealized_pnl, 2),
         "position_count": len(positions),
@@ -1827,6 +1843,12 @@ def _run_conditional_auto_paper_update(
             "summary": summary,
             "positions": enriched_positions,
             "closed_positions": state.get("closed_positions") or [],
+            # 陈旧观察也要把主账的减仓明细与**显式**历史差额带全：少了这两把键，
+            # _write_auto_paper_latest() 的 reconcile 会用“已实现盈亏 − 明细”反推历史
+            # 差额，把刚发生的半卖利润写成 legacy、把 realized_reductions 清空，摘要与
+            # 对账随之不一致（T24-LATEST-REDUCTIONS-20260929）。
+            "realized_reductions": state.get("realized_reductions") or [],
+            "legacy_realized_adjustment": state.get("legacy_realized_adjustment", 0.0),
             "actions": actions,
             "daily_actions": actions,
             "decision_review": decision_review,
@@ -2143,6 +2165,8 @@ def _run_conditional_auto_paper_update(
         "summary": summary,
         "positions": latest_state.get("positions") or [],
         "closed_positions": latest_state.get("closed_positions") or [],
+        "realized_reductions": latest_state.get("realized_reductions") or [],
+        "legacy_realized_adjustment": latest_state.get("legacy_realized_adjustment", 0.0),
         "actions": actions,
         "daily_actions": actions,
         "decision_review": decision_review,
@@ -2846,12 +2870,16 @@ def _run_auto_paper_portfolio_unlocked(
     positions = _enrich_positions_with_theme_map(positions)
     yesterday_review = build_yesterday_holding_review(previous_positions, positions, actions, decision_review, freshness_gate)
     warnings = list(dict.fromkeys(str(item) for item in warnings))
+    summary_for_state = _summary({**state, "cash": round(cash, 2), "positions": positions, "closed_positions": closed_positions}, actions)
+    trade_actions = {"buy", "add", "breakout_add", "reduce_half", "take_profit", "sell", "sell_all", "stop_loss"}
     state.update({
         "schema_version": API_SCHEMA_VERSION,
         "app_version": APP_VERSION,
         "updated_at": now_text(),
         "initial_cash": safe_float(state.get("initial_cash"), initial_cash) or initial_cash,
         "cash": round(cash, 2),
+        "total_return_pct": summary_for_state["total_return_pct"],
+        "last_trade_date": (max((str(row.get("decision_date") or "")[:10] for row in actions if str(row.get("action") or "") in trade_actions), default="") or state.get("last_trade_date", "")),
         "positions": positions,
         "closed_positions": closed_positions,
         "actions": actions,
@@ -2878,6 +2906,8 @@ def _run_auto_paper_portfolio_unlocked(
         "summary": _summary(state, actions),
         "positions": positions,
         "closed_positions": closed_positions,
+        "realized_reductions": state.get("realized_reductions") or [],
+        "legacy_realized_adjustment": state.get("legacy_realized_adjustment", 0.0),
         "actions": actions,
         "daily_actions": actions,
         "decision_review": decision_review,

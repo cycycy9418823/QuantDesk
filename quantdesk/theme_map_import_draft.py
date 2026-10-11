@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -81,27 +82,43 @@ def _resolve_path(path: str | Path | None, default: Path) -> Path:
     return candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
 
 
-def _resolve_project_csv_path(path: str | Path | None, default: Path) -> Path:
-    """Resolve a user-supplied CSV path while keeping writes inside the project.
+def resolve_import_draft_output_path(path: str | Path | None = None) -> Path:
+    """Permit only the configured draft or CSVs in results/theme_map_drafts.
 
-    This guard is intentionally in the generator module, not only in the API
-    layer, so direct calls cannot write arbitrary files via ``..`` traversal or
-    absolute paths outside the repository.
+    Shared by HTTP and direct generation. Project membership alone does not
+    authorize a write: daily prices, ledgers and other results are not drafts.
+    The default is internal configuration, never a caller-supplied permission.
     """
-    if path is None or str(path).strip() == "":
-        candidate = default
-    else:
-        raw = Path(path)
-        candidate = raw if raw.is_absolute() else PROJECT_ROOT / raw
-    resolved = candidate.resolve()
-    project_root = PROJECT_ROOT.resolve()
-    try:
-        resolved.relative_to(project_root)
-    except ValueError as exc:
-        raise ValueError(f"output path must stay inside project root: {path}") from exc
-    if resolved.suffix.lower() != ".csv":
-        raise ValueError(f"output path must be a .csv file: {path}")
-    return resolved
+    if path is not None and not isinstance(path, (str, Path)):
+        raise ValueError("草稿 output 必须是 CSV 路径字符串。")
+    root = Path(os.path.abspath(PROJECT_ROOT))
+    default = Path(os.path.abspath(STOCK_THEME_MAP_IMPORT_CSV))
+    raw = default if path is None or str(path).strip() == "" else Path(path)
+    candidate = Path(os.path.abspath(raw if raw.is_absolute() else root / raw))
+    dedicated = root / "results" / "theme_map_drafts"
+    if candidate.suffix.lower() != ".csv":
+        raise ValueError("草稿 output 必须以 .csv 结尾。")
+    if not candidate.is_relative_to(root) or not (
+        candidate == default or candidate.is_relative_to(dedicated)
+    ):
+        raise ValueError("草稿只能写入配置的默认导入文件或 results/theme_map_drafts/ 内的 CSV。")
+    # Inspect every existing component, including the file itself. This also
+    # refuses Windows junctions and redirects within the allowed tree.
+    current = candidate
+    while current != root:
+        if current.is_symlink() or current.resolve() != current:
+            raise ValueError("草稿路径不能经过符号链接或目录重定向。")
+        current = current.parent
+    if candidate.resolve() != candidate or root.resolve() != root:
+        raise ValueError("草稿路径不能经过符号链接或目录重定向。")
+    return candidate
+
+
+def _resolve_project_csv_path(path: str | Path | None, default: Path) -> Path:
+    """Compatibility entrypoint; a supplied default cannot expand permission."""
+    if Path(default) != STOCK_THEME_MAP_IMPORT_CSV:
+        raise ValueError("草稿默认路径只能来自内部配置。")
+    return resolve_import_draft_output_path(path)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -437,7 +454,7 @@ def generate_import_draft(
     limit: int = 0,
     output_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    output = _resolve_project_csv_path(output_path, STOCK_THEME_MAP_IMPORT_CSV)
+    output = resolve_import_draft_output_path(output_path)
     symbols = collect_symbols(source=source, limit=limit)
     existing_import = _existing_import_by_symbol(output)
     now = now_text()

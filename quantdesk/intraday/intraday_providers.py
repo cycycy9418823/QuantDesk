@@ -381,10 +381,12 @@ def _fetch_local_existing(symbol: str, target_date: str, *, intraday_dir: Path =
             "requires_dependency": False,
             "dependency_available": True,
             "warnings": list(payload.get("warnings") or []),
-            "path": str(path),
+            "path": payload.get("path") or str(path),
             "price_only_intraday": bool(payload.get("price_only_intraday")),
             "price_basis": str(payload.get("price_basis") or "unknown"),
         }
+        if payload.get("requested_path"):
+            result["requested_path"] = payload["requested_path"]
         result = _attach_quality_gate(
             result,
             provider="local_existing",
@@ -411,14 +413,16 @@ def _fetch_local_existing(symbol: str, target_date: str, *, intraday_dir: Path =
         else:
             result["suggested_next_action"] = "本地分钟线未通过质量门（不完整/单行/price-only/目标日不足），请补全或改用其他 provider。"
         return result
-    status = "skipped" if not path.exists() else "failed"
-    reason = "本地分钟线文件不存在" if not path.exists() else "; ".join(payload.get("errors") or ["本地分钟线不覆盖目标日期"])
+    status = "skipped" if not payload.get("exists") else "failed"
+    reason = "本地分钟线文件不存在" if not payload.get("exists") else "; ".join(payload.get("errors") or ["本地分钟线不覆盖目标日期"])
     result = _empty_result("local_existing", symbol, target_date, status, reason)
     if status == "skipped":
         result["skipped_reason"] = "本地没有目标日期分钟线"
         result["suggested_next_action"] = "请尝试 provider 或导入 CSV。"
     result["warnings"] = list(payload.get("warnings") or [])
-    result["path"] = str(path)
+    result["path"] = payload.get("path") or str(path)
+    if payload.get("requested_path"):
+        result["requested_path"] = payload["requested_path"]
     return result
 
 

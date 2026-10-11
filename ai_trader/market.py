@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -36,43 +37,97 @@ def hunting_ground(symbols: list[str], *, limit: int = 240) -> list[str]:
     return picked
 
 
-def last_bar_date(path: Path) -> str | None:
-    if not path.is_file():
-        return None
+def _tail_lines(path: Path, *, window: int = 4000) -> list[str]:
     with path.open("rb") as handle:
         handle.seek(0, 2)
         size = handle.tell()
-        handle.seek(max(size - 4000, 0))
+        handle.seek(max(size - window, 0))
         chunk = handle.read().decode("utf-8", errors="ignore")
-    lines = [line for line in chunk.splitlines() if line.strip()]
-    if not lines:
-        return None
-    for token in lines[-1].split(",")[:4]:
-        text = token.strip().strip('"')
-        if len(text) >= 10 and text[0:4].isdigit() and text[4] in "-/":
-            return text[:10]
+    return [line for line in chunk.splitlines() if line.strip()]
+
+
+def _header_columns(path: Path) -> list[str]:
+    """真表头永远在第一行：长 CSV 的尾块里根本没有表头，不能拿尾块首行当表头。"""
+
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        first = handle.readline()
+    return [part.strip().strip('"').lower() for part in first.split(",")]
+
+
+def _looks_like_date(text: str) -> bool:
+    return len(text) >= 10 and text[0:4].isdigit() and text[4] in "-/"
+
+
+def _valid_day(text: str) -> str:
+    """只有真正的日历日期才算有效行：``2026-99-99`` 这种外形像日期的不算。"""
+
+    candidate = str(text or "").strip()[:10].replace("/", "-")
+    if len(candidate) != 10 or candidate[4] != "-" or candidate[7] != "-":
+        return ""
+    try:
+        return date.fromisoformat(candidate).isoformat()
+    except ValueError:
+        return ""
+
+
+def _price_column_index(columns: list[str]) -> int | None:
+    for key in ("pct_chg", "close"):
+        if key in columns:
+            return columns.index(key)
     return None
 
 
+def _latest_dated_bars(path: Path, *, wanted: int = 2) -> list[tuple[str, list[str]]]:
+    """最后 ``wanted`` 条**有有效日期**的行（倒序找）。
+
+    - 这样长 CSV 不因为尾块没表头就丢字段；
+    - 末尾有半截/残缺行也不会被当成真实最新行（它连日期都不成立）；
+    - 但**不会**因为最新那行的涨跌缺失就退回更老的 bar：最新行就是最新行，
+      读不到就如实返回未知，不能拿陈旧的一行冒充"今天"。
+    """
+
+    columns = _header_columns(path)
+    found: list[tuple[str, list[str]]] = []
+    for line in reversed(_tail_lines(path)):
+        values = [part.strip().strip('"') for part in line.split(",")]
+        if len(values) < 2:
+            continue
+        if columns and [value.lower() for value in values] == columns:
+            continue  # 表头
+        if len(columns) > 1 and len(values) != len(columns):
+            continue  # 缺列或多列的坏行都不是真实 bar（只"不少于表头"不够）
+        day = next((value for value in (_valid_day(item) for item in values[:4]) if value), "")
+        if not day:
+            continue
+        found.append((day, values))
+        if len(found) >= wanted:
+            break
+    return found
+
+
+def last_bar_date(path: Path) -> str | None:
+    if not Path(path).is_file():
+        return None
+    bars = _latest_dated_bars(path, wanted=1)
+    return bars[0][0] if bars else None
+
+
 def last_bar_pct_chg(path: Path) -> float | None:
-    if not path.is_file():
+    if not Path(path).is_file():
         return None
-    with path.open("rb") as handle:
-        handle.seek(0, 2)
-        size = handle.tell()
-        handle.seek(max(size - 4000, 0))
-        chunk = handle.read().decode("utf-8", errors="ignore")
-    lines = [line for line in chunk.splitlines() if line.strip()]
-    if len(lines) < 2:
+    bars = _latest_dated_bars(path, wanted=2)
+    if not bars:
         return None
-    header = [part.strip().lower() for part in lines[0].split(",")]
-    values = lines[-1].split(",")
-    if "pct_chg" in header and header.index("pct_chg") < len(values):
-        return _safe_float(values[header.index("pct_chg")])
-    if "close" in header and header.index("close") < len(values):
-        close = _safe_float(values[header.index("close")])
-        prev_values = lines[-2].split(",")
-        prev = _safe_float(prev_values[header.index("close")]) if header.index("close") < len(prev_values) else None
+    columns = _header_columns(path)
+    _day, values = bars[0]
+    if "pct_chg" in columns and columns.index("pct_chg") < len(values):
+        return _safe_float(values[columns.index("pct_chg")])
+    if "close" in columns and columns.index("close") < len(values):
+        close = _safe_float(values[columns.index("close")])
+        if len(bars) < 2:
+            return None
+        prev_values = bars[1][1]
+        prev = _safe_float(prev_values[columns.index("close")]) if columns.index("close") < len(prev_values) else None
         if close and prev and prev > 0:
             return (close / prev - 1.0) * 100.0
     return None
@@ -96,19 +151,28 @@ def focus_universe(
         if code and code not in pinned:
             pinned.append(code)
     dated: list[tuple[str, float, str]] = []
+    latest_day: dict[str, str] = {}
     if root.is_dir():
-        for path in root.glob("*.csv"):
+        for path in sorted(root.glob("*.csv")):
             symbol = path.stem.strip()
             if not (symbol.isdigit() and len(symbol) == 6):
                 continue
             bar_date = last_bar_date(path)
             if not bar_date:
                 continue
-            dated.append((bar_date, abs(last_bar_pct_chg(path) or 0.0), symbol))
-    available = {row[0] for row in dated}
-    target = as_of if as_of in available else (max(available) if available else as_of)
+            # "今天"由**每个文件的最新有效日期**决定，与涨跌是否读得到无关。
+            latest_day[symbol] = bar_date
+            change = last_bar_pct_chg(path)
+            if change is None:
+                # 涨跌读不到的票不是"异动"：既不能给它名次，也不能凭文件名顺序
+                # 冒充一份排名（T17）。它只会在真实异动之后按代码顺序垫底出现。
+                continue
+            dated.append((bar_date, abs(float(change)), symbol))
+    days = set(latest_day.values())
+    target = as_of if as_of in days else (max(days) if days else as_of)
     movers = [(change, symbol) for day, change, symbol in dated if day == target]
-    movers.sort(reverse=True)
+    # 排序只按真实涨跌；同值时用代码升序，保证结果与文件/glob 顺序无关。
+    movers.sort(key=lambda item: (-item[0], item[1]))
     names = list(pinned)
     for _change, symbol in movers:
         if symbol not in names:

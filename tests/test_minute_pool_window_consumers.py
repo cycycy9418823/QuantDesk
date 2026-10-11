@@ -327,6 +327,8 @@ def _write_minute_row(path: Path, symbol: str, trade_date: str = WINDOW_START) -
                 "close": 10.2,
                 "volume": 1000,
                 "amount": 10200,
+                # T08：合成分钟库是未复权原始报价，显式声明口径。
+                "adjust": "raw",
             }
         ]
     ).to_csv(path, index=False, encoding="utf-8-sig")
@@ -344,6 +346,8 @@ def _intraday_frame(symbol: str, trade_date: str) -> pd.DataFrame:
                 "close": 10.2,
                 "volume": 1000,
                 "amount": 10200,
+                # T08：同上，显式声明 raw。
+                "adjust": "raw",
             }
         ]
     )

@@ -1,8 +1,8 @@
 """Owner pause/resume for writers only. Readers stay on.
 
-``qd pause`` stops the Data Close Pipeline and the 20:20 AI trader.
-The snapshot collector is paused if that task exists. Old disabled data
-tasks are left disabled. Resume only re-enables what this command paused.
+``qd pause`` manages the exact market-data and paper-writer task inventory.
+The legacy snapshot collector is included if present. Reader tasks may still
+write reports/status. Resume only re-enables what this command paused.
 """
 
 from __future__ import annotations
@@ -20,6 +20,9 @@ WRITER_TASKS = (
     "QuantDesk Data Close Pipeline",
     "QuantDesk AI Trader Evening",
     "QuantDesk Snapshot Collector",
+    "QuantDesk AI Trader Evening (GLM)",
+    "QuantDesk Intraday Data Refresh",
+    "QuantDesk Snapshot Pull",
 )
 STATE_RELATIVE = Path("state") / "desk_control.json"
 DISCLAIMER = "纸面 · 未验证"
@@ -150,6 +153,28 @@ def pause_writers(
     failed: list[str] = []
     actions: list[dict[str, Any]] = []
     writer_stops: list[dict[str, str]] = []
+    preview: list[dict[str, Any]] = []
+    for item in queried:
+        state = item.get("state")
+        if not item["exists"]:
+            planned = "missing"
+        elif item.get("query_failed"):
+            planned = "query_failed"
+        elif _is_disabled_state(state):
+            planned = "already_disabled"
+        elif _is_running_state(state):
+            planned = "end_then_disable"
+        elif _is_stopped_state(state):
+            planned = "disable"
+        else:
+            planned = "needs_confirmation"
+        preview.append({
+            "name": item["name"], "state": state, "planned_action": planned,
+            "stop_confirmation_required": planned == "end_then_disable",
+            "error": item.get("error", ""),
+        })
+        if not apply and planned in {"query_failed", "needs_confirmation"}:
+            failed.append(str(item["name"]))
     if apply:
         for item in queried:
             name = str(item["name"])
@@ -229,8 +254,10 @@ def pause_writers(
         "writer_stops": writer_stops,
         "skipped_missing_or_already_disabled": skipped,
         "actions": actions,
+        "preview": preview,
+        "runtime_quiescence_proven": False,
         "readers_left_on": True,
-        "note": "只停写手和 20:20 AI。正在跑的会先结束再禁用下次调度。早报、复盘等读者任务不动。暂停期间缺的数据就是缺，恢复后不补。",
+        "note": "仅管理清单中的行情采集、同步和两档纸面写手；预览只查询。实际暂停尝试结束运行、核实停止状态并禁用下次调度；未确认停止时仍明确报告等待或失败。读者仍可写报告和状态；不证明手工写手、孤儿进程或整机已静默。暂停缺口不自动补。",
     }
     return payload
 
@@ -292,6 +319,7 @@ def resume_writers(
         "apply": bool(apply),
         "disclaimer": DISCLAIMER,
         "resumed_tasks": resumed,
+        "preview": [{"name": name, "planned_action": "enable_recorded_task"} for name in names],
         "failed_tasks": failed,
         "actions": actions,
         "note": "只恢复上次 pause 停掉的写手。旧的已禁用数据任务不会被重新打开。失败时保留暂停记录。",

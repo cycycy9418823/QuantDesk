@@ -8,11 +8,15 @@ list so disk and provider load stay bounded.
 from __future__ import annotations
 
 import csv
+import hashlib
+import io
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from quantdesk.shared import normalize_symbol
 from quantdesk.utils import atomic_write_json
@@ -34,12 +38,17 @@ SPOT_COLUMNS = (
     "quote_time",
     "quote_date",
     "source",
+    "fetched_at",
 )
 
 LIMIT_PCT = 9.5
 MOVER_PCT = 7.0
 TOP_AMOUNT = 20
 MAX_MOVERS = 80
+# Match the existing spot/observation 300-second limit. This is not a change
+# to the separate minute-bar freshness or paper execution rules.
+SYNCED_SNAPSHOT_MAX_AGE_SECONDS = 300
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 COLUMN_ALIASES = {
     "代码": "symbol",
@@ -74,7 +83,7 @@ def _num(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if number != number:
+    if not math.isfinite(number):
         return None
     return number
 
@@ -106,6 +115,7 @@ def _row_from_mapping(raw: Mapping[str, Any], *, source: str, now: datetime) -> 
         "quote_time": quote_time,
         "quote_date": quote_date[:10],
         "source": str(mapped.get("source") or source),
+        "fetched_at": str(mapped.get("fetched_at") or ""),
     }
 
 
@@ -145,7 +155,7 @@ def select_mover_symbols(
     ranked: list[tuple[int, float, str, str]] = []
     amount_sorted = sorted(
         rows,
-        key=lambda row: float(row.get("amount") or 0),
+        key=lambda row: _num(row.get("amount")) or 0,
         reverse=True,
     )
     top_amount = {
@@ -166,7 +176,7 @@ def select_mover_symbols(
         elif abs(pct) >= MOVER_PCT:
             ranked.append((1, -abs(pct), symbol, "snapshot_mover"))
         elif symbol in top_amount:
-            ranked.append((2, -float(row.get("amount") or 0), symbol, "snapshot_top_amount"))
+            ranked.append((2, -(_num(row.get("amount")) or 0), symbol, "snapshot_top_amount"))
     ranked.sort()
     out: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -186,6 +196,7 @@ def write_spot_snapshot(
     *,
     source: str,
     now: datetime,
+    evidence: Mapping[str, Any] | None = None,
 ) -> Path:
     path = root / SPOT_RELATIVE
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -202,13 +213,106 @@ def write_spot_snapshot(
         "temporary_quote_only": True,
         "message": "盘中全市场快照，覆盖写入；不替代正式日线，不代表全市场 1 分钟 K。",
     }
+    if evidence:
+        meta.update(evidence)
     atomic_write_json(root / SPOT_META_RELATIVE, meta)
     return path
+
+
+def _quote_stamp(row: Mapping[str, Any], trade_date: str) -> datetime | None:
+    raw_time = str(row.get("quote_time") or "").strip()
+    if not raw_time:
+        return None
+    stamp = raw_time if "-" in raw_time or "/" in raw_time else f"{row.get('quote_date') or trade_date} {raw_time}"
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("/", "-"))
+        if row.get("quote_date") and str(row["quote_date"])[:10] != parsed.date().isoformat():
+            return None
+        return parsed.replace(tzinfo=SHANGHAI) if parsed.tzinfo is None else parsed.astimezone(SHANGHAI)
+    except ValueError:
+        return None
+
+
+def _synced_snapshot(
+    root: Path, current: datetime,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Read a recent verified A0 slot, preserving the provider's original fields."""
+    from quantdesk.snapshot_history import _quote_time_state, _slot_evidence, _valid_price
+
+    reference = current.replace(tzinfo=SHANGHAI) if current.tzinfo is None else current.astimezone(SHANGHAI)
+    day = reference.date().isoformat()
+    directory = root / "data" / "snapshots" / day
+    reasons = []
+    paths = sorted((path for path in directory.glob("[0-9][0-9][0-9][0-9].csv")
+                    if path.stem <= reference.strftime("%H%M")), reverse=True)
+    for path in paths:
+        # Older slot names cannot conceal a fresh observation: reject them
+        # before reading thousands of rows from the rest of the day's archive.
+        try:
+            slot = datetime.strptime(day + path.stem, "%Y-%m-%d%H%M").replace(tzinfo=SHANGHAI)
+        except ValueError:
+            continue
+        if (reference - slot).total_seconds() > SYNCED_SNAPSHOT_MAX_AGE_SECONDS + 300:
+            break
+        proof = _slot_evidence(root, day, path.stem)
+        if proof.get("status") not in {"complete", "partial"}:
+            reasons.append(f"synced_snapshot_invalid:{path.stem}")
+            continue
+        meta, quality = proof["metadata"], proof["quality"]
+        if quality.get("fetch_outside_slot") or meta["source"] == "unknown_provider":
+            reasons.append(f"synced_snapshot_capture_unverified:{path.stem}")
+            continue
+        fetched = datetime.fromisoformat(meta["fetched_at"])
+        capture_age = (reference - fetched).total_seconds()
+        if not 0 <= capture_age <= SYNCED_SNAPSHOT_MAX_AGE_SECONDS:
+            reasons.append(f"synced_snapshot_stale:{path.stem}")
+            continue
+        try:
+            raw = path.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != meta["csv_sha256"]:
+                reasons.append(f"synced_snapshot_changed:{path.stem}")
+                continue
+            original = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
+        except (OSError, UnicodeError, csv.Error):
+            reasons.append(f"synced_snapshot_read_failed:{path.stem}")
+            continue
+        rows = []
+        for row in original:
+            quote = _quote_stamp(row, day)
+            if (_valid_price(row.get("price")) and quote is not None
+                    and _quote_time_state(row, day, fetched_at=fetched) == "usable"
+                    and 0 <= (reference - quote).total_seconds() <= SYNCED_SNAPSHOT_MAX_AGE_SECONDS):
+                # No normalizer: a missing quote_date or pct_chg stays missing.
+                rows.append({name: row.get(name, "") for name in SPOT_COLUMNS})
+        if not rows:
+            reasons.append(f"synced_snapshot_no_fresh_quotes:{path.stem}")
+            continue
+        partial = proof["status"] != "complete" or len(rows) != len(original)
+        evidence = {
+            "reused": True, "reused_at": reference.isoformat(timespec="seconds"),
+            "updated_at": meta["fetched_at"], "source_fetched_at": meta["fetched_at"],
+            "archive_path": path.relative_to(root).as_posix(), "archive_sha256": meta["csv_sha256"],
+            "archive_slot": path.stem, "archive_row_count": len(original), "archive_quality": quality,
+            "capture_age_seconds": capture_age, "max_quote_age_seconds": SYNCED_SNAPSHOT_MAX_AGE_SECONDS,
+            "excluded_quote_count": len(original) - len(rows),
+            "reason_codes": [*reasons, *meta.get("warnings", []), *(["synced_snapshot_partial"] if partial else [])],
+        }
+        return {"rows": rows, "source": meta["source"], "status": "partial" if partial else "reused",
+                "ok": not partial, "evidence": evidence}, reasons
+    return None, reasons
 
 
 # A page that cannot even get this much of the round's remaining window is not
 # started: half-started requests are what let a "bounded" round overrun.
 SINA_SPOT_MINIMUM_PAGE_SECONDS = 0.5
+
+
+class _SpotPageRows(list):
+    """List-compatible provider rows with explicit pagination completion."""
+
+    def __init__(self):
+        super().__init__()
+        self.pagination = {"complete": False, "pages_completed": 0, "failed_page": None, "reason_codes": []}
 
 
 def _fetch_sina_spot_pages(
@@ -237,10 +341,10 @@ def _fetch_sina_spot_pages(
 
     url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
     headers = {"User-Agent": "Mozilla/5.0"}
-    rows: list[dict[str, Any]] = []
-    today = datetime.now().strftime("%Y-%m-%d")
+    rows = _SpotPageRows()
     for page in range(1, max_pages + 1):
         if deadline is not None and deadline - tick() <= SINA_SPOT_MINIMUM_PAGE_SECONDS:
+            rows.pagination["reason_codes"].append(f"sina_spot_deadline_exhausted:page={page}")
             break
         params = {
             "page": page,
@@ -275,22 +379,42 @@ def _fetch_sina_spot_pages(
                     raise TimeoutError("sina_spot_response_after_deadline")
                 break
             except Exception as exc:  # noqa: BLE001
+                payload = None
                 last_error = exc
                 if attempt == 0:
                     time.sleep(0.3)
         if payload is None:
             if rows:
+                rows.pagination.update(failed_page=page)
+                error_type = type(last_error).__name__ if last_error is not None else "budget_exhausted"
+                rows.pagination["reason_codes"].append(f"sina_spot_page_failed:page={page}:{error_type}")
                 return rows
             raise last_error or RuntimeError("sina_spot_empty")
-        if not isinstance(payload, list) or not payload:
+        if not isinstance(payload, list):
+            rows.pagination.update(failed_page=page)
+            rows.pagination["reason_codes"].append(f"sina_spot_invalid_page:page={page}")
             break
+        rows.pagination["pages_completed"] += 1
+        if not payload:
+            rows.pagination["complete"] = True
+            break
+        invalid = 0
         for item in payload:
-            if isinstance(item, dict):
+            symbol = normalize_symbol(item.get("symbol") or item.get("code") or "") if isinstance(item, dict) else ""
+            if len(symbol) != 6 or not symbol.isdigit():
+                invalid += 1
+            else:
                 rows.append(item)
+        if invalid:
+            rows.pagination.update(failed_page=page)
+            rows.pagination["reason_codes"].append(f"sina_spot_invalid_rows:page={page}:count={invalid}")
+            break
         if len(payload) < page_size:
+            rows.pagination["complete"] = True
             break
         time.sleep(0.05)
-    _ = today
+    if not rows.pagination["complete"] and not rows.pagination["reason_codes"]:
+        rows.pagination["reason_codes"].append("sina_spot_page_limit_reached")
     return rows
 
 
@@ -360,7 +484,7 @@ def refresh_full_market_snapshot(
     budget_seconds: float | None = None,
     clock: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
-    """Overwrite the latest full-A spot CSV. Never writes per-symbol 1m files.
+    """Reuse an archived snapshot or fetch the latest full-A spot CSV.
 
     ``budget_seconds`` is the calling round's remaining budget.  It is passed
     down to the default provider chain so the snapshot itself is bounded by the
@@ -390,6 +514,22 @@ def refresh_full_market_snapshot(
         }
     if expired():
         return timed_out()
+    reuse_reasons: list[str] = []
+    if fetcher is None:
+        reused, reuse_reasons = _synced_snapshot(root, current)
+        if expired():
+            return timed_out()
+        if reused is not None:
+            rows, evidence = reused["rows"], reused["evidence"]
+            # The archive already owns its source/time evidence. Use it for
+            # this round's scope, without copying clock-only timestamps into
+            # the legacy spot cache whose readers may infer today's date.
+            movers = select_mover_symbols(rows)
+            return {
+                "ok": reused["ok"], "status": reused["status"], "published": False, "row_count": len(rows),
+                "source": reused["source"], "path": evidence["archive_path"],
+                "movers": movers, "mover_count": len(movers), **evidence,
+            }
     try:
         if fetcher is not None:
             payload, source = fetcher()
@@ -403,7 +543,7 @@ def refresh_full_market_snapshot(
             "status": "provider_failed",
             "row_count": 0,
             "movers": [],
-            "reason_codes": [f"spot_snapshot_failed:{type(exc).__name__}"],
+            "reason_codes": [*reuse_reasons, f"spot_snapshot_failed:{type(exc).__name__}"],
             "error": f"{type(exc).__name__}:{exc}"[:400],
         }
     if expired():
@@ -419,15 +559,24 @@ def refresh_full_market_snapshot(
         }
     if expired():
         return timed_out()
-    path = write_spot_snapshot(root, rows, source=source, now=current)
+    pagination = getattr(payload, "pagination", {})
+    partial = bool(pagination) and pagination.get("complete") is not True
+    reason_codes = [*reuse_reasons, *pagination.get("reason_codes", [])]
+    if len(rows) < len(payload):
+        partial = True
+        reason_codes.append(f"spot_snapshot_normalization_dropped_rows:{len(payload) - len(rows)}")
+    evidence = {"pagination": pagination, "reason_codes": reason_codes, "pagination_complete": pagination.get("complete") is True} if pagination else None
+    path = write_spot_snapshot(root, rows, source=source, now=current, evidence=evidence)
     movers = select_mover_symbols(rows)
     return {
-        "ok": True,
-        "status": "refreshed",
+        "ok": not partial,
+        "status": "partial" if partial else "refreshed",
+        "published": True,
         "row_count": len(rows),
         "source": source,
         "path": str(path.relative_to(root)).replace("\\", "/"),
         "movers": movers,
         "mover_count": len(movers),
-        "reason_codes": [],
+        "pagination": pagination,
+        "reason_codes": reason_codes,
     }

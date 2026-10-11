@@ -108,7 +108,9 @@ def collect_current_review_symbols(target_date: str | None = None) -> list[str]:
 
 
 def _has_intraday_for_date(symbol: str, trade_date: str) -> bool:
-    path = INTRADAY_1M_DIR / f"{symbol}.csv"
+    from quantdesk.intraday.minute_storage import resolve_minute_read_path
+
+    path = resolve_minute_read_path(INTRADAY_1M_DIR / f"{symbol}.csv")
     if not path.exists() or not trade_date:
         return False
     try:

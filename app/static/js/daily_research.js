@@ -124,6 +124,18 @@ function escapeHtml(value) {
         .replaceAll("'", "&#039;");
 }
 
+// 固定门：默认只开 http://127.0.0.1:8000/（launcher 默认不漂端口）。
+const PROJECT_STATUS_DOOR = "http://127.0.0.1:8000/";
+const PROJECT_STATUS_SERVICE_DOWN_HINT =
+    `主服务可能没在运行：先双击项目根目录的 start_ui.cmd（或运行 python scripts/qd.py app），`
+    + `等窗口里出现 ${PROJECT_STATUS_DOOR} 再刷新本页；默认只开 8000，不漂到别的端口。`;
+
+function looksLikeServerUnreachable(error) {
+    const text = errorText(error).toLowerCase();
+    return ["failed to fetch", "fetch failed", "networkerror", "network error", "load failed", "econnrefused"]
+        .some((token) => text.includes(token));
+}
+
 let projectStatusLastOk = null;
 let projectStatusFullOpen = false;
 
@@ -172,15 +184,16 @@ function renderOwnerRuntimeSummary(observations) {
     const ratioKnown = typeof snapshot.valid_quote_ratio === "number"
         && Number.isFinite(snapshot.valid_quote_ratio) && snapshot.valid_quote_ratio >= 0 && snapshot.valid_quote_ratio <= 1;
     const quoteText = ratioKnown ? `有效报价 ${(snapshot.valid_quote_ratio * 100).toFixed(2)}%` : "有效报价比例未知";
+    const slotsText = slotsKnown
+        ? `${snapshot.collected_slots} / ${snapshot.expected_slots} 次${snapshot.collected_slots < snapshot.expected_slots ? "（半份·当日未跑满）" : ""}`
+        : "采集次数未知";
     const card = (label, stamp, main, badge, tone, detail) => `<article class="owner-runtime-card">
         <div class="owner-runtime-card-head"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(stamp || "日期未知")}</span></div>
         <div class="owner-runtime-value">${escapeHtml(main)}</div>
         <span class="owner-runtime-badge ${tone}">${escapeHtml(badge)}</span>
         <p>${escapeHtml(detail || "尚无可确认记录")}</p>
     </article>`;
-    const cards = [card("行情采集", snapshot.as_of,
-        slotsKnown ? `${snapshot.collected_slots} / ${snapshot.expected_slots} 次` : "采集次数未知",
-        quoteText, "owner-tone-data", snapshot.message)];
+    const cards = [card("行情采集", snapshot.as_of, slotsText, quoteText, "owner-tone-data", snapshot.message)];
     for (const [profile, label] of [["default", "默认档"], ["glm", "GLM 档"]]) {
         const item = observations.profiles?.[profile] || {};
         const replied = item.model_replied;
@@ -194,14 +207,14 @@ function renderOwnerRuntimeSummary(observations) {
         <p class="section-note">${escapeHtml(observations.source_label || "已有运行记录")}；各项日期分别列出。</p>`;
 }
 
-function renderProjectStatusFailure(message, keepPrevious, readAt = "") {
+function renderProjectStatusFailure(message, keepPrevious, readAt = "", hint = "") {
     if (!keepPrevious) renderOwnerRuntimeSummary(null);
     const banner = document.getElementById("projectStatusBanner");
     if (banner) {
         banner.hidden = false;
-        banner.textContent = keepPrevious
-            ? `上次读取；本次失败。${message} 这是状态文件问题，不是账本清空，也不是行情全部坏掉。`
-            : `${message} 这是状态文件问题，不是账本清空，也不是行情全部坏掉。`;
+        const prefix = keepPrevious ? "上次读取；本次失败。" : "";
+        const tail = "这是状态文件问题，不是账本清空，也不是行情全部坏掉。";
+        banner.textContent = `${prefix}${message} ${hint ? `${hint} ` : ""}${tail}`;
     }
     setText("projectStatusReadTime", readAt || "本次读取失败（服务器时间未提供）");
     const health = document.getElementById("projectStatusHealth");
@@ -313,11 +326,13 @@ async function loadProjectStatus() {
         renderProjectStatusPayload(data, { stale: false });
     } catch (error) {
         const message = `本次读取失败：${errorText(error)}`;
+        // 连不上服务器＝门没开（服务未运行或已退出）：给一句能照做的恢复指令。
+        const hint = looksLikeServerUnreachable(error) ? PROJECT_STATUS_SERVICE_DOWN_HINT : "";
         if (projectStatusLastOk) {
             renderProjectStatusPayload(projectStatusLastOk, { stale: true });
-            renderProjectStatusFailure(message, true);
+            renderProjectStatusFailure(message, true, "", hint);
         } else {
-            renderProjectStatusFailure(message, false);
+            renderProjectStatusFailure(message, false, "", hint);
         }
     } finally {
         if (refresh) refresh.disabled = false;
@@ -1316,7 +1331,12 @@ function renderDecisionOutcomeSummary(source) {
             <div class="owner-review-number">${mature}<small>条</small></div>
             <p>观察期已结束的个股结果</p><p class="section-note">${result}${unknown}</p>
             <dl><dt>提前命中，还在观察</dt><dd>${numberText(group.early_hits)} 条</dd>
-                <dt>尚在等待结果</dt><dd>${numberText(group.pending)} 条</dd></dl></article>`;
+                <dt>尚在等待结果</dt><dd>${numberText(group.pending)} 条</dd>
+                <dt>到期缺证据</dt><dd>${numberText(group.due_evidence_gap)} 条</dd>
+                <dt>未接收 / 陈述不符</dt><dd>${numberText(group.unaccepted)} / ${numberText(group.statement_mismatch)} 条</dd>
+                <dt>补证后重评（另计）</dt><dd>${numberText(group.rechecked)} 条</dd>
+                <dt>重评对 / 错 / 仍缺证</dt><dd>${numberText(group.rechecked_correct)} / ${numberText(group.rechecked_wrong)} / ${numberText(group.recheck_gap)} 条</dd></dl>
+                <p class="section-note">补证评价不改原判断，不混入原观察期正确率；仍缺证不算对或错。</p></article>`;
     });
     return `<div class="owner-review-summary">
         <p class="section-note">核对截至 ${escapeHtml(summary.as_of || "日期未知")}。
@@ -1354,6 +1374,14 @@ function renderAiDecisionRecord(row, index) {
         <div class="review-decision-body">
             <dl>${fields.map(([label, value]) => `<dt>${text(label)}</dt><dd>${text(value)}</dd>`).join("")}</dl>
             <details><summary>核对证据</summary><pre>${text(JSON.stringify(row.result_evidence ?? [], null, 2))}</pre></details>
+            ${Array.isArray(row.statement_unverified) && row.statement_unverified.length
+                ? `<details><summary>未核验陈述（不算确定对错）</summary><pre>${text(JSON.stringify(row.statement_unverified, null, 2))}</pre></details>` : ""}
+            ${row.recheck && typeof row.recheck === "object" ? `<section class="section-note">
+                <strong>补证后重评 · 原判断及原结果保留</strong>
+                <dl><dt>重评截至</dt><dd>${text(row.recheck.as_of)}</dd>
+                    <dt>关联结果</dt><dd>${text(row.recheck.result || "未核验")}</dd>
+                    <dt>证据状态</dt><dd>${text(row.recheck.evidence_status)}</dd></dl>
+                <details><summary>补充证据</summary><pre>${text(JSON.stringify(row.recheck, null, 2))}</pre></details></section>` : ""}
             ${row.symbol ? `<button type="button" class="action-button" data-review-index="${index}" data-review-symbol="${text(row.symbol)}">查看 ${text(row.symbol)}</button>` : ""}
         </div>
     </details>`;
@@ -1796,9 +1824,9 @@ async function loadAiTraderPanel() {
 function renderAiTraderDashboard(payload) {
     renderAiTraderWarnings(payload.warnings || [], payload.degraded === true);
     renderAiTraderAccount(payload.account || {});
-    renderAiTraderSchedule(payload.schedule_status || {}, payload.llm || {});
+    renderAiTraderSchedule(payload.schedule_status || {}, payload.llm || {}, payload.source_availability?.plan === false);
     renderAiTraderLlmRuntime(payload.llm_runtime || {});
-    renderAiTraderPositions(payload.positions || [], payload.degraded === true && numericValue(payload.account?.equity) === null);
+    renderAiTraderPositions(payload.positions || [], payload.source_availability?.positions === false || (payload.degraded === true && numericValue(payload.account?.equity) === null));
     renderAiTraderJournal(payload.latest_journal || {}, payload.llm || {});
     renderAiTraderProposed(payload);
     renderAiTraderFills(payload);
@@ -1861,6 +1889,8 @@ function renderAiTraderAccount(account) {
     host.innerHTML = [
         aiTraderKv("权益（模拟）", aiTraderNum(account.equity)),
         aiTraderKv("现金", aiTraderNum(account.cash)),
+        aiTraderKv("已实现盈亏（纸面）", aiTraderNum(account.realized_pnl)),
+        aiTraderKv("未实现盈亏（纸面）", aiTraderNum(account.unrealized_pnl)),
         aiTraderKv("持仓数", aiTraderNum(account.positions_count, 0)),
         aiTraderKv("账本更新时间", safeText(account.updated_at)),
         aiTraderKv("数据日期", safeText(account.as_of)),
@@ -1868,16 +1898,19 @@ function renderAiTraderAccount(account) {
     ].join("");
 }
 
-function renderAiTraderSchedule(schedule, llm) {
+function renderAiTraderSchedule(schedule, llm, planUnavailable = false) {
     const host = document.getElementById("aiTraderSchedulePanel");
     if (!host) return;
     host.innerHTML = [
         aiTraderKv("最近复盘日期", safeText(schedule.last_journal_date)),
-        aiTraderKv("LLM 是否真实使用", schedule.llm_used ? "是 used=true" : "否 used=false"),
-        aiTraderKv("模型", safeText(llm.model || "") === "数据缺失" && !schedule.model ? "—" : safeText(schedule.model)),
-        aiTraderKv("不可用原因", schedule.unavailable_reason ? escapeHtml(String(schedule.unavailable_reason)) : "—"),
+        aiTraderKv("本次判断方式", llm.mode === "model" ? "模型判断" : llm.mode === "rule_fallback" ? "备用规则" : "未评估 / 来源未知"),
+        aiTraderKv("实际模型", escapeHtml(llm.model || "未知")),
+        aiTraderKv("记录来源", escapeHtml(llm.model_source || "未知")),
+        aiTraderKv("不可用原因", llm.unavailable_reason ? escapeHtml(String(llm.unavailable_reason)) : "—"),
+        aiTraderKv("恢复状态", escapeHtml(llm.recovery_status || "未记录")),
+        aiTraderKv("复用原判断", llm.raw_response_reused === true ? "是，保留原记录时间" : "未记录复用"),
         aiTraderKv("计划状态", humanStatus(schedule.plan_status)),
-        aiTraderKv("是否提交", schedule.plan_committed ? "committed=true" : "committed=false"),
+        aiTraderKv("是否提交", planUnavailable ? "计划缺失，提交状态未知" : schedule.plan_committed ? "committed=true" : "committed=false"),
         aiTraderKv("目标交易日", safeText(schedule.trade_date)),
         aiTraderKv("数据是否陈旧", numericValue(schedule.age_days) === null || typeof schedule.stale !== "boolean"
             ? "未知（未提供可核对的时间状态）"
@@ -1934,7 +1967,7 @@ function renderAiTraderJournal(journal, llm) {
         <p class="section-note" style="margin:4px 0;">${escapeHtml(safeText(journal.thought))}</p>
         ${aiTraderKv("复盘日期", safeText(journal.as_of))}
         ${aiTraderKv("次日计划交易日", safeText(journal.trade_date))}
-        ${llm.used
+        ${llm.mode === "unknown" ? aiTraderKv("AI 大脑", "未评估 / 来源未知") : llm.used
             ? aiTraderKv("AI 大脑", `已使用 · ${escapeHtml(safeText(llm.model))}`)
             : aiTraderKv("AI 大脑", llm.unavailable_reason
                 ? `未使用 · 原因：${escapeHtml(String(llm.unavailable_reason))}`
@@ -1947,6 +1980,10 @@ function renderAiTraderJournal(journal, llm) {
 function renderAiTraderProposed(payload) {
     const host = document.getElementById("aiTraderProposedPanel");
     if (!host) return;
+    if (payload.source_availability?.plan === false) {
+        host.innerHTML = '<div class="empty-state">计划缺失或不可读，无法判断模型提议及提交状态。</div>';
+        return;
+    }
     const proposed = Array.isArray(payload.proposed_symbols) ? payload.proposed_symbols : [];
     const notCommitted = Array.isArray(payload.proposed_not_committed_symbols) ? payload.proposed_not_committed_symbols : [];
     // Only what the backend certified as committed shows here; a deferred or
@@ -2035,7 +2072,7 @@ function renderAiTraderFills(payload) {
             <td>${escapeHtml(t.side === "buy" ? "纸面买入" : t.side === "sell" ? "纸面卖出" : safeText(t.side))}</td>
             <td>${escapeHtml(aiTraderNum(t.quantity, 0))}</td>
             <td>${escapeHtml(aiTraderNum(t.price))}</td>
-            <td>${t.status ? escapeHtml(String(t.status)) : "filled"}</td>
+            <td>${t.status ? escapeHtml(String(t.status)) : "filled"}${t.st_unknown ? `<small>身份未知 · ${escapeHtml(t.st_note || "缺少当时身份资料")}</small>` : ""}</td>
         </tr>
     `).join("");
     html += `<p class="section-note" style="margin:8px 0 4px;">已按历史开盘价完成的纸面成交：</p>`;
@@ -2043,17 +2080,23 @@ function renderAiTraderFills(payload) {
         ? `<div class="paper-table-wrap"><table class="compact-table paper-trades-table">
             <thead><tr><th>日期</th><th>代码</th><th>方向</th><th>股数</th><th>成交价</th><th>状态</th></tr></thead>
             <tbody>${fillRows}</tbody></table></div>`
-        : '<div class="empty-state">还没有纸面成交。</div>';
+        : `<div class="empty-state">${payload.source_availability?.trades === false && payload.source_availability?.actions === false
+            ? "账本与成交记录缺失，无法判断是否成交。" : "本次可读取记录中没有纸面成交。"}</div>`;
     html += `<p class="section-note" style="margin:10px 0 4px;">被拒/放弃及原因：</p>`;
     html += rejected.length
-        ? `<ul class="section-note" style="margin:0;padding-left:18px;">${rejected.slice(0, 6).map((r) => `<li>${escapeHtml(safeText(r.symbol))}：${escapeHtml(String(r.reason || r.status || "未知原因"))}</li>`).join("")}</ul>`
-        : '<div class="empty-state">没有被拒或放弃的委托。</div>';
+        ? `<ul class="section-note" style="margin:0;padding-left:18px;">${rejected.slice(0, 6).map((r) => `<li>${escapeHtml(safeText(r.symbol))}：${escapeHtml(String(r.reason || r.status || "未知原因"))}${r.st_unknown ? " · 身份未知" : ""}</li>`).join("")}</ul>`
+        : `<div class="empty-state">${payload.source_availability?.actions === false
+            ? "复盘记录缺失，无法判断是否有被拒或放弃的委托。" : "本次可读取记录中没有被拒或放弃的委托。"}</div>`;
     host.innerHTML = html;
 }
 
 function renderAiTraderPhilosophy(payload) {
     const host = document.getElementById("aiTraderPhilosophyPanel");
     if (!host) return;
+    if (payload.source_availability?.philosophy === false) {
+        host.innerHTML = '<div class="empty-state">主张记录缺失或不可读，风格战绩及修订次数未知。</div>';
+        return;
+    }
     const stance = payload.stance || {};
     const styleLedger = payload.style_ledger || {};
     const notes = Array.isArray(payload.notes) ? payload.notes : [];
@@ -8600,6 +8643,8 @@ async function loadChartOverlays(symbol, profile = "default") {
             date: recordedAt ? String(recordedAt).slice(0, 10) : plan.decision_date || "",
             event_time: recordedAt,
             target_date: plan.trade_date || "",
+            recovery_status: ai.llm?.recovery_status,
+            raw_response_reused: ai.llm?.raw_response_reused,
             label: aiLabel + (committed ? "AI·已提交" : "AI·拟议"),
             text: `${committed ? "已提交次日纸面计划" : "仅提议、未提交"}；${safeText(intent.side || "")} ${safeText(intent.quantity || "")}。不是成交。`,
             side: intent.side,
@@ -8652,6 +8697,8 @@ function renderWorkbenchEventList(overlays, chartData = {}, warnings = []) {
                 · ${escapeHtml(safeText(item.event_time || item.date))}
                 <div>${escapeHtml(status.plot ? "已画在图上" : `只在列表：${status.reasons.join("；")}`)}</div>
                 <div>${escapeHtml(safeText(item.text))}</div>
+                ${item.st_unknown ? `<p class="section-note">身份未知 · ${escapeHtml(item.st_note || "缺少当时身份资料")}</p>` : ""}
+                ${item.recovery_status || item.raw_response_reused ? `<p class="section-note">恢复状态：${escapeHtml(item.recovery_status || "未记录")} ${item.raw_response_reused ? "· 复用原判断，原时间保留" : ""}</p>` : ""}
                 <details><summary>记录与证据</summary>
                     <p>ID：${escapeHtml(safeText(item.event_id))} · 来源：${escapeHtml(safeText(item.source))} · ${escapeHtml(safeText(item.api_source))}</p>
                     <p>原价：${escapeHtml(safeText(item.price))} · 口径：${escapeHtml(safeText(item.price_basis))} · 目标日期：${escapeHtml(safeText(item.target_date))}</p>
@@ -9348,6 +9395,9 @@ async function loadHomeAiLedger() {
         const parts = [];
         if (equity === null) parts.push("AI 账权益缺失，不能据此判定空仓或亏损");
         if (data.degraded === true) parts.push("AI 账降级展示");
+        if (data.research_state?.records?.available === false) parts.push("判断记录不可读，数量未知");
+        if (data.llm?.mode === "rule_fallback") parts.push("本次使用备用规则");
+        if (data.llm?.raw_response_reused === true) parts.push("恢复原判断，原时间保留");
         if (positions !== null) parts.push(`纸面持仓 ${positions} 只`);
         if (hasValue(account.as_of)) parts.push(`截至 ${safeText(account.as_of)}`);
         subEl.textContent = parts.length ? parts.join(" · ") : "独立 AI 纸面账；数据日期未提供";

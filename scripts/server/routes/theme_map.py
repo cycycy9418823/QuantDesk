@@ -9,6 +9,7 @@ from typing import Any, Callable
 from flask import Blueprint, Flask, jsonify, request
 
 from scripts.server.helpers.util import clean_payload, safe_int
+from quantdesk.theme_map_import_draft import resolve_import_draft_output_path
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,15 @@ def create_theme_map_blueprint(deps: ThemeMapRouteDeps) -> Blueprint:
     """Create theme-map routes used by the active 8000 UI."""
 
     bp = Blueprint("theme_map_api", __name__)
+
+    def request_object() -> tuple[dict[str, Any] | None, Any]:
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return None, (jsonify({
+                "ok": False, "status": "bad_request_body",
+                "message_for_ui": "请求正文必须是 JSON 对象；空操作参数请使用 {}。",
+            }), 400)
+        return body, None
 
     @bp.route("/api/theme-map/status", methods=["GET"])
     def get_theme_map_status() -> Any:
@@ -68,12 +78,14 @@ def create_theme_map_blueprint(deps: ThemeMapRouteDeps) -> Blueprint:
     @bp.route("/api/theme-map/import-draft", methods=["POST"])
     @bp.route("/api/theme-map/generate-import-draft", methods=["POST"])
     def generate_theme_map_import_draft_endpoint() -> Any:
-        body = request.get_json(silent=True) or {}
+        body, error = request_object()
+        if error is not None:
+            return error
         source = str(body.get("source") or "current").strip().lower()
         if source not in {"current", "pending", "low-price", "all"}:
             source = "current"
         try:
-            output_path = deps.resolve_project_csv_path(body.get("output"), deps.stock_theme_map_import_csv())
+            output_path = resolve_import_draft_output_path(body.get("output"))
             result = deps.generate_theme_map_import_draft(
                 source=source,
                 overwrite=deps.request_truthy(body.get("overwrite")),
@@ -92,7 +104,9 @@ def create_theme_map_blueprint(deps: ThemeMapRouteDeps) -> Blueprint:
 
     @bp.route("/api/theme-map/import", methods=["POST"])
     def import_theme_map_endpoint() -> Any:
-        body = request.get_json(silent=True) or {}
+        body, error = request_object()
+        if error is not None:
+            return error
         try:
             input_path = deps.resolve_project_csv_path(
                 body.get("input") or body.get("input_path"),
@@ -114,7 +128,9 @@ def create_theme_map_blueprint(deps: ThemeMapRouteDeps) -> Blueprint:
     @bp.route("/api/theme-map/refresh", methods=["POST"])
     @bp.route("/api/theme-map/update", methods=["POST"])
     def refresh_theme_map_endpoint() -> Any:
-        body = request.get_json(silent=True) or {}
+        body, error = request_object()
+        if error is not None:
+            return error
         source = str(body.get("source") or "local").strip().lower()
         if source not in {"local", "auto", "akshare"}:
             source = "local"
