@@ -61,6 +61,9 @@ def _bar(symbol: str, time_text: str, close: float) -> dict[str, Any]:
         "amount": round(close * 10000, 2),
         "source": "self_validation_synthetic",
         "updated_at": now_text(),
+        # The synthetic bars are raw minute closes; declare it so the
+        # price-basis gate (simulate_conditional_plan) treats them as raw.
+        "price_basis": "raw",
     }
 
 

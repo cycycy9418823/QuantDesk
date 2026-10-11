@@ -92,7 +92,9 @@ def _runner_kind(text: str) -> str:
                     break
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
             has_top_level_test = True
-    if has_top_level_test and not has_unittest_class:
+    # Any module-level test function needs pytest: unittest discovery would
+    # silently skip it, even when the same file also defines TestCase classes.
+    if has_top_level_test:
         return "pytest"
     return "unittest"
 

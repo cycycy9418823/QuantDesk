@@ -8,6 +8,9 @@ results/
 reports/
 logs/
 dist/
+# Charter §6 attic: retired runtime artifacts kept for 20 trading days before
+# deletion. Never source; never committed.
+/attic/
 
 __pycache__/
 *.pyc

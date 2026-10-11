@@ -133,7 +133,9 @@ def test_daily_cell_always_shows_a_non_zero_gap(tmp_path: Path) -> None:
                     snapshot_slots=0, collected=0, minute=None)
     cell, extra = load_health().daily_cell(root, TARGET)
     assert cell == "日线 ✓99/100(缺1)"
-    assert extra == ""
+    # A gap with no provider suspension list behind it is reported as
+    # unexplained instead of being left silent.
+    assert extra == "日线缺口原因未核验1只"
 
 
 def test_daily_cell_marks_a_large_gap_as_cross(tmp_path: Path) -> None:
