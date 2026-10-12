@@ -450,6 +450,30 @@ def _bootstrap_sharpe_ci(
     }
 
 
+def _combine_sleeve_equity(
+    sleeves: list[pd.Series],
+    sleeve_cash: list[float],
+) -> pd.Series:
+    """Sum independent per-symbol equity sleeves into one pooled curve.
+
+    Each sleeve is funded with its own capital on the first day of the window,
+    whether or not the symbol has printed a bar yet. A symbol that lists (or
+    resumes) part-way through the window therefore holds idle cash -- its own
+    starting capital -- until its first bar, and the last observed value after
+    its final bar. Summing the raw concat instead turns the leading NaN into 0,
+    so the sleeve's whole capital shows up as "profit" on the day the first bar
+    appears; that is how a strategy that never traded reported +5.72% a year
+    with a Sharpe of 2.11.
+    """
+
+    if not sleeves:
+        return pd.Series(dtype=float)
+    frame = pd.concat(sleeves, axis=1).sort_index().ffill()
+    for position, cash in enumerate(sleeve_cash):
+        frame.iloc[:, position] = frame.iloc[:, position].fillna(float(cash))
+    return frame.sum(axis=1)
+
+
 def run_single_window(
     *,
     daily_dir: Path,
@@ -471,11 +495,17 @@ def run_single_window(
 
     ``min_sleeve_cash`` is a floor on the per-symbol capital. Splitting a fixed pot
     across the universe means a wide run gives each symbol too little to buy one
-    board lot, so almost nothing trades and the pooled equity curve then reports
-    idle-cash drift as "annual return" -- a 210-symbol probe produced **2 trades**
+    board lot, so almost nothing trades -- a 210-symbol probe produced **2 trades**
     over 8 years alongside a +6.65% median annual return, which cannot both be
-    true. Each symbol now gets a sleeve it can actually trade, and the reported
-    return is per-sleeve rather than a fraction of a pot nobody could deploy.
+    true. Each symbol now gets a sleeve it can actually trade.
+
+    The reported equity is the SUM of those sleeves (one per symbol that passed
+    the data gates in this window), not a per-sleeve figure and not a single
+    account. Every sleeve is funded from the first day of the window; a symbol
+    whose first bar comes later sits in idle cash until then (see
+    ``_combine_sleeve_equity``) instead of contributing zero and then appearing
+    as a jump in equity. Each entry deploys only ``max_position_pct`` of its
+    sleeve, so the pooled curve understates the risk of a fully invested book.
     """
     test_start = pd.Timestamp(window["test_start"])
     test_end = pd.Timestamp(window["test_end"])
@@ -483,6 +513,7 @@ def run_single_window(
     sleeve_cash = max(float(initial_cash) / max(len(symbols), 1), float(min_sleeve_cash))
     all_trades: list[TradeRecord] = []
     equity_series_by_symbol: list[pd.Series] = []
+    sleeve_cash_by_symbol: list[float] = []
     valid_count = 0
     skipped_count = 0
     invalid_count = 0
@@ -524,10 +555,11 @@ def run_single_window(
                 equity_series_by_symbol.append(pd.Series(equity, index=equity_dates[: len(equity)], dtype=float))
             else:
                 equity_series_by_symbol.append(pd.Series(equity, dtype=float))
+            sleeve_cash_by_symbol.append(float(sleeve_cash))
 
     trade_metrics = compute_trade_metrics(all_trades)
     if equity_series_by_symbol:
-        aligned_equity = pd.concat(equity_series_by_symbol, axis=1).ffill().sum(axis=1).sort_index()
+        aligned_equity = _combine_sleeve_equity(equity_series_by_symbol, sleeve_cash_by_symbol)
         all_equity = aligned_equity.tolist()
     else:
         all_equity = []
@@ -633,17 +665,24 @@ def run_walk_forward(
     summary.cost_bps = cost_bps
     summary.slippage_bps = slippage_bps
     if len(symbols) > 1:
-        # Equity here is the SUM of one independent sleeve per symbol, and every
-        # sleeve sits in cash whenever its rule is silent. Idle cash does not draw
-        # down, so aggregate drawdown is smoothed by roughly the symbol count and
-        # the return is spread over capital that was never all deployed at once.
-        # These are per-rule diagnostics, NOT what an account with a few positions
-        # would experience -- for that, use scripts/run_portfolio_simulation.py,
-        # which models slot contention and a single shared pot.
+        # Equity here is the SUM of one independent sleeve per symbol that passed
+        # the data gates in a window (so the count can differ per window), and
+        # every sleeve sits in cash whenever its rule is silent -- including the
+        # days before a late-listing symbol's first bar, when it holds its own
+        # starting capital rather than counting as zero. Idle cash does not draw
+        # down, so aggregate drawdown is smoothed by roughly the symbol count, and
+        # each entry deploys only max_position_pct of its sleeve. These are
+        # per-rule diagnostics, NOT what an account with a few positions would
+        # experience -- for that, use `scripts/qd.py backtest --mode portfolio`
+        # (simulate_portfolio_backtest), which models slot contention and a
+        # single shared pot. The scripts/run_portfolio_simulation.py named here
+        # before never existed.
         summary.warnings.append(
-            f"聚合口径提示：equity 是 {len(symbols)} 个独立仓位(每个 sleeve 独立本金)之和，"
-            "空闲现金不产生回撤，因此这里的年化/最大回撤被分散效应显著平滑，"
+            f"聚合口径提示：equity 是最多 {len(symbols)} 个独立仓位(每个 sleeve 独立本金，"
+            "只计入当期通过数据门禁的股票)之和；窗口中途才有首根K线的股票在此之前按自身本金计为闲置现金。"
+            f"每次开仓只用 sleeve 的 {max_position_pct:.0%}，空闲现金不产生回撤，"
+            "因此这里的年化/最大回撤被分散效应显著平滑，"
             "不等于你用一个账户几个仓位能拿到的收益。"
-            "要贴近现实请用 scripts/run_portfolio_simulation.py。"
+            "要贴近现实请用 python scripts/qd.py backtest --mode portfolio（共享资金池）。"
         )
     return summary
