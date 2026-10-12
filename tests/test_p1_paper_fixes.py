@@ -841,6 +841,8 @@ def test_delist_liquidation_payloads_are_explicitly_paper_only() -> None:
         },
         as_of="2026-06-19",
         data=data,
+        # 1A: liquidation needs an observed last-tradable close (no invented 75% price).
+        last_close_lookup={"000002": 8.0},
     )
 
     for row in [result, result["state"], result["actions"][0], result["state"]["closed_positions"][0]]:
@@ -848,6 +850,15 @@ def test_delist_liquidation_payloads_are_explicitly_paper_only() -> None:
         assert row["research_only"] is True
         assert row["paper_only"] is True
         assert row["no_broker"] is True
+
+    pending = delist_liquidation.apply_delisting_liquidation(
+        {"cash": 1000.0, "positions": [{"symbol": "000002", "quantity": 100, "avg_cost": 10.0}],
+         "closed_positions": []},
+        as_of="2026-06-19",
+        data=data,
+    )
+    for row in [pending, pending["state"], pending["actions"][0]]:
+        assert row["is_real_order"] is False and row["paper_only"] is True and row["no_broker"] is True
 
 
 def test_conditional_execution_applies_unified_trade_costs() -> None:
