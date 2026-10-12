@@ -57,8 +57,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from quantdesk.pipeline_process_guard import (  # noqa: E402
     acquire_linux_ofd_lock,
     activate_market_writer_lease,
+    register_daily_writer,
     require_linux_ofd_support,
     reset_market_writer_lease,
+    unregister_daily_writer,
 )
 
 if os.name == "nt":
@@ -353,6 +355,12 @@ class MarketWriterLease:
                 self._context_token = activate_market_writer_lease(
                     self._handle._fh.fileno(), self._handle._path, self.assert_active,
                 )
+            # The low-level data/daily writers check this registration, so
+            # only code running under this lease can write canonical bars.
+            register_daily_writer(self.root, scope=self.scope, assert_active=self.assert_active, proof={
+                "root": str(self.root), "run_id": self.run_id, "target": self.target,
+                "scope": self.scope, "token": self._token,
+            })
         except BaseException:
             self._handle.release()
             raise
@@ -386,6 +394,7 @@ class MarketWriterLease:
 
     def __exit__(self, *_args: Any) -> None:
         try:
+            unregister_daily_writer(self.assert_active)
             if self._context_token is not None:
                 reset_market_writer_lease(self._context_token)
                 self._context_token = None

@@ -41,6 +41,7 @@ from quantdesk.market_clock import (
 )
 from quantdesk.price_basis import PRICE_BASIS_RAW, classify_frame_price_basis
 from quantdesk.interprocess_lock import interprocess_file_lock
+from quantdesk.pipeline_process_guard import daily_writer_proof
 from quantdesk.process_deadline import run_process_tasks_until_deadline
 from quantdesk.shared import normalize_symbol, now_text, safe_float, truthy
 from quantdesk.theme_map_updater import theme_map_status
@@ -668,6 +669,64 @@ def _latest_date(frame: pd.DataFrame) -> str:
     return "" if dates.empty else dates.max().strftime("%Y-%m-%d")
 
 
+SPOT_CLOSE_EARLIEST = "15:00:00"
+SPOT_FETCH_SKEW_SECONDS = 5
+_NULL_TEXT = {"", "nan", "nat", "none", "null", "<na>"}
+
+
+def _spot_row_close_reason(row: dict[str, Any], target_date: str) -> str:
+    """'' when a spot-cache row is the target day's closing quote by its own evidence.
+
+    The provider's own time decides: it must be dated ``target_date`` and be at
+    or after 15:00 (a 14:30 round's cumulative amount is not the day's
+    amount). Sina sends a clock time only; its day is the row's quote_date,
+    else the day the collector fetched it - never the reader's clock. A quote
+    stamped after its own recorded fetch is not trusted.
+    """
+
+    raw_time = str(row.get("quote_time") or "").strip()
+    if raw_time.lower() in _NULL_TEXT:
+        return "quote_time_missing"
+    raw_date = str(row.get("quote_date") or "").strip()[:10]
+    raw_date = "" if raw_date.lower() in _NULL_TEXT else raw_date
+    fetched_text = str(row.get("fetched_at") or "").strip()
+    fetched = None
+    if fetched_text.lower() not in _NULL_TEXT:
+        try:
+            fetched = to_shanghai_datetime(datetime.fromisoformat(fetched_text))
+        except ValueError:
+            return "fetched_at_unparseable"
+    if fetched is None:
+        # A row without a fetch record comes from the writer that filled the
+        # quote time with its own clock (10/09: 3600 rows "15:00:01"; 89 of the
+        # 121 that even matched the close carried less than the day's amount).
+        return "fetched_at_missing"
+    if " " in raw_time or "T" in raw_time:
+        text = raw_time.replace("T", " ")
+        day, clock = text[:10], text[11:19]
+    else:
+        clock = raw_time[:8]
+        day = raw_date or (fetched.date().isoformat() if fetched is not None else "")
+        if not day:
+            return "quote_date_unknown"
+    try:
+        quoted = datetime.fromisoformat(f"{day} {clock if len(clock) == 8 else clock + ':00'}")
+    except ValueError:
+        return "quote_time_unparseable"
+    if raw_date and raw_date != quoted.date().isoformat():
+        return "quote_date_conflict"
+    if quoted.date().isoformat() != target_date:
+        return "quote_date_not_target"
+    if quoted.strftime("%H:%M:%S") < SPOT_CLOSE_EARLIEST:
+        return "quote_before_close"
+    if fetched is not None:
+        if fetched.date().isoformat() != target_date:
+            return "fetched_not_target_day"
+        if quoted > fetched.replace(tzinfo=None) + timedelta(seconds=SPOT_FETCH_SKEW_SECONDS):
+            return "quote_after_fetch"
+    return ""
+
+
 def _backfill_target_amount_from_spot_snapshot(symbols: list[str], target_date: str) -> dict[str, Any]:
     """Fill missing target-date amount from the same-day full-market snapshot.
 
@@ -687,22 +746,31 @@ def _backfill_target_amount_from_spot_snapshot(symbols: list[str], target_date: 
     if not symbol_col:
         return {"provider": "spot_snapshot_amount_fill", "status": "cache_no_symbol", "attempted": 0, "updated": 0, "updated_symbol_list": [], "warnings": csv_read_warnings}
     spot["symbol"] = spot[symbol_col].astype(str).map(normalize_symbol)
-    if "quote_time" in spot.columns:
-        quote_dates = pd.to_datetime(spot["quote_time"], errors="coerce").dt.strftime("%Y-%m-%d")
-        spot = spot.loc[quote_dates == target_date].copy()
+    if "quote_time" not in spot.columns:
+        # Without the provider's own time the cache proves nothing about the
+        # target day's close (previously this case was not filtered at all).
+        return {"provider": "spot_snapshot_amount_fill", "status": "cache_no_quote_time", "attempted": 0, "updated": 0, "updated_symbol_list": [], "warnings": csv_read_warnings}
+    row_reasons = [_spot_row_close_reason(row, target_date) for row in spot.to_dict("records")]
+    rejected_rows = dict(Counter(reason for reason in row_reasons if reason))
+    spot = spot.loc[[not reason for reason in row_reasons]].copy()
     if spot.empty:
-        return {"provider": "spot_snapshot_amount_fill", "status": "cache_date_mismatch", "attempted": 0, "updated": 0, "updated_symbol_list": [], "warnings": csv_read_warnings}
+        return {"provider": "spot_snapshot_amount_fill", "status": "cache_date_mismatch", "attempted": 0, "updated": 0, "updated_symbol_list": [], "warnings": csv_read_warnings, "rejected_rows": rejected_rows}
     spot_amount: dict[str, float] = {}
     spot_volume: dict[str, float] = {}
+    spot_price: dict[str, float] = {}
     for _, row in spot.iterrows():
         symbol = normalize_symbol(row.get("symbol"))
         amount = safe_float(row.get("amount"))
         if symbol and amount is not None and amount > 0:
             spot_amount[symbol] = amount
+        price = safe_float(row.get("price"))
+        if symbol and price is not None and price > 0:
+            spot_price[symbol] = price
         volume = safe_float(row.get("volume"))
         if symbol and volume is not None and volume > 0:
             spot_volume[symbol] = volume
     updated_symbols: list[str] = []
+    price_mismatch: list[str] = []
     attempted = 0
     for symbol in [normalize_symbol(item) for item in symbols if normalize_symbol(item)]:
         amount = spot_amount.get(symbol)
@@ -723,6 +791,13 @@ def _backfill_target_amount_from_spot_snapshot(symbols: list[str], target_date: 
             existing_amount = safe_float(frame.at[latest_index, "amount"] if "amount" in frame.columns else None)
             if existing_amount is not None and existing_amount > 0:
                 continue
+            # The snapshot row must describe this very bar: its price equals
+            # the bar's close. A stale or intraday quote is not borrowed.
+            daily_close = safe_float(frame.at[latest_index, "close"] if "close" in frame.columns else None)
+            spot_close = spot_price.get(symbol)
+            if daily_close is None or spot_close is None or abs(daily_close - spot_close) > 1e-6:
+                price_mismatch.append(symbol)
+                continue
             frame.at[latest_index, "amount"] = amount
             volume = spot_volume.get(symbol)
             if volume is not None and volume > 0:
@@ -742,6 +817,9 @@ def _backfill_target_amount_from_spot_snapshot(symbols: list[str], target_date: 
         "latest_date": target_date,
         "updated_symbol_list": updated_symbols,
         "failed_symbol_list": [],
+        "rejected_rows": rejected_rows,
+        "price_mismatch_count": len(price_mismatch),
+        "price_mismatch_symbols": price_mismatch[:50],
         "warnings": csv_read_warnings + ["same_day_spot_snapshot_amount_fill; research_only; no_new_daily_bar_created"],
     }
 
@@ -1074,15 +1152,20 @@ def _provider_process_worker(
     symbol: str,
     context: dict[str, Any],
 ) -> dict[str, Any]:
-    return _fetch_merge_write_symbol(
-        str(context["provider_name"]),
-        symbol,
-        target=str(context["target"]),
-        network=bool(context["network"]),
-        calendar=dict(context["calendar"]),
-        daily_dir=Path(str(context["daily_dir"])),
-        metadata_dir=Path(str(context["metadata_dir"])),
-    )
+    # A spawned worker does not inherit the parent's registered lease; it
+    # re-verifies the parent's proof before any canonical write (charter s3).
+    from quantdesk.pipeline_process_guard import adopt_daily_writer_proof
+
+    with adopt_daily_writer_proof(context.get("writer_proof")):
+        return _fetch_merge_write_symbol(
+            str(context["provider_name"]),
+            symbol,
+            target=str(context["target"]),
+            network=bool(context["network"]),
+            calendar=dict(context["calendar"]),
+            daily_dir=Path(str(context["daily_dir"])),
+            metadata_dir=Path(str(context["metadata_dir"])),
+        )
 
 
 _PROVIDER_PROCESS_WORKER = _provider_process_worker
@@ -1207,6 +1290,19 @@ def update_daily_prices(
             "nondefault_project_root_network_write_blocked:"
             + str(requested_project_root)
         )
+    if network and safe_to_write:
+        # data/daily has one writer (charter s3, handbook H7b): the UI button,
+        # bootstrap and CLI fallback are refused before any provider request.
+        from quantdesk.pipeline_process_guard import (
+            CanonicalDailyWriteRefused,
+            assert_canonical_daily_write,
+        )
+
+        try:
+            assert_canonical_daily_write(resolved_daily_dir)
+        except CanonicalDailyWriteRefused as exc:
+            safe_to_write = False
+            unsafe_reason = str(exc)
     selected_providers = [str(item).strip() for item in (providers or DEFAULT_PROVIDERS) if str(item).strip()]
     selected_providers = selected_providers or list(DEFAULT_PROVIDERS)
     symbol_rows = resolve_symbols(only_low_price=only_low_price, limit=max(0, int(limit or 0)), symbols=symbols)
@@ -1484,6 +1580,7 @@ def update_daily_prices(
                     "calendar": calendar,
                     "daily_dir": str(resolved_daily_dir),
                     "metadata_dir": str(resolved_metadata_dir),
+                    "writer_proof": daily_writer_proof(),
                 },
                 max_workers=min(worker_count, len(remaining)),
                 timeout_seconds=stage_timeout,

@@ -504,6 +504,11 @@ def write_daily(
     nested acquire from a caller that already holds it would deadlock.
     """
 
+    # data/daily has one writer (charter s3, handbook H7b). Refuse a canonical
+    # write that does not run under the Pipeline writer lease, before any work.
+    from quantdesk.pipeline_process_guard import assert_canonical_daily_write
+
+    assert_canonical_daily_write(Path(daily_dir or DAILY_DIR))
     # attrs are not serialized to CSV. Reject unknown/mixed original evidence
     # here so a caller cannot persist only its apparently-clean surviving rows.
     # Single known qfq/hfq research frames remain supported; engine enforces raw.
