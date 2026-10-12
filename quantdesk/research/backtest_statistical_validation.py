@@ -24,11 +24,17 @@ REPORTS_DIR = PROJECT_ROOT / "reports"
 DEFAULT_JSON_PATH = RESULTS_DIR / "backtest_statistical_validation_latest.json"
 DEFAULT_REPORT_PATH = REPORTS_DIR / "backtest_statistical_validation_report_latest.md"
 DEFAULT_BACKTEST_RESULT_PATH = Path("results") / "backtest" / "backtest_latest.json"
-BACKTEST_RESULT_FALLBACK_PATHS = (
-    DEFAULT_BACKTEST_RESULT_PATH,
-    Path("results") / "backtest" / "latest.json",
-    Path("results") / "backtest_latest.json",
-)
+# There is deliberately NO fallback list. The loader used to try
+# results/backtest/latest.json and results/backtest_latest.json whenever the
+# requested file had no extractable returns, so a 2026-10-09 run validated a
+# 2026-09-07 artefact and reported "passed". A result that cannot be measured is
+# reported as "missing"; it is never replaced by an older file.
+MIN_TRADES_FOR_VALIDATION = 30
+MIN_RETURNS_FOR_VALIDATION = 8
+# Return lists whose entries are one closed trade each; their length IS the trade
+# count. Period series (daily/window returns, equity curves) are not.
+_TRADE_LEVEL_RETURN_SOURCES = {"trade_returns", "trades"}
+_TRADE_COUNT_KEYS = ("trades_count", "total_trades", "number_of_trades", "trade_count")
 DISCLAIMER = "统计检验仅基于历史样本，不代表未来收益。"
 
 
@@ -91,21 +97,51 @@ def _extract_equity_curve_returns(rows: Any) -> list[float]:
     return returns
 
 
-def _extract_returns(backtest_result: Any) -> list[float]:
+def _extract_returns_with_source(backtest_result: Any) -> tuple[list[float], str]:
+    """Return (returns, key they came from); ``""`` when nothing is extractable."""
+
     payload = backtest_result if isinstance(backtest_result, dict) else {}
     for key in ("trade_returns", "returns", "daily_returns", "window_returns"):
         rows = payload.get(key)
         if isinstance(rows, list):
             returns = _extract_return_values(rows)
             if returns:
-                return returns
+                return returns, key
     for key in ("trades", "results", "rows"):
         rows = payload.get(key)
         if isinstance(rows, list):
             returns = _extract_return_values(rows)
             if returns:
-                return returns
-    return _extract_equity_curve_returns(payload.get("equity_curve"))
+                return returns, key
+    returns = _extract_equity_curve_returns(payload.get("equity_curve"))
+    return returns, ("equity_curve" if returns else "")
+
+
+def _extract_returns(backtest_result: Any) -> list[float]:
+    return _extract_returns_with_source(backtest_result)[0]
+
+
+def _trade_count(payload: dict[str, Any], returns: list[float], source: str) -> tuple[int | None, str]:
+    """Number of trades behind the sample, and where that number came from.
+
+    A list of per-trade returns is its own count. Otherwise an explicit count
+    field is required; a bare period series (daily returns, equity curve) does
+    not say how many trades produced it, so the count stays unknown (``None``)
+    and the sample cannot pass.
+    """
+
+    if source in _TRADE_LEVEL_RETURN_SOURCES:
+        return len(returns), source
+    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+    for label, container in (("metrics", metrics), ("payload", payload)):
+        for key in _TRADE_COUNT_KEYS:
+            value = container.get(key)
+            if isinstance(value, bool):
+                continue
+            numeric = _as_float(value)
+            if numeric is not None and numeric >= 0:
+                return int(numeric), f"{label}.{key}"
+    return None, ""
 
 
 def _extract_metric(backtest_result: dict[str, Any], returns: list[float]) -> float:
@@ -262,34 +298,30 @@ def bootstrap_metric_confidence_intervals(
     }
 
 
-def _candidate_backtest_paths(backtest_result_path: str | Path) -> list[Path]:
-    primary = _project_path(backtest_result_path)
-    candidates = [primary]
-    default_like = {
-        _project_path(DEFAULT_BACKTEST_RESULT_PATH),
-        _project_path(Path("results") / "backtest_latest.json"),
+def _load_backtest_result_with_source(
+    backtest_result: Any = None,
+    backtest_result_path: str | Path = DEFAULT_BACKTEST_RESULT_PATH,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load exactly the requested result; never substitute another file."""
+
+    if isinstance(backtest_result, dict):
+        payload = json.loads(json.dumps(backtest_result, ensure_ascii=False, default=str))
+        return payload, {"kind": "in_memory", "path": "", "exists": True, "generated_at": str(payload.get("generated_at") or "")}
+    path = _project_path(backtest_result_path)
+    payload = read_json(path, {}) if path.exists() else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return payload, {
+        "kind": "file",
+        "path": str(path),
+        "exists": path.exists(),
+        "generated_at": str(payload.get("generated_at") or ""),
+        "fallback_used": False,
     }
-    if primary in default_like:
-        for path in BACKTEST_RESULT_FALLBACK_PATHS:
-            candidate = _project_path(path)
-            if candidate not in candidates:
-                candidates.append(candidate)
-    return candidates
 
 
 def _load_backtest_result(backtest_result: Any = None, backtest_result_path: str | Path = DEFAULT_BACKTEST_RESULT_PATH) -> dict[str, Any]:
-    if isinstance(backtest_result, dict):
-        return json.loads(json.dumps(backtest_result, ensure_ascii=False, default=str))
-    first_payload: dict[str, Any] = {}
-    for path in _candidate_backtest_paths(backtest_result_path):
-        payload = read_json(path, {})
-        if not isinstance(payload, dict):
-            continue
-        if not first_payload:
-            first_payload = payload
-        if _extract_returns(payload):
-            return payload
-    return first_payload
+    return _load_backtest_result_with_source(backtest_result, backtest_result_path)[0]
 
 
 def run_backtest_statistical_validation(
@@ -306,29 +338,52 @@ def run_backtest_statistical_validation(
     output_path: str | Path = DEFAULT_JSON_PATH,
     report_path: str | Path = DEFAULT_REPORT_PATH,
 ) -> dict[str, Any]:
-    payload = _load_backtest_result(backtest_result, backtest_result_path)
-    returns = _extract_returns(payload)
-    actual_metric = _extract_metric(payload, returns)
+    payload, source = _load_backtest_result_with_source(backtest_result, backtest_result_path)
+    returns, return_source = _extract_returns_with_source(payload)
+    source["return_source"] = return_source
+    # Kept for reference only. The permutation test compares the compounded
+    # return of THIS sample against the compounded return of its reshuffles; a
+    # reported annual_return from the file is a different quantity (annualised,
+    # possibly from a different run) and must never be the "actual" side.
+    reported_metric = _extract_metric(payload, returns) if payload else None
+    trade_count, trade_count_source = _trade_count(payload, returns, return_source)
+    negative_count = sum(1 for value in returns if value < 0)
     warnings: list[str] = []
     if not payload:
         warnings.append("backtest_result_missing")
-    if len(returns) < 8:
+    if not returns:
+        warnings.append("backtest_returns_missing")
+    if len(returns) < MIN_RETURNS_FOR_VALIDATION:
         warnings.append("insufficient_sample")
-    permutation = permutation_test_signals(returns, iterations=iterations, seed=seed, actual_metric=actual_metric)
+    insufficient_reasons: list[str] = []
+    if returns:
+        if len(returns) < MIN_RETURNS_FOR_VALIDATION:
+            insufficient_reasons.append(f"return_count_below_{MIN_RETURNS_FOR_VALIDATION}")
+        if negative_count == 0:
+            # Sign-shuffling cannot produce a baseline from a sample with no
+            # losses; "beating" it says nothing.
+            insufficient_reasons.append("no_negative_return_in_sample")
+        if trade_count is None:
+            insufficient_reasons.append("trade_count_unknown")
+        elif trade_count < MIN_TRADES_FOR_VALIDATION:
+            insufficient_reasons.append(f"trade_count_below_{MIN_TRADES_FOR_VALIDATION}")
+    permutation = permutation_test_signals(returns, iterations=iterations, seed=seed, actual_metric=_compounded_return(returns))
     bootstrap = bootstrap_metric_confidence_intervals(returns, iterations=iterations, seed=seed)
     warnings.extend(permutation.get("warnings") or [])
     warnings.extend(bootstrap.get("warnings") or [])
+    if insufficient_reasons and "insufficient_sample" not in warnings:
+        warnings.append("insufficient_sample")
     metric_summary = compute_metric_summary(returns)
     if not returns:
-        status = "warning"
-    elif "insufficient_sample" in warnings:
-        status = "warning"
+        status = "missing"
+    elif insufficient_reasons:
+        status = "insufficient_sample"
     elif permutation.get("status") == "passed" and bootstrap.get("status") == "passed":
         status = "passed"
     else:
         status = "warning"
     result = {
-        "ok": status != "failed",
+        "ok": status not in {"failed", "missing"},
         "schema_version": API_SCHEMA_VERSION,
         "app_version": APP_VERSION,
         "package_version": PACKAGE_VERSION,
@@ -340,6 +395,14 @@ def run_backtest_statistical_validation(
         "network": bool(network),
         "strict": bool(strict),
         "sample_size": len(returns),
+        "trade_count": trade_count,
+        "trade_count_source": trade_count_source,
+        "negative_return_count": negative_count,
+        "min_trades_for_validation": MIN_TRADES_FOR_VALIDATION,
+        "insufficient_sample_reasons": insufficient_reasons,
+        "backtest_result_source": source,
+        "reported_metric": reported_metric,
+        "actual_metric_definition": "compounded_return_of_the_validated_sample",
         "iterations": int(iterations),
         "seed": int(seed),
         "metric_summary": metric_summary,
@@ -356,7 +419,9 @@ def run_backtest_statistical_validation(
 
 
 def _interpret_result(status: str, permutation: dict[str, Any], sample_size: int) -> str:
-    if sample_size < 8:
+    if status == "missing":
+        return "回测结果里提不出收益序列，统计检验没有运行；不会改用旧文件代替。"
+    if sample_size < 8 or status == "insufficient_sample":
         return "当前统计样本不足，不能据此判断策略稳定性。"
     if permutation.get("status") != "passed":
         return "当前样本中未显示出明显优于随机基线的证据。"
@@ -371,6 +436,10 @@ def summarize_statistical_validation(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": payload.get("status") or "missing",
         "sample_size": int(payload.get("sample_size") or 0),
+        "trade_count": payload.get("trade_count"),
+        "negative_return_count": payload.get("negative_return_count"),
+        "insufficient_sample_reasons": list(payload.get("insufficient_sample_reasons") or []),
+        "backtest_result_source": payload.get("backtest_result_source") if isinstance(payload.get("backtest_result_source"), dict) else {},
         "p_value": permutation.get("p_value"),
         "permutation_status": permutation.get("status"),
         "bootstrap_status": bootstrap.get("status"),
@@ -397,6 +466,11 @@ def build_statistical_validation_report(payload: dict[str, Any]) -> str:
             "",
             f"- status: `{payload.get('status') or '-'}`",
             f"- sample_size: `{payload.get('sample_size') or 0}`",
+            f"- trade_count: `{payload.get('trade_count')}` (需 >= {MIN_TRADES_FOR_VALIDATION})",
+            f"- negative_return_count: `{payload.get('negative_return_count')}`",
+            f"- insufficient_sample_reasons: `{payload.get('insufficient_sample_reasons') or []}`",
+            f"- backtest_result_source: `{(payload.get('backtest_result_source') or {}).get('path') or '-'}`"
+            f" generated_at=`{(payload.get('backtest_result_source') or {}).get('generated_at') or '-'}`",
             f"- iterations: `{payload.get('iterations') or 0}`",
             f"- seed: `{payload.get('seed') or 0}`",
             f"- p_value: `{summary.get('p_value')}`",

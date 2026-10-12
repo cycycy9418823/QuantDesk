@@ -405,6 +405,7 @@ def _human_status(value: Any) -> str:
         "warning": "注意",
         "partial": "部分完成",
         "missing": "缺失",
+        "insufficient_sample": "样本不足",
         "failed": "失败",
         "stale": "滞后",
         "skipped": "已跳过",
@@ -561,7 +562,7 @@ def _guardrail_payload_status(
     status = str(payload.get("status") or payload.get("workflow_status") or default).strip().lower()
     if status in {"ok", "success", "completed"}:
         status = "passed"
-    if status not in {"passed", "warning", "failed", "missing", "skipped", "unavailable", "partial"}:
+    if status not in {"passed", "warning", "failed", "missing", "skipped", "unavailable", "partial", "insufficient_sample"}:
         status = default
     warnings = [str(item) for item in (payload.get("warnings") or []) if item] if isinstance(payload.get("warnings"), list) else []
     return status, warnings[:5]

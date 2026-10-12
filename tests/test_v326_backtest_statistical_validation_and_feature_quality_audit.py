@@ -132,7 +132,9 @@ class BacktestStatisticalValidationAndFeatureQualityAuditTests(unittest.TestCase
 
     def test_insufficient_sample_returns_warning(self) -> None:
         result = stats.run_backtest_statistical_validation({"returns": [0.01, -0.01]}, iterations=20, seed=42, write=False)
-        self.assertEqual(result["status"], "warning")
+        # fix(1d) #2: a too-small sample now carries its own verdict instead of
+        # the generic "warning"; it still never reads as passed.
+        self.assertEqual(result["status"], "insufficient_sample")
         self.assertIn("insufficient_sample", result["warnings"])
 
     def test_extract_returns_from_equity_curve(self) -> None:
@@ -148,7 +150,10 @@ class BacktestStatisticalValidationAndFeatureQualityAuditTests(unittest.TestCase
         self.assertAlmostEqual(returns[0], 0.01)
         self.assertAlmostEqual(returns[1], -0.01)
 
-    def test_default_loader_falls_back_to_extractable_backtest_latest(self) -> None:
+    def test_default_loader_does_not_fall_back_to_an_older_backtest_file(self) -> None:
+        # fix(1d) #2: this test used to pin the fallback itself. Validating a
+        # different, older file than the one requested is how a 2026-10-09 run
+        # reported "passed" from a 2026-09-07 artefact.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             backtest_dir = root / "results" / "backtest"
@@ -161,8 +166,9 @@ class BacktestStatisticalValidationAndFeatureQualityAuditTests(unittest.TestCase
             (backtest_dir / "latest.json").write_text(json.dumps({"equity_curve": equity_curve}), encoding="utf-8")
             with mock.patch.object(stats, "PROJECT_ROOT", root):
                 result = stats.run_backtest_statistical_validation(iterations=20, seed=42, write=False)
-        self.assertEqual(result["sample_size"], 9)
-        self.assertNotIn("backtest_result_missing", result["warnings"])
+        self.assertEqual(result["sample_size"], 0)
+        self.assertEqual(result["status"], "missing")
+        self.assertIn("backtest_returns_missing", result["warnings"])
 
     def test_bootstrap_confidence_intervals_return_ranges(self) -> None:
         returns = [0.01, -0.02, 0.03, 0.01, -0.01, 0.02, 0.04, -0.01, 0.02, 0.01]

@@ -69,7 +69,9 @@ def main(argv: list[str] | None = None) -> int:
     print("json path: results/backtest_statistical_validation_latest.json")
     print("report path: reports/backtest_statistical_validation_report_latest.md")
     print("统计检验仅基于历史样本，不代表未来收益。")
-    return 0 if payload.get("status") in {"passed", "warning"} else 1
+    # "insufficient_sample" is an honest diagnostic outcome; "missing" means no
+    # return series could be read from the requested file, so nothing was tested.
+    return 0 if payload.get("status") in {"passed", "warning", "insufficient_sample"} else 1
 
 
 if __name__ == "__main__":
