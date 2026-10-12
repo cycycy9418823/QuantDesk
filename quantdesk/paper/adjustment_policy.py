@@ -71,6 +71,17 @@ class AdjustmentFactorTable:
             return
         self._load_from_csv(symbols=missing)
 
+    def last_factor_date(self, symbol: Any) -> int | None:
+        """Date key (YYYYMMDD) of the newest factor row for ``symbol``, if any."""
+
+        code = _symbol(symbol)
+        if not code:
+            return None
+        if code not in self.rows_by_symbol and not self._loaded_all:
+            self.ensure_symbols([code])
+        rows = self.rows_by_symbol.get(code) or []
+        return rows[-1][0] if rows else None
+
     def factor_at_or_before(self, symbol: Any, date_value: Any) -> float | None:
         code = _symbol(symbol)
         key = _date_key(date_value)
@@ -265,6 +276,26 @@ def apply_paper_adjustment_policy(
         row["price_adjustment_warning"] = "missing adjustment factor evidence; raw paper valuation retained"
         row["entry_adj_factor"] = entry_factor
         row["latest_adj_factor"] = latest_factor
+        return row
+
+    # A factor table that ends before the valuation date silently returns its
+    # last row for every later date, so the ratio reads 1.0 and the position
+    # used to be labelled "adjusted" although any ex-rights event after the
+    # table's end is invisible. That is stale evidence, not an adjustment.
+    last_key = factors.last_factor_date(symbol) if factors else None
+    latest_key = _date_key(latest_date)
+    if last_key is not None and latest_key is not None and latest_key > last_key:
+        last_text = f"{str(last_key)[:4]}-{str(last_key)[4:6]}-{str(last_key)[6:]}"
+        row["price_adjustment_status"] = "stale_adj_factor"
+        row["price_adjustment_mode"] = "raw_price_factor_table_stale"
+        row["price_adjustment_warning_level"] = "warning"
+        row["price_adjustment_warning"] = (
+            f"adjustment factor table ends {last_text}, before {latest_date}: "
+            "ex-rights events after that date are not reflected; raw paper valuation retained"
+        )
+        row["adj_factor_table_last_date"] = last_text
+        row["entry_adj_factor"] = float(entry_factor)
+        row["latest_adj_factor"] = float(latest_factor)
         return row
 
     ratio = latest_factor / entry_factor

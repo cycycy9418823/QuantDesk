@@ -1486,7 +1486,7 @@ def apply_conditional_execution_to_state(
         if valuation_warnings:
             position["valuation_warnings"] = valuation_warnings
         _apply_valuation_gate_marks(position, valuation_warnings)
-        if position.get("price_adjustment_status") == "missing_adj_factor":
+        if position.get("price_adjustment_status") in {"missing_adj_factor", "stale_adj_factor"}:
             warnings = list(position.get("valuation_warnings") or [])
             warnings.append(str(position.get("price_adjustment_warning") or "missing adjustment factor evidence"))
             position["valuation_warnings"] = list(dict.fromkeys(warnings))
