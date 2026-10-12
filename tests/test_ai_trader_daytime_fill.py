@@ -62,6 +62,10 @@ def _row(**overrides: object) -> dict:
 def _book(**overrides: object) -> dict:
     ledger = empty_ledger()
     ledger.update({"cash": 100000.0, "equity": 100000.0, "positions": [], "trades": []})
+    # 1A: a daytime fill writes the real ledger only with an explicit header
+    # grant (charter §10). These tests exercise the write path, so they say so.
+    ledger["daytime_trust"] = {"level": 2, "authorized_by": "test-owner",
+                               "authorized_at": "2026-09-21T20:00:00+08:00"}
     ledger.update(overrides)
     return ledger
 

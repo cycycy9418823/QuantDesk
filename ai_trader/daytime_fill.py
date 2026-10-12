@@ -70,6 +70,49 @@ MANDATE_CASH_FLOOR = "mandate_min_cash_weight"
 SIDE_BUY = "buy"
 SIDE_SELL = "sell"
 
+# Charter §10 trust ladder, read from the ledger header (never from the
+# environment): 0 = evening only; 1 = intraday exits/stops; 2 = intraday opens
+# with caps; 3 = self-escalation. A daytime fill may write the real ledger only
+# when the header grants at least this level AND names who authorised it.
+DAYTIME_TRUST_KEY = "daytime_trust"
+DAYTIME_TRUST_REQUIRED = {SIDE_SELL: 1, SIDE_BUY: 2}
+BLOCK_TRUST_GATE = "daytime_trust_level_insufficient"
+BLOCK_NO_SOURCE = "missing_price_source_no_fill"
+BLOCK_ZERO_VOLUME = "zero_volume_no_fill"
+
+
+def daytime_trust(ledger: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The book's declared daytime trust: ``{"level", "authorized_by", "authorized_at"}``.
+
+    Missing or malformed headers mean level 0 (default deny).
+    """
+
+    raw = (ledger or {}).get(DAYTIME_TRUST_KEY) if isinstance(ledger, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return {"level": 0, "authorized_by": "", "authorized_at": "", "declared": False}
+    try:
+        level = int(raw.get("level") or 0)
+    except (TypeError, ValueError):
+        level = 0
+    return {
+        "level": max(0, level),
+        "authorized_by": str(raw.get("authorized_by") or "").strip(),
+        "authorized_at": str(raw.get("authorized_at") or "").strip(),
+        "declared": True,
+    }
+
+
+def trust_gate(ledger: Mapping[str, Any] | None, side: str) -> str:
+    """Empty string when the header lets a daytime fill on ``side`` write the ledger."""
+
+    trust = daytime_trust(ledger)
+    required = DAYTIME_TRUST_REQUIRED.get(str(side or ""), 99)
+    if trust["level"] < required:
+        return f"{BLOCK_TRUST_GATE}:level={trust['level']}<required={required}"
+    if not trust["authorized_by"] or not trust["authorized_at"]:
+        return f"{BLOCK_TRUST_GATE}:authorization_missing"
+    return ""
+
 
 def dry_mode() -> bool:
     return os.environ.get(DRY_ENV, "").strip() == "1"
@@ -440,6 +483,15 @@ def plan_fills(
             blocks.append(_record(intent, quote, BLOCK_MISSING_QUOTE,
                                   f"{symbol} 报价缺失或非正，不成交。"))
             continue
+        if not str(quote.get("source") or "").strip():
+            blocks.append(_record(intent, quote, BLOCK_NO_SOURCE,
+                                  f"{symbol} 报价没有来源，成交证据不全，不成交。"))
+            continue
+        volume = quote.get("volume")
+        if volume is not None and volume <= 0:
+            blocks.append(_record(intent, quote, BLOCK_ZERO_VOLUME,
+                                  f"{symbol} 成交量为 {volume}（停牌或无成交），不成交。"))
+            continue
         lot = int(lot_size_for_symbol(symbol) or 100)
         if lot <= 0 or quantity % lot != 0:
             blocks.append(_record(intent, quote, BLOCK_NOT_A_LOT,
@@ -491,6 +543,7 @@ def plan_fills(
             "symbol": symbol, "side": side, "quantity": quantity,
             "price": round(price, 4), "price_source": str(quote.get("source") or ""),
             "price_timestamp": str(quote.get("time") or ""), "pct_chg": quote.get("pct_chg"),
+            "pre_close": quote.get("pre_close"), "volume": quote.get("volume"),
             "quote_date": quote.get("quote_date"), "quote_time": quote.get("quote_time"),
             "received_at": quote.get("received_at"), "time_source": quote.get("time_source"),
             "intent_created_at": intent.get("created_at"),
@@ -689,9 +742,27 @@ def fill_slot(
     expired = expired_intents(runtime, as_of, slot=quote_slot)
     plan = plan_fills(intents, quotes, book, as_of=as_of, mandate=mandate,
                       already_filled=fill_keys(runtime, as_of))
-    updated, applied = apply_to_ledger(book, plan["fills"], as_of=as_of)
+    # Default deny: an environment switch alone may not write the real ledger.
+    # Only the ledger header's daytime_trust (charter §10 level + named
+    # authorisation) lets a fill on that side change money; the rest stay dry.
+    gate_reasons: dict[str, str] = {}
+    if write and not is_dry:
+        for fill in plan["fills"]:
+            reason = trust_gate(book, str(fill.get("side") or ""))
+            if reason:
+                gate_reasons[str(fill.get("intent_key") or "")] = reason
+    allowed = [fill for fill in plan["fills"] if str(fill.get("intent_key") or "") not in gate_reasons]
+    updated, applied = apply_to_ledger(book, allowed, as_of=as_of)
     records = [{**dict(record), "dry_run": is_dry,
                 "ledger_written": bool(write and not is_dry)} for record in applied]
+    gated_records: list[dict[str, Any]] = []
+    if gate_reasons:
+        _would_book, would_apply = apply_to_ledger(book, plan["fills"], as_of=as_of)
+        gated_records = [
+            {**dict(record), "dry_run": True, "ledger_written": False,
+             "gate_blocked": gate_reasons[str(record.get("intent_key") or "")]}
+            for record in would_apply if str(record.get("intent_key") or "") in gate_reasons
+        ]
     journal_rows: list[dict[str, Any]] = []
     for status, source in (("blocked", plan["blocks"]),
                            ("mandate_blocked", plan["mandate_blocks"])):
@@ -702,6 +773,13 @@ def fill_slot(
             "ai_reason": row.get("ai_reason"), "detail": row.get("detail"),
             "model_used": row.get("model_used"), "elapsed_ms": row.get("elapsed_ms"),
         } for row in source)
+    journal_rows.extend({
+        "schema_version": "ai_trader_daytime_journal_v1", "as_of": as_of,
+        "slot": row.get("slot"), "status": "trust_blocked", "blocked_by": BLOCK_TRUST_GATE,
+        "symbol": row.get("symbol"), "side": row.get("side"), "qty": row.get("quantity"),
+        "ai_reason": row.get("ai_reason"), "detail": row.get("gate_blocked"),
+        "model_used": row.get("model_used"), "elapsed_ms": row.get("elapsed_ms"),
+    } for row in gated_records)
 
     result = {
         "schema_version": FILL_SCHEMA, "as_of": as_of, "profile": str(profile or ""),
@@ -711,6 +789,8 @@ def fill_slot(
         "dry_run": is_dry, "written": False, "ledger_written": False,
         "records": records, "blocks": plan["blocks"], "mandate_blocks": plan["mandate_blocks"],
         "journal_rows": journal_rows, "restored_records": restored,
+        "gated_fills": len(gated_records), "gated_records": gated_records,
+        "daytime_trust": daytime_trust(book),
     }
     if not write:
         return result
@@ -731,12 +811,13 @@ def fill_slot(
         result["ledger_written"] = True
     try:
         _append_jsonl(fills_path(runtime, dry=is_dry), records)
+        _append_jsonl(fills_path(runtime, dry=True), gated_records)
         _append_jsonl(journal_path(runtime), journal_rows)
     except OSError as exc:
         result["evidence_error"] = f"{type(exc).__name__}:{exc}"
         result["recovery_pending"] = True
         return result
-    result["written"] = bool(records or journal_rows or restored)
+    result["written"] = bool(records or journal_rows or restored or gated_records)
     return result
 
 
@@ -760,6 +841,13 @@ def load_daytime_journal_for(as_of: str, *, state_dir: Path) -> list[dict[str, A
 
 __all__ = [
     "BLOCK_INVALID_INTENT",
+    "BLOCK_NO_SOURCE",
+    "BLOCK_TRUST_GATE",
+    "BLOCK_ZERO_VOLUME",
+    "DAYTIME_TRUST_KEY",
+    "DAYTIME_TRUST_REQUIRED",
+    "daytime_trust",
+    "trust_gate",
     "BLOCK_LIMIT_DOWN",
     "BLOCK_LIMIT_UNVERIFIABLE",
     "BLOCK_LIMIT_UP",
