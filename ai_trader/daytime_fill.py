@@ -33,7 +33,7 @@ from ai_trader.mandate import DEFAULT_MANDATE, TraderMandate, mandate_from_ledge
 from ai_trader.paths import PROJECT_ROOT, CyclePaths, assert_not_quantdesk_ledger, profile_paths
 from quantdesk.data_quality import classify_market
 from quantdesk.paper.matching import next_open_limit_blocked
-from quantdesk.paper.market_rules import lot_size_for_symbol
+from quantdesk.paper.market_rules import lot_size_for_symbol, order_quantity_rule
 from quantdesk.paper.trade_costs import TradeCostConfig, buy_cash_outflow, sell_cash_inflow
 from quantdesk.market_clock import to_shanghai_datetime
 
@@ -503,10 +503,13 @@ def plan_fills(
             blocks.append(_record(intent, quote, BLOCK_ZERO_VOLUME,
                                   f"{symbol} 成交量为 {volume}（停牌或无成交），不成交。"))
             continue
-        lot = int(lot_size_for_symbol(symbol) or 100)
-        if lot <= 0 or quantity % lot != 0:
+        held_now = int((positions.get(symbol) or {}).get("quantity") or 0) if side == SIDE_SELL else None
+        lot_problem = order_quantity_rule(symbol, quantity, held_shares=held_now,
+                                          name=quote.get("name") or None)
+        if lot_problem:
+            lot = int(lot_size_for_symbol(symbol) or 100)
             blocks.append(_record(intent, quote, BLOCK_NOT_A_LOT,
-                                  f"{quantity} 不是 {lot} 股整数倍，不成交。"))
+                                  f"{quantity} 股不符合该板块下单规则（{lot_problem}，最小 {lot} 股），不成交。"))
             continue
         # 涨跌停按快照自己的昨收算到分；昨收与涨跌幅都缺时算不出涨跌停价，不成交。
         limit = next_open_limit_blocked(

@@ -194,6 +194,29 @@ def is_valid_order_quantity(
     return parsed % lot == 0
 
 
+def order_quantity_rule(
+    symbol: Any,
+    quantity: Any,
+    *,
+    held_shares: Any = None,
+    name: Any = None,
+) -> str:
+    """The one A-share order-size rule for every paper path; ``""`` when valid.
+
+    Main board / ChiNext: whole multiples of 100. STAR: at least 200, then any
+    share count. BSE: at least 100, then any share count. A sell may clear an
+    entire sub-lot remainder (``held_shares``). The AI daytime parser, the
+    daytime fill and the evening book used three different rules before.
+    """
+
+    code = str(symbol or "").strip()
+    lot = lot_size_for_symbol(code, name=name)
+    board = board_type_for_symbol(code, name=name)
+    if is_valid_order_quantity(quantity, lot_size=lot, board_type=board, held_shares=held_shares):
+        return ""
+    return f"qty_not_valid_for_board:{board}:min_lot={lot}"
+
+
 def board_type_for_symbol(
     symbol: Any,
     *,
