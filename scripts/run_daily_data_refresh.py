@@ -71,6 +71,13 @@ UNIVERSE_MISMATCH_WARN_THRESHOLD = 30
 UNIVERSE_DIFF_REQUERY_LIMIT = 50
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 _OPTIONAL_DEADLINE: ContextVar[float | None] = ContextVar("daily_refresh_deadline", default=None)
+# bars_and_valuation's own deadline. On 2026-10-09 the 15:40 run had written
+# every bar by 15:47:31 and was still killed at the stage's 900 s limit, so the
+# whole run read "failed". Bars stop with evidence before the budget is gone;
+# the optional families stop earlier still, leaving time for the final report.
+_BARS_DEADLINE: ContextVar[float | None] = ContextVar("daily_refresh_bars_deadline", default=None)
+BARS_PUBLISH_RESERVE_SECONDS = 90.0
+OPTIONAL_PUBLISH_RESERVE_SECONDS = 60.0
 
 
 def _now_iso() -> str:
@@ -80,6 +87,22 @@ def _now_iso() -> str:
 def _remaining_refresh_seconds() -> float | None:
     deadline = _OPTIONAL_DEADLINE.get()
     return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+
+def _bars_time_left() -> float | None:
+    deadline = _BARS_DEADLINE.get()
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def _bars_expired() -> bool:
+    left = _bars_time_left()
+    return left is not None and left <= 0
+
+
+def _reserve(budget: float, reserve: float) -> float:
+    """A reserve that scales down with a small budget (never the whole budget)."""
+
+    return min(float(reserve), max(0.0, float(budget)) * 0.10)
 
 
 def _optional_fetch_worker(task: dict[str, Any], context: dict[str, Any]) -> Any:
@@ -201,12 +224,24 @@ def _dated_close_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
     from quantdesk.notifications.redaction import redact_text
 
     quotes = _DatedQuotes()
+    quotes.not_requested = []
     for start in range(0, len(symbols), 100):
         pending = symbols[start:start + 100]
+        if _bars_expired():
+            # No new request once bars' own deadline is gone; the rest stays
+            # an explicit "not requested" gap, never a silent absence.
+            quotes.not_requested.extend(symbols[start:])
+            quotes.batch_diagnostics.append({"batch_start": start, "reason": "bars_deadline_exhausted",
+                                             "not_requested_count": len(symbols) - start})
+            break
         # One bounded retry of missing rows; do not request successful rows twice.
         for attempt in (1, 2):
+            if attempt == 2 and _bars_expired():
+                break
             requested = set(pending)
-            result = fetch_spot_sina_batch(pending, batch_size=100, timeout=10)
+            left = _bars_time_left()
+            timeout = 10 if left is None else max(1.0, min(10.0, left))
+            result = fetch_spot_sina_batch(pending, batch_size=100, timeout=timeout)
             for row in result.rows:
                 code = str(row.get("symbol") or "")[-6:]
                 if code not in requested:
@@ -247,8 +282,14 @@ def _requery_universe_diff(
 
     quotes = _DatedQuotes()
     outcomes: dict[str, dict[str, Any]] = {}
-    for code in symbols[:UNIVERSE_DIFF_REQUERY_LIMIT]:
+    for index, code in enumerate(symbols[:UNIVERSE_DIFF_REQUERY_LIMIT]):
         lease.assert_active()
+        if _bars_expired():
+            for later in symbols[index:UNIVERSE_DIFF_REQUERY_LIMIT]:
+                outcomes[later] = {"attempted": False, "reason": "bars_deadline_exhausted",
+                                   "quote_date": "", "quote_time": "",
+                                   "note": "bars 自身截止时间已到，本轮未补查；缺口保留。"}
+            break
         single = _dated_close_quotes([code])
         for entry in getattr(single, "batch_diagnostics", None) or []:
             quotes.batch_diagnostics.append(
@@ -397,12 +438,57 @@ def _load_universe_symbols() -> list[str]:
     return out
 
 
+class _ListRows(list):
+    """The list snapshot plus how its pagination actually ended."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pagination: dict[str, Any] = {
+            "complete": False, "pages_completed": 0, "end": "", "failed_page": None,
+            "page_errors": [], "reason_codes": [],
+        }
+
+
+def _page_error(exc: Exception, status: int | None) -> str:
+    """Name a page failure: HTTP status (e.g. 456 rate limit), timeout, connect, decode."""
+
+    if status is not None and status != 200:
+        return f"http_{status}"
+    name = type(exc).__name__
+    if "Timeout" in name:
+        return "timeout"
+    if "Connection" in name:
+        return "connect"
+    if isinstance(exc, ValueError):  # JSONDecodeError and other undecodable bodies
+        return "decode"
+    return f"request:{name}"
+
+
 def fetch_market_snapshot(session: requests.Session) -> list[dict]:
-    rows: list[dict] = []
+    """Sina list pages. A page that still fails after its retries is a failure.
+
+    Before 2026-10-12 a page that failed three times was taken as "end of the
+    list": 2026-10-08 15:40 kept 900 rows and silently lost 4670 symbols. Now
+    the page's failure (HTTP status, timeout, connect, decode) is recorded and
+    ``pagination.complete`` stays False, so the caller can fill the gap.
+    """
+
+    rows = _ListRows()
+    evidence = rows.pagination
     page = 1
     while page <= 80:
+        if _bars_expired():
+            evidence.update(end="deadline", failed_page=page)
+            evidence["reason_codes"].append(f"list_deadline_exhausted:page={page}")
+            break
         payload = None
+        failure = ""
         for attempt in range(1, 4):
+            status: int | None = None
+            left = _bars_time_left()
+            if left is not None and left <= 0:
+                failure = failure or "deadline"
+                break
             try:
                 resp = session.get(
                     SINA_URL,
@@ -416,23 +502,44 @@ def fetch_market_snapshot(session: requests.Session) -> list[dict]:
                         "_s_r_a": "init",
                     },
                     headers={"User-Agent": UA, "Referer": "https://finance.sina.com.cn/"},
-                    timeout=25,
+                    timeout=25 if left is None else max(1.0, min(25.0, left)),
                 )
+                status = getattr(resp, "status_code", None)
+                if isinstance(status, int) and status != 200:
+                    raise RuntimeError(f"http_status_{status}")
                 resp.encoding = "GBK"
                 payload = resp.json()
+                failure = ""
                 break
-            except Exception:  # noqa: BLE001
-                if attempt == 3:
-                    payload = []
-                    break
-                time.sleep(3 * attempt)
-        if not isinstance(payload, list) or not payload:
+            except Exception as exc:  # noqa: BLE001 - recorded per page, never silent
+                failure = _page_error(exc, status if isinstance(status, int) else None)
+                evidence["page_errors"].append({"page": page, "attempt": attempt, "error": failure})
+                if attempt < 3:
+                    time.sleep(3 * attempt)
+        if failure:
+            evidence.update(end="page_failed", failed_page=page)
+            evidence["reason_codes"].append(f"list_page_failed:page={page}:{failure}")
+            break
+        if payload is None or (isinstance(payload, list) and not payload):
+            # Sina answers past the last page with null / an empty list.
+            evidence.update(complete=True, end="empty_page")
+            break
+        if not isinstance(payload, list):
+            evidence.update(end="invalid_page", failed_page=page)
+            evidence["reason_codes"].append(f"list_page_invalid:page={page}")
             break
         rows.extend(payload)
+        evidence["pages_completed"] += 1
         if len(payload) < 100:
+            # A short page is normally the last one. The caller still checks
+            # the result against the local roster; a gap is never assumed away.
+            evidence.update(complete=True, end="short_page")
             break
         page += 1
         time.sleep(0.8)
+    if page > 80 and not evidence["end"]:
+        evidence.update(end="page_limit")
+        evidence["reason_codes"].append("list_page_limit_reached")
     return rows
 
 
@@ -515,6 +622,10 @@ def family_bars_and_valuation(
         rows = fetch_market_snapshot(session)
     finally:
         session.close()
+    pagination = dict(getattr(rows, "pagination", {}) or {})
+    list_row_count = len(rows)
+    # A list whose pagination did not end cleanly is truncated, not complete.
+    list_truncated = bool(rows) and bool(pagination) and pagination.get("complete") is not True
     dated_only = not rows
     quotes: dict[str, dict[str, Any]] | None = None
     if dated_only:
@@ -560,13 +671,62 @@ def family_bars_and_valuation(
     if len(symbols) < 5000:
         warnings.append(f"full_a_snapshot_low_coverage:{len(symbols)}")
 
+    # A truncated list (a page failed, the deadline hit, ...) is not the whole
+    # market. 2026-10-08 15:40: 900 list rows, 4670 roster codes missing, the
+    # single-code re-check stopped at 50 and 4620 symbols got no bar at all.
+    # The missing codes now go through the same batched dated-HQ path the
+    # empty-list fallback uses (100 codes per request, no per-stock history).
+    gap_fill: dict[str, Any] = {}
+    if list_truncated and missing:
+        lease.assert_active()
+        warnings.append(
+            f"snapshot_list_truncated:{list_row_count}_rows:"
+            + ",".join(pagination.get("reason_codes") or ["pagination_incomplete"])[:300]
+        )
+        gap_quotes = _dated_close_quotes(missing)
+        not_requested = set(getattr(gap_quotes, "not_requested", None) or [])
+        filled: list[str] = []
+        for code in missing:
+            quote = gap_quotes.get(code) or {}
+            if not quote:
+                continue
+            price, previous = _fnum(quote.get("price")), _fnum(quote.get("prev_close"))
+            rows.append({
+                "code": code, "name": quote.get("name"),
+                "open": quote.get("open"), "high": quote.get("high"), "low": quote.get("low"),
+                "trade": quote.get("price"), "volume": quote.get("volume"), "amount": quote.get("amount"),
+                "pricechange": price - previous if previous > 0 else None,
+                "changepercent": (price / previous - 1) * 100 if previous > 0 else None,
+                "_gap_fill": True,
+            })
+            quotes[code] = quote
+            counts[code] += 1
+            filled.append(code)
+        main_diagnostics = getattr(quotes, "batch_diagnostics", None)
+        if isinstance(main_diagnostics, list):
+            main_diagnostics.extend(
+                {**entry, "scope": "list_gap_fill"} for entry in getattr(gap_quotes, "batch_diagnostics", None) or []
+            )
+        symbols = sorted(set(symbols) | set(filled))
+        still_missing = sorted(set(universe) - set(symbols))
+        gap_fill = {
+            "attempted": len(missing) - len(not_requested), "filled": len(filled),
+            "no_quote": len([c for c in still_missing if c not in not_requested]),
+            "not_requested_deadline": len(not_requested),
+            "still_missing_sample": still_missing[:20],
+        }
+        warnings.append(f"list_gap_filled_by_dated_hq:{len(filled)}/{len(missing)}")
+        warnings.append("valuation_partial:list_truncated")
+        missing = still_missing
+
     # The list is the primary source; a code it silently drops (9/21: 689009)
     # ended up in no request at all.  Every difference code gets one bounded
     # re-check through the same dated-HQ path, and the outcome is kept.  The
-    # empty-list fallback already requested the whole roster, so it needs none.
+    # empty-list fallback already requested the whole roster, so it needs none;
+    # a truncated list's gap was just requested in batches above.
     diff_quotes: dict[str, dict[str, Any]] = {}
     diff_outcomes: dict[str, dict[str, Any]] = {}
-    if missing and not dated_only:
+    if missing and not dated_only and not list_truncated:
         diff_quotes, diff_outcomes = _requery_universe_diff(missing, lease=lease)
         main_diagnostics = getattr(quotes, "batch_diagnostics", None)
         if isinstance(main_diagnostics, list):
@@ -585,11 +745,18 @@ def family_bars_and_valuation(
     valuation_writer = csv.writer(valuations, lineterminator="\n")
     valuation_writer.writerow(val_fields)
     accepted_quotes = 0
-    for item in rows:
+    unprocessed: list[str] = []
+    for position, item in enumerate(rows):
         lease.assert_active()
+        if _bars_expired():
+            # Stop with evidence: these codes were not checked or written in
+            # this run and stay missing (the slow path may still fill them).
+            unprocessed = [str(other.get("code") or "").strip() for other in rows[position:]]
+            break
         code = str(item.get("code") or "").strip()
         if not code.isdigit() or len(code) != 6:
             continue
+        gap_item = bool(item.get("_gap_fill"))
         quote = quotes.get(code) or {}
         reason = "duplicate_list_symbol" if counts[code] != 1 else (
             "duplicate_or_missing_hq_quote" if not quote else _close_quote_reason(item, quote, target))
@@ -605,7 +772,7 @@ def family_bars_and_valuation(
                 }
             continue
         accepted_quotes += 1
-        if not dated_only:
+        if not dated_only and not gap_item:
             valuation_writer.writerow([
                 code, str(item.get("name") or ""), _fmt_price(item.get("trade")),
                 _fmt_price(item.get("changepercent")), _fmt_price(item.get("per")), _fmt_price(item.get("pb")),
@@ -628,7 +795,7 @@ def family_bars_and_valuation(
             _fmt_price(item.get("low")), _fmt_price(item.get("trade")), _fmt_float1(item.get("volume")),
             _fmt_float1(item.get("amount")), _fmt_price(item.get("pricechange")),
             _fmt_price(item.get("changepercent")), "raw",
-            "sina_dated_hq_close" if dated_only else "sina_spot_close", now,
+            "sina_dated_hq_close" if dated_only else "sina_dated_hq_list_gap_fill" if gap_item else "sina_spot_close", now,
         ])
         path = DAILY_DIR / f"{code}.csv"
         was_new = not path.exists()
@@ -650,6 +817,10 @@ def family_bars_and_valuation(
         lease.assert_active()
         quote = diff_quotes[code]
         outcome = diff_outcomes.setdefault(code, {"attempted": True, "reason": ""})
+        if _bars_expired():
+            unprocessed.append(code)
+            outcome["reason"] = "bars_deadline_exhausted"
+            continue
         reason = _dated_quote_target_reason(quote, target)
         if reason:
             outcome["reason"] = f"universe_diff_requery:{reason}"
@@ -709,8 +880,18 @@ def family_bars_and_valuation(
         "contract": "Missing or invalid data remains missing; no suspension is inferred.",
     }, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8"), lease=lease)
     usable = stats["appended"] + stats["already_had_bar"]
+    not_requested = list(getattr(quotes, "not_requested", None) or [])
+    deadline_hit = bool(unprocessed or not_requested)
+    if deadline_hit:
+        warnings.append(f"bars_deadline_exhausted:unprocessed={len(unprocessed)}:not_requested={len(not_requested)}")
+    status = ("partial" if usable and deadline_hit else "completed_with_warnings" if usable and warnings
+              else "completed" if usable else "failed")
     return {
-        "ok": bool(usable), "status": "completed_with_warnings" if usable and warnings else "completed" if usable else "failed",
+        "ok": bool(usable), "status": status,
+        "list_rows": list_row_count, "list_pagination": pagination, "list_truncated": list_truncated,
+        "list_gap_fill": gap_fill,
+        "bars_deadline": {"hit": deadline_hit, "unprocessed_count": len(unprocessed),
+                          "unprocessed_sample": unprocessed[:20], "not_requested_count": len(not_requested)},
         "snapshot_rows": len(rows), "dated_close_quotes": accepted_quotes, "bars": stats,
         "valuation_snapshot": _display_path(val_path) if accepted_quotes and not dated_only else "",
         "quote_source": "sina_dated_hq_fallback" if dated_only else "sina_list_and_dated_hq",
@@ -974,7 +1155,13 @@ def main(argv: list[str] | None = None) -> int:
         printed = dict(report)
     else:
         started = time.monotonic()
-        deadline_token = _OPTIONAL_DEADLINE.set(None if args.max_refresh_seconds is None else started + args.max_refresh_seconds)
+        budget = args.max_refresh_seconds
+        # Bars get their own deadline; the optional families stop earlier than
+        # the whole budget, so the final report is always written in time.
+        deadline_token = _OPTIONAL_DEADLINE.set(
+            None if budget is None else started + budget - _reserve(budget, OPTIONAL_PUBLISH_RESERVE_SECONDS))
+        bars_token = _BARS_DEADLINE.set(
+            None if budget is None else started + budget - _reserve(budget, BARS_PUBLISH_RESERVE_SECONDS))
         try:
             with MarketWriterLease(PROJECT_ROOT, run_id=report["pipeline_run_id"], target=target) as lease:
                 if not _complete_live_session(target):
@@ -1019,7 +1206,10 @@ def main(argv: list[str] | None = None) -> int:
                     "overall_ok": all_ok and not skipped_families, "canonical_write": True,
                     "skipped_families": skipped_families, "finished_at": _now_iso(),
                     "elapsed_seconds": round(time.monotonic() - started, 1),
-                    "status": "failed" if not bars.get("ok") else "completed" if all_ok and not skipped_families and not bars.get("warnings") else "completed_with_warnings",
+                    # Bars stopped by their own deadline wrote some bars but not
+                    # all: that is "partial", never relabelled as warnings.
+                    "status": "failed" if not bars.get("ok") else "partial" if bars.get("status") == "partial"
+                              else "completed" if all_ok and not skipped_families and not bars.get("warnings") else "completed_with_warnings",
                 })
                 benchmark = report["families"]["benchmarks"]
                 report["benchmark_evidence"] = {
@@ -1045,10 +1235,12 @@ def main(argv: list[str] | None = None) -> int:
                            "reason_codes": [str(exc) if isinstance(exc, MarketWriterUnauthorized) else "writer_io_failure"]})
             printed = dict(report)
         finally:
+            _BARS_DEADLINE.reset(bars_token)
             _OPTIONAL_DEADLINE.reset(deadline_token)
     if truthy(args.json):
         print(json.dumps(printed, ensure_ascii=False, indent=2, allow_nan=False))
-    return 0 if report["status"] in {"completed", "completed_with_warnings", "planned_offline"} else 5 if report["status"] == "blocked" else 1
+    return (0 if report["status"] in {"completed", "completed_with_warnings", "planned_offline"}
+            else 5 if report["status"] == "blocked" else 4 if report["status"] == "partial" else 1)
 
 
 if __name__ == "__main__":
