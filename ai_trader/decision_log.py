@@ -9,8 +9,11 @@ from __future__ import annotations
 import csv
 import html
 import json
+import os
 import re
 import subprocess
+import tempfile
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -1088,10 +1091,77 @@ def load_decision_records(path: Path) -> list[dict[str, Any]]:
     return out
 
 
-def write_decision_records(path: Path, records: list[dict[str, Any]]) -> None:
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Whole-file replacement: temp file in the same folder, fsync, then replace.
+
+    A crash at any point leaves either the old file or the new file, never a
+    half-written one.  Windows can briefly refuse the replace while a reader has
+    the file open, so the replace is retried a few times before failing loudly.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(temp_name, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _quarantine_unreadable_lines(path: Path) -> int:
+    """Copy lines that are not JSON objects to ``<name>.corrupt.jsonl`` before a rewrite.
+
+    Reading skips such lines; without this step the next whole-file rewrite would
+    erase them for good.  The quarantine file is append-only and fsynced.
+    """
+
+    if not path.is_file():
+        return 0
+    bad: list[bytes] = []
+    for raw in path.read_bytes().splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            bad.append(raw)
+            continue
+        if not isinstance(row, dict):
+            bad.append(raw)
+    if not bad:
+        return 0
+    quarantine = path.with_name(path.stem + ".corrupt.jsonl")
+    stamp = _now_iso()
+    with quarantine.open("ab") as handle:
+        for raw in bad:
+            handle.write(json.dumps({"quarantined_at": stamp, "source": path.name,
+                                     "raw_line": raw.decode("utf-8", errors="replace")},
+                                    ensure_ascii=False).encode("utf-8") + b"\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return len(bad)
+
+
+def write_decision_records(path: Path, records: list[dict[str, Any]]) -> None:
+    path = Path(path)
+    _quarantine_unreadable_lines(path)
     payload = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in records)
-    path.write_text(payload, encoding="utf-8")
+    _atomic_write_bytes(path, payload.encode("utf-8"))
 
 
 def _judgment_fingerprint(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
@@ -1476,8 +1546,7 @@ def render_owner_page(
                 f"{item.get('observed_price') if item.get('observed_price') is not None else '-'} | "
                 f"{band} | {note} |"
             )
-    md_path.parent.mkdir(parents=True, exist_ok=True)
-    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _atomic_write_bytes(Path(md_path), ("\n".join(lines) + "\n").encode("utf-8"))
     html_doc = (
         "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
         f"<title>C线决策对照 · {html.escape(DISCLAIMER)}</title>"
@@ -1527,8 +1596,7 @@ def render_owner_page(
         )
         + "</body></html>"
     )
-    html_path.parent.mkdir(parents=True, exist_ok=True)
-    html_path.write_text(html_doc, encoding="utf-8")
+    _atomic_write_bytes(Path(html_path), html_doc.encode("utf-8"))
 
 
 def records_from_plan(
