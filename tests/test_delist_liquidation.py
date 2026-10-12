@@ -60,7 +60,11 @@ def test_apply_moves_delisted_to_closed_and_credits_cash() -> None:
         ],
         "closed_positions": [],
     }
-    out = dl.apply_delisting_liquidation(state, as_of="2024-06-01", data=_data_with_delist())
+    # 1A: liquidation needs an observed last-tradable close; without one the
+    # holding is kept as "no price, pending manual" (tests/test_fix1a_delist_no_invented_price.py).
+    out = dl.apply_delisting_liquidation(
+        state, as_of="2024-06-01", data=_data_with_delist(), last_close_lookup={"000002": 4.2}
+    )
     assert out["ok"] is True
     assert out["liquidated"] >= 1
     new_state = out["state"]
