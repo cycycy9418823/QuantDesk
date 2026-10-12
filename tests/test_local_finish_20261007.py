@@ -68,12 +68,13 @@ def test_restore_torn_receipt_retains_original_evidence_and_ledger(tmp_path, mon
             raise OSError('partial_write')
         return append(path, records)
     monkeypatch.setattr(fill,'_append_jsonl',torn)
-    first = fill.fill_slot(tmp_path,paths=paths,ledger=_book(),now=NOW,rows=[_row()],quote_slot=QUOTE_SLOT,write=True,dry=False)
+    # 1A: a fill needs a price source (rows_source); a sourceless quote no longer fills.
+    first = fill.fill_slot(tmp_path,paths=paths,ledger=_book(),now=NOW,rows=[_row()],quote_slot=QUOTE_SLOT,rows_source='cloud_slot',write=True,dry=False)
     assert first['ledger_written'] and first['recovery_pending'] and not first['written']
     before = paths.ledger.read_bytes()
     monkeypatch.setattr(fill,'_append_jsonl',append)
     for _ in range(2):
-        fill.fill_slot(tmp_path,paths=paths,now=NOW,rows=[_row(price=99)],quote_slot=QUOTE_SLOT,write=True,dry=False)
+        fill.fill_slot(tmp_path,paths=paths,now=NOW,rows=[_row(price=99)],quote_slot=QUOTE_SLOT,rows_source='cloud_slot',write=True,dry=False)
         assert paths.ledger.read_bytes() == before
     rows = fill.load_daytime_fills_for(DAY,state_dir=paths.ledger.parent)
     original = json.loads(before)['trades'][0]['daytime_fill_record']
