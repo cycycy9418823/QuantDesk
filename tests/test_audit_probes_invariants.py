@@ -205,7 +205,9 @@ def test_probe_stat_validation_reports_insufficient_sample_not_fake_pass() -> No
     result = stats.run_backtest_statistical_validation(
         {"returns": [0.01, -0.01]}, iterations=20, seed=42, write=False
     )
-    assert result["status"] == "warning"
+    # fix(1d) #2: the verdict is now the explicit "insufficient_sample".
+    assert result["status"] == "insufficient_sample"
+    assert result["status"] != "passed"
     assert "insufficient_sample" in result["warnings"]
 
 
