@@ -568,11 +568,19 @@ def test_actual_daily_schema_preserves_updated_at_without_inventing_fetched_at(t
 
 
 @pytest.mark.parametrize(
-    ("side", "open_price", "reason"),
-    [("buy", 10.5, "limit_up:"), ("sell", 9.5, "limit_down:")],
+    ("side", "open_price", "status", "reason"),
+    # TRADE_DATE is 2026-09-05: from 2026-07-06 the main-board ST band is 10%
+    # (HKEX circular 055/2026), so +/-5% opens fill and +/-10% opens are blocked.
+    [
+        # 10.48 (+4.8%): blocked under the old 5% band, under the 5% chase limit.
+        ("buy", 10.48, "filled", ""),
+        ("buy", 11.0, "rejected", "limit_up:"),
+        ("sell", 9.5, "filled", ""),
+        ("sell", 9.0, "rejected", "limit_down:"),
+    ],
 )
 def test_explicit_st_evidence_uses_the_existing_st_limit_band(
-    tmp_path: Path, side: str, open_price: float, reason: str
+    tmp_path: Path, side: str, open_price: float, status: str, reason: str
 ) -> None:
     _write_bars(tmp_path, "600000", open_price=open_price)
     path = tmp_path / "600000.csv"
@@ -585,9 +593,10 @@ def test_explicit_st_evidence_uses_the_existing_st_limit_band(
     )
 
     action = _only_action(actions)
-    assert action["status"] == "rejected"
-    assert action["reason"].startswith(reason)
-    assert ledger["trades"] == []
+    assert action["status"] == status
+    if status == "rejected":
+        assert action["reason"].startswith(reason)
+        assert ledger["trades"] == []
 
 
 def test_non_raw_holding_prices_cannot_change_open_buy_acceptance_or_raw_valuation(tmp_path: Path) -> None:

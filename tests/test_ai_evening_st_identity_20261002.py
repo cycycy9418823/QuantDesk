@@ -27,10 +27,10 @@ def _buy(quantity: int = 1000) -> list[dict]:
     return [{"symbol": SYMBOL, "side": "buy", "quantity": quantity, "ref_close": 10.0}]
 
 
-def _run(*, open_px: float, prev: float, identity) -> list[dict]:
+def _run(*, open_px: float, prev: float, identity, day: str = DAY) -> list[dict]:
     _ledger_after, actions = trader.execute_intents(
         _ledger(),
-        as_of=DAY,
+        as_of=day,
         intents=_buy(),
         open_prices={SYMBOL: open_px},
         prev_closes={SYMBOL: prev},
@@ -41,13 +41,25 @@ def _run(*, open_px: float, prev: float, identity) -> list[dict]:
 
 
 def test_st_identity_narrows_the_limit_and_blocks_the_buy() -> None:
-    """ST（±5%）时，+4.8% 的开盘缺口已经是涨停附近 → 不得成交。"""
+    """2026-07-06 前主板 ST 是 ±5%：开在涨停价 10.50 → 不得成交。
 
-    actions = _run(open_px=10.48, prev=10.0, identity={SYMBOL: (True, False)})
+    1A 起涨跌停按前收算到分比较价格（不再用"幅度减容差"），所以用当时的涨停价本身。
+    """
+
+    actions = _run(open_px=10.50, prev=10.0, identity={SYMBOL: (True, False)}, day="2026-07-03")
 
     assert actions and actions[0]["status"] == "rejected", actions
     assert actions[0]["reason"].startswith("limit_up:"), actions[0]["reason"]
     assert actions[0]["is_st"] is True and actions[0]["st_unknown"] is False
+
+
+def test_main_board_st_band_is_10pct_from_2026_07_06() -> None:
+    """HKEX 通函 055/2026：2026-07-06 起主板风险警示股 ±10%，+4.8% 不是涨停。"""
+
+    actions = _run(open_px=10.48, prev=10.0, identity={SYMBOL: (True, False)})
+    assert actions and actions[0]["status"] == "filled", actions
+    blocked = _run(open_px=11.00, prev=10.0, identity={SYMBOL: (True, False)})
+    assert blocked[0]["status"] == "rejected" and blocked[0]["reason"].startswith("limit_up:")
 
 
 def test_non_st_stock_is_not_blocked_by_that_gap() -> None:

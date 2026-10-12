@@ -450,6 +450,9 @@ def test_open_gap_abandons_chase_buy() -> None:
         open_prices={"600000": 10.8},
         prev_closes={"600000": 10.0},
         live_id="reversal_5",
+        # 1A: before 2026-07-06 an unknown ST identity uses the strict 5% band,
+        # which would refuse +8% as limit-up before the chase rule is reached.
+        st_identity={"600000": (False, False)},
     )
     assert actions[0]["status"] == "abandoned"
     assert ledger["positions"] == []

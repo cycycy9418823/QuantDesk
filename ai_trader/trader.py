@@ -7,6 +7,7 @@ from typing import Any
 
 from ai_trader.ledger import mark_to_market, position_map, session_days_held
 from ai_trader.mandate import DEFAULT_MANDATE, TraderMandate
+from quantdesk.board_rules import MAIN_ST_10PCT_START, ST_STATUS_NOT_ST, ST_STATUS_ST, ST_STATUS_UNKNOWN
 from quantdesk.paper.matching import next_open_limit_blocked
 from quantdesk.paper.market_rules import lot_size_for_symbol, round_notional_down_to_lot_quantity
 from quantdesk.paper.trade_costs import TradeCostConfig, buy_cash_outflow, sell_cash_inflow
@@ -15,12 +16,40 @@ COST_CONFIG = TradeCostConfig.cn_current()
 
 
 def _limit_blocked(
-    symbol: str, pct_chg: float | None, side: str, *, is_st: bool = False
+    symbol: str, pct_chg: float | None, side: str, *, is_st: bool = False, **exact: Any
 ) -> str | None:
-    return next_open_limit_blocked(symbol, pct_chg, side, is_st=is_st)
+    """Shared limit gate. ``exact`` (price / pre_close / trade_date / st_status)
+    switches to the cent-rounded limit-price comparison in ``quantdesk.board_rules``."""
+
+    return next_open_limit_blocked(symbol, pct_chg, side, is_st=is_st, **exact)
+
+
+def _st_status(is_st: bool, st_unknown: bool) -> str:
+    if st_unknown:
+        return ST_STATUS_UNKNOWN
+    return ST_STATUS_ST if is_st else ST_STATUS_NOT_ST
+
+
+def _pre_close_from_pct(price: float | None, pct: float | None) -> float | None:
+    try:
+        px = float(price)  # type: ignore[arg-type]
+        change = float(pct)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if px <= 0 or change <= -100 or px != px or change != change:
+        return None
+    return px / (1.0 + change / 100.0)
 
 
 ST_UNKNOWN_NOTE = "ST 未知，按 10% 判断"
+# 2026-07-06 前主板 ST 是 5%：身份未知时按更严的 5% 判断，并如实写出来。
+ST_UNKNOWN_NOTE_STRICT = "ST 未知，按更严的 5% 判断"
+
+
+def st_unknown_note(as_of: str) -> str:
+    """身份未知时的说明，随交易日期给出实际使用的幅度。"""
+
+    return ST_UNKNOWN_NOTE if str(as_of or "")[:10] >= MAIN_ST_10PCT_START else ST_UNKNOWN_NOTE_STRICT
 
 
 def _listing_snapshot(symbol: str, daily_dir: Any) -> tuple[str, str]:
@@ -158,7 +187,11 @@ def decide_and_trade(
         if exits >= mandate.max_exits_per_day:
             break
         pos = positions[symbol]
-        blocked = _can_sell(pos, as_of) or _limit_blocked(symbol, pct_chg.get(symbol), "sell")
+        sell_px = prices.get(symbol) or float(pos.get("market_price") or 0.0)
+        blocked = _can_sell(pos, as_of) or _limit_blocked(
+            symbol, pct_chg.get(symbol), "sell", price=sell_px or None, trade_date=as_of,
+            pre_close=_pre_close_from_pct(prices.get(symbol), pct_chg.get(symbol)),
+        )
         if blocked:
             actions.append({"action": "sell", "symbol": symbol, "status": "rejected", "reason": blocked})
             continue
@@ -212,7 +245,10 @@ def decide_and_trade(
                 }
             )
             break
-        blocked = _limit_blocked(symbol, pct_chg.get(symbol), "buy")
+        blocked = _limit_blocked(
+            symbol, pct_chg.get(symbol), "buy", price=prices.get(symbol), trade_date=as_of,
+            pre_close=_pre_close_from_pct(prices.get(symbol), pct_chg.get(symbol)),
+        )
         if blocked:
             actions.append({"action": "buy", "symbol": symbol, "status": "rejected", "reason": blocked})
             continue
@@ -303,8 +339,14 @@ def execute_intents(
     live_id: str | None,
     mandate: TraderMandate = DEFAULT_MANDATE,
     st_identity: dict[str, Any] | None = None,
+    limit_bases: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Fill pending overnight intents at next-session open only."""
+    """Fill pending overnight intents at next-session open only.
+
+    ``limit_bases`` optionally gives the exchange's previous close per symbol
+    (on an ex-rights day it differs from the intent's ``ref_close``); without
+    it the limit price is computed from ``prev_closes``.
+    """
 
     def _identity(symbol: str) -> tuple[bool, bool]:
         """当晚这条代码的可信身份；没传就按"未知"处理，不改既有限制。"""
@@ -357,13 +399,17 @@ def execute_intents(
                 actions.append({"action": "sell", "symbol": symbol, "status": "rejected", "reason": blocked, "fill_model": "next_open_only"})
                 continue
             is_st, st_unknown = _identity(symbol)
-            limit = _limit_blocked(symbol, gap_pct, "sell", is_st=is_st)
+            limit = _limit_blocked(
+                symbol, gap_pct, "sell", is_st=is_st, price=open_px, trade_date=as_of,
+                pre_close=(limit_bases or {}).get(symbol, prev),
+                st_status=_st_status(is_st, st_unknown),
+            ) if open_px else None
             if limit:
                 actions.append({
                     "action": "sell", "symbol": symbol, "status": "rejected", "reason": limit,
                     "fill_model": "next_open_only",
                     "is_st": is_st, "st_unknown": st_unknown,
-                    "st_note": ST_UNKNOWN_NOTE if st_unknown else "",
+                    "st_note": st_unknown_note(as_of) if st_unknown else "",
                 })
                 continue
             if not open_px or qty <= 0:
@@ -399,7 +445,7 @@ def execute_intents(
                 "fill_model": "next_open_only",
                 "is_st": is_st,
                 "st_unknown": st_unknown,
-                "st_note": ST_UNKNOWN_NOTE if st_unknown else "",
+                "st_note": st_unknown_note(as_of) if st_unknown else "",
                 "style": pos.get("style") or intent.get("style") or None,
                 "held_days": session_days_held(str(pos.get("acquired_on") or "")[:10], as_of),
                 "net_return": _net_return_on_cost(fill, pos, qty),
@@ -418,13 +464,17 @@ def execute_intents(
             actions.append({"action": "buy", "symbol": symbol, "status": "rejected", "reason": "持仓只数已满。", "fill_model": "next_open_only"})
             continue
         is_st, st_unknown = _identity(symbol)
-        limit = _limit_blocked(symbol, gap_pct, "buy", is_st=is_st)
+        limit = _limit_blocked(
+            symbol, gap_pct, "buy", is_st=is_st, price=open_px, trade_date=as_of,
+            pre_close=(limit_bases or {}).get(symbol, prev),
+            st_status=_st_status(is_st, st_unknown),
+        ) if open_px else None
         if limit:
             actions.append({
                 "action": "buy", "symbol": symbol, "status": "rejected", "reason": limit,
                 "fill_model": "next_open_only",
                 "is_st": is_st, "st_unknown": st_unknown,
-                "st_note": ST_UNKNOWN_NOTE if st_unknown else "",
+                "st_note": st_unknown_note(as_of) if st_unknown else "",
             })
             continue
         # An explicit None means the declared style does not treat an opening
@@ -483,7 +533,7 @@ def execute_intents(
             "fill_model": "next_open_only",
             "is_st": is_st,
             "st_unknown": st_unknown,
-            "st_note": ST_UNKNOWN_NOTE if st_unknown else "",
+            "st_note": st_unknown_note(as_of) if st_unknown else "",
         }
         actions.append({**trade, "action": "buy", "status": "filled"})
         marked.setdefault("trades", []).append(trade)

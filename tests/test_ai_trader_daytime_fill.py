@@ -237,12 +237,19 @@ def test_intent_expires_after_its_valid_until_slot(tmp_path, monkeypatch) -> Non
 
 
 def test_st_name_without_is_st_column_uses_the_five_percent_limit(tmp_path, monkeypatch) -> None:
-    """A1-r1：快照 CSV 没有 is_st 列，ST 要从 name 认出来，按 5% 而不是 10%。"""
+    """A1-r1：快照 CSV 没有 is_st 列，ST 要从 name 认出来。
 
-    result, _, saved = _run(tmp_path, monkeypatch, intents=[_intent()],
+    1A：2026-07-06 起主板 ST 涨跌幅为 10%（HKEX 通函 055/2026），DAY=2026-09-22，
+    所以 +5% 不再是涨停、+10% 才是；07-06 前的 5% 由 test_fix1a_fill_gates 覆盖。
+    """
+
+    result, _, saved = _run(tmp_path / "five", monkeypatch, intents=[_intent()],
                             rows=[_row(name="*ST美丽", pct_chg=5.0)])
-    assert result["fills"] == 0 and not saved
-    assert result["blocks"][0]["blocked_by"] == daytime_fill.BLOCK_LIMIT_UP
+    assert result["fills"] == 1 and saved
+    blocked, _, saved_up = _run(tmp_path / "ten", monkeypatch, intents=[_intent()],
+                                rows=[_row(name="*ST美丽", pct_chg=10.0)])
+    assert blocked["fills"] == 0 and not saved_up
+    assert blocked["blocks"][0]["blocked_by"] == daytime_fill.BLOCK_LIMIT_UP
 
 
 def test_normal_name_at_five_percent_still_fills(tmp_path, monkeypatch) -> None:

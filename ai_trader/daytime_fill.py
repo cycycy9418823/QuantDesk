@@ -52,6 +52,8 @@ BLOCK_NOT_LATER = "quote_not_after_intent"
 BLOCK_MISSING_QUOTE = "missing_quote_no_fill"
 BLOCK_LIMIT_UP = "limit_up_no_buy"
 BLOCK_LIMIT_DOWN = "limit_down_no_sell"
+BLOCK_LIMIT_UNVERIFIABLE = "limit_unverifiable_no_fill"
+BLOCK_PRICE_OUTSIDE_BAND = "price_outside_limit_band_no_fill"
 BLOCK_NOT_A_LOT = "not_a_full_lot"
 BLOCK_T_PLUS_1 = "t_plus_1_not_sellable"
 BLOCK_NO_POSITION = "no_position_to_sell"
@@ -267,6 +269,7 @@ def quote_index(rows: Sequence[Mapping[str, Any]], *, quote_slot: str = "",
         if len(symbol) != 6 or not symbol.isdigit():
             continue
         is_st, st_unknown = _st_flags(row)
+        pre_close = _num(row.get("pre_close"))
         market_time = str(row.get("quote_time") or row.get("timestamp") or row.get("time") or "")
         market_date = str(row.get("quote_date") or "").strip()
         parsed_time = market_time
@@ -283,6 +286,9 @@ def quote_index(rows: Sequence[Mapping[str, Any]], *, quote_slot: str = "",
             "symbol": symbol,
             "price": _num(row.get("price")),
             "pct_chg": _num(row.get("pct_chg")),
+            "pre_close": pre_close if pre_close is not None and pre_close > 0 else None,
+            "volume": _num(row.get("volume")),
+            "name": str(row.get("name") or ""),
             "is_st": is_st,
             "st_unknown": st_unknown,
             "st_note": ST_UNKNOWN_NOTE if st_unknown else "",
@@ -439,10 +445,19 @@ def plan_fills(
             blocks.append(_record(intent, quote, BLOCK_NOT_A_LOT,
                                   f"{quantity} 不是 {lot} 股整数倍，不成交。"))
             continue
-        limit = next_open_limit_blocked(symbol, quote.get("pct_chg"), side,
-                                        is_st=bool(quote.get("is_st")))
+        # 涨跌停按快照自己的昨收算到分；昨收与涨跌幅都缺时算不出涨跌停价，不成交。
+        limit = next_open_limit_blocked(
+            symbol, quote.get("pct_chg"), side, is_st=bool(quote.get("is_st")),
+            price=price, pre_close=quote.get("pre_close"), trade_date=as_of,
+            st_status=("unknown" if quote.get("st_unknown") else ("st" if quote.get("is_st") else "not_st")),
+        )
         if limit:
-            token = BLOCK_LIMIT_UP if side == SIDE_BUY else BLOCK_LIMIT_DOWN
+            if limit.startswith(("limit_unverifiable", "missing_fill_price")):
+                token = BLOCK_LIMIT_UNVERIFIABLE
+            elif limit.startswith("price_outside_limit_band"):
+                token = BLOCK_PRICE_OUTSIDE_BAND
+            else:
+                token = BLOCK_LIMIT_UP if side == SIDE_BUY else BLOCK_LIMIT_DOWN
             blocks.append(_record(intent, quote, token, f"{symbol} {limit}，不成交。"))
             continue
 
@@ -746,7 +761,9 @@ def load_daytime_journal_for(as_of: str, *, state_dir: Path) -> list[dict[str, A
 __all__ = [
     "BLOCK_INVALID_INTENT",
     "BLOCK_LIMIT_DOWN",
+    "BLOCK_LIMIT_UNVERIFIABLE",
     "BLOCK_LIMIT_UP",
+    "BLOCK_PRICE_OUTSIDE_BAND",
     "BLOCK_MISSING_QUOTE",
     "BLOCK_NOT_A_LOT",
     "BLOCK_NOT_LATER",
