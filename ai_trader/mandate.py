@@ -16,7 +16,7 @@ for itself (see ``philosophy.py``).
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 BOUNDARY = {
@@ -98,6 +98,10 @@ class TraderMandate:
     # in STYLE_MAX_OPEN_GAP_PCT take precedence.
     max_chase_open_gap_pct: float = 5.0
     max_watchlist: int = 30
+    # Charter §3: whether the book may touch ST / BSE names is a ledger-header
+    # parameter, not code. Defaults keep today's behaviour (both allowed).
+    allow_st: bool = True
+    allow_bse: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {**asdict(self), "boundary": dict(BOUNDARY), "styles": dict(STYLES)}
@@ -113,3 +117,63 @@ class TraderMandate:
 
 
 DEFAULT_MANDATE = TraderMandate()
+
+# Header fields the owner may override. Identity/money fields (ledger_id,
+# initial_cash, currency) and persona text are fixed at creation and ignored.
+# min_holdings is not a rail (0 on purpose, see the class comment); the real
+# headers still carry an old 5, which must not come back to life.
+_OVERRIDABLE_INT = ("target_holdings", "max_holdings", "max_opens_per_day",
+                    "max_exits_per_day", "fallback_hold_days", "max_watchlist")
+_OVERRIDABLE_WEIGHT = ("min_single_weight", "max_single_weight", "min_cash_weight", "max_gross_weight")
+_OVERRIDABLE_FLOAT = ("max_chase_open_gap_pct",)
+_OVERRIDABLE_BOOL = ("allow_st", "allow_bse")
+
+
+def _as_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def mandate_from_ledger(ledger: Any, *, base: TraderMandate = DEFAULT_MANDATE) -> TraderMandate:
+    """The rails this book actually runs under: header ``mandate`` over the defaults.
+
+    The header used to be written at creation and never read, so changing it did
+    nothing. Unknown or invalid values are ignored (the default stays), so a
+    header that only carries today's defaults changes no behaviour.
+    """
+
+    header = ledger.get("mandate") if isinstance(ledger, dict) else None
+    if not isinstance(header, dict):
+        return base
+    overrides: dict[str, Any] = {}
+    for key in _OVERRIDABLE_INT:
+        if key in header:
+            try:
+                value = int(header[key])
+            except (TypeError, ValueError):
+                continue
+            if value >= 0:
+                overrides[key] = value
+    for key in _OVERRIDABLE_WEIGHT + _OVERRIDABLE_FLOAT:
+        if key in header:
+            try:
+                value = float(header[key])
+            except (TypeError, ValueError):
+                continue
+            if value != value or value < 0 or (key in _OVERRIDABLE_WEIGHT and value > 1):
+                continue
+            overrides[key] = value
+    for key in _OVERRIDABLE_BOOL:
+        if key in header:
+            flag = _as_bool(header[key])
+            if flag is not None:
+                overrides[key] = flag
+    if overrides.get("target_holdings", base.target_holdings) <= 0:
+        overrides.pop("target_holdings", None)
+    return replace(base, **overrides) if overrides else base

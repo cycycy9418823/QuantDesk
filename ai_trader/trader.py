@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from ai_trader.ledger import mark_to_market, position_map, session_days_held
-from ai_trader.mandate import DEFAULT_MANDATE, TraderMandate
+from ai_trader.mandate import DEFAULT_MANDATE, TraderMandate, mandate_from_ledger
 from quantdesk.board_rules import MAIN_ST_10PCT_START, ST_STATUS_NOT_ST, ST_STATUS_ST, ST_STATUS_UNKNOWN
+from quantdesk.data_quality import classify_market
 from quantdesk.paper.matching import next_open_limit_blocked
 from quantdesk.paper.market_rules import lot_size_for_symbol, round_notional_down_to_lot_quantity
 from quantdesk.paper.trade_costs import TradeCostConfig, buy_cash_outflow, sell_cash_inflow
@@ -22,6 +23,20 @@ def _limit_blocked(
     switches to the cent-rounded limit-price comparison in ``quantdesk.board_rules``."""
 
     return next_open_limit_blocked(symbol, pct_chg, side, is_st=is_st, **exact)
+
+
+def _mandate_switch_block(symbol: str, mandate: TraderMandate, *, is_st: bool, st_unknown: bool) -> str:
+    """Ledger-header switches (charter §3): may this book open ST / BSE names?
+
+    Only buys are gated; an existing holding may always be sold. With ST not
+    allowed, an unknown identity is refused too -- it cannot be shown non-ST.
+    """
+
+    if not getattr(mandate, "allow_bse", True) and classify_market(symbol) == "BSE":
+        return f"mandate_bse_not_allowed:{symbol}"
+    if not getattr(mandate, "allow_st", True) and (is_st or st_unknown):
+        return f"mandate_st_not_allowed:{symbol}:{'st' if is_st else 'st_unknown'}"
+    return ""
 
 
 def _st_status(is_st: bool, st_unknown: bool) -> str:
@@ -337,7 +352,7 @@ def execute_intents(
     prev_closes: dict[str, float],
     mark_prices: dict[str, float] | None = None,
     live_id: str | None,
-    mandate: TraderMandate = DEFAULT_MANDATE,
+    mandate: TraderMandate | None = None,
     st_identity: dict[str, Any] | None = None,
     limit_bases: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -358,6 +373,8 @@ def execute_intents(
             return bool(entry[0]), bool(entry[1])
         return False, True
 
+    if mandate is None:
+        mandate = mandate_from_ledger(ledger)
     marks = mark_prices or open_prices
     marked = mark_to_market(ledger, marks, as_of=as_of)
     actions: list[dict[str, Any]] = []
@@ -365,8 +382,13 @@ def execute_intents(
     equity = float(marked.get("equity") or 0.0)
     positions = position_map(marked)
     min_cash = mandate.min_cash_amount(equity)
-    opens = 0
-    exits = 0
+    # The daily rails count the whole session: daytime fills already booked
+    # today use up the same opens/exits quota (they used to restart at zero).
+    same_day = [row for row in (ledger.get("trades") or [])
+                if isinstance(row, dict) and str(row.get("date") or "")[:10] == as_of
+                and str(row.get("source") or "") == "daytime_snapshot"]
+    opens = sum(1 for row in same_day if row.get("side") == "buy")
+    exits = sum(1 for row in same_day if row.get("side") == "sell")
     if not intents:
         actions.append(
             {
@@ -464,6 +486,11 @@ def execute_intents(
             actions.append({"action": "buy", "symbol": symbol, "status": "rejected", "reason": "持仓只数已满。", "fill_model": "next_open_only"})
             continue
         is_st, st_unknown = _identity(symbol)
+        switch = _mandate_switch_block(symbol, mandate, is_st=is_st, st_unknown=st_unknown)
+        if switch:
+            actions.append({"action": "buy", "symbol": symbol, "status": "rejected", "reason": switch,
+                            "fill_model": "next_open_only", "is_st": is_st, "st_unknown": st_unknown})
+            continue
         limit = _limit_blocked(
             symbol, gap_pct, "buy", is_st=is_st, price=open_px, trade_date=as_of,
             pre_close=(limit_bases or {}).get(symbol, prev),

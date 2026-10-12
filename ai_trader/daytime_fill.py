@@ -29,8 +29,9 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from ai_trader.ledger import load_ledger, mark_to_market, position_map, save_ledger, session_days_held
-from ai_trader.mandate import DEFAULT_MANDATE, TraderMandate
+from ai_trader.mandate import DEFAULT_MANDATE, TraderMandate, mandate_from_ledger
 from ai_trader.paths import PROJECT_ROOT, CyclePaths, assert_not_quantdesk_ledger, profile_paths
+from quantdesk.data_quality import classify_market
 from quantdesk.paper.matching import next_open_limit_blocked
 from quantdesk.paper.market_rules import lot_size_for_symbol
 from quantdesk.paper.trade_costs import TradeCostConfig, buy_cash_outflow, sell_cash_inflow
@@ -66,6 +67,8 @@ MANDATE_EXITS_PER_DAY = "mandate_max_exits_per_day"
 MANDATE_MAX_HOLDINGS = "mandate_max_holdings"
 MANDATE_SINGLE_WEIGHT = "mandate_max_single_weight"
 MANDATE_CASH_FLOOR = "mandate_min_cash_weight"
+MANDATE_BSE_NOT_ALLOWED = "mandate_bse_not_allowed"
+MANDATE_ST_NOT_ALLOWED = "mandate_st_not_allowed"
 
 SIDE_BUY = "buy"
 SIDE_SELL = "sell"
@@ -379,10 +382,18 @@ def _mandate_block(
     exits_today: int,
     holdings: int,
     mandate: TraderMandate,
+    symbol: str = "",
+    is_st: bool = False,
+    st_unknown: bool = False,
 ) -> tuple[str, str]:
     """The household rails, checked before any market rule writes a fill."""
 
     if side == SIDE_BUY:
+        if not getattr(mandate, "allow_bse", True) and classify_market(symbol) == "BSE":
+            return MANDATE_BSE_NOT_ALLOWED, f"{symbol} 是北交所股票，账本头部不允许买入。"
+        if not getattr(mandate, "allow_st", True) and (is_st or st_unknown):
+            return (MANDATE_ST_NOT_ALLOWED,
+                    f"{symbol} {'是 ST' if is_st else 'ST 身份未知'}，账本头部不允许买入 ST。")
         if opens_today >= mandate.max_opens_per_day:
             return (MANDATE_OPENS_PER_DAY,
                     f"今天已开 {opens_today} 只，上限 {mandate.max_opens_per_day}。")
@@ -517,7 +528,8 @@ def plan_fills(
         mandate_token, mandate_detail = _mandate_block(
             side=side, quantity=quantity, price=price, position=position, cash=cash,
             equity=equity, opens_today=opens_today, exits_today=exits_today,
-            holdings=len(positions), mandate=mandate)
+            holdings=len(positions), mandate=mandate, symbol=symbol,
+            is_st=bool(quote.get("is_st")), st_unknown=bool(quote.get("st_unknown")))
         if mandate_token:
             mandate_blocks.append(_record(intent, quote, mandate_token, mandate_detail))
             continue
@@ -710,7 +722,7 @@ def fill_slot(
     quote_time: str = "",
     rows_source: str = "",
     ledger: dict[str, Any] | None = None,
-    mandate: TraderMandate = DEFAULT_MANDATE,
+    mandate: TraderMandate | None = None,
     write: bool = False,
     dry: bool | None = None,
     save: Callable[[dict[str, Any], Path], Path] | None = None,
@@ -736,6 +748,8 @@ def fill_slot(
             return {"schema_version": FILL_SCHEMA, "as_of": as_of, "fills": 0,
                     "written": False, "ledger_written": False, "records": [],
                     "evidence_error": f"{type(exc).__name__}:{exc}", "recovery_pending": True}
+    if mandate is None:
+        mandate = mandate_from_ledger(book)
     quotes = quote_index(rows or [], quote_slot=quote_slot, quote_time=quote_time,
                          source=rows_source)
     intents = pending_intents(runtime, as_of, slot=quote_slot)
