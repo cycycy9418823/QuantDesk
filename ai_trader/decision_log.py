@@ -9,8 +9,11 @@ from __future__ import annotations
 import csv
 import html
 import json
+import os
 import re
 import subprocess
+import tempfile
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -75,6 +78,16 @@ _CLAUSE_BOUNDARY = re.compile(r"[，,；;。！？!?\n]|但是|但|然而|不过
 _FUTURE_TIME = {"明天", "明日", "后天", "次日", "往后", "未来"}
 _PREDICTION_CONTEXT = re.compile(r"预计|预判|预期|目标价?|将会?|有望|看涨|看跌")
 _INTENT_FACT_FIELDS = ("llm_reason", "reason", "thesis", "recommendation_note")
+# Any percent / point / yuan number the specific recognisers above did not claim
+# is still a factual-looking statement. It is recorded as "未核验" instead of
+# being let through as if it had been checked (charter §2 invariant 3).
+_FACT_NUMBER = re.compile(r"(?<![\d.])([+\-]?\d+(?:\.\d+)?)\s*(?:%|％|个百分点|个点|元)")
+# Clauses that state a plan or condition (stop-loss, give-up gap, target) are
+# not claims about what already happened, so the catch-all leaves them alone.
+_PLAN_CONTEXT = re.compile(r"放弃|止损|止盈|目标|打算|计划|如果|若|一旦|挂单|买点|卖点|加仓|减仓|仓位")
+# The program appends news headlines to ``reason`` as "消息：…。"; that is outside
+# text, not the trader's own statement, and is not checked as one.
+_NEWS_SEGMENT = re.compile(r"消息：[^。]*。?")
 TZ_SHANGHAI = timezone(timedelta(hours=8))
 _DAILY_PRICE_CONSUMER = "paper_execution"
 @dataclass(frozen=True)
@@ -213,6 +226,8 @@ def _intent_fact_texts(intent: dict[str, Any]) -> list[str]:
     fields = ("reason",) if intent.get("side") == "sell" else _INTENT_FACT_FIELDS
     for key in fields:
         value = str(intent.get(key) or "").strip()
+        if key == "reason":
+            value = _NEWS_SEGMENT.sub("", value).strip()
         if value and value not in texts:
             texts.append(value)
     return texts
@@ -726,7 +741,34 @@ def _verify_fact_text(
         if actual is None or not _price_close_enough(claimed, float(actual)):
             hits.append(_mismatch(f"claimed_{kind}", f"陈述{scope.evidence_date}{label}{claimed}，日线{label}{actual}",
                                   actual=actual, **extra, **({"evidence_status": "unverified"} if actual is None else {})))
+    # Catch-all: a percent/point/yuan number none of the recognisers above claimed
+    # is never treated as checked. Forecasts and plan/condition clauses are skipped.
+    for match in _FACT_NUMBER.finditer(text):
+        pos = match.start(1)
+        if any(start <= pos < end for start, end, _, _ in claims):
+            continue
+        scope = _claim_scope(text, pos, decision_date)
+        clause = _clause_around(text, pos)
+        if scope.forecast or _PLAN_CONTEXT.search(clause):
+            continue
+        checked += 1
+        hits.append(_mismatch(
+            "claimed_unrecognized",
+            f"“{match.group(0)}”这句说法程序认不出该怎么核对，未核验。",
+            claimed_text=match.group(0),
+            clause=clause[:80],
+            evidence_status="unverified",
+            claim_indeterminate=True,
+            evidence_date=scope.evidence_date,
+        ))
     return hits, checked
+
+
+def _clause_around(text: str, pos: int) -> str:
+    starts = [item.end() for item in _CLAUSE_BOUNDARY.finditer(text, 0, pos)]
+    start = starts[-1] if starts else 0
+    following = _CLAUSE_BOUNDARY.search(text, pos)
+    return text[start: following.start() if following else len(text)]
 
 
 def verify_intent_against_daily(
@@ -1088,10 +1130,77 @@ def load_decision_records(path: Path) -> list[dict[str, Any]]:
     return out
 
 
-def write_decision_records(path: Path, records: list[dict[str, Any]]) -> None:
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Whole-file replacement: temp file in the same folder, fsync, then replace.
+
+    A crash at any point leaves either the old file or the new file, never a
+    half-written one.  Windows can briefly refuse the replace while a reader has
+    the file open, so the replace is retried a few times before failing loudly.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(temp_name, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _quarantine_unreadable_lines(path: Path) -> int:
+    """Copy lines that are not JSON objects to ``<name>.corrupt.jsonl`` before a rewrite.
+
+    Reading skips such lines; without this step the next whole-file rewrite would
+    erase them for good.  The quarantine file is append-only and fsynced.
+    """
+
+    if not path.is_file():
+        return 0
+    bad: list[bytes] = []
+    for raw in path.read_bytes().splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            bad.append(raw)
+            continue
+        if not isinstance(row, dict):
+            bad.append(raw)
+    if not bad:
+        return 0
+    quarantine = path.with_name(path.stem + ".corrupt.jsonl")
+    stamp = _now_iso()
+    with quarantine.open("ab") as handle:
+        for raw in bad:
+            handle.write(json.dumps({"quarantined_at": stamp, "source": path.name,
+                                     "raw_line": raw.decode("utf-8", errors="replace")},
+                                    ensure_ascii=False).encode("utf-8") + b"\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return len(bad)
+
+
+def write_decision_records(path: Path, records: list[dict[str, Any]]) -> None:
+    path = Path(path)
+    _quarantine_unreadable_lines(path)
     payload = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in records)
-    path.write_text(payload, encoding="utf-8")
+    _atomic_write_bytes(path, payload.encode("utf-8"))
 
 
 def _judgment_fingerprint(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
@@ -1476,8 +1585,7 @@ def render_owner_page(
                 f"{item.get('observed_price') if item.get('observed_price') is not None else '-'} | "
                 f"{band} | {note} |"
             )
-    md_path.parent.mkdir(parents=True, exist_ok=True)
-    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _atomic_write_bytes(Path(md_path), ("\n".join(lines) + "\n").encode("utf-8"))
     html_doc = (
         "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
         f"<title>C线决策对照 · {html.escape(DISCLAIMER)}</title>"
@@ -1527,8 +1635,7 @@ def render_owner_page(
         )
         + "</body></html>"
     )
-    html_path.parent.mkdir(parents=True, exist_ok=True)
-    html_path.write_text(html_doc, encoding="utf-8")
+    _atomic_write_bytes(Path(html_path), html_doc.encode("utf-8"))
 
 
 def records_from_plan(
