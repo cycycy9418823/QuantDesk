@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,9 +14,20 @@ from typing import Any
 from ai_trader.mandate import BOUNDARY, DEFAULT_MANDATE, TraderMandate
 from ai_trader.paths import LEDGER_PATH, assert_not_quantdesk_ledger, ledger_id_for_path, ledger_id_for_profile
 from quantdesk.paper.matching import POLICY_NEXT_OPEN, ensure_declared_fill_policy
-from quantdesk.utils import atomic_write_json
+from quantdesk.shared import _json_default, to_jsonable
 
 LEDGER_SCHEMA = "ai_trader_ledger_v1"
+# Rotating copies of the ledger after each successful save (charter §2: the
+# book is the evidence; a torn or lost file must be recoverable).
+LEDGER_BACKUP_DIRNAME = "ledger_backups"
+LEDGER_BACKUP_KEEP = 7
+# Files whose presence proves this book already had a history. A missing
+# ledger.json next to any of them is a lost book, not a first run.
+_HISTORY_MARKERS = ("journal.jsonl", "decision_log.jsonl", "daytime_fills.jsonl")
+
+
+class LedgerMissingError(FileNotFoundError):
+    """ledger.json is absent where a book must already exist; nothing was created."""
 
 
 def session_days_held(acquired_on: str, as_of: str) -> int:
@@ -68,9 +82,44 @@ def empty_ledger(
     return ensure_declared_fill_policy(ledger, policy_id=POLICY_NEXT_OPEN)
 
 
-def load_ledger(path: Path | None = None) -> dict[str, Any]:
+def ledger_backup_dir(path: Path) -> Path:
+    return Path(path).parent / LEDGER_BACKUP_DIRNAME
+
+
+def ledger_history_evidence(path: Path) -> list[str]:
+    """What proves this directory already held a book (empty list = first run)."""
+
+    target = Path(path)
+    found: list[str] = []
+    backups = ledger_backup_dir(target)
+    if backups.is_dir() and any(backups.glob(f"{target.stem}.*.json")):
+        found.append(str(backups))
+    for name in _HISTORY_MARKERS:
+        marker = target.parent / name
+        try:
+            if marker.is_file() and marker.stat().st_size > 0:
+                found.append(str(marker))
+        except OSError:
+            continue
+    evidence_dir = target.parent / "execution_evidence"
+    if evidence_dir.is_dir() and any(evidence_dir.iterdir()):
+        found.append(str(evidence_dir))
+    return found
+
+
+def load_ledger(path: Path | None = None, *, missing_ok: bool = True) -> dict[str, Any]:
+    """Load the book. ``missing_ok=False`` raises instead of inventing an empty book.
+
+    The default keeps the historical read-only behaviour (status pages show an
+    empty, unsaved book). Any path that trades and then saves must pass
+    ``missing_ok=False`` so a lost ledger.json can never be replaced by a fresh
+    100k book.
+    """
+
     target = assert_not_quantdesk_ledger(path or LEDGER_PATH)
     if not target.is_file():
+        if not missing_ok:
+            raise LedgerMissingError(f"ai_trader ledger missing: {target}")
         return empty_ledger(ledger_id=ledger_id_for_path(target))
     payload = json.loads(target.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -80,6 +129,63 @@ def load_ledger(path: Path | None = None) -> dict[str, Any]:
     return ensure_declared_fill_policy(payload, policy_id=POLICY_NEXT_OPEN)
 
 
+def _fsync_dir(directory: Path) -> None:
+    if os.name == "nt":  # directories cannot be opened for fsync on Windows
+        return
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _durable_write_text(target: Path, text: str) -> None:
+    """Write, flush, fsync, then atomically replace; the old file survives a crash."""
+
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        # Same text mode as the previous Path.write_text writer, so the bytes on
+        # disk (platform newlines) do not change -- only durability does.
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(tmp, target)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        _fsync_dir(target.parent)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _rotate_backup(target: Path, text: str) -> Path:
+    directory = ledger_backup_dir(target)
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S_%f")
+    backup = directory / f"{target.stem}.{stamp}.json"
+    _durable_write_text(backup, text)
+    copies = sorted(directory.glob(f"{target.stem}.*.json"), key=lambda item: item.name)
+    for stale in copies[: max(0, len(copies) - LEDGER_BACKUP_KEEP)]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    return backup
+
+
 def save_ledger(ledger: dict[str, Any], path: Path | None = None) -> Path:
     target = assert_not_quantdesk_ledger(path or LEDGER_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -87,14 +193,32 @@ def save_ledger(ledger: dict[str, Any], path: Path | None = None) -> Path:
     payload["updated_at"] = _now()
     payload["boundary"] = dict(BOUNDARY)
     ensure_declared_fill_policy(payload, policy_id=POLICY_NEXT_OPEN)
-    atomic_write_json(target, payload)
+    text = json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2, allow_nan=False,
+                      default=_json_default) + "\n"
+    _durable_write_text(target, text)
+    _rotate_backup(target, text)
     return target
 
 
 def init_ledger(*, reset: bool = False, path: Path | None = None) -> dict[str, Any]:
+    """Load the book, or create it on a genuine first run only.
+
+    A missing ledger.json next to evidence of an earlier book (rotating backups,
+    journal, decision log, fills, execution evidence) raises
+    ``LedgerMissingError`` instead of silently starting a new 100k book. An
+    explicit ``reset=True`` is the owner's deliberate re-initialisation.
+    """
+
     target = path or LEDGER_PATH
     if target.is_file() and not reset:
         return load_ledger(target)
+    if not reset:
+        evidence = ledger_history_evidence(target)
+        if evidence:
+            raise LedgerMissingError(
+                f"ai_trader ledger missing but history exists ({'; '.join(evidence)}); "
+                "restore from ledger_backups instead of starting a new book"
+            )
     ledger = empty_ledger()
     save_ledger(ledger, target)
     return ledger

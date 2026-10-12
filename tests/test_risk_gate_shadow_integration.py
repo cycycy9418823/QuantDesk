@@ -45,6 +45,14 @@ def _patch_auto_root(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
     intraday = root / "data" / "intraday"
     for path in (results, reports, state, daily, intraday / "1m"):
         path.mkdir(parents=True, exist_ok=True)
+    # 1A: a strategy-book fill needs the session's limit-price evidence (previous
+    # close / change), so the candidate's raw daily bar must exist.
+    (daily / "600000.csv").write_text(
+        "date,symbol,open,high,low,close,volume,amount,change,pct_chg,adjust,source,updated_at\n"
+        "2026-07-16,600000,9.8,9.9,9.7,9.8,1000000,9800000,0.0,0.0,raw,fixture,2026-07-16T15:30:00+08:00\n"
+        "2026-07-17,600000,9.9,10.1,9.8,10.0,1000000,10000000,0.2,2.041,raw,fixture,2026-07-17T15:30:00+08:00\n",
+        encoding="utf-8",
+    )
     values = {
         "PROJECT_ROOT": root,
         "RESULTS_DIR": results,

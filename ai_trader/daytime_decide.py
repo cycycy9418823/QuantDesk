@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 from ai_trader.paths import PROJECT_ROOT, CyclePaths, assert_not_quantdesk_ledger, profile_paths
 from ai_trader.daytime_screen import build_screen, render_text
+from quantdesk.paper.market_rules import order_quantity_rule
 
 DAYTIME_ENV = "AI_TRADER_DAYTIME"
 DRY_ENV = "AI_TRADER_DAYTIME_DRY"
@@ -159,7 +160,8 @@ def parse_orders(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[di
             problems.append("bad_side")
         if quantity <= 0:
             problems.append("bad_qty")
-        elif quantity % 100 != 0:
+        elif symbol and order_quantity_rule(symbol, quantity):
+            # Same board rule as the fill (STAR 200 起 1 股递增, BSE 100 起).
             problems.append("qty_not_a_lot")
         if not reason:
             problems.append("reason_missing")

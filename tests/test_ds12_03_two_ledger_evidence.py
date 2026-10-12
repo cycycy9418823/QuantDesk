@@ -224,7 +224,11 @@ def test_strategy_raw_basis_candidate_still_fills(tmp_path: Path, monkeypatch) -
     _write_daily(
         daily_dir,
         "000001",
-        ["2026-06-18,000001,10.0,10.6,9.9,10.5,1000000,10000000,raw,diag,2026-06-18T15:00:00+08:00\n"],
+        [
+            # 1A: the previous session's close is the limit-price evidence for 06-18.
+            "2026-06-17,000001,10.1,10.3,10.0,10.2,1000000,10000000,raw,diag,2026-06-17T15:00:00+08:00\n",
+            "2026-06-18,000001,10.0,10.6,9.9,10.5,1000000,10000000,raw,diag,2026-06-18T15:00:00+08:00\n",
+        ],
     )
     payload = _run_strategy(monkeypatch)
 

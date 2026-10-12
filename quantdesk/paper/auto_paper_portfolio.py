@@ -42,6 +42,7 @@ from quantdesk.data_truth.daily_bar_validity import daily_bar_validity_from_row
 from quantdesk.intraday.intraday_gap_checker import intraday_gap_status
 from quantdesk.intraday.intraday_swing_strategy import build_swing_plan
 from quantdesk.intraday_execution import simulate_intraday_plan
+from quantdesk.board_rules import limit_fill_check
 from quantdesk.paper.adjustment_policy import (
     AdjustmentFactorTable,
     apply_paper_adjustment_policy,
@@ -63,6 +64,7 @@ from quantdesk.paper.portfolio_contracts import (
 )
 from quantdesk.paper.position_management_engine import (
     CONDITIONAL_EXECUTION_LATEST_JSON,
+    SHADOW_UNRECORDED as _SHADOW_UNRECORDED,
     _write_shadow_ledger_snapshot_once,
     apply_conditional_execution_to_state,
     simulate_conditional_plan_file,
@@ -387,6 +389,12 @@ def _write_auto_paper_latest(snapshot: dict[str, Any]) -> dict[str, Any]:
         for key in ("cash", "market_value", "total_equity", "realized_pnl", "unrealized_pnl", "initial_cash"):
             if prepared.get(key) is None and summary.get(key) is not None:
                 prepared[key] = summary[key]
+    if _SHADOW_UNRECORDED:
+        # Shadow-risk failures that could not reach their own sink (used to be
+        # `except Exception: pass`). Published here, never in the ledger state.
+        unrecorded = list(dict.fromkeys(_SHADOW_UNRECORDED))
+        prepared["shadow_warnings"] = list(dict.fromkeys([*(prepared.get("shadow_warnings") or []), *unrecorded]))
+        prepared["warnings"] = list(dict.fromkeys([*(prepared.get("warnings") or []), *unrecorded]))
     normalized = reconcile_paper_account(prepared)
     atomic_write_json(AUTO_PAPER_PORTFOLIO_LATEST_JSON, normalized)
     return normalized
@@ -555,25 +563,32 @@ def _record_shadow_failure(
     as_of: str,
     write_error: bool = True,
 ) -> None:
-    """Keep a shadow failure out of every legacy paper action."""
+    """Keep a shadow failure out of every legacy paper action -- but never lose it.
 
+    The failure is recorded in the shadow records (summary, report, latest);
+    a failure to append it or to write the error log is noted in
+    ``_SHADOW_UNRECORDED`` and published as ``shadow_warnings``, not swallowed.
+    The ledger state bytes stay untouched either way.
+    """
+
+    record = {
+        "evaluated": False,
+        "status": "shadow_error",
+        "surface": surface,
+        "as_of": as_of,
+        "reason_codes": ["shadow_error"],
+        "shadow_error": f"{type(error).__name__}:{error}",
+        "would_pass": False,
+        "would_block": False,
+        "insufficient_evidence": False,
+        "missing_components": [],
+    }
     try:
-        records.append(
-            {
-                "evaluated": False,
-                "status": "shadow_error",
-                "surface": surface,
-                "as_of": as_of,
-                "reason_codes": ["shadow_error"],
-                "shadow_error": f"{type(error).__name__}:{error}",
-                "would_pass": False,
-                "would_block": False,
-                "insufficient_evidence": False,
-                "missing_components": [],
-            }
+        records.append(record)
+    except Exception as append_exc:  # noqa: BLE001 - surfaced below
+        _SHADOW_UNRECORDED.append(
+            f"shadow_record_append_failed:{surface}:{type(error).__name__}:{type(append_exc).__name__}"
         )
-    except Exception:
-        pass
     if write_error:
         try:
             record_shadow_error_best_effort(
@@ -582,8 +597,9 @@ def _record_shadow_failure(
                 as_of=as_of,
                 error_path=_risk_gate_shadow_error_path(),
             )
-        except Exception:
-            pass
+        except Exception as log_exc:  # noqa: BLE001 - surfaced below
+            record["shadow_error_log_failed"] = f"{type(log_exc).__name__}:{log_exc}"
+            _SHADOW_UNRECORDED.append(f"shadow_error_log_write_failed:{surface}:{type(log_exc).__name__}")
 
 
 def _load_auto_strategy(path: Path = AUTO_STRATEGY_LATEST_JSON) -> dict[str, Any]:
@@ -655,6 +671,29 @@ def _last_tradable_close(df: pd.DataFrame) -> float | None:
     return None
 
 
+def _previous_row_close(valid: pd.DataFrame) -> float | None:
+    if valid is None or len(valid) < 2:
+        return None
+    value = safe_float(valid.iloc[-2].get("close"), None)
+    return value if value is not None and value > 0 else None
+
+
+def _quote_limit_base(quote: dict[str, Any]) -> tuple[float | None, str]:
+    """Previous close the exchange used for today's limit (vendor evidence first)."""
+
+    explicit = safe_float(quote.get("pre_close"), None)
+    if explicit is not None and explicit > 0:
+        return explicit, "daily_pre_close"
+    close = safe_float(quote.get("close"), None)
+    change = safe_float(quote.get("change"), None)
+    if close is not None and close > 0 and change is not None and close - change > 0:
+        return round(close - change, 4), "daily_close_minus_change"
+    previous = safe_float(quote.get("previous_row_close"), None)
+    if previous is not None and previous > 0:
+        return previous, "previous_row_close"
+    return None, "missing"
+
+
 def _latest_daily_quote(symbol: str, *, decision_date: str | None = None) -> dict[str, Any]:
     df = _read_daily_bars(symbol)
     warnings = [str(item) for item in df.attrs.get("warnings", [])]
@@ -704,6 +743,12 @@ def _latest_daily_quote(symbol: str, *, decision_date: str | None = None) -> dic
         "close": safe_float(row.get("close"), None),
         "volume": safe_float(row.get("volume"), None),
         "pct_chg": safe_float(row.get("pct_chg"), None),
+        # Limit-price base evidence: the vendor's own previous close (close -
+        # change), else the previous row's close. Kept apart so an ex-rights
+        # day (the two disagree) is visible instead of silently mixed.
+        "pre_close": safe_float(row.get("pre_close"), None),
+        "change": safe_float(row.get("change"), None),
+        "previous_row_close": _previous_row_close(valid),
     }
     basis_reason = str(df.attrs.get("price_basis_reason") or "")
     if basis_reason:
@@ -769,7 +814,15 @@ def _basis_fill_rejection(symbol: Any) -> str:
     )
 
 
-def _fill_tradability_rejection(quote: dict[str, Any], side: str, *, require_quote: bool = False) -> str:
+def _fill_tradability_rejection(
+    quote: dict[str, Any],
+    side: str,
+    *,
+    require_quote: bool = False,
+    fill_price: Any = None,
+    symbol: Any = "",
+    name: Any = None,
+) -> str:
     """Reason this bar cannot support a real paper fill, else ``""``.
 
     Mirrors the AI book's fill reality: a book entry needs today's *tradeable*
@@ -789,17 +842,31 @@ def _fill_tradability_rejection(quote: dict[str, Any], side: str, *, require_quo
     basis_reason = str(quote.get("price_basis_reason") or "")
     if basis_reason in {"mixed_price_basis", "unknown_price_basis"} or quote.get("price_basis_untrusted"):
         return f"价格口径不可用于成交（{basis_reason or 'unknown_price_basis'}），拒绝模拟{label}。"
-    open_px = safe_float(quote.get("open"), None)
-    high = safe_float(quote.get("high"), None)
-    low = safe_float(quote.get("low"), None)
-    close = safe_float(quote.get("close"), None)
-    pct = safe_float(quote.get("pct_chg"), None)
-    one_word = open_px is not None and open_px == high == low == close and (close or 0) > 0
-    if one_word and side == "buy" and pct is not None and pct >= 9.8:
-        return "当日一字涨停，开盘无法买入，拒绝模拟买入。"
-    if one_word and side == "sell" and pct is not None and pct <= -9.8:
-        return "当日一字跌停，无法卖出，拒绝模拟卖出。"
-    return ""
+    # The booked price is compared with the cent-rounded limit price of the
+    # quote's own session (shared rule in quantdesk.board_rules). The old check
+    # only caught a one-word board with pct >= 9.8, so a close sealed at the
+    # limit after trading opened -- and every low-priced limit (+9.6%) -- was
+    # booked as an ordinary fill.
+    booked = safe_float(fill_price, None) or safe_float(quote.get("close"), None) or price
+    base, base_source = _quote_limit_base(quote)
+    check = limit_fill_check(
+        symbol, side, price=booked, trade_date=quote.get("date") or None,
+        pre_close=base, pct_chg=quote.get("pct_chg"), name=name,
+    )
+    if check["ok"]:
+        return ""
+    limits = check["limits"]
+    code = str(check["code"])
+    if code == "limit_up":
+        return (f"成交价 {booked:.2f} 已到当日涨停价 {limits.get('up_limit')}（前收 {limits.get('pre_close')}，"
+                f"{base_source}），涨停不买，拒绝模拟买入。")
+    if code == "limit_down":
+        return (f"成交价 {booked:.2f} 已到当日跌停价 {limits.get('down_limit')}（前收 {limits.get('pre_close')}，"
+                f"{base_source}），跌停不卖，拒绝模拟卖出。")
+    if code == "price_outside_limit_band":
+        return (f"成交价 {booked:.2f} 不在当日涨跌停区间 {limits.get('down_limit')}–{limits.get('up_limit')} 内，"
+                f"价格证据矛盾，拒绝模拟{label}。")
+    return f"缺少前收与涨跌幅，算不出当日涨跌停价（{check['reason']}），缺数据不成交，拒绝模拟{label}。"
 
 
 def _read_intraday_bars(symbol: str, source: str = "1m") -> pd.DataFrame | None:
@@ -1579,6 +1646,10 @@ def _write_report(
         try:
             lines.extend(render_shadow_report_section(risk_gate_shadow_summary))
         except Exception as exc:
+            # A distinct header: the failure is visible, but is never mistaken
+            # for a rendered shadow section.
+            lines.extend(["", "## 影子风险门（未能生成）", "",
+                          f"- 影子风险段生成失败：{type(exc).__name__}: {exc}"])
             try:
                 record_shadow_error_best_effort(
                     surface="auto_paper_report_shadow_section",
@@ -1586,8 +1657,9 @@ def _write_report(
                     as_of=str(risk_gate_shadow_summary.get("as_of") or ""),
                     error_path=_risk_gate_shadow_error_path(),
                 )
-            except Exception:
-                pass
+            except Exception as log_exc:  # noqa: BLE001 - visible in the report
+                lines.append(f"- 影子风险错误日志写入也失败：{type(log_exc).__name__}: {log_exc}")
+                _SHADOW_UNRECORDED.append(f"shadow_error_log_write_failed:auto_paper_report_shadow_section:{type(log_exc).__name__}")
     lines += [
         "",
         "## 今日动作",
@@ -2312,6 +2384,7 @@ def _run_auto_paper_portfolio_unlocked(
 ) -> dict[str, Any]:
     """Initialize or update the persistent automatic paper portfolio."""
 
+    _SHADOW_UNRECORDED.clear()  # one run's unrecorded shadow failures, not a previous run's
     mode = "update" if str(mode) == "update" else "init"
     quantity = round_down_to_lot(quantity_per_stock)
     if candidate_mode == "legacy_diagnostic":
@@ -2636,7 +2709,10 @@ def _run_auto_paper_portfolio_unlocked(
                 # An exit is a real fill: it needs today's tradeable bar. A
                 # suspended / missing / limit-down / untrusted-basis day must
                 # not be booked off the carried old mark.
-                rejection = _fill_tradability_rejection(quote, "sell", require_quote=True)
+                rejection = _fill_tradability_rejection(
+                    quote, "sell", require_quote=True, fill_price=latest_price,
+                    symbol=normalize_symbol(position.get("symbol")), name=position.get("name"),
+                )
                 if rejection:
                     actions.append(_block_action(position, rejection, decision_date))
                     updated_positions.append(dict(position))
@@ -2672,6 +2748,15 @@ def _run_auto_paper_portfolio_unlocked(
         key = _position_key(candidate)
         if key in existing_keys:
             continue
+        # Structural check first: a quantity below the board's lot can never
+        # fill, whatever the price evidence says (also covers the swing path,
+        # whose own check only knew the 100-share main-board lot).
+        early_lot = lot_size_for_symbol(candidate.get("symbol"), name=candidate.get("name"))
+        if quantity < early_lot:
+            reason = f"默认数量 {quantity} 股不足该股票板块整手（{early_lot} 股），未生成纸面持仓。"
+            actions.append(_block_action(candidate, reason, decision_date))
+            record_legacy_shadow_block(candidate, reason, "auto_paper_daily_buy")
+            continue
         # Evidence requirement shared with the AI book: never book a fill off a
         # mixed/unknown price basis. A known basis (raw/qfq/hfq) proceeds.
         basis_rejection = _basis_fill_rejection(candidate.get("symbol"))
@@ -2683,7 +2768,10 @@ def _run_auto_paper_portfolio_unlocked(
         # one-word limit-up board cannot be bought at the open.
         buy_quote = _latest_daily_quote(candidate.get("symbol"))
         warnings.extend(_quote_warnings(candidate.get("symbol"), buy_quote))
-        buy_rejection = _fill_tradability_rejection(buy_quote, "buy")
+        buy_rejection = _fill_tradability_rejection(
+            buy_quote, "buy", fill_price=_candidate_price(candidate),
+            symbol=normalize_symbol(candidate.get("symbol")), name=candidate.get("name"),
+        )
         if buy_rejection:
             actions.append(_block_action(candidate, buy_rejection, decision_date))
             record_legacy_shadow_block(candidate, buy_rejection, "auto_paper_daily_buy")

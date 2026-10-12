@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
@@ -64,12 +65,21 @@ class PaperStateStore:
         data = self._with_schema(payload if isinstance(payload, dict) else {})
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._tmp_path()
-        tmp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        text = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
+        # flush + fsync before the atomic replace: a power cut must leave either
+        # the old file or the complete new one, never a torn ledger.
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         tmp.replace(self.path)
-        shutil.copy2(self.path, self._backup_path())
+        backup = self._backup_path()
+        shutil.copy2(self.path, backup)
+        try:
+            with backup.open("rb+") as handle:
+                os.fsync(handle.fileno())
+        except OSError:
+            pass
         self._rotate_backups()
         return data
 

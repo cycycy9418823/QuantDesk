@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from quantdesk.board_rules import classify_board
+from quantdesk.board_rules import classify_board, limit_fill_check
 
 # Historical QuantDesk paper-account convention: main-board A-share lots are
 # 100 shares. Board-specific lots (e.g. STAR 200) come from ``classify_board``.
@@ -194,6 +194,29 @@ def is_valid_order_quantity(
     return parsed % lot == 0
 
 
+def order_quantity_rule(
+    symbol: Any,
+    quantity: Any,
+    *,
+    held_shares: Any = None,
+    name: Any = None,
+) -> str:
+    """The one A-share order-size rule for every paper path; ``""`` when valid.
+
+    Main board / ChiNext: whole multiples of 100. STAR: at least 200, then any
+    share count. BSE: at least 100, then any share count. A sell may clear an
+    entire sub-lot remainder (``held_shares``). The AI daytime parser, the
+    daytime fill and the evening book used three different rules before.
+    """
+
+    code = str(symbol or "").strip()
+    lot = lot_size_for_symbol(code, name=name)
+    board = board_type_for_symbol(code, name=name)
+    if is_valid_order_quantity(quantity, lot_size=lot, board_type=board, held_shares=held_shares):
+        return ""
+    return f"qty_not_valid_for_board:{board}:min_lot={lot}"
+
+
 def board_type_for_symbol(
     symbol: Any,
     *,
@@ -287,10 +310,43 @@ def paper_trade_block_reason(
     pct = _optional_float(data.get("pct_chg"))
     if pct is None:
         pct = _optional_float(data.get("change_pct"))
+    code = str(symbol or "").strip()
+
+    # Exact path: with a fill price, compare it with the cent-rounded limit
+    # price (shared rule, quantdesk.board_rules). A low-priced stock's limit is
+    # below the board percent (1.04 -> 1.14 is +9.615%), which the percent
+    # tolerance below cannot see.
+    price = next(
+        (value for value in (_optional_float(data.get(key)) for key in ("fill_price", "price", "close", "latest_price"))
+         if value is not None and value > 0),
+        None,
+    )
+    pre_close = next(
+        (value for value in (_optional_float(data.get(key)) for key in ("pre_close", "prev_close"))
+         if value is not None and value > 0),
+        None,
+    )
+    if price is not None and (pre_close is not None or pct is not None):
+        check = limit_fill_check(
+            code, str(side or "").strip().lower(), price=price,
+            trade_date=data.get("trade_date") or data.get("date") or None,
+            pre_close=pre_close, pct_chg=pct,
+            st_status="st" if metadata_is_st(data, name) else None, name=name,
+        )
+        if check["ok"]:
+            return ""
+        if check["code"] == "limit_up":
+            return "涨停不可假设纸面买入成交"
+        if check["code"] == "limit_down":
+            return "跌停不可假设纸面卖出成交"
+        if check["code"] == "price_outside_limit_band":
+            return "成交价不在当日涨跌停区间内，纸面交易已阻断"
+        return "缺少前收与涨跌幅，算不出涨跌停价，纸面交易已阻断"
+
+    # Legacy path (percent only, no price): keep the historical approximation.
     if pct is None:
         return ""
 
-    code = str(symbol or "").strip()
     is_st = metadata_is_st(data, name)
     try:
         rules = classify_board(code, is_st=is_st)

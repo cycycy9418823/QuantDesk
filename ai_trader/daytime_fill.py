@@ -29,10 +29,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from ai_trader.ledger import load_ledger, mark_to_market, position_map, save_ledger, session_days_held
-from ai_trader.mandate import DEFAULT_MANDATE, TraderMandate
+from ai_trader.mandate import DEFAULT_MANDATE, TraderMandate, mandate_from_ledger
 from ai_trader.paths import PROJECT_ROOT, CyclePaths, assert_not_quantdesk_ledger, profile_paths
+from quantdesk.data_quality import classify_market
 from quantdesk.paper.matching import next_open_limit_blocked
-from quantdesk.paper.market_rules import lot_size_for_symbol
+from quantdesk.paper.market_rules import lot_size_for_symbol, order_quantity_rule
 from quantdesk.paper.trade_costs import TradeCostConfig, buy_cash_outflow, sell_cash_inflow
 from quantdesk.market_clock import to_shanghai_datetime
 
@@ -52,6 +53,8 @@ BLOCK_NOT_LATER = "quote_not_after_intent"
 BLOCK_MISSING_QUOTE = "missing_quote_no_fill"
 BLOCK_LIMIT_UP = "limit_up_no_buy"
 BLOCK_LIMIT_DOWN = "limit_down_no_sell"
+BLOCK_LIMIT_UNVERIFIABLE = "limit_unverifiable_no_fill"
+BLOCK_PRICE_OUTSIDE_BAND = "price_outside_limit_band_no_fill"
 BLOCK_NOT_A_LOT = "not_a_full_lot"
 BLOCK_T_PLUS_1 = "t_plus_1_not_sellable"
 BLOCK_NO_POSITION = "no_position_to_sell"
@@ -64,9 +67,54 @@ MANDATE_EXITS_PER_DAY = "mandate_max_exits_per_day"
 MANDATE_MAX_HOLDINGS = "mandate_max_holdings"
 MANDATE_SINGLE_WEIGHT = "mandate_max_single_weight"
 MANDATE_CASH_FLOOR = "mandate_min_cash_weight"
+MANDATE_BSE_NOT_ALLOWED = "mandate_bse_not_allowed"
+MANDATE_ST_NOT_ALLOWED = "mandate_st_not_allowed"
 
 SIDE_BUY = "buy"
 SIDE_SELL = "sell"
+
+# Charter §10 trust ladder, read from the ledger header (never from the
+# environment): 0 = evening only; 1 = intraday exits/stops; 2 = intraday opens
+# with caps; 3 = self-escalation. A daytime fill may write the real ledger only
+# when the header grants at least this level AND names who authorised it.
+DAYTIME_TRUST_KEY = "daytime_trust"
+DAYTIME_TRUST_REQUIRED = {SIDE_SELL: 1, SIDE_BUY: 2}
+BLOCK_TRUST_GATE = "daytime_trust_level_insufficient"
+BLOCK_NO_SOURCE = "missing_price_source_no_fill"
+BLOCK_ZERO_VOLUME = "zero_volume_no_fill"
+
+
+def daytime_trust(ledger: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The book's declared daytime trust: ``{"level", "authorized_by", "authorized_at"}``.
+
+    Missing or malformed headers mean level 0 (default deny).
+    """
+
+    raw = (ledger or {}).get(DAYTIME_TRUST_KEY) if isinstance(ledger, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return {"level": 0, "authorized_by": "", "authorized_at": "", "declared": False}
+    try:
+        level = int(raw.get("level") or 0)
+    except (TypeError, ValueError):
+        level = 0
+    return {
+        "level": max(0, level),
+        "authorized_by": str(raw.get("authorized_by") or "").strip(),
+        "authorized_at": str(raw.get("authorized_at") or "").strip(),
+        "declared": True,
+    }
+
+
+def trust_gate(ledger: Mapping[str, Any] | None, side: str) -> str:
+    """Empty string when the header lets a daytime fill on ``side`` write the ledger."""
+
+    trust = daytime_trust(ledger)
+    required = DAYTIME_TRUST_REQUIRED.get(str(side or ""), 99)
+    if trust["level"] < required:
+        return f"{BLOCK_TRUST_GATE}:level={trust['level']}<required={required}"
+    if not trust["authorized_by"] or not trust["authorized_at"]:
+        return f"{BLOCK_TRUST_GATE}:authorization_missing"
+    return ""
 
 
 def dry_mode() -> bool:
@@ -267,6 +315,7 @@ def quote_index(rows: Sequence[Mapping[str, Any]], *, quote_slot: str = "",
         if len(symbol) != 6 or not symbol.isdigit():
             continue
         is_st, st_unknown = _st_flags(row)
+        pre_close = _num(row.get("pre_close"))
         market_time = str(row.get("quote_time") or row.get("timestamp") or row.get("time") or "")
         market_date = str(row.get("quote_date") or "").strip()
         parsed_time = market_time
@@ -283,6 +332,9 @@ def quote_index(rows: Sequence[Mapping[str, Any]], *, quote_slot: str = "",
             "symbol": symbol,
             "price": _num(row.get("price")),
             "pct_chg": _num(row.get("pct_chg")),
+            "pre_close": pre_close if pre_close is not None and pre_close > 0 else None,
+            "volume": _num(row.get("volume")),
+            "name": str(row.get("name") or ""),
             "is_st": is_st,
             "st_unknown": st_unknown,
             "st_note": ST_UNKNOWN_NOTE if st_unknown else "",
@@ -330,10 +382,18 @@ def _mandate_block(
     exits_today: int,
     holdings: int,
     mandate: TraderMandate,
+    symbol: str = "",
+    is_st: bool = False,
+    st_unknown: bool = False,
 ) -> tuple[str, str]:
     """The household rails, checked before any market rule writes a fill."""
 
     if side == SIDE_BUY:
+        if not getattr(mandate, "allow_bse", True) and classify_market(symbol) == "BSE":
+            return MANDATE_BSE_NOT_ALLOWED, f"{symbol} 是北交所股票，账本头部不允许买入。"
+        if not getattr(mandate, "allow_st", True) and (is_st or st_unknown):
+            return (MANDATE_ST_NOT_ALLOWED,
+                    f"{symbol} {'是 ST' if is_st else 'ST 身份未知'}，账本头部不允许买入 ST。")
         if opens_today >= mandate.max_opens_per_day:
             return (MANDATE_OPENS_PER_DAY,
                     f"今天已开 {opens_today} 只，上限 {mandate.max_opens_per_day}。")
@@ -434,15 +494,36 @@ def plan_fills(
             blocks.append(_record(intent, quote, BLOCK_MISSING_QUOTE,
                                   f"{symbol} 报价缺失或非正，不成交。"))
             continue
-        lot = int(lot_size_for_symbol(symbol) or 100)
-        if lot <= 0 or quantity % lot != 0:
-            blocks.append(_record(intent, quote, BLOCK_NOT_A_LOT,
-                                  f"{quantity} 不是 {lot} 股整数倍，不成交。"))
+        if not str(quote.get("source") or "").strip():
+            blocks.append(_record(intent, quote, BLOCK_NO_SOURCE,
+                                  f"{symbol} 报价没有来源，成交证据不全，不成交。"))
             continue
-        limit = next_open_limit_blocked(symbol, quote.get("pct_chg"), side,
-                                        is_st=bool(quote.get("is_st")))
+        volume = quote.get("volume")
+        if volume is not None and volume <= 0:
+            blocks.append(_record(intent, quote, BLOCK_ZERO_VOLUME,
+                                  f"{symbol} 成交量为 {volume}（停牌或无成交），不成交。"))
+            continue
+        held_now = int((positions.get(symbol) or {}).get("quantity") or 0) if side == SIDE_SELL else None
+        lot_problem = order_quantity_rule(symbol, quantity, held_shares=held_now,
+                                          name=quote.get("name") or None)
+        if lot_problem:
+            lot = int(lot_size_for_symbol(symbol) or 100)
+            blocks.append(_record(intent, quote, BLOCK_NOT_A_LOT,
+                                  f"{quantity} 股不符合该板块下单规则（{lot_problem}，最小 {lot} 股），不成交。"))
+            continue
+        # 涨跌停按快照自己的昨收算到分；昨收与涨跌幅都缺时算不出涨跌停价，不成交。
+        limit = next_open_limit_blocked(
+            symbol, quote.get("pct_chg"), side, is_st=bool(quote.get("is_st")),
+            price=price, pre_close=quote.get("pre_close"), trade_date=as_of,
+            st_status=("unknown" if quote.get("st_unknown") else ("st" if quote.get("is_st") else "not_st")),
+        )
         if limit:
-            token = BLOCK_LIMIT_UP if side == SIDE_BUY else BLOCK_LIMIT_DOWN
+            if limit.startswith(("limit_unverifiable", "missing_fill_price")):
+                token = BLOCK_LIMIT_UNVERIFIABLE
+            elif limit.startswith("price_outside_limit_band"):
+                token = BLOCK_PRICE_OUTSIDE_BAND
+            else:
+                token = BLOCK_LIMIT_UP if side == SIDE_BUY else BLOCK_LIMIT_DOWN
             blocks.append(_record(intent, quote, token, f"{symbol} {limit}，不成交。"))
             continue
 
@@ -450,7 +531,8 @@ def plan_fills(
         mandate_token, mandate_detail = _mandate_block(
             side=side, quantity=quantity, price=price, position=position, cash=cash,
             equity=equity, opens_today=opens_today, exits_today=exits_today,
-            holdings=len(positions), mandate=mandate)
+            holdings=len(positions), mandate=mandate, symbol=symbol,
+            is_st=bool(quote.get("is_st")), st_unknown=bool(quote.get("st_unknown")))
         if mandate_token:
             mandate_blocks.append(_record(intent, quote, mandate_token, mandate_detail))
             continue
@@ -476,6 +558,7 @@ def plan_fills(
             "symbol": symbol, "side": side, "quantity": quantity,
             "price": round(price, 4), "price_source": str(quote.get("source") or ""),
             "price_timestamp": str(quote.get("time") or ""), "pct_chg": quote.get("pct_chg"),
+            "pre_close": quote.get("pre_close"), "volume": quote.get("volume"),
             "quote_date": quote.get("quote_date"), "quote_time": quote.get("quote_time"),
             "received_at": quote.get("received_at"), "time_source": quote.get("time_source"),
             "intent_created_at": intent.get("created_at"),
@@ -642,7 +725,7 @@ def fill_slot(
     quote_time: str = "",
     rows_source: str = "",
     ledger: dict[str, Any] | None = None,
-    mandate: TraderMandate = DEFAULT_MANDATE,
+    mandate: TraderMandate | None = None,
     write: bool = False,
     dry: bool | None = None,
     save: Callable[[dict[str, Any], Path], Path] | None = None,
@@ -668,15 +751,35 @@ def fill_slot(
             return {"schema_version": FILL_SCHEMA, "as_of": as_of, "fills": 0,
                     "written": False, "ledger_written": False, "records": [],
                     "evidence_error": f"{type(exc).__name__}:{exc}", "recovery_pending": True}
+    if mandate is None:
+        mandate = mandate_from_ledger(book)
     quotes = quote_index(rows or [], quote_slot=quote_slot, quote_time=quote_time,
                          source=rows_source)
     intents = pending_intents(runtime, as_of, slot=quote_slot)
     expired = expired_intents(runtime, as_of, slot=quote_slot)
     plan = plan_fills(intents, quotes, book, as_of=as_of, mandate=mandate,
                       already_filled=fill_keys(runtime, as_of))
-    updated, applied = apply_to_ledger(book, plan["fills"], as_of=as_of)
+    # Default deny: an environment switch alone may not write the real ledger.
+    # Only the ledger header's daytime_trust (charter §10 level + named
+    # authorisation) lets a fill on that side change money; the rest stay dry.
+    gate_reasons: dict[str, str] = {}
+    if write and not is_dry:
+        for fill in plan["fills"]:
+            reason = trust_gate(book, str(fill.get("side") or ""))
+            if reason:
+                gate_reasons[str(fill.get("intent_key") or "")] = reason
+    allowed = [fill for fill in plan["fills"] if str(fill.get("intent_key") or "") not in gate_reasons]
+    updated, applied = apply_to_ledger(book, allowed, as_of=as_of)
     records = [{**dict(record), "dry_run": is_dry,
                 "ledger_written": bool(write and not is_dry)} for record in applied]
+    gated_records: list[dict[str, Any]] = []
+    if gate_reasons:
+        _would_book, would_apply = apply_to_ledger(book, plan["fills"], as_of=as_of)
+        gated_records = [
+            {**dict(record), "dry_run": True, "ledger_written": False,
+             "gate_blocked": gate_reasons[str(record.get("intent_key") or "")]}
+            for record in would_apply if str(record.get("intent_key") or "") in gate_reasons
+        ]
     journal_rows: list[dict[str, Any]] = []
     for status, source in (("blocked", plan["blocks"]),
                            ("mandate_blocked", plan["mandate_blocks"])):
@@ -687,6 +790,13 @@ def fill_slot(
             "ai_reason": row.get("ai_reason"), "detail": row.get("detail"),
             "model_used": row.get("model_used"), "elapsed_ms": row.get("elapsed_ms"),
         } for row in source)
+    journal_rows.extend({
+        "schema_version": "ai_trader_daytime_journal_v1", "as_of": as_of,
+        "slot": row.get("slot"), "status": "trust_blocked", "blocked_by": BLOCK_TRUST_GATE,
+        "symbol": row.get("symbol"), "side": row.get("side"), "qty": row.get("quantity"),
+        "ai_reason": row.get("ai_reason"), "detail": row.get("gate_blocked"),
+        "model_used": row.get("model_used"), "elapsed_ms": row.get("elapsed_ms"),
+    } for row in gated_records)
 
     result = {
         "schema_version": FILL_SCHEMA, "as_of": as_of, "profile": str(profile or ""),
@@ -696,6 +806,8 @@ def fill_slot(
         "dry_run": is_dry, "written": False, "ledger_written": False,
         "records": records, "blocks": plan["blocks"], "mandate_blocks": plan["mandate_blocks"],
         "journal_rows": journal_rows, "restored_records": restored,
+        "gated_fills": len(gated_records), "gated_records": gated_records,
+        "daytime_trust": daytime_trust(book),
     }
     if not write:
         return result
@@ -716,12 +828,13 @@ def fill_slot(
         result["ledger_written"] = True
     try:
         _append_jsonl(fills_path(runtime, dry=is_dry), records)
+        _append_jsonl(fills_path(runtime, dry=True), gated_records)
         _append_jsonl(journal_path(runtime), journal_rows)
     except OSError as exc:
         result["evidence_error"] = f"{type(exc).__name__}:{exc}"
         result["recovery_pending"] = True
         return result
-    result["written"] = bool(records or journal_rows or restored)
+    result["written"] = bool(records or journal_rows or restored or gated_records)
     return result
 
 
@@ -745,8 +858,17 @@ def load_daytime_journal_for(as_of: str, *, state_dir: Path) -> list[dict[str, A
 
 __all__ = [
     "BLOCK_INVALID_INTENT",
+    "BLOCK_NO_SOURCE",
+    "BLOCK_TRUST_GATE",
+    "BLOCK_ZERO_VOLUME",
+    "DAYTIME_TRUST_KEY",
+    "DAYTIME_TRUST_REQUIRED",
+    "daytime_trust",
+    "trust_gate",
     "BLOCK_LIMIT_DOWN",
+    "BLOCK_LIMIT_UNVERIFIABLE",
     "BLOCK_LIMIT_UP",
+    "BLOCK_PRICE_OUTSIDE_BAND",
     "BLOCK_MISSING_QUOTE",
     "BLOCK_NOT_A_LOT",
     "BLOCK_NOT_LATER",

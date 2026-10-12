@@ -22,7 +22,13 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Mapping
 
-from quantdesk.board_rules import classify_board
+from quantdesk.board_rules import (
+    ST_STATUS_NOT_ST,
+    ST_STATUS_ST,
+    ST_STATUS_UNKNOWN,
+    classify_board,
+    limit_fill_check,
+)
 
 POLICY_NEXT_OPEN = "next_open"
 POLICY_DAILY_APPROX = "daily_approx"
@@ -142,14 +148,37 @@ def _finite(value: float | None) -> bool:
 
 
 def next_open_limit_blocked(
-    symbol: str, pct_chg: float | None, side: str, *, is_st: bool = False
+    symbol: str,
+    pct_chg: float | None,
+    side: str,
+    *,
+    is_st: bool = False,
+    price: float | None = None,
+    pre_close: float | None = None,
+    trade_date: str | None = None,
+    st_status: str | None = None,
+    name: str | None = None,
 ) -> str | None:
-    """Limit-up cannot buy, limit-down cannot sell, using the open gap.
+    """Limit-up cannot buy, limit-down cannot sell.
 
-    Same numeric tolerance the AI trader already used: board limit minus 0.3
-    percentage points. Missing gap is not treated as a limit block.
+    Exact path (``price`` given): compare the fill price with the cent-rounded
+    limit price from the previous close (``quantdesk.board_rules`` decides the
+    band by board and date). A missing previous close is rebuilt from
+    ``price`` and ``pct_chg``; when neither exists the fill is refused with
+    ``limit_unverifiable`` -- missing data is no fill.
+
+    Legacy path (no ``price``): only a change percent is known, so the old
+    "board limit minus 0.3 percentage points" approximation remains for callers
+    that never had a price. A missing gap there is not a block.
     """
 
+    if price is not None:
+        status = st_status or (ST_STATUS_ST if is_st else ST_STATUS_UNKNOWN)
+        check = limit_fill_check(
+            symbol, side, price=price, trade_date=trade_date, pre_close=pre_close,
+            pct_chg=pct_chg, st_status=status, name=name,
+        )
+        return None if check["ok"] else str(check["reason"] or check["code"])
     if not _finite(pct_chg):
         return None
     change = float(pct_chg)
@@ -164,6 +193,56 @@ def next_open_limit_blocked(
     if side == "sell" and change <= down:
         return f"limit_down:{symbol}:{change:.2f}%"
     return None
+
+
+def _number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if _finite(number) else None
+
+
+def exchange_pre_close(row: Mapping[str, Any] | None, fallback: float | None) -> tuple[float | None, str]:
+    """The exchange's previous close for this session -- the limit-price base.
+
+    On an ex-rights / ex-dividend day the exchange computes limits off the
+    adjusted previous close, which differs from yesterday's raw close. Prefer
+    the bar's own evidence: an explicit ``pre_close`` column, else
+    ``close - change``; only then fall back to the caller's reference close.
+    """
+
+    data = dict(row or {})
+    sources: list[Mapping[str, Any]] = []
+    original = data.get("original_row")
+    if isinstance(original, Mapping):
+        sources.append(original)
+    sources.append(data)
+    for src in sources:
+        value = _number(src.get("pre_close"))
+        if value is not None and value > 0:
+            return value, "bar_pre_close"
+    for src in sources:
+        close = _number(src.get("close"))
+        change = _number(src.get("change"))
+        if close is not None and close > 0 and change is not None and close - change > 0:
+            return round(close - change, 4), "bar_close_minus_change"
+    if fallback is not None and _finite(fallback) and float(fallback) > 0:
+        return float(fallback), "caller_reference_close"
+    return None, "missing"
+
+
+def row_st_status(row: Mapping[str, Any] | None) -> str:
+    """Tri-state ST identity from a row's own ``is_st`` column (empty = unknown)."""
+
+    raw = str((row or {}).get("is_st") or "").strip().lower()
+    if raw in {"1", "1.0", "true", "yes", "y", "st"}:
+        return ST_STATUS_ST
+    if raw in {"0", "0.0", "false", "no", "n"}:
+        return ST_STATUS_NOT_ST
+    return ST_STATUS_UNKNOWN
 
 
 def evaluate_next_open_fill(
@@ -212,11 +291,14 @@ def evaluate_next_open_fill(
 
     if not _finite(prev_close) or float(prev_close) <= 0:
         return {"ok": False, "reason": "missing_or_invalid_previous_close"}
-    gap_pct = (float(open_px) / float(prev_close) - 1.0) * 100.0
-    is_st = str(row.get("is_st") or "").strip().lower() in {"1", "1.0", "true", "yes"}
-    blocked = next_open_limit_blocked(symbol, gap_pct, side, is_st=is_st)
-    if blocked:
-        return {"ok": False, "reason": blocked}
+    limit_base, limit_base_source = exchange_pre_close(row, float(prev_close))
+    check = limit_fill_check(
+        symbol, side, price=float(open_px), trade_date=trade_date,
+        pre_close=limit_base, st_status=row_st_status(row),
+    )
+    if not check["ok"]:
+        return {"ok": False, "reason": str(check["reason"] or check["code"])}
+    limits = check["limits"]
 
     source = str(row.get("source") or "")
     missing_tokens = {"", "nan", "none", "null", "<na>", "nat", "n/a", "na"}
@@ -253,6 +335,15 @@ def evaluate_next_open_fill(
         "timestamp_field": timestamp_field,
         timestamp_field: timestamp,
         "volume": float(volume),
+        "limit_check": {
+            "up_limit": limits.get("up_limit"),
+            "down_limit": limits.get("down_limit"),
+            "pre_close": limits.get("pre_close"),
+            "pre_close_source": limit_base_source,
+            "intent_ref_close": float(prev_close),
+            "ratio_basis": limits.get("ratio_basis"),
+            "st_status": limits.get("st_status"),
+        },
     }
     return {
         "ok": True,
@@ -280,6 +371,8 @@ __all__ = [
     "default_policy_for_ledger",
     "ensure_declared_fill_policy",
     "evaluate_next_open_fill",
+    "exchange_pre_close",
+    "row_st_status",
     "get_policy",
     "next_open_limit_blocked",
     "policy_header",

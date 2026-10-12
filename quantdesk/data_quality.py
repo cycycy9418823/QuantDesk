@@ -49,9 +49,10 @@ def classify_market(symbol: str) -> str:
         return MARKET_BSE
     if s.startswith("83") or s.startswith("87") or s.startswith("43"):
         return MARKET_BSE
-    if s.startswith("688"):
+    # 689xxx = 科创板存托凭证（如 689009），302xxx = 创业板新代码段（如 302132）。
+    if s.startswith("688") or s.startswith("689"):
         return MARKET_STAR
-    if s.startswith("300") or s.startswith("301"):
+    if s.startswith("300") or s.startswith("301") or s.startswith("302"):
         return MARKET_CHINEXT
     if s.startswith("60"):
         return MARKET_SH
