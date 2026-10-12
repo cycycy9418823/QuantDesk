@@ -75,7 +75,20 @@ COLUMN_ALIASES = {
     "最低": "low",
     "时间戳": "quote_time",
     "time": "quote_time",
+    # Sina Market_Center rows carry the provider's own clock time here (for
+    # example "14:55:03", no date). It is the quote's time, not the fetch time.
+    "ticktime": "quote_time",
+    "quote_time": "quote_time",
+    "日期": "quote_date",
+    "date": "quote_date",
+    "trade_date": "quote_date",
+    "quote_date": "quote_date",
 }
+
+# What ``quote_time`` / ``quote_date`` mean in the cache.  They come from the
+# provider or stay empty; the fetch moment is recorded separately in
+# ``fetched_at`` and is never copied into them.
+QUOTE_TIME_BASIS = "provider_quote_time_or_empty"
 
 
 def _num(value: Any) -> float | None:
@@ -88,18 +101,41 @@ def _num(value: Any) -> float | None:
     return number
 
 
-def _row_from_mapping(raw: Mapping[str, Any], *, source: str, now: datetime) -> dict[str, Any] | None:
+def _provider_text(value: Any) -> str:
+    """A provider field as text; null-like spellings are missing, not data."""
+
+    text = str(value if value is not None else "").strip()
+    return "" if text.lower() in {"", "nan", "nat", "none", "null", "<na>"} else text
+
+
+def _as_shanghai(value: datetime) -> datetime:
+    return value.replace(tzinfo=SHANGHAI) if value.tzinfo is None else value.astimezone(SHANGHAI)
+
+
+def _row_from_mapping(
+    raw: Mapping[str, Any], *, source: str, now: datetime, fetched_at: str = "",
+) -> dict[str, Any] | None:
     mapped: dict[str, Any] = {}
     for key, value in raw.items():
         name = COLUMN_ALIASES.get(str(key).strip(), str(key).strip())
+        # Several provider spellings can map to one name; never let a later
+        # empty alias erase a value an earlier one supplied.
+        if name in mapped and not _provider_text(value):
+            continue
         mapped[name] = value
     symbol = normalize_symbol(mapped.get("symbol") or mapped.get("code") or "")
     if len(symbol) != 6 or not symbol.isdigit():
         return None
     pct = _num(mapped.get("pct_chg"))
     amount = _num(mapped.get("amount")) or 0.0
-    quote_time = str(mapped.get("quote_time") or now.strftime("%Y-%m-%d %H:%M:%S"))
-    quote_date = str(mapped.get("quote_date") or now.strftime("%Y-%m-%d"))
+    # The quote's own time and date come from the provider or stay empty.
+    # Sina's ``ticktime`` is a clock time without a date ("14:55:03"); it is
+    # kept as sent, exactly like the A0 archive. The round's clock is never a
+    # substitute: on 2026-10-09 every 15:00 cache row read "15:00:01" because
+    # the missing provider time was filled with ``now``.
+    quote_time = _provider_text(mapped.get("quote_time"))
+    quote_date = _provider_text(mapped.get("quote_date"))[:10]
+    stamp = _provider_text(mapped.get("fetched_at")) or fetched_at or _as_shanghai(now).isoformat(timespec="seconds")
     return {
         "symbol": symbol,
         "name": str(mapped.get("name") or ""),
@@ -113,9 +149,10 @@ def _row_from_mapping(raw: Mapping[str, Any], *, source: str, now: datetime) -> 
         "high": _num(mapped.get("high")) or 0.0,
         "low": _num(mapped.get("low")) or 0.0,
         "quote_time": quote_time,
-        "quote_date": quote_date[:10],
+        "quote_date": quote_date,
         "source": str(mapped.get("source") or source),
-        "fetched_at": str(mapped.get("fetched_at") or ""),
+        # When this process received the row. Separate from the quote time.
+        "fetched_at": stamp,
     }
 
 
@@ -124,6 +161,7 @@ def normalize_spot_rows(
     *,
     source: str,
     now: datetime,
+    fetched_at: str = "",
 ) -> list[dict[str, Any]]:
     records: list[Mapping[str, Any]]
     if payload is None:
@@ -137,7 +175,7 @@ def normalize_spot_rows(
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in records:
-        row = _row_from_mapping(raw, source=source, now=now)
+        row = _row_from_mapping(raw, source=source, now=now, fetched_at=fetched_at)
         if row is None or row["symbol"] in seen:
             continue
         seen.add(row["symbol"])
@@ -199,24 +237,63 @@ def write_spot_snapshot(
     evidence: Mapping[str, Any] | None = None,
 ) -> Path:
     path = root / SPOT_RELATIVE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(SPOT_COLUMNS), extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in SPOT_COLUMNS})
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=list(SPOT_COLUMNS), extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key, "") for key in SPOT_COLUMNS})
+    # One complete file or the previous one: a reader (or a killed round) can
+    # never see a half-written cache.
+    _atomic_replace_bytes(path, stream.getvalue().encode("utf-8-sig"))
+    fetched = sorted({str(row.get("fetched_at") or "") for row in rows if str(row.get("fetched_at") or "")})
     meta = {
         "updated_at": now.isoformat(timespec="seconds"),
         "source": source,
         "row_count": len(rows),
+        "fetched_at": fetched[-1] if fetched else "",
+        "quote_time_basis": QUOTE_TIME_BASIS,
+        "quote_time_missing_count": sum(1 for row in rows if not str(row.get("quote_time") or "").strip()),
+        "quote_date_missing_count": sum(1 for row in rows if not str(row.get("quote_date") or "").strip()),
         "research_only": True,
         "temporary_quote_only": True,
-        "message": "盘中全市场快照，覆盖写入；不替代正式日线，不代表全市场 1 分钟 K。",
+        "message": "盘中全市场快照，覆盖写入；不替代正式日线，不代表全市场 1 分钟 K。"
+                   "quote_time/quote_date 只来自行情源，缺失即留空；抓取时刻见 fetched_at。",
     }
     if evidence:
         meta.update(evidence)
     atomic_write_json(root / SPOT_META_RELATIVE, meta)
     return path
+
+
+def _atomic_replace_bytes(path: Path, content: bytes, *, attempts: int = 5) -> None:
+    """Write beside the target, fsync, then replace; retry a briefly-held target.
+
+    Windows refuses ``os.replace`` while another process holds the target open
+    without delete sharing (a reader in the middle of ``read_csv``).  A few
+    short retries cover that; a persistent failure raises and the previous
+    file stays intact.
+    """
+
+    import os
+    import time
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(max(1, int(attempts))):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt + 1 >= attempts:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _quote_stamp(row: Mapping[str, Any], trade_date: str) -> datetime | None:
@@ -492,11 +569,12 @@ def refresh_full_market_snapshot(
     """
 
     root = Path(project_root).resolve()
-    current = now or datetime.now()
+    current = _as_shanghai(now or datetime.now(SHANGHAI))
     import time
 
     tick = clock or time.monotonic
-    deadline = None if budget_seconds is None else tick() + max(0.0, float(budget_seconds))
+    round_started = tick()
+    deadline = None if budget_seconds is None else round_started + max(0.0, float(budget_seconds))
 
     def expired() -> bool:
         return deadline is not None and tick() >= deadline
@@ -546,9 +624,18 @@ def refresh_full_market_snapshot(
             "reason_codes": [*reuse_reasons, f"spot_snapshot_failed:{type(exc).__name__}"],
             "error": f"{type(exc).__name__}:{exc}"[:400],
         }
-    if expired():
+    # One clock read serves both the deadline check and the fetch moment, so
+    # the round's clock is read exactly as often as before.
+    fetched_tick = tick()
+    if deadline is not None and fetched_tick >= deadline:
         return timed_out()
-    rows = normalize_spot_rows(payload, source=source, now=current)
+    # The moment the provider's rows were in hand: the round's start clock
+    # plus the time the fetch took. Recorded per row as ``fetched_at``.
+    from datetime import timedelta
+
+    fetch_elapsed = max(0.0, float(fetched_tick - round_started))
+    fetched_at = (current + timedelta(seconds=fetch_elapsed)).isoformat(timespec="seconds")
+    rows = normalize_spot_rows(payload, source=source, now=current, fetched_at=fetched_at)
     if not rows:
         return {
             "ok": False,

@@ -3396,8 +3396,8 @@ def test_target_amount_backfill_uses_same_day_spot_snapshot(monkeypatch, tmp_pat
         encoding="utf-8",
     )
     (cache_dir / "spot_snapshot_latest.csv").write_text(
-        "symbol,name,price,pct_chg,volume,amount,quote_time,source\n"
-        "000802,北京文化,4.42,-0.67,41821352,186791640,2026-06-15 15:00:00,sina.spot_direct\n",
+        "symbol,name,price,pct_chg,volume,amount,quote_time,source,fetched_at\n"
+        "000802,北京文化,4.42,-0.67,41821352,186791640,2026-06-15 15:00:00,sina.spot_direct,2026-06-15T15:05:00+08:00\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(daily_price_update_engine, "PROJECT_ROOT", tmp_path)
@@ -3423,9 +3423,9 @@ def test_target_amount_backfill_skips_bad_spot_snapshot_rows(monkeypatch, tmp_pa
         encoding="utf-8",
     )
     (cache_dir / "spot_snapshot_latest.csv").write_text(
-        "symbol,name,price,pct_chg,volume,amount,quote_time,source\n"
-        "000802,北京文化,4.42,-0.67,41821352,186791640,2026-06-15 15:00:00,sina.spot_direct\n"
-        "bad-row,坏行,4.42,-0.67,41821352,186791640,2026-06-15 15:00:00,sina.spot_direct,extra-field\n",
+        "symbol,name,price,pct_chg,volume,amount,quote_time,source,fetched_at\n"
+        "000802,北京文化,4.42,-0.67,41821352,186791640,2026-06-15 15:00:00,sina.spot_direct,2026-06-15T15:05:00+08:00\n"
+        "bad-row,坏行,4.42,-0.67,41821352,186791640,2026-06-15 15:00:00,sina.spot_direct,2026-06-15T15:05:00+08:00,extra-field\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(daily_price_update_engine, "PROJECT_ROOT", tmp_path)

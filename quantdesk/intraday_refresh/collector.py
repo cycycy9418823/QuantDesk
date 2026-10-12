@@ -32,7 +32,7 @@ from typing import Any, Callable, Iterator
 from zoneinfo import ZoneInfo
 
 from quantdesk.interprocess_lock import interprocess_file_lock
-from quantdesk.intraday.minute_storage import minute_write_path
+from quantdesk.intraday.minute_storage import QUARANTINE_DIR, envelope_violation, minute_write_path
 from quantdesk.intraday_refresh.scope import build_dynamic_scope  # noqa: E402
 from quantdesk.intraday_refresh.snapshot import refresh_full_market_snapshot  # noqa: E402
 
@@ -52,7 +52,11 @@ FRESH_MAX_LAG_SECONDS = 600  # 10 minutes during market hours
 # Bounded round budget.  The scheduled task kills a round at its 10-minute
 # ExecutionTimeLimit (event 329 / 0x41306 on 2026-09-10), so the collector must
 # stop itself well before that and say so, instead of dying with no manifest.
-DEFAULT_MAX_ROUND_SECONDS = 480.0
+# It must also end before the next 5-minute trigger: with 480 s on 2026-10-09
+# rounds overlapped the following triggers, only 32 of 48 slots started and no
+# round finished ready.  240 s leaves the rest of the 300 s slot for start-up,
+# the daytime observers and the terminal manifest.
+DEFAULT_MAX_ROUND_SECONDS = 240.0
 DEFAULT_MAX_SYMBOL_SECONDS = 20.0
 PROGRESS_EVERY_SYMBOLS = 10
 PROVIDER_TIMEOUT_SECONDS = 8
@@ -191,12 +195,10 @@ def validate_minute_bar(row: dict[str, Any], *, now: datetime, symbol: str) -> t
     if None not in (open_price, high, low, close):
         # Both open and close must lie inside [low, high]. Keep the existing
         # reason priority when more than one envelope constraint fails.
-        body_top = max(open_price, close)
-        body_bottom = min(open_price, close)
-        low_above = low > body_bottom
-        high_below = high < body_top or high < low
-        if low_above or high_below:
-            code = "low_above_body" if low_above else "high_below_body"
+        # Float serialization noise (39.690000000000005 vs 39.69) is not an
+        # inverted bar; the shared tolerance is ~1e6 times below one tick.
+        code = envelope_violation(open_price, high, low, close)
+        if code:
             return False, f"invalid_minute_bar:{symbol}:{code}"
     dt_raw = str(row.get("datetime") or "").strip()
     dt = parse_minute_datetime(dt_raw)
@@ -317,7 +319,8 @@ def _append_rows_with_latest(
 
     requested_path = path
     path = minute_write_path(path, history_now=datetime.fromisoformat(now_iso.replace("Z", "+00:00")))
-    exists_with_data = path.is_file() and path.stat().st_size > 0
+    scanned = path.stat() if path.is_file() else None
+    exists_with_data = scanned is not None and scanned.st_size > 0
     needs_newline = False
     fieldnames = list(MINUTE_COLUMNS)
     if exists_with_data:
@@ -331,6 +334,7 @@ def _append_rows_with_latest(
             needs_newline = handle.read(1) not in {b"\n", b"\r"}
 
     seen: set[str] = set()
+    quarantined: list[dict[str, Any]] = []
     if exists_with_data:
         checked_at = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -339,22 +343,36 @@ def _append_rows_with_latest(
             for line_number, values in enumerate(reader, 2):
                 if not values:
                     continue
-                reason = ""
                 stored = dict(zip(fieldnames, values))
-                if len(values) != len(fieldnames):
-                    reason = "column_count"
-                elif str(stored.get("price_basis") or "").strip().lower() != "raw":
-                    reason = "price_basis_not_raw"
-                elif stored.get("symbol") != path.stem:
-                    reason = "symbol_mismatch"
+                if len(values) == len(fieldnames):
+                    # File-level: the archive is not a raw archive of this
+                    # symbol. Raw bars appended beside it would mix price
+                    # bases or identities, so the whole file stays blocked.
+                    if str(stored.get("price_basis") or "").strip().lower() != "raw":
+                        return 0, [f"minute_stored_row_invalid:{path.name}:{line_number}:price_basis_not_raw"], ""
+                    if stored.get("symbol") != path.stem:
+                        return 0, [f"minute_stored_row_invalid:{path.name}:{line_number}:symbol_mismatch"], ""
+                    _ok, reason = validate_minute_bar(stored, now=checked_at, symbol=path.stem)
                 else:
-                    ok, reason = validate_minute_bar(stored, now=checked_at, symbol=path.stem)
+                    reason = "column_count"
                 if reason:
-                    return 0, [f"minute_stored_row_invalid:{path.name}:{line_number}:{reason}"], ""
+                    # Row-level: one damaged row (a torn tail, a bad price, an
+                    # unparseable time) is recorded and isolated. It never
+                    # deduplicates a new bar and never counts as freshness;
+                    # the rest of the archive stays appendable (2026-10-09:
+                    # 73 symbols were refused for a whole day by one row).
+                    quarantined.append({
+                        "line": line_number, "reason": reason.rsplit(":", 1)[-1],
+                        "values": values[: len(fieldnames) + 2],
+                    })
+                    continue
                 seen.add(_minute_datetime_key(stored.get("datetime")))
     latest = max(seen, default="")
+    stored_latest = latest
     reject_reasons: list[str] = ([f"legacy_price_basis_unknown:{requested_path.name}"]
                                  if path != requested_path else [])
+    if quarantined:
+        reject_reasons.append(_record_quarantine(path, quarantined, now_iso=now_iso))
     accepted: list[dict[str, Any]] = []
     for row in rows:
         if str(row.get("price_basis") or "").strip().lower() != "raw":
@@ -375,40 +393,120 @@ def _append_rows_with_latest(
         accepted.append(row)
     if not accepted:
         return 0, reject_reasons, latest
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = "a" if exists_with_data else "w"
-    with path.open(mode, encoding="utf-8", newline="") as handle:
-        if needs_newline:
-            handle.write("\n")
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=fieldnames,
-            extrasaction="ignore",
-            lineterminator="\n",
+    import io
+
+    buffer = io.StringIO(newline="")
+    if needs_newline:
+        buffer.write("\n")
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=fieldnames,
+        extrasaction="ignore",
+        lineterminator="\n",
+    )
+    if not exists_with_data:
+        writer.writeheader()
+    for row in accepted:
+        writer.writerow(
+            {
+                "symbol": str(row.get("symbol") or ""),
+                "datetime": str(row.get("datetime") or ""),
+                "date": str(row.get("date") or ""),
+                "time": str(row.get("time") or ""),
+                "open": repr(float(row.get("open"))),
+                "high": repr(float(row.get("high"))),
+                "low": repr(float(row.get("low"))),
+                "close": repr(float(row.get("close"))),
+                "volume": "%.1f" % float(row.get("volume") or 0),
+                "amount": "%.1f" % float(row.get("amount") or 0),
+                "source": str(row.get("source") or ""),
+                "updated_at": now_iso,
+                "price_basis": str(row["price_basis"]).strip().lower(),
+            }
         )
-        if not exists_with_data:
-            writer.writeheader()
-        for row in accepted:
-            writer.writerow(
-                {
-                    "symbol": str(row.get("symbol") or ""),
-                    "datetime": str(row.get("datetime") or ""),
-                    "date": str(row.get("date") or ""),
-                    "time": str(row.get("time") or ""),
-                    "open": repr(float(row.get("open"))),
-                    "high": repr(float(row.get("high"))),
-                    "low": repr(float(row.get("low"))),
-                    "close": repr(float(row.get("close"))),
-                    "volume": "%.1f" % float(row.get("volume") or 0),
-                    "amount": "%.1f" % float(row.get("amount") or 0),
-                    "source": str(row.get("source") or ""),
-                    "updated_at": now_iso,
-                    "price_basis": str(row["price_basis"]).strip().lower(),
-                }
-            )
-        handle.flush()
-        os.fsync(handle.fileno())
+    try:
+        _atomic_append_bytes(path, buffer.getvalue().encode("utf-8"), scanned=scanned if exists_with_data else None)
+    except OSError as exc:
+        # The archive is unchanged; this symbol's round is a storage failure,
+        # not an aborted round for every other symbol.
+        return 0, [*reject_reasons, f"minute_append_failed:{path.name}:{type(exc).__name__}"], stored_latest
     return len(accepted), reject_reasons, latest
+
+
+def _atomic_append_bytes(path: Path, payload: bytes, *, scanned: os.stat_result | None, attempts: int = 5) -> None:
+    """Old bytes unchanged + new rows, published in one ``os.replace``.
+
+    A killed or failed round leaves the previous archive exactly as it was
+    (an in-place append could leave half a line).  ``scanned`` is the stat
+    taken before the archive was validated: if the file changed since, the
+    validation no longer describes it and nothing is written.
+    """
+
+    import shutil
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.append.tmp")
+    try:
+        with tmp.open("wb") as out:
+            if scanned is not None:
+                with path.open("rb") as source:
+                    current = os.fstat(source.fileno())
+                    if (current.st_size, current.st_mtime_ns) != (scanned.st_size, scanned.st_mtime_ns):
+                        raise OSError("minute_archive_changed_during_round")
+                    shutil.copyfileobj(source, out, 1024 * 1024)
+            elif path.exists() and path.stat().st_size > 0:
+                raise OSError("minute_archive_appeared_during_round")
+            out.write(payload)
+            out.flush()
+            os.fsync(out.fileno())
+        expected = (scanned.st_size if scanned is not None else 0) + len(payload)
+        if tmp.stat().st_size != expected:
+            raise OSError("minute_append_size_mismatch")
+        for attempt in range(max(1, int(attempts))):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                # Windows: a reader holding the archive without delete sharing.
+                if attempt + 1 >= attempts:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _record_quarantine(path: Path, rows: list[dict[str, Any]], *, now_iso: str) -> str:
+    """Write the isolated rows beside the archive; the archive is not touched."""
+
+    from collections import Counter
+
+    from quantdesk.utils import atomic_write_json
+
+    reasons = Counter(str(item["reason"]) for item in rows)
+    target = path.parent / QUARANTINE_DIR / f"{path.stem}.json"
+    code = f"minute_stored_rows_quarantined:{path.name}:{len(rows)}"
+    payload = {
+        "schema_version": "minute_quarantine_v1",
+        "symbol": path.stem,
+        "archive": path.name,
+        "checked_at": now_iso,
+        "quarantined_count": len(rows),
+        "reasons": dict(sorted(reasons.items())),
+        "rows": rows[:200],
+        "rows_truncated": len(rows) > 200,
+        "contract": "Rows stay byte-for-byte in the archive; they are never used for "
+                    "deduplication, freshness or prices. New bars append after them.",
+    }
+    try:
+        previous = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = {}
+    if (previous.get("quarantined_count"), previous.get("reasons")) != (payload["quarantined_count"], payload["reasons"]):
+        try:
+            atomic_write_json(target, payload)
+        except OSError:
+            return code + ":record_write_failed"
+    return code
 
 
 # ---------------------------------------------------------------------------
@@ -1376,8 +1474,15 @@ def collect_intraday_refresh(
                     actual_path = minute_write_path(path, history_now=current)
                     manifest["appended_rows"] += accepted
                     manifest["reason_codes"].extend(rejects[:3])
+                    quarantine_reason = next(
+                        (reason for reason in rejects if reason.startswith("minute_stored_rows_quarantined:")), ""
+                    )
+                    if quarantine_reason and quarantine_reason not in rejects[:3]:
+                        manifest["reason_codes"].append(quarantine_reason)
                     storage_reason = next(
-                        (reason for reason in rejects if reason.startswith(("minute_header_mismatch:", "minute_stored_row_invalid:"))), ""
+                        (reason for reason in rejects if reason.startswith((
+                            "minute_header_mismatch:", "minute_stored_row_invalid:", "minute_append_failed:",
+                        ))), ""
                     )
                     receipt_status = "ok"
                     receipt_reason = ""
@@ -1400,6 +1505,7 @@ def collect_intraday_refresh(
                         "status": receipt_status,
                         "reason": receipt_reason,
                         "appended": accepted,
+                        "quarantined_rows": int(quarantine_reason.split(":")[2]) if quarantine_reason else 0,
                         "latest_bar_time": newest,
                         "storage_path": str(actual_path.relative_to(root)),
                         "legacy_price_basis_unknown": actual_path != path,

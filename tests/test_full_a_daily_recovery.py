@@ -177,6 +177,11 @@ def test_daily_price_engine_waits_between_serial_network_symbols(monkeypatch) ->
     monkeypatch.setattr(engine, "theme_map_status", lambda: {})
     monkeypatch.setattr(engine, "daily_feature_status", lambda: {})
     monkeypatch.setattr(engine, "atomic_write_json", lambda *_args, **_kwargs: None)
+    from quantdesk import pipeline_process_guard
+
+    # 1C: a network write to data/daily needs the Pipeline writer lease; this
+    # pacing test stands in for it the way it stands in for the safety check.
+    monkeypatch.setattr(pipeline_process_guard, "assert_canonical_daily_write", lambda _path: None)
 
     payload = engine.update_daily_prices(
         target_date="2026-08-17",
