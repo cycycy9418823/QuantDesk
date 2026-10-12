@@ -64,6 +64,7 @@ from quantdesk.paper.portfolio_contracts import (
 )
 from quantdesk.paper.position_management_engine import (
     CONDITIONAL_EXECUTION_LATEST_JSON,
+    SHADOW_UNRECORDED as _SHADOW_UNRECORDED,
     _write_shadow_ledger_snapshot_once,
     apply_conditional_execution_to_state,
     simulate_conditional_plan_file,
@@ -388,6 +389,12 @@ def _write_auto_paper_latest(snapshot: dict[str, Any]) -> dict[str, Any]:
         for key in ("cash", "market_value", "total_equity", "realized_pnl", "unrealized_pnl", "initial_cash"):
             if prepared.get(key) is None and summary.get(key) is not None:
                 prepared[key] = summary[key]
+    if _SHADOW_UNRECORDED:
+        # Shadow-risk failures that could not reach their own sink (used to be
+        # `except Exception: pass`). Published here, never in the ledger state.
+        unrecorded = list(dict.fromkeys(_SHADOW_UNRECORDED))
+        prepared["shadow_warnings"] = list(dict.fromkeys([*(prepared.get("shadow_warnings") or []), *unrecorded]))
+        prepared["warnings"] = list(dict.fromkeys([*(prepared.get("warnings") or []), *unrecorded]))
     normalized = reconcile_paper_account(prepared)
     atomic_write_json(AUTO_PAPER_PORTFOLIO_LATEST_JSON, normalized)
     return normalized
@@ -556,25 +563,32 @@ def _record_shadow_failure(
     as_of: str,
     write_error: bool = True,
 ) -> None:
-    """Keep a shadow failure out of every legacy paper action."""
+    """Keep a shadow failure out of every legacy paper action -- but never lose it.
 
+    The failure is recorded in the shadow records (summary, report, latest);
+    a failure to append it or to write the error log is noted in
+    ``_SHADOW_UNRECORDED`` and published as ``shadow_warnings``, not swallowed.
+    The ledger state bytes stay untouched either way.
+    """
+
+    record = {
+        "evaluated": False,
+        "status": "shadow_error",
+        "surface": surface,
+        "as_of": as_of,
+        "reason_codes": ["shadow_error"],
+        "shadow_error": f"{type(error).__name__}:{error}",
+        "would_pass": False,
+        "would_block": False,
+        "insufficient_evidence": False,
+        "missing_components": [],
+    }
     try:
-        records.append(
-            {
-                "evaluated": False,
-                "status": "shadow_error",
-                "surface": surface,
-                "as_of": as_of,
-                "reason_codes": ["shadow_error"],
-                "shadow_error": f"{type(error).__name__}:{error}",
-                "would_pass": False,
-                "would_block": False,
-                "insufficient_evidence": False,
-                "missing_components": [],
-            }
+        records.append(record)
+    except Exception as append_exc:  # noqa: BLE001 - surfaced below
+        _SHADOW_UNRECORDED.append(
+            f"shadow_record_append_failed:{surface}:{type(error).__name__}:{type(append_exc).__name__}"
         )
-    except Exception:
-        pass
     if write_error:
         try:
             record_shadow_error_best_effort(
@@ -583,8 +597,9 @@ def _record_shadow_failure(
                 as_of=as_of,
                 error_path=_risk_gate_shadow_error_path(),
             )
-        except Exception:
-            pass
+        except Exception as log_exc:  # noqa: BLE001 - surfaced below
+            record["shadow_error_log_failed"] = f"{type(log_exc).__name__}:{log_exc}"
+            _SHADOW_UNRECORDED.append(f"shadow_error_log_write_failed:{surface}:{type(log_exc).__name__}")
 
 
 def _load_auto_strategy(path: Path = AUTO_STRATEGY_LATEST_JSON) -> dict[str, Any]:
@@ -1631,6 +1646,10 @@ def _write_report(
         try:
             lines.extend(render_shadow_report_section(risk_gate_shadow_summary))
         except Exception as exc:
+            # A distinct header: the failure is visible, but is never mistaken
+            # for a rendered shadow section.
+            lines.extend(["", "## 影子风险门（未能生成）", "",
+                          f"- 影子风险段生成失败：{type(exc).__name__}: {exc}"])
             try:
                 record_shadow_error_best_effort(
                     surface="auto_paper_report_shadow_section",
@@ -1638,8 +1657,9 @@ def _write_report(
                     as_of=str(risk_gate_shadow_summary.get("as_of") or ""),
                     error_path=_risk_gate_shadow_error_path(),
                 )
-            except Exception:
-                pass
+            except Exception as log_exc:  # noqa: BLE001 - visible in the report
+                lines.append(f"- 影子风险错误日志写入也失败：{type(log_exc).__name__}: {log_exc}")
+                _SHADOW_UNRECORDED.append(f"shadow_error_log_write_failed:auto_paper_report_shadow_section:{type(log_exc).__name__}")
     lines += [
         "",
         "## 今日动作",
@@ -2364,6 +2384,7 @@ def _run_auto_paper_portfolio_unlocked(
 ) -> dict[str, Any]:
     """Initialize or update the persistent automatic paper portfolio."""
 
+    _SHADOW_UNRECORDED.clear()  # one run's unrecorded shadow failures, not a previous run's
     mode = "update" if str(mode) == "update" else "init"
     quantity = round_down_to_lot(quantity_per_stock)
     if candidate_mode == "legacy_diagnostic":

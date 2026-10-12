@@ -62,6 +62,10 @@ SECTOR_ROTATION_LATEST_JSON = RESULTS_DIR / "sector_rotation_latest.json"
 AUTO_PAPER_PORTFOLIO_STATE_JSON = PROJECT_ROOT / "state" / "auto_paper_portfolio.json"
 
 TRADE_ACTIONS = {"buy", "add", "breakout_add", "reduce_half", "take_profit", "sell_all", "stop_loss"}
+# Shadow-risk failures that could not reach their own sink (the shadow record
+# list or the error log). Published by the strategy book's latest writer as
+# ``shadow_warnings``; never written into the ledger state.
+SHADOW_UNRECORDED: list[str] = []
 EXIT_ACTIONS = {"reduce_half", "take_profit", "sell_all", "stop_loss"}
 BUY_ACTIONS = {"buy", "add", "breakout_add"}
 
@@ -1207,23 +1211,24 @@ def apply_conditional_execution_to_state(
     owns_shadow_records = risk_gate_shadow_records is None
 
     def record_shadow_failure(surface: str, error: BaseException) -> None:
+        record = {
+            "evaluated": False,
+            "status": "shadow_error",
+            "surface": surface,
+            "as_of": trade_date,
+            "reason_codes": ["shadow_error"],
+            "shadow_error": f"{type(error).__name__}:{error}",
+            "would_pass": False,
+            "would_block": False,
+            "insufficient_evidence": False,
+            "missing_components": [],
+        }
         try:
-            shadow_records.append(
-                {
-                    "evaluated": False,
-                    "status": "shadow_error",
-                    "surface": surface,
-                    "as_of": trade_date,
-                    "reason_codes": ["shadow_error"],
-                    "shadow_error": f"{type(error).__name__}:{error}",
-                    "would_pass": False,
-                    "would_block": False,
-                    "insufficient_evidence": False,
-                    "missing_components": [],
-                }
+            shadow_records.append(record)
+        except Exception as append_exc:  # noqa: BLE001 - surfaced via SHADOW_UNRECORDED
+            SHADOW_UNRECORDED.append(
+                f"shadow_record_append_failed:{surface}:{type(error).__name__}:{type(append_exc).__name__}"
             )
-        except Exception:
-            pass
         if risk_gate_shadow_write_errors:
             try:
                 record_shadow_error_best_effort(
@@ -1235,8 +1240,9 @@ def apply_conditional_execution_to_state(
                         or (RESULTS_DIR / "risk_gate_shadow_errors.jsonl")
                     ),
                 )
-            except Exception:
-                pass
+            except Exception as log_exc:  # noqa: BLE001 - surfaced, not swallowed
+                record["shadow_error_log_failed"] = f"{type(log_exc).__name__}:{log_exc}"
+                SHADOW_UNRECORDED.append(f"shadow_error_log_write_failed:{surface}:{type(log_exc).__name__}")
     incoming_results = list(execution_payload.get("events") or []) + list(execution_payload.get("no_fill") or []) + list(execution_payload.get("blocked") or [])
     ordered_results = sorted(
         enumerate(incoming_results),
