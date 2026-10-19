@@ -145,7 +145,11 @@ def _run_task_locked(root: Path, name: str, policy: str, action: dict[str, str],
         def record(status: str, **values: object) -> None:
             payload = {"at": datetime.now(SHANGHAI).isoformat(), "run_id": run_id, "pid": os.getpid(),
                 "task": name, "policy": policy, "date": current.date().isoformat(),
-                "status": status, "action_sha256": action_sha256, "code_fingerprint": fingerprint, **values}
+                "status": status, "process_status": status,
+                "business_status": "not_run" if status == "skipped_non_trading_day" else "unverified",
+                "business_completed": False if status == "skipped_non_trading_day" else None,
+                "completion_scope": "launcher_process_only",
+                "action_sha256": action_sha256, "code_fingerprint": fingerprint, **values}
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())

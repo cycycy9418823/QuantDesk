@@ -8,9 +8,11 @@ requirements exclude them from the model-accuracy denominator.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, time, timezone, timedelta
+from datetime import date, datetime, time, timezone, timedelta
 from math import isfinite
 from typing import Any
+
+from quantdesk.trading_calendar import is_trade_day
 
 SCHEMA = "ai_decision_evaluation.v1"
 TZ_SHANGHAI = timezone(timedelta(hours=8))
@@ -27,6 +29,8 @@ EXCLUSION_LABELS = {
     "filled_trade_unconfirmed": "未确认实际纸面成交",
     "verdict_before_maturity": "原判定早于观察期结束",
     "outcome_evidence_incomplete": "到期日线证据不完整",
+    "decision_identity_missing": "缺原始判断或账户计划身份",
+    "duplicate_decision_conflict": "同一判断编号有冲突记录",
 }
 
 
@@ -63,6 +67,34 @@ def _positive_number(value: Any) -> bool:
             and isfinite(value) and value > 0)
 
 
+def _calendar_date(value: Any) -> date | None:
+    if not isinstance(value, str) or len(value) != 10:
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+        return parsed if parsed.isoformat() == value else None
+    except ValueError:
+        return None
+
+
+def _confirmed_fill(row: dict[str, Any]) -> bool:
+    proof = row.get("fill_evidence")
+    if not isinstance(proof, dict) or proof.get("status") != "confirmed" or proof.get("ledger_id") != row.get("ledger_id"):
+        return False
+    trades = proof.get("trades")
+    if not isinstance(trades, list) or not trades:
+        return False
+    identity = {"plan_id": row.get("plan_id"), "symbol": row.get("symbol"),
+                "side": row.get("side"), "date": row.get("trade_date"), "price_basis": "raw"}
+    for trade in trades:
+        if (not isinstance(trade, dict) or any(trade.get(key) != value for key, value in identity.items())
+                or not _positive_number(trade.get("quantity")) or not float(trade["quantity"]).is_integer()
+                or not _positive_number(trade.get("price")) or not isinstance(trade.get("evidence_id"), str)
+                or not trade["evidence_id"].strip()):
+            return False
+    return True
+
+
 def with_fill_evidence(records: list[dict[str, Any]], ledger: dict[str, Any] | None,
                        *, ledger_status: str = "ok") -> list[dict[str, Any]]:
     """Join booked trades by exact plan/symbol/side/day, never by resemblance."""
@@ -79,9 +111,11 @@ def with_fill_evidence(records: list[dict[str, Any]], ledger: dict[str, Any] | N
                                  "ledger_id": ledger_id, "trades": []}
         if ledger is None or ledger_status != "ok":
             proof["reason"] = f"ledger_{ledger_status}"
-        elif row.get("ledger_id") and row["ledger_id"] != ledger_id:
+        elif not isinstance(row.get("ledger_id"), str) or not row["ledger_id"].strip():
+            proof["reason"] = "exact_identity_missing"
+        elif row["ledger_id"] != ledger_id:
             proof["reason"] = "ledger_identity_mismatch"
-        elif not ledger_id or not plan_id or not symbol or side not in {"buy", "sell"} or len(day) != 10:
+        elif not ledger_id or not plan_id or not symbol or side not in {"buy", "sell"} or _calendar_date(day) is None:
             proof["reason"] = "exact_identity_missing"
         else:
             matched = []
@@ -90,13 +124,21 @@ def with_fill_evidence(records: list[dict[str, Any]], ledger: dict[str, Any] | N
                     str(trade.get("side") or ""), str(trade.get("date") or "")) != (plan_id, symbol, side, day):
                     continue
                 evidence = trade.get("price_evidence") if isinstance(trade.get("price_evidence"), dict) else {}
-                if not _positive_number(trade.get("quantity")) or not _positive_number(trade.get("price")):
+                quantity = trade.get("quantity")
+                if (not _positive_number(quantity) or not float(quantity).is_integer()
+                        or not _positive_number(trade.get("price"))
+                        or ("ledger_id" in trade and trade["ledger_id"] != ledger_id)):
                     continue
                 # A receipt in a plan is insufficient: this row must be in the
                 # booked ledger, with original raw-price evidence for this fill.
                 if (evidence.get("price_basis") != "raw" or evidence.get("trade_date") != day
                         or evidence.get("side") != side or evidence.get("price") != trade.get("price")
-                        or not evidence.get("evidence_id")):
+                        or not _positive_number(evidence.get("price"))
+                        or not isinstance(evidence.get("evidence_id"), str) or not evidence["evidence_id"].strip()):
+                    continue
+                identity = {"ledger_id": ledger_id, "plan_id": plan_id, "symbol": symbol, "quantity": quantity}
+                if (any(key in evidence and evidence[key] != value for key, value in identity.items())
+                        or ("quantity" in evidence and not _positive_number(evidence["quantity"]))):
                     continue
                 matched.append({"date": day, "plan_id": plan_id, "symbol": symbol, "side": side,
                                 "quantity": trade["quantity"], "price": trade["price"],
@@ -112,6 +154,10 @@ def with_fill_evidence(records: list[dict[str, Any]], ledger: dict[str, Any] | N
 def eligibility(row: dict[str, Any]) -> dict[str, Any]:
     """Prerequisites for an accuracy sample, independent of whether it won."""
     reasons: list[str] = []
+    if (any(not isinstance(row.get(key), str) or not row[key].strip()
+            for key in ("decision_id", "ledger_id", "plan_id", "symbol"))
+            or row.get("side") not in {"buy", "sell"} or _calendar_date(row.get("trade_date")) is None):
+        reasons.append("decision_identity_missing")
     if row.get("backfill") or row.get("provenance") == "historical_review":
         reasons.append("historical_review")
     if decision_origin(row) != "model":
@@ -138,8 +184,7 @@ def eligibility(row: dict[str, Any]) -> dict[str, Any]:
             reasons.append("declaration_not_before_window")
     except (ValueError, TypeError):
         reasons.append("original_timestamp_missing")
-    fill = row.get("fill_evidence") if isinstance(row.get("fill_evidence"), dict) else {}
-    if fill.get("status") != "confirmed" or not fill.get("trades"):
+    if not _confirmed_fill(row):
         reasons.append("filled_trade_unconfirmed")
     return {"schema": SCHEMA, "eligible": not reasons, "exclusion_reasons": reasons,
             "exclusion_labels": [EXCLUSION_LABELS[reason] for reason in reasons]}
@@ -147,15 +192,40 @@ def eligibility(row: dict[str, Any]) -> dict[str, Any]:
 
 def complete_outcome_evidence(row: dict[str, Any]) -> bool:
     """Require the full declared observation window, even for an early hit."""
-    spec = row.get("verification") if isinstance(row.get("verification"), dict) else {}
-    count = spec.get("n_sessions")
-    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+    verification = row.get("verification") if isinstance(row.get("verification"), dict) else {}
+    spec = declared_verification(verification)
+    start, due = _calendar_date(row.get("trade_date")), _calendar_date(verification.get("due_date"))
+    if spec is None or start is None or due is None or due < start:
         return False
-    for evidence in row.get("result_evidence") or []:
+    expected = []
+    cursor = start
+    # Match the evaluator's bounded trading-calendar window, without accepting
+    # an arbitrary set of equally numerous dates as the declared observation.
+    for _ in range(800):
+        if is_trade_day(cursor):
+            expected.append(cursor.isoformat())
+        if cursor >= due or len(expected) > spec["n_sessions"]:
+            break
+        cursor += timedelta(days=1)
+    if len(expected) != spec["n_sessions"] or not expected or expected[-1] != due.isoformat():
+        return False
+    evidence_rows = row.get("result_evidence")
+    if not isinstance(evidence_rows, list):
+        return False
+    for evidence in evidence_rows:
         if not isinstance(evidence, dict) or evidence.get("kind") not in {"window_hit", "window_miss"}:
             continue
-        observed = evidence.get("observed") or []
-        if (evidence.get("price_basis") == "raw" and len(observed) == count
-                and len({str(item[0]) for item in observed if isinstance(item, (list, tuple)) and len(item) == 2}) == count):
+        observed = evidence.get("observed")
+        if (evidence.get("price_basis") != "raw" or evidence.get("due_date") != due.isoformat()
+                or evidence.get("level") != spec["level"] or not _positive_number(evidence.get("level"))
+                or not isinstance(observed, (list, tuple)) or len(observed) != len(expected)):
+            continue
+        if not all(isinstance(item, (list, tuple)) and len(item) == 2
+                   and item[0] == day and _positive_number(item[1]) for item, day in zip(observed, expected)):
+            continue
+        hit = any(close < spec["level"] if spec["kind"] == "break_below" else close >= spec["level"]
+                  for _, close in observed)
+        if (evidence["kind"] == ("window_hit" if hit else "window_miss")
+                and row.get("result") == ("对" if hit else "错")):
             return True
     return False

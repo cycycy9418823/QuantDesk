@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import uuid
@@ -107,6 +108,25 @@ def ledger_history_evidence(path: Path) -> list[str]:
     return found
 
 
+def assert_finite_json_numbers(value: Any) -> None:
+    """Refuse JSON NaN/Infinity, including overflowed numeric literals."""
+    pending, visited = [value], set()
+    while pending:
+        item = pending.pop()
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("ai_trader nonfinite JSON number")
+        if isinstance(item, (dict, list, tuple)) and id(item) not in visited:
+            visited.add(id(item))
+            pending.extend(item.values() if isinstance(item, dict) else item)
+
+
+def _assert_ledger_identity(payload: Any, target: Path) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("ai_trader ledger is not an object")
+    if str(payload.get("ledger_id") or "") != ledger_id_for_path(target):
+        raise ValueError("ai_trader ledger_id mismatch; refusing to use foreign book")
+
+
 def load_ledger(path: Path | None = None, *, missing_ok: bool = True) -> dict[str, Any]:
     """Load the book. ``missing_ok=False`` raises instead of inventing an empty book.
 
@@ -122,10 +142,8 @@ def load_ledger(path: Path | None = None, *, missing_ok: bool = True) -> dict[st
             raise LedgerMissingError(f"ai_trader ledger missing: {target}")
         return empty_ledger(ledger_id=ledger_id_for_path(target))
     payload = json.loads(target.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("ai_trader ledger is not an object")
-    if str(payload.get("ledger_id") or "") != ledger_id_for_path(target):
-        raise ValueError("ai_trader ledger_id mismatch; refusing to load foreign book")
+    assert_finite_json_numbers(payload)
+    _assert_ledger_identity(payload, target)
     return ensure_declared_fill_policy(payload, policy_id=POLICY_NEXT_OPEN)
 
 
@@ -188,13 +206,15 @@ def _rotate_backup(target: Path, text: str) -> Path:
 
 def save_ledger(ledger: dict[str, Any], path: Path | None = None) -> Path:
     target = assert_not_quantdesk_ledger(path or LEDGER_PATH)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _assert_ledger_identity(ledger, target)
+    assert_finite_json_numbers(ledger)
     payload = deepcopy(ledger)
     payload["updated_at"] = _now()
     payload["boundary"] = dict(BOUNDARY)
     ensure_declared_fill_policy(payload, policy_id=POLICY_NEXT_OPEN)
     text = json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2, allow_nan=False,
                       default=_json_default) + "\n"
+    target.parent.mkdir(parents=True, exist_ok=True)
     _durable_write_text(target, text)
     _rotate_backup(target, text)
     return target
@@ -209,7 +229,7 @@ def init_ledger(*, reset: bool = False, path: Path | None = None) -> dict[str, A
     explicit ``reset=True`` is the owner's deliberate re-initialisation.
     """
 
-    target = path or LEDGER_PATH
+    target = assert_not_quantdesk_ledger(path or LEDGER_PATH)
     if target.is_file() and not reset:
         return load_ledger(target)
     if not reset:
@@ -219,7 +239,7 @@ def init_ledger(*, reset: bool = False, path: Path | None = None) -> dict[str, A
                 f"ai_trader ledger missing but history exists ({'; '.join(evidence)}); "
                 "restore from ledger_backups instead of starting a new book"
             )
-    ledger = empty_ledger()
+    ledger = empty_ledger(ledger_id=ledger_id_for_path(target))
     save_ledger(ledger, target)
     return ledger
 

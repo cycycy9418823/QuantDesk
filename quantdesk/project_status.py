@@ -512,6 +512,12 @@ def read_runtime_observations(project_root: str | Path, *, report_date: str | No
         llm = plan.get("llm") if isinstance(plan.get("llm"), dict) else {}
         used = llm.get("used") if type(llm.get("used")) is bool else None
         observed_date = day(cycle.get("as_of")) or day(plan.get("decision_date"))
+        date_conflict = ("as_of" in cycle and day(cycle.get("as_of")) is None
+                         or "decision_date" in plan and day(plan.get("decision_date")) is None
+                         or bool(day(cycle.get("as_of")) and day(plan.get("decision_date"))
+                                 and cycle["as_of"] != plan["decision_date"]))
+        if date_conflict:
+            used = None
         reason = llm.get("unavailable_reason")
         model = str(llm.get("model") or "").lower()
         model_label = next((label for key, label in (("kimi", "Kimi"), ("glm", "GLM"), ("deepseek", "DeepSeek"))
@@ -531,9 +537,13 @@ def read_runtime_observations(project_root: str | Path, *, report_date: str | No
                 message = f"{detail}；固定规则接管" if reason else "本轮未使用模型，由固定规则判断"
         else:
             message = "尚无可确认的模型回应记录，不能当作成功或零成交"
+        if date_conflict:
+            message = "运行记录与原计划日期冲突或无效，模型回应状态未核验"
         profiles[profile] = {
             "label": label, "as_of": observed_date, "model_replied": used,
             "model_label": model_label,
+            "decision_mode": plan.get("decision_mode") if isinstance(plan.get("decision_mode"), str) else None,
+            "record_status": "date_conflict" if date_conflict else "readable" if cycle else "missing_or_unreadable",
             "decision_accepted": plan.get("committed") if type(plan.get("committed")) is bool else None,
             "message": message, "source": source,
         }
@@ -543,7 +553,7 @@ def read_runtime_observations(project_root: str | Path, *, report_date: str | No
     source = f"data/snapshots/{target_date}/manifest.json" if target_date else None
     manifest = read_object(source) if source else {}
     declared_date = manifest.get("trade_date")
-    if declared_date is not None and declared_date != target_date:
+    if declared_date != target_date:
         manifest = {}
     collected = count(manifest.get("collected_slot_count"))
     expected = count(manifest.get("expected_slot_count"))
@@ -564,7 +574,8 @@ def read_runtime_observations(project_root: str | Path, *, report_date: str | No
     return {
         "source_label": "已有运行记录 · 查看不会重新运行任务", "profiles": profiles,
         "snapshot": {
-            "as_of": target_date, "source": source, "collected_slots": collected, "expected_slots": expected,
+            "as_of": target_date, "document_report_date": day(report_date),
+            "source": source, "collected_slots": collected, "expected_slots": expected,
             "quoted_rows": quoted, "valid_quotes": valid, "invalid_quotes": invalid,
             "valid_quote_ratio": ratio, "blocks_workflow": False, "message": message,
         },

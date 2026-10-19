@@ -10,9 +10,9 @@ from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, render_template, request
 
-from ai_trader.ledger import LedgerMissingError, load_ledger
+from ai_trader.ledger import LedgerMissingError, assert_finite_json_numbers, load_ledger
 from ai_trader.mandate import BOUNDARY, DEFAULT_MANDATE
-from ai_trader.paths import active_profile, profile_paths
+from ai_trader.paths import active_profile, ledger_id_for_path, profile_paths
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
@@ -137,13 +137,32 @@ def _empty_snapshot() -> dict:
     }
 
 
+def _snapshot_identity_problem(payload: dict, expected: str) -> str | None:
+    ledger = payload.get("ledger")
+    journal = payload.get("journal")
+    account = journal.get("account") if isinstance(journal, dict) else None
+    money_keys = {"cash", "equity", "market_value", "pnl", "positions", "holdings"}
+    financial = ((isinstance(ledger, dict) and bool(money_keys & ledger.keys()))
+                 or (isinstance(account, dict) and bool(money_keys & account.keys())))
+    declared = str(ledger.get("ledger_id") or "") if isinstance(ledger, dict) else ""
+    if financial and not declared:
+        return "ledger_identity_unverified"
+    if declared and declared != expected:
+        return "ledger_identity_mismatch"
+    for section in (payload, payload.get("plan")):
+        if isinstance(section, dict) and section.get("ledger_id") and str(section["ledger_id"]) != expected:
+            return "ledger_identity_mismatch"
+    return None
+
+
 def load_snapshot() -> dict:
     snapshot_path = profile_paths().snapshot
     if not snapshot_path.is_file():
         return _empty_snapshot()
     try:
         payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        assert_finite_json_numbers(payload)
+    except (OSError, UnicodeError, ValueError):
         snap = _empty_snapshot()
         snap["degraded"] = True
         snap["snapshot_status"] = "unreadable"
@@ -153,6 +172,12 @@ def load_snapshot() -> dict:
         snap = _empty_snapshot()
         snap["snapshot_status"] = "invalid_shape"
         snap["reason"] = "快照结构无效（未改动文件）；" + snap["reason"]
+        return snap
+    problem = _snapshot_identity_problem(payload, ledger_id_for_path(profile_paths().ledger))
+    if problem:
+        snap = _empty_snapshot()
+        snap["snapshot_status"] = problem
+        snap["reason"] = "快照账户身份缺失或不匹配（未改动文件）；" + snap["reason"]
         return snap
     return payload
 

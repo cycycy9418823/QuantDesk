@@ -838,6 +838,31 @@ def _plan_fill_mismatch(plan: dict[str, Any], ledger: dict[str, Any]) -> str | N
     return None
 
 
+def _assert_plan_ledger_identity(plan: dict[str, Any], ledger: dict[str, Any]) -> None:
+    declared = str(plan.get("ledger_id") or "")
+    if declared and declared != str(ledger.get("ledger_id") or ""):
+        raise RuntimeError(f"plan_ledger_id_mismatch:{plan.get('plan_id')}")
+
+
+def _pending_plan_fill_mismatch(plan: dict[str, Any], ledger: dict[str, Any]) -> str | None:
+    """Check tagged effects against the frozen pending plan without repricing."""
+    if any(isinstance(row, dict) and row.get("status") == "filled" for row in plan.get("actions") or []):
+        return _plan_fill_mismatch(plan, ledger)
+    remaining = [row for row in plan.get("intents") or [] if isinstance(row, dict)]
+    for trade in ledger.get("trades") or []:
+        if not isinstance(trade, dict) or str(trade.get("plan_id") or "") != str(plan.get("plan_id") or ""):
+            continue
+        match = next((index for index, intent in enumerate(remaining)
+                      if str(intent.get("symbol") or "") == str(trade.get("symbol") or "")
+                      and str(intent.get("side") or "buy") == str(trade.get("side") or "")), None)
+        if match is None:
+            return f"plan_fill_identity_missing:{trade.get('symbol')}:{trade.get('side')}"
+        remaining.pop(match)
+        if str(trade.get("date") or "") != str(plan.get("trade_date") or ""):
+            return f"plan_fill_date_mismatch:{trade.get('symbol')}"
+    return None
+
+
 def settle_plan(
     plan: dict[str, Any],
     ledger: dict[str, Any],
@@ -848,6 +873,7 @@ def settle_plan(
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     if str(plan.get("trade_date") or "") != as_of:
         return plan, ledger, []
+    _assert_plan_ledger_identity(plan, ledger)
     if str(plan.get("status") or "") == "settled":
         # A settled marker alone is NOT proof the ledger effect was committed,
         # because the writer persists the ledger before the settled plan, not
@@ -861,6 +887,9 @@ def settle_plan(
         raise RuntimeError(f"settled_plan_effect_unverified:{plan.get('plan_id')}:{mismatch}")
     plan_id = str(plan.get("plan_id") or "")
     if _ledger_has_plan_fills(ledger, plan_id):
+        mismatch = _pending_plan_fill_mismatch(plan, ledger)
+        if mismatch:
+            raise RuntimeError(f"plan_recovery_effect_unverified:{plan_id}:{mismatch}")
         # Reverse interruption: the ledger effect is already committed but the
         # settled marker was not written.  Return a settled view without
         # re-executing, so recovery never debits the same plan twice.
@@ -1096,6 +1125,8 @@ def run_evening(
             if row.get("close") is not None:
                 prices[symbol] = float(row["close"])
     existing = load_plan(runtime.plan_latest)
+    if existing:
+        _assert_plan_ledger_identity(existing, ledger)
     if existing and str(existing.get("status") or "") == "settled":
         # run_evening skips re-settling a settled plan, so an inconsistent
         # past effect would otherwise be swallowed and a fresh plan written on

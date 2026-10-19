@@ -17,7 +17,7 @@ import hashlib
 import json
 import math
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -980,6 +980,16 @@ def read_sector_membership_as_of(history_root: Path, *, as_of: str) -> dict[str,
         "observed_at": None, "age_calendar_days": None, "freshness": "missing",
         "evidence_kind": "missing", "eligible_for_requested_day": False,
         "source_path": None, "snapshot_hash": None, "reason_codes": []}
+    cutoff: datetime | None = None
+    if len(str(as_of).strip()) != 10:
+        try:
+            cutoff = datetime.fromisoformat(str(as_of).replace("Z", "+00:00"))
+            if cutoff.utcoffset() is None:
+                raise ValueError("as_of_timezone_missing")
+            requested = cutoff.astimezone(timezone(timedelta(hours=8))).date()
+        except ValueError:
+            context.update(freshness="blocked", reason_codes=["as_of_instant_invalid_or_timezone_missing"])
+            return {"snapshot": {}, "observation": context}
     if requested is None or not root.exists():
         return {"snapshot": {}, "observation": context}
     candidates = sorted(((_parse_day(path.parent.name), path) for path in root.glob("*/snapshot.json")
@@ -1002,6 +1012,10 @@ def read_sector_membership_as_of(history_root: Path, *, as_of: str) -> dict[str,
                 raise ValueError("snapshot_date_conflict")
             if payload.get("evidence_eligible") is not True or payload.get("status") != "passed":
                 raise ValueError("snapshot_not_eligible")
+            if cutoff is not None:
+                captured = datetime.fromisoformat(str(payload.get("captured_at") or "").replace("Z", "+00:00"))
+                if captured.utcoffset() is None or captured > cutoff:
+                    raise ValueError("snapshot_not_available_at_requested_instant")
             rows = payload.get("sector_membership")
             if not isinstance(rows, list) or not rows:
                 raise ValueError("membership_missing")
@@ -1010,11 +1024,17 @@ def read_sector_membership_as_of(history_root: Path, *, as_of: str) -> dict[str,
                 if not isinstance(row, dict):
                     raise ValueError("membership_row_invalid")
                 symbol = str(row.get("symbol") or "")
+                if not isinstance(row.get("sector"), str) or not _usable_label(row["sector"]):
+                    raise ValueError("membership_sector_identity_missing")
                 observed = _parse_day(row.get("observed_at"))
                 effective = _parse_day(row.get("effective_from"))
                 if (not symbol or symbol in symbols or observed is None or effective is None
                         or observed != snapshot_day or effective > snapshot_day):
                     raise ValueError("membership_ambiguous_or_future")
+                if cutoff is not None:
+                    observed_time = datetime.fromisoformat(str(row.get("observed_at") or "").replace("Z", "+00:00"))
+                    if observed_time.utcoffset() is None or observed_time > cutoff:
+                        raise ValueError("membership_not_available_at_requested_instant")
                 symbols.add(symbol)
         except (OSError, UnicodeError, ValueError, TypeError) as exc:
             reason = str(exc) if isinstance(exc, ValueError) else type(exc).__name__

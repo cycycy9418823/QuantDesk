@@ -197,7 +197,9 @@ function renderOwnerRuntimeSummary(observations) {
     for (const [profile, label] of [["default", "默认档"], ["glm", "GLM 档"]]) {
         const item = observations.profiles?.[profile] || {};
         const replied = item.model_replied;
-        const main = replied === true ? "模型有回应" : replied === false ? "固定规则接管" : "回应情况未知";
+        const nonModelText = item.decision_mode === "hold_only" ? "无新增交易意图"
+            : [null, undefined, "", "rule_research"].includes(item.decision_mode) ? "固定规则接管" : "回应情况未知";
+        const main = replied === true ? "模型有回应" : replied === false ? nonModelText : "回应情况未知";
         const badge = replied === true ? (item.decision_accepted === false ? "判断未接收" : item.model_label || "已取得模型回答")
             : replied === false ? "本轮不是模型判断" : "不能按成功统计";
         cards.push(card(label, item.as_of, main, badge,
@@ -9113,6 +9115,18 @@ function renderHomeCandidates(data) {
     renderHomeCandidateChart(data);
 }
 
+function homeCandidateBatch(data) {
+    const generation = data?.candidate_generation || {};
+    const signalDate = String(generation.signal_date || "");
+    const targetDate = String(generation.target_date || "");
+    const count = generation.candidate_count;
+    const complete = ["completed", "completed_with_warnings", "passed", "passed_with_warnings"].includes(generation.status);
+    const dated = /^\d{4}-\d{2}-\d{2}$/.test(signalDate) && signalDate === targetDate;
+    const validCount = Number.isSafeInteger(count) && count >= 0;
+    const current = complete && dated && validCount && generation.freshness_status === "current";
+    return { generation, signalDate, targetDate, count: current ? count : null, current };
+}
+
 function renderHomeKpiCandidates(data) {
     const valueEl = document.getElementById("kpiCandidatesValue");
     const subEl = document.getElementById("kpiCandidatesSub");
@@ -9122,20 +9136,16 @@ function renderHomeKpiCandidates(data) {
         subEl.textContent = "候选接口暂时不可用";
         return;
     }
-    const generation = data.candidate_generation || {};
-    const todayCount = Array.isArray(data.today_recommendations) ? data.today_recommendations.length : 0;
+    const batch = homeCandidateBatch(data);
     const focusCount = Array.isArray(data.daily_focus) ? data.daily_focus.length : 0;
-    const observationCount = Array.isArray(data.observation_candidates) ? data.observation_candidates.length : currentObservationCandidates.length;
-    const generatedCount = numericValue(generation.candidate_count) || 0;
-    const readable = Math.max(todayCount, focusCount, observationCount, generatedCount);
-    valueEl.textContent = `${readable} 只`;
+    const observationCount = Array.isArray(data.observation_candidates) ? data.observation_candidates.length : null;
+    valueEl.textContent = batch.count === null ? "—" : `${batch.count} 只`;
     const parts = [];
-    if (todayCount > 0 || generatedCount > 0) parts.push(`今日新生成 ${todayCount || generatedCount}`);
-    else parts.push("今日未新生成");
+    if (batch.current) parts.push(`今日新生成 ${batch.count} · ${batch.signalDate}`);
+    else parts.push(`今日批次未核验${batch.signalDate ? `；最近批次 ${batch.signalDate}` : ""}`);
+    if (batch.targetDate) parts.push(`目标 ${batch.targetDate}`);
     if (focusCount) parts.push(`可读复核池 ${focusCount}`);
-    else if (observationCount) parts.push(`观察池 ${observationCount}`);
-    const freshness = safeText(generation.freshness_label || "");
-    if (freshness && freshness !== "数据缺失") parts.push(freshness);
+    if (observationCount !== null) parts.push(`历史观察 ${observationCount}`);
     subEl.textContent = parts.join(" · ");
 }
 
@@ -9148,6 +9158,7 @@ function renderHomeCandidateChart(data) {
     const todayRows = Array.isArray(data.today_recommendations) ? data.today_recommendations : [];
     const focusRows = Array.isArray(data.daily_focus) ? data.daily_focus : [];
     const usingFallback = !todayRows.length && focusRows.length > 0;
+    const batch = homeCandidateBatch(data);
     const rows = todayRows.length ? todayRows : focusRows;
     const scored = rows
         .map((candidate) => ({ candidate, score: candidatePriorityScore(candidate) }))
@@ -9159,7 +9170,9 @@ function renderHomeCandidateChart(data) {
         return;
     }
     if (note) {
-        const sourceText = usingFallback ? "今日无新候选，暂以每日重点复核池排序" : `共 ${rows.length} 只，按研究优先分显示前 ${scored.length} 只`;
+        const sourceText = usingFallback
+            ? `历史观察/复核池排序；${batch.current && batch.count === 0 ? "当日批次已核验为 0 只" : "今日批次数量未核验"}`
+            : `${batch.current ? `今日批次 ${batch.signalDate}` : `最近候选批次 ${batch.signalDate || "日期未核验"}`}；可读 ${rows.length} 只，按研究优先分显示前 ${scored.length} 只`;
         note.textContent = `${sourceText}；点击条形打开个股详情。仅为研究排序，不是买卖建议。`;
     }
     showHomeChart("homeCandidateChart", true);
@@ -9456,6 +9469,9 @@ function renderHomeEquity(decisionBoard) {
         const parts = [];
         if (totalReturn !== null) parts.push(`累计 ${formatChange(totalReturn)}`);
         if (numericValue(latest.position_count) !== null) parts.push(`纸面持仓 ${safeText(latest.position_count)} 只`);
+        const valuationDate = latest.valuation_date;
+        parts.push(hasValue(valuationDate) ? `估值截至 ${safeText(valuationDate)}` : "估值日期未提供");
+        if (hasValue(latest.daily_pnl) && latest.daily_pnl_status === "verified") parts.push(`该日纸面盈亏 ¥${safeText(latest.daily_pnl)}`);
         subEl.textContent = parts.length ? parts.join(" · ") : "纸面模拟账户（不接券商）";
         feedDutyLamp(
             "paper",

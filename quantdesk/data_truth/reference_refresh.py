@@ -138,7 +138,7 @@ def _read_staged(config: ReferenceRefreshConfig, api: str, day: str) -> tuple[li
         rows.append(row)
         if len(rows) > config.max_rows_per_response:
             raise ValueError("reference_row_budget_exceeded")
-    if receipt.get("rows") != len(rows):
+    if type(receipt.get("rows")) is not int or receipt["rows"] != len(rows):
         raise ValueError("reference_receipt_row_count_mismatch")
     return _normalize(api, rows, day), {"path": str(path), **receipt}
 
@@ -152,8 +152,11 @@ def plan_reference_refresh(config: ReferenceRefreshConfig, *, _deadline: float |
     batch_path = config.staging_dir / "batch.json"
     if batch_path.exists():
         try:
-            if json.loads(batch_path.read_text(encoding="utf-8")).get("status") != "staged":
+            batch = json.loads(batch_path.read_text(encoding="utf-8"))
+            if batch.get("status") != "staged":
                 errors.append("reference_staging_batch_incomplete")
+            elif type(batch.get("response_count")) is not int or batch["response_count"] != len(dates) * len(FAMILIES):
+                errors.append("reference_staging_batch_response_count_mismatch")
         except (OSError, ValueError, AttributeError):
             errors.append("reference_staging_batch_unreadable")
     updates: dict[str, list[dict[str, str]]] = {}
