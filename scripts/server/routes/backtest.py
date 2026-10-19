@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from quantdesk.research.sample_provenance import research_sample_context
+
+from quantdesk.research.backtest_return_evidence import closed_trade_return_evidence
+from quantdesk.backtest_loaders import read_backtest_daily, validate_backtest_history_sources, align_backtest_research_basis
+
 import json
 import os
 import re
@@ -120,6 +125,9 @@ def _load_backtest_histories(
     max_symbols: int,
     symbols: list[str] | None = None,
     candidate_rows_func: CandidateRowsFunc | None = None,
+    *,
+    start_date: str = "",
+    end_date: str = "",
 ) -> dict[str, pd.DataFrame]:
     """Load local daily CSVs for a bounded backtest sample.
 
@@ -159,9 +167,7 @@ def _load_backtest_histories(
                 # dropping it here would change that universe and hide the defect.
                 histories[sym] = df
                 continue
-            if "date" in df.columns:
-                df = df.sort_values("date").reset_index(drop=True)
-            df = _sanitize_daily(df)
+            df, _reason = read_backtest_daily(sym, daily_dir, start_date=start_date, end_date=end_date)
             if len(df) >= 130:
                 histories[sym] = df
         except Exception:  # noqa: BLE001
@@ -230,6 +236,23 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
             body = request.get_json(silent=True) or {}
             strategy = str(body.get("strategy") or "ma_breakout").strip() or "ma_breakout"
             source = str(body.get("source") or "").strip()
+            start_date = str(body.get("start_date") or "").strip()
+            end_date = str(body.get("end_date") or "").strip()
+            try:
+                from datetime import date
+                from quantdesk.trading_calendar import resolve_target_complete_trade_date
+
+                if start_date:
+                    date.fromisoformat(start_date)
+                if end_date:
+                    date.fromisoformat(end_date)
+                else:
+                    target = resolve_target_complete_trade_date()
+                    end_date = str(target.get("target_complete_trade_date") or target.get("target_date") or "")
+                if start_date and end_date and start_date > end_date:
+                    raise ValueError("start_date_after_end_date")
+            except ValueError:
+                return jsonify({"ok": False, "message_for_ui": "回测起止日期无效，需 YYYY-MM-DD 且开始不晚于结束。"}), 400
             try:
                 max_symbols = int(body.get("max_symbols") or 20)
             except (TypeError, ValueError):
@@ -248,7 +271,9 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                 histories = _load_backtest_histories(
                     max_symbols,
                     symbols=requested_symbols or handoff_symbols or None,
-                    candidate_rows_func=candidate_rows_func,
+                    candidate_rows_func=candidate_rows_func if source != "full_a" else None,
+                    start_date=start_date,
+                    end_date=end_date,
                 )
                 if not histories:
                     return jsonify(
@@ -261,10 +286,8 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                             }
                         )
                     )
-                price_policy_validation = validate_price_frame_set(
-                    histories,
-                    consumer="backtest",
-                )
+                histories = align_backtest_research_basis(histories)
+                price_policy_validation = validate_backtest_history_sources(histories)
                 if not price_policy_validation.get("eligible"):
                     reason_codes = [
                         str(item)
@@ -294,7 +317,13 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                         ),
                     }
                     return jsonify(clean_payload(blocked_payload)), 422
-                result = simulate_portfolio_backtest(histories, PortfolioBacktestConfig(), strategy=strategy)
+                from quantdesk.research.official_limit_metadata import load_official_limit_metadata, attach_official_limit_metadata
+
+                metadata = load_official_limit_metadata(list(histories), metadata_dir=project_root / "data" / "metadata", start_date=start_date or None, end_date=end_date or None)
+                for symbol, frame in histories.items():
+                    histories[symbol] = attach_official_limit_metadata(frame, symbol, metadata)
+                config = PortfolioBacktestConfig(use_official_limit_metadata=True, historical_costs=body.get("historical_costs", True) not in (False, "false"))
+                result = simulate_portfolio_backtest(histories, config, strategy=strategy)
                 equity_df = result.equity_curve
                 equity: list[dict[str, Any]] = []
                 if equity_df is not None and not equity_df.empty and "equity" in equity_df.columns:
@@ -306,11 +335,25 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                     price_policy_validation.get("accepted_price_basis")
                     or PRICE_BASIS_UNKNOWN
                 )
+                return_data = closed_trade_return_evidence(result.trades or [])
                 payload = {
                     "ok": True,
                     "exists": True,
                     "strategy": strategy,
-                    "source": source or "current_analysis_pool",
+                    "source": source or ("current_analysis_pool_sample" if candidate_rows_func else "full_a_local_archive_sample"),
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    **research_sample_context({"sample_role": "in_sample", "start_date": start_date, "end_date": end_date}),
+                    "sample_limit": max_symbols,
+                    "research_evidence": {
+                        "universe_basis": "local_archive; bounded sample",
+                        "point_in_time_membership_complete": False,
+                        "out_of_sample_validation": "not_established",
+                        "survivorship_bias_not_excluded": True,
+                        "price_preparation": "shared_cli_api_as_of_research_restatement",
+                    },
+                    "warnings": [*metadata.warnings, *return_data["return_evidence"]["warnings"]],
+                    "cost_evidence_status": "complete" if return_data["return_evidence"]["cost_coverage_complete"] else "partial",
                     "backtest_handoff": handoff,
                     "symbol_count": len(histories),
                     "symbols": list(histories.keys()),
@@ -329,6 +372,8 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                     },
                     "equity_curve": equity,
                     "trades": [_backtest_trade_boundary(clean_payload(t)) for t in (result.trades or [])[:200]],
+                    **return_data,
+                    "trades_preview_limit": 200,
                     "assumptions": clean_payload(result.assumptions),
                     "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                     "message_for_ui": (

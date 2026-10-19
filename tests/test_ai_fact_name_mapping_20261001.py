@@ -128,7 +128,8 @@ def test_real_mismatch_is_still_rejected_even_beside_an_unknown(tmp_path: Path) 
 
     write_daily(tmp_path)
 
-    gate = gate_with(tmp_path, plan_with("今天收盘价99元", market_note=f"{NAME}涨99%"))
+    # 2AI-1：盘面点评只标注、不并进意图，所以"未知"和"真实矛盾"都放在这笔买入自己的理由里。
+    gate = gate_with(tmp_path, plan_with(f"今天收盘价99元，{NAME}今天收盘价10元"))
 
     assert gate.rejections, "真实矛盾在场就必须拒绝"
     hits = gate.rejections[0]["statement_rejections"]

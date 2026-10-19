@@ -177,12 +177,18 @@ def test_benchmark_cell_uses_the_calendar_not_the_weekend(tmp_path: Path) -> Non
     assert "应有 2026-09-18，实际 hs300=2026-09-17" in extra
 
 
-def test_snapshot_cell_shows_sheets_and_completed(tmp_path: Path) -> None:
+def test_snapshot_cell_keeps_archive_and_unverified_counts_separate(tmp_path: Path) -> None:
     root = _project(tmp_path, universe=100, daily_days=100, benchmark_day=PREV,
                     snapshot_slots=48, collected=0, minute=None)
     cell, extra = load_health().snapshot_cell(root, TARGET)
-    assert cell == "快照 ✗48张/完成 0"
-    assert "快照未拉回" in extra
+    assert cell == "快照 ✗48张/覆盖完成 未知/字段核实 未知"
+    assert "已归档 48 张" in extra and "仍未核实" in extra
+    assert "快照未拉回" not in extra
+    missing = _project(tmp_path / "missing", universe=100, daily_days=100, benchmark_day=PREV,
+                       snapshot_slots=0, collected=0, minute=None)
+    missing_cell, missing_extra = load_health().snapshot_cell(missing, TARGET)
+    assert missing_cell.startswith("快照 ✗0张")
+    assert "快照未拉回" in missing_extra
 
 
 def test_minute_cell_counts_gaps_and_storage_blocks(tmp_path: Path) -> None:

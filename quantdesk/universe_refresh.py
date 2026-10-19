@@ -973,7 +973,122 @@ def refresh_universe_snapshot(
         return payload
 
 
-__all__ = ["refresh_universe_snapshot", "build_default_fetchers", "restore_formal_learning_universe"]
+__all__ = ["refresh_universe_snapshot", "build_default_fetchers", "restore_formal_learning_universe",
+           "discover_daily_universe_symbols"]
+
+
+def discover_daily_universe_symbols(
+    project_root: Path, target_date: str, *, known_symbols: Sequence[str] = (),
+    status_path: Path | None = None, snapshot_roots: Sequence[Path] = (),
+    max_snapshot_files: int = 4, now: datetime | None = None,
+) -> dict[str, Any]:
+    """Find omitted request targets from actual same-day source observations.
+
+    This is a read-only membership hint. It never verifies prices, exclusions,
+    listing history or a complete universe; the caller must still fetch a
+    dated quote before writing any bar. External snapshot roots are explicit.
+    """
+    import csv
+    import io
+    from quantdesk.snapshot_history import _quote_time_state, _slot_evidence
+
+    root = Path(project_root)
+    observed_now = to_shanghai_datetime(now)
+    date.fromisoformat(target_date)
+    known = set(known_symbols)
+    provenance: dict[str, list[dict[str, Any]]] = {}
+    sources: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    approved = {"stock_info_a_code_name", "baostock.query_stock_basic", "stock_zh_a_spot", "stock_zh_a_spot_em", "sina.spot_direct"}
+
+    def same_day_stamp(value: Any) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(str(value or ""))
+            if parsed.tzinfo is None:
+                return None
+            local = to_shanghai_datetime(parsed)
+            return local if local.date().isoformat() == target_date and local <= observed_now else None
+        except (TypeError, ValueError):
+            return None
+
+    def remember(codes: Sequence[str], evidence: dict[str, Any]) -> None:
+        valid = {str(code) for code in codes if re.fullmatch(r"[0-9]{6}", str(code))}
+        added = sorted(valid - known)
+        sources.append({**evidence, "observed_count": len(valid), "new_count": len(added)})
+        for code in added:
+            provenance.setdefault(code, []).append(evidence)
+
+    receipt = Path(status_path) if status_path is not None else root / "data/cache/a_share_universe_status.json"
+    if receipt.is_file():
+        try:
+            if receipt.stat().st_size > 8 * 1024 * 1024:
+                raise ValueError("source_receipt_size_limit")
+            raw = receipt.read_bytes()
+            payload = json.loads(raw.decode("utf-8-sig"))
+            if not isinstance(payload, dict) or payload.get("schema_version") != "universe_update.v2":
+                raise ValueError("source_receipt_schema_unverified")
+            for entry in payload.get("source_snapshots") or []:
+                if not isinstance(entry, dict):
+                    warnings.append("universe_discovery_source_invalid")
+                    continue
+                source = str(entry.get("source") or "")
+                codes = entry.get("symbols")
+                if (source not in approved or entry.get("status") not in {"complete", "partial"}
+                        or not same_day_stamp(entry.get("observed_at")) or not isinstance(codes, list)):
+                    warnings.append(f"universe_discovery_source_unverified:{source}")
+                    continue
+                digest = hashlib.sha256(json.dumps(codes, separators=(",", ":")).encode()).hexdigest()
+                if (entry.get("symbols_sha256") != digest or entry.get("row_count") != len(codes)
+                        or codes != sorted(set(codes))
+                        or any(not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code) for code in codes)):
+                    warnings.append(f"universe_discovery_source_hash_or_symbols_invalid:{source}")
+                    continue
+                remember(codes, {"kind": "live_membership_receipt", "source": source,
+                                 "path": str(receipt), "sha256": hashlib.sha256(raw).hexdigest(),
+                                 "observed_at": entry["observed_at"], "source_status": entry["status"]})
+        except (OSError, ValueError, TypeError, UnicodeError) as exc:
+            warnings.append(f"universe_discovery_receipt_invalid:{type(exc).__name__}:{exc}")
+    else:
+        warnings.append("universe_discovery_source_receipt_missing")
+
+    seen_roots: set[str] = set()
+    for snapshot_root in (root, *snapshot_roots):
+        archive_root = Path(snapshot_root).resolve()
+        if str(archive_root) in seen_roots:
+            continue
+        seen_roots.add(str(archive_root))
+        folder = archive_root / "data/snapshots" / target_date
+        paths = sorted((path for path in folder.glob("*.csv") if re.fullmatch(r"[0-9]{4}", path.stem)), reverse=True)
+        for path in paths[:max(0, min(48, int(max_snapshot_files)))]:
+            evidence = _slot_evidence(archive_root, target_date, path.stem)
+            if evidence.get("status") not in {"complete", "partial"}:
+                warnings.append(f"universe_discovery_archive_invalid:{path}:{evidence.get('reason')}")
+                continue
+            metadata = evidence["metadata"]
+            fetched_at = same_day_stamp(metadata.get("fetched_at"))
+            if not fetched_at or metadata.get("source") == "unknown_provider":
+                warnings.append(f"universe_discovery_archive_time_or_source_unverified:{path}")
+                continue
+            try:
+                content = path.read_bytes()
+                if hashlib.sha256(content).hexdigest() != metadata["csv_sha256"]:
+                    raise ValueError("archive_changed_after_validation")
+                rows = list(csv.DictReader(io.StringIO(content.decode("utf-8-sig"))))
+                codes = [row["symbol"] for row in rows if row.get("quote_date") == target_date
+                         and _quote_time_state(row, target_date, fetched_at=fetched_at) == "usable"]
+                remember(codes, {"kind": "dated_quote_archive", "path": str(path),
+                                 "source": metadata["source"], "sha256": metadata["csv_sha256"],
+                                 "observed_at": metadata["fetched_at"]})
+                if len(codes) < len(rows):
+                    warnings.append(f"universe_discovery_archive_quote_date_or_time_unverified:{path}:{len(rows)-len(codes)}")
+            except (OSError, ValueError, UnicodeError, KeyError, csv.Error) as exc:
+                warnings.append(f"universe_discovery_archive_read_failed:{path}:{type(exc).__name__}")
+    return {
+        "status": "observed" if sources else "unavailable", "target_date": target_date,
+        "symbols": sorted(provenance), "provenance": provenance, "sources": sources,
+        "warnings": warnings, "read_only": True, "network_attempted": False,
+        "contract": "Request-scope hints only; no price, suspension, PIT or full-market completeness claim.",
+    }
 
 
 def _invoke_request_get(
@@ -1267,6 +1382,7 @@ def _build_sina_fetcher(
         )
         partial = intraday_snapshot
         terminated = False
+        pagination_complete = False
         for page in range(1, max(1, int(max_pages)) + 1):
             params = {
                 "page": page,
@@ -1302,6 +1418,7 @@ def _build_sina_fetcher(
             if not payload:
                 expected_pages = observed_pages
                 terminated = True
+                pagination_complete = True
                 break
             observed_pages += 1
             quote_day = _sina_quote_day(observed_at)
@@ -1336,6 +1453,7 @@ def _build_sina_fetcher(
             if len(payload) < max(1, int(page_size)):
                 expected_pages = observed_pages
                 terminated = True
+                pagination_complete = True
                 break
         if not terminated:
             partial = True
@@ -1348,7 +1466,7 @@ def _build_sina_fetcher(
         status = "partial" if partial else ("complete" if rows else "empty")
         if not rows and not warning:
             warning = "sina returned no rows"
-        return _annotate_provider_frame(
+        frame = _annotate_provider_frame(
             rows,
             provider="sina",
             status=status,
@@ -1359,6 +1477,10 @@ def _build_sina_fetcher(
             observed_rows=len(rows),
             warning=warning,
         )
+        # Roster membership needs terminal pagination proof independently of
+        # whether this quote snapshot is eligible for daily-price settlement.
+        frame.attrs["pagination_complete"] = pagination_complete
+        return frame
 
     return fetch
 

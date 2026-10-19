@@ -19,13 +19,20 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import importlib
+import inspect
+import ipaddress
 import json
 import logging
 import math
 import os
+import subprocess
+import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -75,7 +82,7 @@ AFTERNOON_END = (15, 5)
 
 
 def _now_shanghai(now: datetime | None = None) -> datetime:
-    current = now or datetime.now()
+    current = now if now is not None else datetime.now(SHANGHAI)
     if current.tzinfo is None:
         return current.replace(tzinfo=SHANGHAI)
     return current.astimezone(SHANGHAI)
@@ -545,6 +552,28 @@ def _remaining_round_seconds(round_deadline: float, monotonic: Callable[[], floa
     return max(0.0, float(round_deadline) - monotonic())
 
 
+def _fair_symbol_allowance(remaining_seconds: float, remaining_symbols: int, symbol_limit: float) -> float:
+    """Reserve time for receipts and share the rest among every untried name."""
+    remaining = max(0.0, float(remaining_seconds))
+    reserve = min(5.0, remaining * 0.05)
+    share = max(0.0, remaining - reserve) / max(1, int(remaining_symbols))
+    limits = [share, float(PROVIDER_TIMEOUT_SECONDS)]
+    if symbol_limit > 0:
+        limits.append(float(symbol_limit))
+    return min(limits)
+
+
+def _accepts_timeout(fetcher: Callable[..., Any]) -> bool:
+    """Legacy two-argument injected fetchers remain supported, without retries."""
+    try:
+        parameters = inspect.signature(fetcher).parameters
+    except (TypeError, ValueError):
+        return False
+    return "timeout_seconds" in parameters or any(
+        item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+    )
+
+
 def _record_stage_failure(
     manifest: dict[str, Any],
     exc: BaseException,
@@ -566,6 +595,9 @@ def _record_stage_failure(
         "error_stage": _failure_stage(exc),
         "message": _sanitize_error_text(exc),
     }
+    http = getattr(exc, "http_diagnostics", None)
+    if isinstance(http, Mapping):
+        entry["http"] = dict(http)
     started = current_stage.get("started")
     if isinstance(started, (int, float)) and name != "unknown":
         entry["duration_ms"] = _elapsed_ms(float(started), monotonic)
@@ -646,6 +678,201 @@ def _provider_exception_evidence(exc: BaseException, *, error_stage: str) -> dic
     return evidence
 
 
+class _MootdxDeadlineAdapterError(RuntimeError):
+    pass
+
+
+class _MootdxDeadlineRestoreError(RuntimeError):
+    pass
+
+
+_NATIVE_SOCKET_PATCH_LOCK = threading.RLock()
+
+
+def _native_time_left(deadline: float, monotonic: Callable[[], float]) -> float:
+    left = deadline - monotonic()
+    if left <= 0:
+        raise TimeoutError("mootdx_symbol_deadline_exhausted")
+    return left
+
+
+class _DeadlineSocket:
+    """Bound each native connect/send/recv to the same absolute deadline."""
+
+    _LOCAL_FIELDS = frozenset({"_socket", "_deadline", "_monotonic", "_timeout",
+                               "_diagnostics", "_closed_by_owner"})
+
+    def __init__(self, sock: Any, deadline: float, monotonic: Callable[[], float],
+                 diagnostics: dict[str, Any]) -> None:
+        self._socket = sock
+        self._deadline = deadline
+        self._monotonic = monotonic
+        self._timeout: float | None = None
+        self._diagnostics = diagnostics
+        self._closed_by_owner = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._socket, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # The parser updates traffic counters on this object; keep them on the
+        # real TrafficStatSocket, alongside its existing socket attributes.
+        if name in self._LOCAL_FIELDS:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._socket, name, value)
+
+    def _apply_timeout(self) -> None:
+        left = _native_time_left(self._deadline, self._monotonic)
+        self._socket.settimeout(left if self._timeout is None else min(left, self._timeout))
+
+    def settimeout(self, value: float | None) -> None:
+        self._timeout = value
+        self._apply_timeout()
+
+    def _io(self, operation: str, *args: Any, **kwargs: Any) -> Any:
+        try:
+            self._apply_timeout()
+            self._diagnostics["native_socket_io_count"] = self._diagnostics.get("native_socket_io_count", 0) + 1
+            result = getattr(self._socket, operation)(*args, **kwargs)
+            _native_time_left(self._deadline, self._monotonic)
+            return result
+        except TimeoutError:
+            self._diagnostics["native_deadline_operation"] = operation
+            raise
+
+    def connect(self, address: Any) -> Any:
+        # Socket timeouts do not bound DNS resolution. The inspected native
+        # source uses numeric server IPs; reject an unbounded hostname lookup.
+        ipaddress.ip_address(str(address[0]))
+        return self._io("connect", address)
+
+    def send(self, *args: Any, **kwargs: Any) -> Any:
+        return self._io("send", *args, **kwargs)
+
+    def sendall(self, *args: Any, **kwargs: Any) -> Any:
+        return self._io("sendall", *args, **kwargs)
+
+    def recv(self, *args: Any, **kwargs: Any) -> Any:
+        return self._io("recv", *args, **kwargs)
+
+    def recv_into(self, *args: Any, **kwargs: Any) -> Any:
+        return self._io("recv_into", *args, **kwargs)
+
+    def shutdown(self, *args: Any, **kwargs: Any) -> Any:
+        if not self._closed_by_owner:
+            return self._socket.shutdown(*args, **kwargs)
+        return None
+
+    def close(self) -> None:
+        if not self._closed_by_owner:
+            self._socket.close()
+            self._closed_by_owner = True
+
+
+@contextmanager
+def _mootdx_deadline_sockets(
+    quotes_module: Any, *, deadline: float, monotonic: Callable[[], float],
+    sockets: list[_DeadlineSocket], diagnostics: dict[str, Any],
+) -> Iterator[None]:
+    """Intercept only this construction thread, restoring the library symbol.
+
+    mootdx has no socket injection argument. Its inspected Python backend
+    creates TrafficStatSocket in BaseSocketClient.connect. Other threads keep
+    the original socket factory; competing collector patches wait within the
+    same deadline. No worker/heartbeat thread is started or left behind.
+    """
+    api = getattr(quotes_module, "TdxHq_API", None)
+    connect = getattr(api, "connect", None)
+    if api is None and getattr(quotes_module, "__spec__", None) is None:
+        # Preserve manually injected, no-I/O provider modules used by legacy
+        # callers/tests. Only this explicit injection seam is cooperative.
+        diagnostics["native_deadline_enforcement"] = "cooperative_injected_factory"
+        yield
+        return
+    module_name = str(getattr(connect, "__module__", ""))
+    module = importlib.import_module(module_name) if module_name else None
+    if module is None or not callable(getattr(module, "TrafficStatSocket", None)):
+        diagnostics["native_deadline_enforcement"] = "unavailable"
+        raise _MootdxDeadlineAdapterError("native_socket_factory_unavailable")
+    if (getattr(quotes_module, "__spec__", None) is not None
+            and getattr(connect, "__globals__", None) is not vars(module)):
+        diagnostics["native_deadline_enforcement"] = "unavailable"
+        raise _MootdxDeadlineAdapterError("native_connect_globals_unverified")
+    config = getattr(quotes_module, "config", None)
+    if (getattr(quotes_module, "__spec__", None) is not None
+            and not callable(getattr(config, "bestip", None))):
+        diagnostics["native_deadline_enforcement"] = "unavailable"
+        raise _MootdxDeadlineAdapterError("native_config_discovery_guard_unavailable")
+
+    wait_started = monotonic()
+    acquired = _NATIVE_SOCKET_PATCH_LOCK.acquire(timeout=_native_time_left(deadline, monotonic))
+    diagnostics["socket_patch_lock_wait_ms"] = _elapsed_ms(wait_started, monotonic)
+    if not acquired:
+        raise TimeoutError("mootdx_socket_adapter_lock_deadline_exhausted")
+    original = None
+    original_bestip = None
+    patches: list[tuple[Any, str, Any, Any]] = []
+    active = True
+    owner = threading.get_ident()
+
+    def socket_factory(*args: Any, **kwargs: Any) -> Any:
+        if not active or threading.get_ident() != owner:
+            return original(*args, **kwargs)
+        _native_time_left(deadline, monotonic)
+        sock = _DeadlineSocket(original(*args, **kwargs), deadline, monotonic, diagnostics)
+        sockets.append(sock)
+        return sock
+
+    def no_implicit_discovery(*args: Any, **kwargs: Any) -> Any:
+        if not active or threading.get_ident() != owner:
+            return original_bestip(*args, **kwargs)
+        # BaseQuotes always calls config.setup(), even with bestip=False.
+        # Missing/invalid config otherwise triggers its own unbounded probes,
+        # outside this socket path. Block that branch for the whole construct,
+        # including a config disappearing after any earlier read.
+        diagnostics["native_discovery_blocked"] = True
+        raise _MootdxDeadlineAdapterError("implicit_native_server_discovery_disabled")
+
+    try:
+        _native_time_left(deadline, monotonic)
+        original = module.TrafficStatSocket
+        module.TrafficStatSocket = socket_factory
+        patches.append((module, "TrafficStatSocket", original, socket_factory))
+        if callable(getattr(config, "bestip", None)):
+            original_bestip = config.bestip
+            config.bestip = no_implicit_discovery
+            patches.append((config, "bestip", original_bestip, no_implicit_discovery))
+            diagnostics["native_implicit_discovery"] = "disabled_for_this_thread"
+        diagnostics.update(native_deadline_enforcement="socket_io_absolute_deadline",
+                           socket_patch_restored=False, native_socket_module=module_name)
+        yield
+    finally:
+        # Even a failed restoration must leave our callable inert. Never
+        # silently overwrite a third party's concurrent replacement.
+        active = False
+        try:
+            restore_errors = []
+            for target, name, before, replacement in reversed(patches):
+                try:
+                    if getattr(target, name) is not replacement:
+                        reason = ("native_socket_factory_changed_during_call" if name == "TrafficStatSocket"
+                                  else "native_config_discovery_guard_changed_during_call")
+                        raise _MootdxDeadlineRestoreError(reason)
+                    setattr(target, name, before)
+                except Exception as exc:
+                    restore_errors.append(_sanitize_error_text(exc))
+            if restore_errors:
+                raise _MootdxDeadlineRestoreError("; ".join(restore_errors))
+            if patches:
+                diagnostics["socket_patch_restored"] = True
+        except Exception as exc:
+            diagnostics["socket_patch_restore_error"] = _sanitize_error_text(exc)
+            raise
+        finally:
+            _NATIVE_SOCKET_PATCH_LOCK.release()
+
+
 def _mootdx_minute_rows_once(
     symbol: str,
     *,
@@ -671,15 +898,13 @@ def _mootdx_minute_rows_once(
         "timeout_seconds": float(timeout_seconds),
     }
     client: Any = None
+    native_sockets: list[_DeadlineSocket] = []
     provider_error = ""
     close_error = ""
     deadline = monotonic() + max(0.0, float(timeout_seconds))
 
     def remaining() -> float:
-        left = deadline - monotonic()
-        if left <= 0:
-            raise TimeoutError("mootdx_symbol_deadline_exhausted")
-        return left
+        return _native_time_left(deadline, monotonic)
 
     def request_timeout() -> None:
         left = remaining()
@@ -701,99 +926,135 @@ def _mootdx_minute_rows_once(
             {"stage": name, "outcome": outcome, "duration_ms": _elapsed_ms(started, monotonic)}
         )
 
-    started = monotonic()
     try:
-        connect_timeout = remaining()
-        if client_factory is not None:
-            client = client_factory()
-        else:
-            from mootdx.quotes import Quotes
-
-            client = Quotes.factory(
-                market="std",
-                timeout=connect_timeout,
-                auto_retry=False,
-                raise_exception=True,
-            )
-    except Exception as exc:  # noqa: BLE001 - surfaced as stage evidence
-        _stage("connect", "failed", started)
-        diagnostics.update(_provider_exception_evidence(exc, error_stage="connect"))
-        provider_error = f"provider_failed:mootdx:{type(exc).__name__}"
-    else:
-        _stage("connect", "ok", started)
-
-    if not provider_error:
         started = monotonic()
         try:
-            request_timeout()
-            frame = client.bars(symbol=symbol, frequency=8, offset=offset)
             remaining()
-        except Exception as exc:  # noqa: BLE001
-            _stage("request", "failed", started)
-            diagnostics.update(_provider_exception_evidence(exc, error_stage=_failure_stage(exc)))
+            if client_factory is not None:
+                diagnostics["native_deadline_enforcement"] = "cooperative_injected_factory"
+                client = client_factory()
+            else:
+                quotes_module = importlib.import_module("mootdx.quotes")
+                quotes = quotes_module.Quotes
+                # Import, lock wait and every handshake all consume this allowance.
+                # Recompute here, never reuse a timeout calculated before import.
+                with _mootdx_deadline_sockets(
+                    quotes_module, deadline=deadline, monotonic=monotonic,
+                    sockets=native_sockets, diagnostics=diagnostics,
+                ):
+                    client = quotes.factory(
+                        market="std", timeout=remaining(), heartbeat=False, bestip=False,
+                        auto_retry=False, raise_exception=True,
+                    )
+            remaining()
+        except Exception as exc:  # noqa: BLE001 - surfaced as stage evidence
+            _stage("connect", "failed", started)
+            diagnostics.update(_provider_exception_evidence(exc, error_stage="connect"))
             provider_error = f"provider_failed:mootdx:{type(exc).__name__}"
         else:
-            _stage("request", "ok", started)
+            _stage("connect", "ok", started)
 
-    rows: list[dict[str, Any]] = []
-    if not provider_error:
-        started = monotonic()
-        try:
-            if frame is None or len(frame) == 0:
-                _stage("parse", "empty", started)
-                diagnostics.update(
-                    error_stage="empty", error_type="EmptyResponse",
-                    message="provider_returned_no_rows",
-                )
-                provider_error = "provider_no_rows:mootdx"
+        if not provider_error:
+            started = monotonic()
+            try:
+                request_timeout()
+                if (len(symbol) == 6 and symbol.isascii() and symbol.isdigit()
+                        and symbol.startswith(("92", "4", "8"))):
+                    # mootdx 0.11.x infers Shanghai for 92xxxx. Use the same
+                    # connected transport and deadline with explicit BJ=2.
+                    count = min(int(offset), 800)
+                    diagnostics["native_request"] = {
+                        "method": "get_security_bars", "market": 2, "symbol": symbol,
+                        "frequency": 8, "start": 0, "count": count,
+                    }
+                    getter = getattr(getattr(client, "client", None), "get_security_bars", None)
+                    if not callable(getter):
+                        raise RuntimeError("mootdx BSE transport does not expose get_security_bars")
+                    frame = getter(8, 2, symbol, 0, count)
+                else:
+                    frame = client.bars(symbol=symbol, frequency=8, offset=offset)
+                remaining()
+            except Exception as exc:  # noqa: BLE001
+                _stage("request", "failed", started)
+                diagnostics.update(_provider_exception_evidence(exc, error_stage=_failure_stage(exc)))
+                provider_error = f"provider_failed:mootdx:{type(exc).__name__}"
             else:
-                records = frame.to_dict("records")
-                for rec in records:
-                    dt = rec.get("datetime")
-                    if dt is None:
-                        continue
-                    norm = parse_minute_datetime(str(dt))
-                    if norm is None:
-                        continue
-                    rows.append(
-                        {
-                            "symbol": symbol,
-                            "datetime": norm.strftime("%Y-%m-%d %H:%M:%S"),
-                            "date": norm.strftime("%Y-%m-%d"),
-                            "time": norm.strftime("%H:%M:%S"),
-                            "open": float(rec.get("open") or 0),
-                            "high": float(rec.get("high") or 0),
-                            "low": float(rec.get("low") or 0),
-                            "close": float(rec.get("close") or 0),
-                            "volume": float(rec.get("volume") or 0),
-                            "amount": float(rec.get("amount") or 0),
-                            "price_basis": "raw",
-                            "source": "mootdx_minute",
-                        }
-                    )
-                if not rows:
+                _stage("request", "ok", started)
+
+        rows: list[dict[str, Any]] = []
+        if not provider_error:
+            started = monotonic()
+            try:
+                if frame is None or len(frame) == 0:
                     _stage("parse", "empty", started)
                     diagnostics.update(
-                        error_stage="parse", error_type="EmptyParse",
-                        message="no_usable_minute_records",
+                        error_stage="empty", error_type="EmptyResponse",
+                        message="provider_returned_no_rows",
                     )
                     provider_error = "provider_no_rows:mootdx"
                 else:
-                    diagnostics["rows"] = len(rows)
-                    _stage("parse", "ok", started)
-        except Exception as exc:  # noqa: BLE001
-            _stage("parse", "failed", started)
-            diagnostics.update(_provider_exception_evidence(exc, error_stage="parse"))
-            rows = []
-            provider_error = f"provider_parse_failed:mootdx:{type(exc).__name__}"
+                    # Native bars bypass mootdx.to_data(), whose volume
+                    # conversion copies vol as-is without scaling.
+                    records = (
+                        [{**rec, "volume": rec.get("vol", rec.get("volume"))} for rec in frame]
+                        if isinstance(frame, list) else frame.to_dict("records")
+                    )
+                    for rec in records:
+                        dt = rec.get("datetime")
+                        if dt is None:
+                            continue
+                        norm = parse_minute_datetime(str(dt))
+                        if norm is None:
+                            continue
+                        rows.append(
+                            {
+                                "symbol": symbol,
+                                "datetime": norm.strftime("%Y-%m-%d %H:%M:%S"),
+                                "date": norm.strftime("%Y-%m-%d"),
+                                "time": norm.strftime("%H:%M:%S"),
+                                "open": float(rec.get("open") or 0),
+                                "high": float(rec.get("high") or 0),
+                                "low": float(rec.get("low") or 0),
+                                "close": float(rec.get("close") or 0),
+                                "volume": float(rec.get("volume") or 0),
+                                "amount": float(rec["amount"]) if rec.get("amount") is not None else float("nan"),
+                                "price_basis": "raw",
+                                "source": "mootdx_minute",
+                            }
+                        )
+                    if not rows:
+                        _stage("parse", "empty", started)
+                        diagnostics.update(
+                            error_stage="parse", error_type="EmptyParse",
+                            message="no_usable_minute_records",
+                        )
+                        provider_error = "provider_no_rows:mootdx"
+                    else:
+                        diagnostics["rows"] = len(rows)
+                        _stage("parse", "ok", started)
+            except Exception as exc:  # noqa: BLE001
+                _stage("parse", "failed", started)
+                diagnostics.update(_provider_exception_evidence(exc, error_stage="parse"))
+                rows = []
+                provider_error = f"provider_parse_failed:mootdx:{type(exc).__name__}"
 
-    close = getattr(client, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception as exc:  # noqa: BLE001 - close failures are reported too
-            close_error = f"provider_close_failed:mootdx:{type(exc).__name__}"
-            diagnostics["close_error"] = close_error
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001 - close failures are reported too
+                close_error = f"provider_close_failed:mootdx:{type(exc).__name__}"
+                diagnostics["close_error"] = close_error
+        for sock in native_sockets:
+            try:
+                sock.close()
+            except Exception as exc:  # noqa: BLE001 - factory failures can precede client assignment
+                close_error = f"provider_close_failed:mootdx:{type(exc).__name__}"
+                diagnostics.setdefault("socket_close_errors", []).append(_sanitize_error_text(exc))
+                diagnostics["close_error"] = close_error
+        diagnostics["native_socket_count"] = len(native_sockets)
+        diagnostics["native_sockets_closed"] = all(sock._closed_by_owner for sock in native_sockets)
     _ = now
 
     if provider_error:
@@ -804,6 +1065,14 @@ def _mootdx_minute_rows_once(
         diagnostics.update(error_stage="timeout", error_type="TimeoutError", message="mootdx_symbol_deadline_exhausted")
         return [], "provider_failed:mootdx:TimeoutError", diagnostics
     return rows, "", diagnostics
+
+
+def _native_retry_allowed(diagnostics: Mapping[str, Any]) -> bool:
+    """A failed adapter/discovery guard must survive both retry layers."""
+    return not (
+        diagnostics.get("socket_patch_restore_error") or diagnostics.get("native_discovery_blocked")
+        or diagnostics.get("native_deadline_enforcement") == "unavailable"
+    )
 
 
 def _mootdx_minute_rows(
@@ -839,6 +1108,8 @@ def _mootdx_minute_rows(
             break
         if diagnostics.get("error_stage") not in {"connect", "request", "timeout"}:
             break
+        if not _native_retry_allowed(diagnostics):
+            break
         delay = 0.1 * attempt
         if attempt == attempt_limit or deadline - monotonic() <= delay:
             break
@@ -847,28 +1118,328 @@ def _mootdx_minute_rows(
     return rows, error, {**diagnostics, "attempt_count": len(attempts), "attempts": attempts}
 
 
-def _live_minute_rows(
+_SINA_HTTP_MAX_BODY_BYTES = 1024 * 1024
+# This small stdlib-only child is the sole owner of the HTTP socket. A parent
+# timeout can terminate DNS/TLS/header/body waits, and its own watchdog also
+# bounds the request if the collector itself exits. No work thread is abandoned
+# in the collector. Python 3.10+ monotonic clocks share the same OS reference.
+_SINA_HTTP_PROGRAM = r'''
+import hashlib
+import http.client
+import json
+import os
+import sys
+import threading
+import time
+import urllib.request
+
+def emit(value):
+    print(json.dumps(value, ensure_ascii=True, separators=(",", ":")), flush=True)
+
+def run():
+    url, user_agent, cutoff, body_limit = sys.argv[1:]
+    cutoff, body_limit = float(cutoff), int(body_limit)
+    evidence = {"phase": "open", "received_bytes": None}
+    response = None
+    watchdog = None
+    result = {"event": "result", "ok": False}
+    try:
+        left = cutoff - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("sina_http_deadline_exhausted_before_open")
+        watchdog = threading.Timer(left, lambda: os._exit(124))
+        watchdog.daemon = True
+        watchdog.start()
+        emit({"event": "stage", "http": dict(evidence)})
+        request = urllib.request.Request(url, headers={"User-Agent": user_agent})
+        response = urllib.request.urlopen(request, timeout=left)
+        evidence.update(phase="read", status=getattr(response, "status", None))
+        headers = response.headers
+        length_text = headers.get("Content-Length")
+        length = int(length_text) if length_text is not None else None
+        chunked = str(headers.get("Transfer-Encoding", "")).lower().strip() == "chunked"
+        evidence.update(content_length=length, transfer_encoding="chunked" if chunked else "not_chunked")
+        if length is not None and (length < 0 or length > body_limit):
+            raise ValueError("sina_http_content_length_out_of_bounds")
+        emit({"event": "stage", "http": dict(evidence)})
+        body = response.read(body_limit + 1)
+        evidence["received_bytes"] = len(body)
+        if len(body) > body_limit:
+            raise ValueError("sina_http_body_too_large")
+        # read(n) may silently return a short fixed-length response. Reject it
+        # even if its prefix happens to be a syntactically complete JSON list.
+        if not chunked and length is not None and len(body) < length:
+            raise http.client.IncompleteRead(body, length - len(body))
+        if not chunked and length is not None and len(body) != length:
+            raise ValueError("sina_http_content_length_mismatch")
+        evidence["phase"] = "decode"
+        # Preserve UTF-8; silently dropping corrupt bytes can alter a price.
+        text = body.decode("utf-8", errors="strict")
+        if time.monotonic() >= cutoff:
+            raise TimeoutError("sina_http_deadline_exhausted_after_read")
+        result.update(ok=True, text=text)
+    except Exception as exc:
+        result.update(error_type=type(exc).__name__, message=str(exc)[:1200])
+        if isinstance(exc, http.client.IncompleteRead):
+            chain = []
+            current, seen = exc, set()
+            for _ in range(4):
+                if current is None or id(current) in seen:
+                    break
+                seen.add(id(current))
+                if isinstance(current, http.client.IncompleteRead):
+                    chain.append({"partial_bytes": len(current.partial), "expected_bytes": current.expected,
+                                  "partial_sha256": hashlib.sha256(current.partial).hexdigest()})
+                current = current.__cause__ or current.__context__
+            # Chunked readers can hide the final truncated chunk in a cause.
+            # These partial buffers need not be disjoint: never invent a total.
+            evidence.update(received_bytes=len(exc.partial) if len(chain) == 1 and current is None else None,
+                            reported_partial_bytes=len(exc.partial), incomplete_read_chain=chain,
+                            incomplete_chain_truncated=current is not None,
+                            incomplete_expected_bytes=exc.expected,
+                            partial_sha256=hashlib.sha256(exc.partial).hexdigest())
+        cause = getattr(exc, "reason", None) or exc.__cause__ or exc.__context__
+        if cause is not None:
+            result["original_exception"] = (type(cause).__name__ + ": " + str(cause))[:1200]
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception as exc:
+                evidence["response_close_error"] = type(exc).__name__
+                if result.get("ok"):
+                    result = {"event": "result", "ok": False,
+                              "error_type": type(exc).__name__, "message": "sina_http_response_close_failed"}
+        result["http"] = evidence
+        # The watchdog remains active through response cleanup and output.
+        emit(result)
+        if watchdog is not None:
+            watchdog.cancel()
+
+if __name__ == "__main__":
+    run()
+'''
+
+
+class _SinaHTTPFailure(RuntimeError):
+    def __init__(self, error_type: str, message: str, http: Mapping[str, Any], *, origin: str = "") -> None:
+        super().__init__(_sanitize_error_text(message))
+        self.error_type = error_type
+        self.http = dict(http)
+        self.origin = _sanitize_error_text(origin)
+
+
+# An OS cleanup failure must not spawn additional sockets in later symbols or
+# rounds. Retain the actual child handle until its exit can be confirmed.
+@dataclass
+class _SinaHTTPPending:
+    process: Any
+    output_drained: bool = False
+
+
+_SINA_HTTP_UNREAPED: _SinaHTTPPending | None = None
+
+
+def _sina_http_pending_failure(
+    *, deadline: float, monotonic: Callable[[], float],
+) -> _SinaHTTPFailure | None:
+    global _SINA_HTTP_UNREAPED
+    if _SINA_HTTP_UNREAPED is None:
+        return None
+    pending = _SINA_HTTP_UNREAPED
+    exited = False
+    cleanup_error = ""
+    interrupted = None
+    try:
+        exited = pending.process.poll() is not None
+        if exited and not pending.output_drained:
+            # POSIX communicate(timeout=0) can expire before reading any EOF.
+            # Borrow a small positive slice of the caller's existing budget.
+            left = min(0.05, max(0.0, deadline - monotonic()))
+            if left <= 0:
+                raise TimeoutError("sina_http_pending_cleanup_budget_exhausted")
+            pending.process.communicate(timeout=left)
+            pending.output_drained = True
+        if exited and pending.output_drained:
+            _SINA_HTTP_UNREAPED = None
+            return None
+    except BaseException as exc:
+        cleanup_error = f"{type(exc).__name__}: {_sanitize_error_text(exc)}"
+        if not isinstance(exc, Exception):
+            interrupted = exc
+    http = {
+        "phase": "cleanup", "cleanup": "unconfirmed", "stop_collection": True,
+        "process_exit": "confirmed" if exited else "unconfirmed",
+        "output_drain": "confirmed" if pending.output_drained else "unconfirmed",
+        "cleanup_error": cleanup_error,
+        "process_id": pending.process.pid, "deadline_enforcement": "process_watchdog",
+    }
+    if interrupted is not None:
+        setattr(interrupted, "http_diagnostics", http)
+        raise interrupted
+    return _SinaHTTPFailure("HTTPWorkerCleanupError", "sina_http_worker_cleanup_unconfirmed", http)
+
+
+def _sina_http_frames(output: bytes) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Keep complete progress records, but never accept a partial final record."""
+    evidence: dict[str, Any] = {}
+    final = None
+    if len(output) > _SINA_HTTP_MAX_BODY_BYTES * 6 + 65536:
+        return evidence, final
+    for line in output.splitlines(keepends=True):
+        if not line.endswith(b"\n"):
+            return evidence, None
+        try:
+            item = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            return evidence, None
+        if not isinstance(item, dict) or item.get("event") not in {"stage", "result"} or final is not None:
+            return evidence, None
+        if isinstance(item.get("http"), dict):
+            evidence.update(item["http"])
+        if item["event"] == "result":
+            final = item
+    return evidence, final
+
+
+def _sina_http_get_text(
+    url: str, *, timeout: float, monotonic: Callable[[], float] = time.monotonic,
+    popen_factory: Callable[..., Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """One HTTP request; launch, request, cancellation and reap share a budget."""
+    global _SINA_HTTP_UNREAPED
+    started = monotonic()
+    deadline = started + max(0.0, float(timeout))
+    pending = _sina_http_pending_failure(deadline=deadline, monotonic=monotonic)
+    if pending is not None:
+        raise pending
+    http: dict[str, Any] = {"phase": "launch", "deadline_enforcement": "process_watchdog",
+                            "granted_seconds": max(0.0, float(timeout)), "cleanup": "not_started"}
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise _SinaHTTPFailure("TimeoutError", "sina_http_no_budget", http)
+    # Reserve inside, not after, the caller's allowance. Stdlib process launch
+    # itself is synchronous; an OS-delayed launch is recorded and immediately
+    # cancelled, never labelled an on-time response.
+    reserve = min(0.2, timeout * 0.1)
+    cutoff = deadline - reserve
+    http["cleanup_reserve_seconds"] = reserve
+    from quantdesk.version import PACKAGE_VERSION
+    process = None
+    pending_state = None
+    output = b""
+    failure: tuple[str, str] | None = None
+    interrupted: BaseException | None = None
+    try:
+        if monotonic() >= cutoff:
+            raise TimeoutError("sina_http_deadline_exhausted_before_launch")
+        factory = popen_factory or subprocess.Popen
+        process = factory(
+            [sys.executable, "-I", "-S", "-B", "-c", _SINA_HTTP_PROGRAM,
+             url, f"QuantDesk/{PACKAGE_VERSION}", str(cutoff), str(_SINA_HTTP_MAX_BODY_BYTES)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            close_fds=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        pending_state = _SinaHTTPPending(process)
+        _SINA_HTTP_UNREAPED = pending_state
+        http.update(process_id=process.pid, cleanup="pending")
+        left = cutoff - monotonic()
+        if left <= 0:
+            raise TimeoutError("sina_http_deadline_exhausted_during_launch")
+        output, _ = process.communicate(timeout=left)
+        pending_state.output_drained = True
+        if process.returncode == 124:
+            failure = ("TimeoutError", "sina_http_child_total_deadline_exhausted")
+        elif process.returncode != 0:
+            failure = ("HTTPWorkerError", "sina_http_worker_failed")
+    except subprocess.TimeoutExpired as exc:
+        output = exc.output or b""
+        failure = ("TimeoutError", "sina_http_total_deadline_exhausted")
+    except Exception as exc:
+        failure = (type(exc).__name__, _sanitize_error_text(exc))
+    except BaseException as exc:
+        interrupted = exc
+    finally:
+        if process is not None:
+            if pending_state is None:
+                pending_state = _SinaHTTPPending(process)
+                _SINA_HTTP_UNREAPED = pending_state
+            try:
+                if process.poll() is None:
+                    process.kill()  # Only this Popen child; never a PID/name search.
+                    http["terminated"] = True
+                if http.get("terminated") or not pending_state.output_drained:
+                    drained, _ = process.communicate(timeout=max(0.0, deadline - monotonic()))
+                    output = drained or output
+                    pending_state.output_drained = True
+                if process.poll() is None:
+                    raise TimeoutError("sina_http_worker_exit_unconfirmed")
+                http.update(cleanup="confirmed", process_exit="confirmed", output_drain="confirmed")
+                if _SINA_HTTP_UNREAPED is pending_state:
+                    _SINA_HTTP_UNREAPED = None
+            except BaseException as exc:
+                http["cleanup_error"] = _sanitize_error_text(exc)
+                http["cleanup_error_type"] = type(exc).__name__
+                try:
+                    exited = process.poll() is not None
+                except BaseException as poll_exc:
+                    exited = False
+                    http["cleanup_poll_error_type"] = type(poll_exc).__name__
+                    if not isinstance(poll_exc, Exception):
+                        interrupted = poll_exc
+                drained = pending_state is not None and pending_state.output_drained
+                http.update(process_exit="confirmed" if exited else "unconfirmed",
+                            output_drain="confirmed" if drained else "unconfirmed",
+                            cleanup="confirmed" if exited and drained else "unconfirmed")
+                if not (exited and drained):
+                    _SINA_HTTP_UNREAPED = pending_state
+                    http["stop_collection"] = True
+                    failure = ("HTTPWorkerCleanupError", "sina_http_worker_cleanup_unconfirmed")
+                elif _SINA_HTTP_UNREAPED is pending_state:
+                    _SINA_HTTP_UNREAPED = None
+                if not isinstance(exc, Exception):
+                    interrupted = exc
+    progress, result = _sina_http_frames(output)
+    http = {**progress, **http, "phase": progress.get("phase", http["phase"]),
+            "elapsed_ms": _elapsed_ms(started, monotonic), "deadline_exceeded": monotonic() >= deadline}
+    if result is not None and result.get("ok") is not True:
+        http["child_error"] = {
+            key: _sanitize_error_text(result[key])
+            for key in ("error_type", "message", "original_exception") if key in result
+        }
+    if interrupted is not None:
+        setattr(interrupted, "http_diagnostics", http)
+        raise interrupted
+    if failure is None and monotonic() >= deadline:
+        failure = ("TimeoutError", "sina_http_deadline_exhausted_after_cleanup")
+    if failure is not None:
+        raise _SinaHTTPFailure(*failure, http)
+    if result is None:
+        raise _SinaHTTPFailure("HTTPWorkerProtocolError", "sina_http_worker_result_incomplete", http)
+    if result.get("ok") is not True:
+        raise _SinaHTTPFailure(str(result.get("error_type") or "HTTPWorkerError"),
+                               str(result.get("message") or "sina_http_request_failed"), http,
+                               origin=str(result.get("original_exception") or ""))
+    if not isinstance(result.get("text"), str):
+        raise _SinaHTTPFailure("HTTPWorkerProtocolError", "sina_http_worker_text_missing", http)
+    return result["text"], http
+
+
+def _sina_minute_rows(
     symbol: str, *, offset: int, now: datetime,
     monotonic: Callable[[], float] = time.monotonic,
     timeout_seconds: float = PROVIDER_TIMEOUT_SECONDS,
 ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
-    """Try the existing raw Sina source when the native minute request fails."""
+    """Read this source's dated raw OHLCV; absent turnover stays absent."""
     deadline = monotonic() + max(0.0, float(timeout_seconds))
     now = _now_shanghai(now)
     sina_prefix = _sina_minute_prefix(symbol)
-    supported = bool(sina_prefix)
-    native_allowance = min(2.0, timeout_seconds / 3) if supported else timeout_seconds
-    rows, error, diagnostics = _mootdx_minute_rows(
-        symbol, offset=offset, now=now, monotonic=monotonic,
-        timeout_seconds=native_allowance, max_attempts=1 if supported else 3,
-    )
-    if not error or not supported or monotonic() >= deadline:
-        return rows, error, diagnostics
-    primary = {"provider": "mootdx", "error": error, **diagnostics}
-    fallback_started = monotonic()
+    started = monotonic()
+    http: dict[str, Any] = {}
     try:
+        if not sina_prefix:
+            raise ValueError("sina_minute_market_unsupported")
         import pandas as pd
-        from quantdesk.intraday.intraday_providers import _http_get_text, _normalize_provider_frame
+        from quantdesk.intraday.intraday_providers import _normalize_provider_frame
 
         prefix = sina_prefix
         url = ("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData"
@@ -876,7 +1447,8 @@ def _live_minute_rows(
         left = deadline - monotonic()
         if left <= 0:
             raise TimeoutError("minute_provider_deadline_exhausted")
-        payload = json.loads(_http_get_text(url, timeout=left))
+        text, http = _sina_http_get_text(url, timeout=left, monotonic=monotonic)
+        payload = json.loads(text)
         records = []
         rejected: list[str] = []
         for row in payload if isinstance(payload, list) else []:
@@ -917,24 +1489,143 @@ def _live_minute_rows(
         rows = frame.tail(max(1, int(offset))).to_dict("records")
         return rows, "", {
             "provider": "sina_intraday", "rows": len(rows), "error_stage": "", "error_type": "", "message": "",
-            "fallback_from": "mootdx", "primary_error": error,
+            "http": http,
             "rejected_rows": len(rejected), "rejection_reasons": sorted(set(rejected)),
-            "attempts": [primary, {"provider": "sina_intraday", "outcome": "ok"}],
+            "stages": [{"stage": "request", "provider": "sina_intraday", "outcome": "ok",
+                        "duration_ms": _elapsed_ms(started, monotonic)}],
+        }
+    except Exception as exc:  # noqa: BLE001 - keep the real failure stage and cause
+        evidence = _provider_exception_evidence(exc, error_stage=_failure_stage(exc))
+        if isinstance(exc, _SinaHTTPFailure):
+            http = exc.http
+            stage = ("cleanup" if http.get("cleanup") == "unconfirmed" else
+                     "timeout" if exc.error_type == "TimeoutError" else
+                     "parse" if exc.error_type in {"UnicodeDecodeError", "ValueError"} else "request")
+            evidence.update(error_type=exc.error_type, error_stage=stage)
+            if exc.origin:
+                evidence["original_exception"] = exc.origin
+                evidence["message"] += " <- " + exc.origin
+        return [], f"provider_failed:sina_intraday:{evidence['error_type']}", {
+            "provider": "sina_intraday", "rows": 0,
+            **evidence, "http": http, "stop_collection": bool(http.get("stop_collection")),
+            "stages": [{"stage": "request", "provider": "sina_intraday", "outcome": "failed",
+                        "duration_ms": _elapsed_ms(started, monotonic)}],
+        }
+
+
+def _live_minute_rows(
+    symbol: str, *, offset: int, now: datetime,
+    monotonic: Callable[[], float] = time.monotonic,
+    timeout_seconds: float = PROVIDER_TIMEOUT_SECONDS,
+    preferred_provider: str = "mootdx",
+) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    """Bound both sources together and reuse proven source health this round."""
+    deadline = monotonic() + max(0.0, float(timeout_seconds))
+    pending = _sina_http_pending_failure(deadline=deadline, monotonic=monotonic)
+    if pending is not None:
+        return [], "provider_failed:sina_intraday:HTTPWorkerCleanupError", {
+            "error_type": pending.error_type, "error_stage": "cleanup", "message": str(pending),
+            "http": pending.http, "stop_collection": True,
+        }
+    timeout_seconds = max(0.0, deadline - monotonic())
+    if timeout_seconds <= 0:
+        return [], "provider_failed:deadline_exhausted", {
+            "error_type": "TimeoutError", "error_stage": "timeout",
+            "message": "minute_provider_deadline_exhausted_after_http_cleanup",
+        }
+    supported = bool(_sina_minute_prefix(symbol))
+    if preferred_provider == "sina_intraday" and supported:
+        # A prior symbol proved the native source failed and Sina worked. Avoid
+        # spending that same connection timeout for every remaining symbol.
+        rows, error, diagnostics = _sina_minute_rows(
+            symbol, offset=offset, now=now, monotonic=monotonic,
+            timeout_seconds=max(0.0, timeout_seconds * 0.8),
+        )
+        first = {"provider": "sina_intraday", "error": error, **diagnostics}
+        if not error or diagnostics.get("stop_collection"):
+            return rows, error, {**diagnostics, "routing": "round_sina_first", "attempts": [first]}
+        left = deadline - monotonic()
+        if left <= 0:
+            return [], error, {**diagnostics, "routing": "round_sina_first", "attempts": [first]}
+        rows, native_error, native_diagnostics = _mootdx_minute_rows(
+            symbol, offset=offset, now=now, monotonic=monotonic,
+            timeout_seconds=left, max_attempts=1,
+        )
+        return rows, native_error, {
+            **native_diagnostics, "provider": "mootdx", "routing": "round_sina_first",
+            "fallback_from": "sina_intraday", "primary_error": error,
+            "attempts": [first, {"provider": "mootdx", "error": native_error, **native_diagnostics}],
+        }
+
+    native_allowance = min(2.0, timeout_seconds / 3) if supported else timeout_seconds
+    rows, error, diagnostics = _mootdx_minute_rows(
+        symbol, offset=offset, now=now, monotonic=monotonic,
+        timeout_seconds=native_allowance, max_attempts=1 if supported else 3,
+    )
+    if not error or not supported or monotonic() >= deadline:
+        return rows, error, diagnostics
+    primary = {"provider": "mootdx", "error": error, **diagnostics}
+    fallback_started = monotonic()
+    fallback_rows, fallback_error, fallback_diagnostics = _sina_minute_rows(
+        symbol, offset=offset, now=now, monotonic=monotonic,
+        timeout_seconds=max(0.0, deadline - monotonic()),
+    )
+    attempts = [primary, {"provider": "sina_intraday", "error": fallback_error, **fallback_diagnostics}]
+    if fallback_diagnostics.get("stop_collection"):
+        return [], fallback_error, {**fallback_diagnostics, "attempts": attempts}
+    if not fallback_error:
+        return fallback_rows, "", {
+            **fallback_diagnostics, "fallback_from": "mootdx", "primary_error": error,
+            "primary_error_stage": diagnostics.get("error_stage") or "",
+            "attempts": attempts,
             "stages": [*diagnostics.get("stages", []), {"stage": "fallback", "outcome": "ok",
                         "duration_ms": _elapsed_ms(fallback_started, monotonic)}],
         }
-    except Exception as exc:  # noqa: BLE001 - keep both providers' failure evidence
-        diagnostics = {**diagnostics, "fallback_error": f"{type(exc).__name__}:{_sanitize_error_text(exc)}",
-                       "attempts": [primary, {"provider": "sina_intraday", "outcome": "failed",
-                                             "error_type": type(exc).__name__}]}
+    diagnostics = {
+        **diagnostics,
+        "fallback_error": f"{fallback_diagnostics.get('error_type')}:{fallback_diagnostics.get('message')}",
+        "attempts": attempts,
+    }
     left = deadline - monotonic()
-    if left > 0:
+    if left > 0 and _native_retry_allowed(diagnostics):
         retry_rows, retry_error, retry_diag = _mootdx_minute_rows(
             symbol, offset=offset, now=now, monotonic=monotonic, timeout_seconds=left, max_attempts=2,
         )
         return retry_rows, retry_error, {**retry_diag, "fallback_error": diagnostics["fallback_error"],
                                         "prior_attempts": diagnostics["attempts"]}
     return [], error, diagnostics
+
+
+_BUILTIN_MINUTE_FETCHERS = (_mootdx_minute_rows, _sina_minute_rows, _live_minute_rows)
+
+
+def _prepare_minute_sources(
+    *, deadline: float, monotonic: Callable[[], float],
+) -> list[dict[str, Any]]:
+    """Charge cold imports to the round before assigning any symbol a share."""
+    entries: list[dict[str, Any]] = []
+    sources = (("mootdx", _mootdx_minute_rows, _BUILTIN_MINUTE_FETCHERS[0]),
+               ("sina_intraday", _sina_minute_rows, _BUILTIN_MINUTE_FETCHERS[1]))
+    for provider, fetcher, original in sources:
+        if fetcher is not original:
+            continue  # An injected provider owns its own initialization.
+        started = monotonic()
+        entry: dict[str, Any] = {"provider": provider, "outcome": "ok"}
+        try:
+            if monotonic() >= deadline:
+                raise TimeoutError("round_budget_exhausted:provider_initialization")
+            if provider == "mootdx":
+                importlib.import_module("mootdx.quotes").Quotes
+            else:
+                importlib.import_module("pandas")
+                importlib.import_module("quantdesk.intraday.intraday_providers")
+            if monotonic() >= deadline:
+                raise TimeoutError("round_budget_exhausted:provider_initialization")
+        except Exception as exc:  # noqa: BLE001 - the other source may still be available
+            entry.update(outcome="failed", **_provider_exception_evidence(exc, error_stage="initialize"))
+        entry["duration_ms"] = _elapsed_ms(started, monotonic)
+        entries.append(entry)
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -1142,6 +1833,7 @@ def collect_intraday_refresh(
     max_round_seconds: float = DEFAULT_MAX_ROUND_SECONDS,
     max_symbol_seconds: float = DEFAULT_MAX_SYMBOL_SECONDS,
     monotonic: Callable[[], float] = time.monotonic,
+    read_ai_minute_focus: bool = False,
 ) -> dict[str, Any]:
     """One intraday refresh round. Returns the manifest payload.
 
@@ -1168,21 +1860,35 @@ def collect_intraday_refresh(
     # provider is built from them, so a call is never given more time than the
     # round and the symbol both have left.
     budget_clock: dict[str, float] = {"symbol_ms": 0.0, "round_deadline": 1e9}
+    source_route = {"preferred_provider": "mootdx", "evidence_symbol": "", "reason": ""}
 
-    def _default_fetch(symbol: str, offset: int) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
-        return _live_minute_rows(
+    def _default_fetch(
+        symbol: str, offset: int, *, timeout_seconds: float | None = None,
+    ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+        rows, error, diagnostics = _live_minute_rows(
             symbol,
             offset=offset,
             now=current,
             monotonic=monotonic,
-            timeout_seconds=_provider_timeout_seconds(
+            timeout_seconds=timeout_seconds if timeout_seconds is not None else _provider_timeout_seconds(
                 symbol_budget_ms=int(budget_clock["symbol_ms"]),
                 round_deadline=float(budget_clock["round_deadline"]),
                 monotonic=monotonic,
             ),
+            preferred_provider=source_route["preferred_provider"],
         )
+        used_route = dict(source_route)
+        if not error and diagnostics.get("fallback_from") == "mootdx":
+            if diagnostics.get("primary_error_stage") in {"connect", "request", "timeout"}:
+                source_route.update(preferred_provider="sina_intraday", evidence_symbol=symbol,
+                                    reason=str(diagnostics.get("primary_error") or ""))
+        elif not error and diagnostics.get("fallback_from") == "sina_intraday":
+            source_route.update(preferred_provider="mootdx", evidence_symbol=symbol,
+                                reason=str(diagnostics.get("primary_error") or ""))
+        return rows, error, {**diagnostics, "round_source_route": used_route}
 
     fetch = fetcher or _default_fetch
+    fetch_accepts_timeout = _accepts_timeout(fetch)
     round_started = monotonic()
 
     manifest: dict[str, Any] = {
@@ -1202,6 +1908,9 @@ def collect_intraday_refresh(
         "round_duration_ms": 0,
         "stage_timings": [],
         "not_attempted_symbols": [],
+        "not_attempted_reasons": {},
+        "budget_allocation": "remaining_round_shared_across_untried_symbols",
+        "ai_minute_focus_read_enabled": read_ai_minute_focus is True,
         "previous_run": {},
         "market_session": session if is_trading_day else "closed",
         "network": network,
@@ -1363,7 +2072,8 @@ def collect_intraday_refresh(
         if budget_exhausted:
             scope = {"symbols": [], "warnings": []}
         elif scope_builder is None:
-            scope = build_dynamic_scope(root, extra_symbols=extra_symbols)
+            scope = build_dynamic_scope(root, now=current, extra_symbols=extra_symbols,
+                                        read_ai_minute_focus=read_ai_minute_focus)
         else:
             try:
                 scope = scope_builder(root, extra_symbols=extra_symbols)
@@ -1378,6 +2088,10 @@ def collect_intraday_refresh(
         )
         manifest["reason_codes"].extend(f"scope:{w}" for w in scope.get("warnings", []))
         symbols = scope.get("symbols") or []
+        manifest["ai_minute_focus"] = [
+            {"symbol": entry["symbol"], "provenance": entry["focus_provenance"]}
+            for entry in symbols if entry.get("focus_provenance")
+        ]
         critical = {s["symbol"] for s in symbols if s.get("priority") == "critical"}
         manifest["requested_count"] = len(symbols)
         if wants_provider_work and not budget_exhausted and scope_finished > round_deadline:
@@ -1404,26 +2118,48 @@ def collect_intraday_refresh(
             # for its own constant timeout (DSR-07).
             budget_clock["symbol_ms"] = float(max_symbol_ms)
             budget_clock["round_deadline"] = deadline
+            if fetcher is None and _live_minute_rows is _BUILTIN_MINUTE_FETCHERS[2]:
+                _begin_stage("provider_initialization")
+                initialized = monotonic()
+                entries = _prepare_minute_sources(deadline=deadline, monotonic=monotonic)
+                manifest["provider_initialization"] = entries
+                manifest["stage_timings"].append({
+                    "stage": "provider_initialization",
+                    "outcome": "failed" if any(row["outcome"] == "failed" for row in entries) else "ok",
+                    "duration_ms": _elapsed_ms(initialized, monotonic),
+                    "budget_overrun": monotonic() >= deadline,
+                })
             for index, entry in enumerate(symbols):
                 symbol = entry["symbol"]
-                if monotonic() >= deadline:
+                symbol_started = monotonic()
+                allowance = _fair_symbol_allowance(
+                    max(0.0, deadline - symbol_started), len(symbols) - index,
+                    float(max_symbol_seconds),
+                )
+                if symbol_started >= deadline or allowance < 0.001:
                     # Stop ourselves with evidence instead of running into the
                     # task's 10-minute kill (which writes nothing at all).
                     manifest["status"] = "timed_out"
                     manifest["not_attempted_symbols"] = [item["symbol"] for item in symbols[index:]]
+                    manifest["not_attempted_reasons"] = {
+                        code: "round_budget_exhausted" for code in manifest["not_attempted_symbols"]
+                    }
                     manifest["reason_codes"].append(
                         "round_budget_exhausted:"
                         f"{len(manifest['not_attempted_symbols'])}_symbols_not_attempted"
                     )
                     break
-                symbol_started = monotonic()
+                symbol_deadline = symbol_started + allowance
+                budget_clock["symbol_ms"] = allowance * 1000.0
                 _begin_stage("provider", symbol)
                 path = intraday_dir / f"{symbol}.csv"
+                fetched = (fetch(symbol, MINUTE_OFFSET, timeout_seconds=allowance)
+                           if fetch_accepts_timeout else fetch(symbol, MINUTE_OFFSET))
                 rows, err, diagnostics = _unpack_fetch_result(
-                    fetch(symbol, MINUTE_OFFSET) if network else ([], "network_not_authorized")
+                    fetched
                 )
                 duration_ms = _elapsed_ms(symbol_started, monotonic)
-                if not err and (monotonic() >= deadline or (max_symbol_ms and duration_ms >= max_symbol_ms)):
+                if not err and (monotonic() >= deadline or monotonic() >= symbol_deadline):
                     rows = []
                     err = "provider_failed:deadline_exhausted"
                     diagnostics = {**diagnostics, "error_stage": "timeout", "error_type": "TimeoutError",
@@ -1439,9 +2175,18 @@ def collect_intraday_refresh(
                         "stages": list(diagnostics.get("stages") or []),
                         "diagnostics": diagnostics,
                         "duration_ms": duration_ms,
+                        "granted_budget_seconds": allowance,
                         "priority": entry.get("priority"),
                     })
                     provider_failed += 1
+                    if diagnostics.get("stop_collection"):
+                        manifest["status"] = "partial"
+                        manifest["not_attempted_symbols"] = [item["symbol"] for item in symbols[index + 1:]]
+                        manifest["not_attempted_reasons"] = {
+                            code: "http_worker_cleanup_unconfirmed" for code in manifest["not_attempted_symbols"]
+                        }
+                        manifest["reason_codes"].append("minute_http_worker_cleanup_unconfirmed")
+                        break
                     if not _sina_minute_prefix(symbol):
                         # No verified fallback for this market: keep the failure a
                         # visible gap instead of letting it look recoverable.
@@ -1516,6 +2261,7 @@ def collect_intraday_refresh(
                         "stages": list(diagnostics.get("stages") or []),
                         "diagnostics": diagnostics,
                         "duration_ms": duration_ms,
+                        "granted_budget_seconds": allowance,
                         "priority": entry.get("priority"),
                     })
                     if max_symbol_ms and duration_ms > max_symbol_ms:
@@ -1557,6 +2303,9 @@ def collect_intraday_refresh(
             # The round ran out of budget before the provider stage: the scope it
             # never reached is recorded as untried, not as a clean round.
             manifest["not_attempted_symbols"] = [item["symbol"] for item in symbols]
+            manifest["not_attempted_reasons"] = {
+                code: "round_budget_exhausted_before_provider" for code in manifest["not_attempted_symbols"]
+            }
 
         # The round budget is unconditional.  An empty scope, or a stage that
         # overran without the provider loop ever running, must not be able to

@@ -227,7 +227,14 @@ def health_scenario(root: Path, *, daily: int, benchmark: str, slots: int, colle
     day.mkdir(parents=True, exist_ok=True)
     for slot in range(slots):
         (day / f"{slot:04d}.csv").write_text("symbol,price\n600000,10\n", encoding="utf-8")
-    write_json(day / "manifest.json", {"collected_slot_count": collected})
+    names = [f"{slot:04d}" for slot in range(slots)]
+    for name in names:
+        write_json(day / f"{name}.json", {"trade_date": TARGET_DATE, "slot_time": name,
+                   "csv_sha256": sha(day / f"{name}.csv")})
+    write_json(day / "manifest.json", {"trade_date": TARGET_DATE, "collected_slot_count": slots,
+        "completed_slot_count": collected, "field_verified_complete_slot_count": collected,
+        "partial_slot_count": max(0, slots - collected), "expected_slot_count": 48,
+        "field_verified_complete_slots": names[:collected]})
     if minute is not None:
         write_json(root / "results" / "intraday" / "intraday_refresh_latest.json", minute)
     strategy_fixture(root, TARGET_DATE, generated=f"{TARGET_DATE}T20:03:44")
@@ -263,7 +270,7 @@ def test_t9_nine_cells_all_green_dry_run(tmp_path: Path) -> None:
                     minute=GOOD_MINUTE)
     payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
     assert payload["line"] == (
-        "日线 ✓100/100 · 基准 ✓2026-09-17 · 快照 ✓48张/完成 48 · 分钟 ✓90/90 · "
+        "日线 ✓100/100 · 基准 ✓2026-09-17 · 快照 ✓48张/覆盖完成 48/字段核实 48 · 分钟 ✓90/90 · "
         "策略账 ✓ · AI账 ✓0笔 · 核对 ✓ · 备份 ✓"
     )
 
@@ -292,10 +299,10 @@ def test_t12_snapshot_partial_and_blocked_minute_are_visible(tmp_path: Path) -> 
     health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=0,
                     minute=BLOCKED_MINUTE)
     payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
-    assert "快照 ✗48张/完成 0" in payload["line"]
+    assert "快照 ✗48张/覆盖完成 0/字段核实 0" in payload["line"]
     assert "分钟 ✗82/90(缺8+拒写2)" in payload["line"]
     text = " ".join(payload["explains"])
-    assert "快照未拉回 2026-09-18" in text
+    assert "快照 2026-09-18 已归档 48 张，完整字段或档案哈希仍未核实" in text
     assert "缺8，拒写2" in text
 
 
@@ -330,7 +337,7 @@ def test_t13_yesterday_quote_received_today_keeps_its_own_date(tmp_path: Path) -
 
     payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
 
-    assert "快照 ✓48张/完成 48（本地 09-19 10:12 收到）" in payload["line"]
+    assert "快照 ✓48张/覆盖完成 48/字段核实 48（本地 09-19 10:12 收到）" in payload["line"]
     text = " ".join(payload["explains"])
     assert f"行情日期仍是 {TARGET_DATE}" in text
     assert "上游发布 未知" in text

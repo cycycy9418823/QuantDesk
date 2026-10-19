@@ -48,7 +48,7 @@ def test_pause_disables_only_ready_writers_and_resume_restores_them(tmp_path: Pa
         "QuantDesk Data Close Pipeline",
         "QuantDesk AI Trader Evening",
     ]
-    assert "QuantDesk Snapshot Collector" in paused["skipped_missing_or_already_disabled"]
+    assert "QuantDesk A0 Snapshot Collector" in paused["skipped_missing_or_already_disabled"]
     assert runner.states["QuantDesk Data Close Pipeline"] == "Disabled"
     state = tmp_path / "state" / "desk_control.json"
     assert state.is_file()

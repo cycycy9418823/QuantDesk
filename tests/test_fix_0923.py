@@ -39,7 +39,9 @@ def test_f2_false_natural_market_claims_never_pass(tmp_path: Path, note: str, wi
             "intents": [{"symbol": "600000", "side": "buy", "reason": "观望", "ref_close": 10}]}
     gate = dl.gate_plan_statements(plan, daily_dir=folder, name_to_symbol=names)
     assert gate.market_note_ok is False
-    assert gate.accepted_intents == []
+    # 2AI-1（所有者规则 2）：盘面点评说错只标注，不再拦下理由本身没问题的买入。
+    assert [row["symbol"] for row in gate.accepted_intents] == ["600000"]
+    assert gate.rejections == []
     hits = dl.verify_market_note(note, decision_date=DAY, daily_dir=folder, name_to_symbol=names)
     assert hits == gate.market_note_rejections
     assert hits == dl.verify_intent_against_daily(plan["intents"][0], decision_date=DAY,
@@ -110,7 +112,9 @@ def test_f3_old_entry_thesis_cannot_veto_a_correct_sell(tmp_path: Path) -> None:
     sell["entry_thesis"] = {"text": "其他历史背景", "date": "2026-09-14"}
     assert dl.build_decision_record(sell, plan=plan, daily_dir=folder)["decision_id"] == original_id
     sell["reason"] = "今日涨99%"
-    assert dl.gate_plan_statements(plan, daily_dir=folder).accepted_intents == []
+    # 2AI-1（所有者规则 2）：卖出照常放行，但带上"含与数据不符说法"的标注。
+    flagged = dl.gate_plan_statements(plan, daily_dir=folder).accepted_intents
+    assert len(flagged) == 1 and flagged[0]["statement_label"] == dl.STATEMENT_FLAG_MISMATCH
 
 
 def health_module():

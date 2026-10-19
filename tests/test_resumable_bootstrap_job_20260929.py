@@ -151,8 +151,29 @@ class ResumableBootstrapJobTests(unittest.TestCase):
         self.assertTrue(result['research_only'])
         self.assertEqual(result['validation_status'], '研究输出·未验证')
         self.assertIn('not annualized', result['interpretation']['annual_return_ci'])
+        self.assertIn('not annualized', result['interpretation']['sample_compounded_return_ci'])
+        self.assertEqual(result['bootstrap']['annual_return_ci'], [None, None])
+        self.assertEqual(result['bootstrap']['annualization_status'], 'unavailable_without_observation_frequency')
         self.assertIn('not annualized', result['interpretation']['sharpe_ci'])
         self.assertIn('not evidence', result['interpretation']['passed'])
+
+    def test_fixed_observations_keep_compounded_return_separate_from_unknown_annual_return(self) -> None:
+        self.input.write_text('return\n' + '0.01\n' * 8, encoding='ascii')
+        result = self._run()
+        expected = round(1.01 ** 8 - 1, 8)
+        self.assertEqual(result['bootstrap']['sample_compounded_return_ci'], [expected, expected])
+        self.assertEqual(result['bootstrap']['annual_return_ci'], [None, None])
+        self.assertEqual(result['binding']['implementation_version'], '2')
+
+    def test_short_sample_has_no_invented_return_interval_and_can_resume(self) -> None:
+        self.input.write_text('return\n0.01\n0.02\n', encoding='ascii')
+        result = self._run()
+        self.assertEqual(result['bootstrap']['status'], 'warning')
+        self.assertEqual(result['bootstrap']['warnings'], ['insufficient_sample'])
+        self.assertEqual(result['bootstrap']['annual_return_ci'], [None, None])
+        self.assertEqual(result['bootstrap']['sample_compounded_return_ci'], [None, None])
+        with mock.patch.object(job, 'bootstrap_metric_confidence_intervals', side_effect=AssertionError('duplicate compute')):
+            self.assertEqual(self._run(input_path=None), result)
 
     def test_result_bytes_are_independent_of_job_id_path_and_attempt_clock(self) -> None:
         self._run('first')
@@ -377,7 +398,11 @@ class ResumableBootstrapJobTests(unittest.TestCase):
         original_checkpoint = self._doc()
         result_before = self._path().read_bytes()
         changes = [('iterations', True), ('sharpe_ci', [2, 1]), ('win_rate_ci', [-1, 2]),
-                   ('annual_return_ci', ['not-a-number', 0])]
+                   ('annual_return_ci', ['not-a-number', 0]), ('annual_return_ci', [0.01, 0.10]),
+                   ('sample_compounded_return_ci', [None, None]),
+                   ('sample_compounded_return_ci', [0.02, 0.01]),
+                   ('sample_compounded_return_ci', [-2, -1]),
+                   ('annualization_status', 'annualized')]
         for field, value in changes:
             with self.subTest(field=field):
                 computation = json.loads(json.dumps(original_compute))

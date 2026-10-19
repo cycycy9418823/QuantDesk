@@ -90,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--alert-dry-run", default="true")
     parser.add_argument("--no-alerts", action="store_true")
     parser.add_argument("--json", default="true")
+    parser.add_argument("--read-ai-minute-focus", action="store_true",
+                        help="Read same-day model focus only for books with existing level-3 authorization.")
     parser.add_argument(
         "--max-round-seconds",
         type=float,
@@ -120,8 +122,10 @@ def main(argv: list[str] | None = None) -> int:
     push = bool(args.alert_push)
     dry_run = truthy(args.alert_dry_run)
 
+    focus_options = {"read_ai_minute_focus": True} if args.read_ai_minute_focus else {}
     manifest = collect_intraday_refresh(
         PROJECT_ROOT, network=network, max_round_seconds=float(args.max_round_seconds),
+        **focus_options,
     )
 
     profile_runs, observe_result, intent_result = observe_all_profiles(PROJECT_ROOT)

@@ -42,9 +42,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ST_RATIO = 0.05
 
 
-def board_ratio(symbol: str, *, is_st: bool) -> float:
+def board_ratio(symbol: str, *, is_st: bool, trade_date: str | None = None) -> float:
     """Limit ratio for a symbol on a given day (ST only narrows main boards)."""
 
+    if trade_date:
+        from quantdesk.board_rules import classify_board
+
+        return classify_board(symbol, is_st=is_st, trade_date=trade_date).limit_up_pct / 100.0
     sym = str(symbol).strip()
     if sym.startswith(("300", "301", "688", "689")):
         return 0.20  # ChiNext / STAR: 20% even for ST
@@ -60,8 +64,8 @@ def round_half_up(value: float, digits: int = 2) -> float:
     return math.floor(value * factor + 0.5) / factor
 
 
-def derive_limits(pre_close: float, symbol: str, *, is_st: bool) -> tuple[float, float]:
-    ratio = board_ratio(symbol, is_st=is_st)
+def derive_limits(pre_close: float, symbol: str, *, is_st: bool, trade_date: str | None = None) -> tuple[float, float]:
+    ratio = board_ratio(symbol, is_st=is_st, trade_date=trade_date)
     up = round_half_up(pre_close * (1 + ratio))
     down = round_half_up(pre_close * (1 - ratio))
     return up, down
@@ -205,7 +209,7 @@ def derive_for_dates(
             continue
         if prev_close is not None and date >= start_date:
             st = is_st_on(st_intervals, date)
-            up, down = derive_limits(prev_close, symbol, is_st=st)
+            up, down = derive_limits(prev_close, symbol, is_st=st, trade_date=date)
             out.append({
                 "trade_date": date,
                 "symbol": symbol,
@@ -300,7 +304,7 @@ def run(
                     # sealed one-word bar: matches EITHER the up limit
                     # (sealed limit-up) or the down limit (sealed limit-down).
                     st = is_st_on(st_intervals, date)
-                    up, down = derive_limits(prev_close, sym, is_st=st)
+                    up, down = derive_limits(prev_close, sym, is_st=st, trade_date=date)
                     sealed_checks["total"] += 1
                     if abs(up - close_f) < 0.005 or abs(down - close_f) < 0.005:
                         sealed_checks["match"] += 1

@@ -32,6 +32,7 @@ from quantdesk.daily_candidate_refresh import (
     run_formal_candidate_refresh,
 )
 from quantdesk.daily_feature_engine import build_daily_features
+from quantdesk.daily_gap_recovery import recover_target_day_gaps, merge_recovered_daily_status
 from quantdesk.daily_plan_freeze import (
     REQUIRED_DATA_CHAIN_CONTRACT_VERSION,
     freeze_t_plus_one_plan,
@@ -3342,6 +3343,27 @@ def _run_daily_data_chain_impl(
         session_symbols = _normalized_symbols(
             list(analysis_symbols) + list(critical_symbols)
         )
+        target_gap_payload: dict[str, Any] = {"status": "skipped", "reason": "not_verified_full_a_upstream", "session_evidence": {}}
+        if (
+            network and not dry_run and formal_authorized and root == PROJECT_ROOT
+            and symbols is None and not use_low_price_filter
+            and upstream_reuse_normalized is not None
+        ):
+            target_gap_payload = recover_target_day_gaps(
+                project_root=root, target_date=resolved_target,
+                daily_payload=daily_payload, output_dir=run_dir / "target_day_gap_recovery",
+                network=True,
+            )
+            touched = list(target_gap_payload.get("appended_symbols") or [])
+            refreshed = _reused_daily_payload(
+                root, target_date=resolved_target, symbols=touched,
+                source_run_id=str(upstream_reuse_normalized.get("run_id") or ""),
+            ) if touched else {}
+            daily_payload = merge_recovered_daily_status(
+                daily_payload, refreshed, touched, target_gap_payload,
+            )
+            atomic_write_json(run_dir / "daily_update.json", daily_payload)
+        base_manifest["components"]["target_day_gap_recovery"] = target_gap_payload
         session_output_path = (
             run_dir / "session_expectation.json" if not dry_run else None
         )
@@ -3356,6 +3378,7 @@ def _run_daily_data_chain_impl(
             fast_daily_status=True,
             network=session_network,
             output_path=session_output_path,
+            target_gap_session_evidence=target_gap_payload.get("session_evidence") or {},
         )
         session_legitimate = set(
             _normalized_symbols(

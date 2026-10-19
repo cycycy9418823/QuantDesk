@@ -55,6 +55,14 @@ def _write_fixture(root: Path) -> tuple[Path, Path, pd.DataFrame, list[str]]:
             ),
             encoding="utf-8",
         )
+    from quantdesk.data_truth.sector_history_archive import _canonical_bytes
+    import hashlib
+    for day in as_of_days:
+        path = history_dir / day / "snapshot.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(usable_from=day, captured_at=f"{day}T15:30:00+08:00")
+        payload["snapshot_hash"] = "sha256:" + hashlib.sha256(_canonical_bytes(payload)).hexdigest()
+        path.write_text(json.dumps(payload), encoding="utf-8")
     return daily_dir, history_dir, frame, as_of_days
 
 

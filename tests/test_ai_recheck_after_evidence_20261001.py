@@ -38,11 +38,12 @@ def _record() -> dict:
     intent = {
         "symbol": SYMBOL,
         "side": "buy",
+        "decision_origin": "model",
         "ref_close": 10.0,
         "reason": "站上10.4就拿两天",
         "style": "波段",
         "planned_hold_days": 2,
-        "verification": {"kind": "stand_above", "n_sessions": 2, "level": 10.4, "due_date": DUE_DAY},
+        "verification": {"kind": "stand_above", "n_sessions": 2, "level": 10.4, "price_basis": "raw", "due_date": DUE_DAY},
     }
     return dl.build_decision_record(intent, plan=plan, daily_dir=Path("no-such-dir"), backfill=False)
 

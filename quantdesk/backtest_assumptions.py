@@ -88,6 +88,9 @@ def backtest_assumptions_from_config(
         "stamp_duty_rate": config.stamp_duty_rate,
         "transfer_fee_rate": getattr(config, "transfer_fee_rate", 0.0),
         "cost_profile": getattr(config, "cost_profile", "current_a_share"),
+        "historical_costs": bool(getattr(config, "historical_costs", False)),
+        "historical_cost_schedule": "sell stamp 0.001 before 2023-08-28, 0.0005 thereafter; transfer 0.00002 from 2015-08-01, 0.00001 from 2022-04-29; older transfer history unresolved",
+        "historical_costs_complete_before_20150801": False,
         "cost_model": "cn_a_share_unified",
         "stamp_duty_rate_warning": (
             "legacy pre-2023-08-28 stamp-duty profile; current A-share sell-side rate is lower."

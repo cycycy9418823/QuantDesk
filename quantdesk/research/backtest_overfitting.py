@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
@@ -12,20 +13,41 @@ def deflated_sharpe_ratio(
     skew: float = 0.0,
     kurt: float = 3.0,
     var_sharpes: float | None = None,
+    *,
+    periods_per_year: float = 252.0,
+    observed_sharpe: float | None = None,
 ) -> float:
+    """Probability that an annualized Sharpe exceeds the multiple-trial baseline.
+
+    T counts return observations, not years. Convert annualized Sharpes and their
+    variance to per-observation units before applying the PSR/DSR formula. The
+    returned value is a probability in [0, 1], not the old unlabelled z score.
+    The candidate list must describe the actual trial family; it is not proof
+    against unrecorded strategy searches or dependent returns.
+    """
     values = np.array([x for x in sharpe_ratios if np.isfinite(x)], dtype=float)
-    if len(values) == 0 or T <= 1:
+    if len(values) == 0 or T <= 1 or periods_per_year <= 0:
         return float("nan")
+    values = values / math.sqrt(periods_per_year)
     if len(values) == 1:
         expected_max = 0.0
-        variance = var_sharpes if var_sharpes is not None else 0.001
     else:
         n = len(values)
-        variance = float(np.var(values)) if var_sharpes is None else float(var_sharpes)
-        expected_max = math.sqrt(2 * math.log(n)) - (0.5772156649 + math.log(math.log(n))) / math.sqrt(2 * math.log(n))
-    best = float(np.max(values))
-    se = math.sqrt(max(1e-12, (1 + 0.5 * best**2 - skew * best + (kurt - 3) / 4 * best**2) / T))
-    return round(float((best - expected_max * math.sqrt(max(variance, 0.0))) / se), 4)
+        variance = float(np.var(values, ddof=1)) if var_sharpes is None else float(var_sharpes) / periods_per_year
+        if not math.isfinite(variance) or variance < 0:
+            return float("nan")
+        normal = NormalDist()
+        gamma = 0.5772156649015329
+        expected_max = math.sqrt(variance) * (
+            (1.0 - gamma) * normal.inv_cdf(1.0 - 1.0 / n)
+            + gamma * normal.inv_cdf(1.0 - 1.0 / (n * math.e))
+        )
+    observed = float(np.max(values)) if observed_sharpe is None else float(observed_sharpe) / math.sqrt(periods_per_year)
+    variance_factor = 1.0 - skew * observed + (kurt - 1.0) * observed**2 / 4.0
+    if not math.isfinite(variance_factor) or variance_factor <= 0:
+        return float("nan")
+    z_score = (observed - expected_max) * math.sqrt(T - 1) / math.sqrt(variance_factor)
+    return float(NormalDist().cdf(z_score))
 
 
 def pbo_test(returns_matrix: pd.DataFrame, n_splits: int = 16, n_trials: int = 100, seed: int | None = 7) -> dict:
@@ -76,15 +98,21 @@ def minimum_track_record_length(
     skew: float = -0.5,
     kurt: float = 5.0,
     alpha: float = 0.05,
-) -> int:
+    *,
+    periods_per_year: float = 252.0,
+) -> int | None:
+    """Minimum whole years, using annualized Sharpe inputs and observed periods."""
+    if not 0.0 < alpha < 0.5 or periods_per_year <= 0:
+        raise ValueError("alpha must be in (0, .5) and periods_per_year positive")
+    if not math.isfinite(sharpe) or not math.isfinite(target_sharpe):
+        return None
     if sharpe <= target_sharpe:
-        return 99999
-    try:
-        from scipy import stats
-
-        z_alpha = float(stats.norm.ppf(1 - alpha))
-    except Exception:
-        z_alpha = 1.6448536269514722
-    numerator = z_alpha * math.sqrt(max(1e-12, 1 - skew * sharpe + (kurt - 1) / 4 * sharpe**2))
-    periods = (numerator / (sharpe - target_sharpe)) ** 2
-    return int(math.ceil(periods / 252))
+        return None
+    sharpe /= math.sqrt(periods_per_year)
+    target_sharpe /= math.sqrt(periods_per_year)
+    variance_factor = 1.0 - skew * sharpe + (kurt - 1.0) / 4.0 * sharpe**2
+    if not math.isfinite(variance_factor) or variance_factor <= 0:
+        return None
+    z_alpha = NormalDist().inv_cdf(1.0 - alpha)
+    periods = 1.0 + variance_factor * (z_alpha / (sharpe - target_sharpe)) ** 2
+    return int(math.ceil(periods / periods_per_year))

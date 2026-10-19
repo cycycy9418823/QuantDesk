@@ -23,6 +23,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+from quantdesk.maintenance.test_safety import configure_pytest_fence
+
+configure_pytest_fence(ROOT)
+
 
 REVIEW_PACK_GENERATORS: dict[str, tuple[str, list[str]]] = {}
 

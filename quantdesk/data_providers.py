@@ -130,6 +130,7 @@ class SinaQuote:
     amount: float | None = None
     date: str = ""
     time: str = ""
+    price_basis: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -144,6 +145,7 @@ class SinaQuote:
             "amount": self.amount,
             "date": self.date,
             "time": self.time,
+            "price_basis": self.price_basis,
         }
 
 
@@ -202,6 +204,9 @@ def parse_sina_quote_text(text: str) -> list[SinaQuote]:
                 amount=amount,
                 date=date,
                 time=time_str,
+                # This parser handles the exchange quote endpoint, which sends
+                # unadjusted prices. Generic CSV readers never infer this field.
+                price_basis="raw",
             )
         )
     return quotes

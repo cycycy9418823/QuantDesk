@@ -88,7 +88,7 @@ from quantdesk.research.daily_strategy_recommendation_snapshot import (
     render_daily_strategy_recommendation_snapshot_markdown,
 )
 from quantdesk.research_workflow_cards import render_research_workflow_cards_markdown
-from quantdesk.shared import normalize_symbol, now_text
+from quantdesk.shared import normalize_symbol, now_text, utc_now_iso
 from quantdesk.theme_current_candidate_validator import validate_theme_map_for_current_candidates
 from quantdesk.theme_map_updater import theme_map_status, update_theme_map
 from quantdesk.theme_sector_engine import THEME_MAP_PATH, load_theme_map
@@ -420,10 +420,52 @@ def _extract_strategy_counts(strategy_payload: dict[str, Any]) -> tuple[int, int
     return long_count, board_count
 
 
+def _reported_candidate_counts(payload: dict[str, Any]) -> dict[str, Any]:
+    """Count the verified dated batch; a missing batch is not an empty batch."""
+    if "formal_candidate_intake" not in payload:
+        legacy = payload.get("auto_strategy") or {}
+        if legacy and legacy.get("status") not in {"skipped", "missing", "blocked"}:
+            long_count, board_count = _extract_strategy_counts(legacy)
+            return {"long_candidate_count": long_count, "board_candidate_count": board_count,
+                    "candidate_count_status": "legacy", "candidate_count_source": "legacy_research",
+                    "candidate_count_target_date": "", "unclassified_candidate_count": 0}
+    intake = payload.get("formal_candidate_intake") or {}
+    status = str(intake.get("status") or "missing")
+    target = str(payload.get("target_date") or "")
+    rows = intake.get("candidates")
+    count = intake.get("candidate_count")
+    valid = (status in {"passed", "passed_with_warnings"} and isinstance(rows, list)
+             and isinstance(count, int) and not isinstance(count, bool) and count == len(rows)
+             and all(isinstance(row, dict) for row in rows)
+             and (not target or intake.get("target_date") == target))
+    if not valid:
+        return {"long_candidate_count": None, "board_candidate_count": None,
+                "candidate_count_status": status if status not in {"passed", "passed_with_warnings"} else "invalid",
+                "candidate_count_source": "formal_candidate_batch",
+                "candidate_count_target_date": intake.get("target_date") or target,
+                "unclassified_candidate_count": None}
+    long_count = sum(row.get("strategy_type") == "long" for row in rows)
+    board_count = sum(row.get("strategy_type") == "board" for row in rows)
+    return {"long_candidate_count": long_count, "board_candidate_count": board_count,
+            "candidate_count_status": "passed", "candidate_count_source": "formal_candidate_batch",
+            "candidate_count_target_date": intake.get("target_date") or target,
+            "unclassified_candidate_count": len(rows) - long_count - board_count}
+
+
+def _review_due_plan_for_workflow(trade_date: str, *, simulation_enabled: bool) -> dict[str, Any]:
+    """Use an observed, timezone-aware instant for the strict receipt API."""
+    ledger_state = PaperStateStore(AUTO_PAPER_PORTFOLIO_STATE_JSON, schema_version=API_SCHEMA_VERSION, max_backups=7).read({})
+    return plan_review_snapshot(
+        PROJECT_ROOT, trade_date=trade_date, checked_at=utc_now_iso(),
+        applied_execution_ids=list(ledger_state.get("applied_execution_ids") or []),
+        simulation_enabled=simulation_enabled, write=True,
+    )
+
+
 def _build_summary(payload: dict[str, Any]) -> dict[str, Any]:
     theme = payload.get("theme_map_status") if isinstance(payload.get("theme_map_status"), dict) else {}
     strategy_payload = payload.get("auto_strategy") if isinstance(payload.get("auto_strategy"), dict) else {}
-    long_count, board_count = _extract_strategy_counts(strategy_payload)
+    candidate_counts = _reported_candidate_counts(payload)
     plan_summary = payload.get("conditional_plan_summary") if isinstance(payload.get("conditional_plan_summary"), dict) else {}
     execution_summary = payload.get("conditional_execution_summary") if isinstance(payload.get("conditional_execution_summary"), dict) else {}
     portfolio_payload = payload.get("auto_paper_portfolio") if isinstance(payload.get("auto_paper_portfolio"), dict) else {}
@@ -488,8 +530,7 @@ def _build_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "theme_unknown_count": _int(theme.get("unknown_count")),
         "theme_pending_count": _int(theme.get("pending_count")),
         "theme_failed_reason": theme.get("failed_reason") or "",
-        "long_candidate_count": long_count,
-        "board_candidate_count": board_count,
+        **candidate_counts,
         "legacy_research_status": strategy_payload.get("status", "requested"),
         "formal_candidate_intake": payload.get("formal_candidate_intake") or {},
         "conditional_plan_count": _int(plan_summary.get("symbol_count") or plan_summary.get("total_symbols")),
@@ -504,7 +545,11 @@ def _build_summary(payload: dict[str, Any]) -> dict[str, Any]:
         and _int(intraday_status_payload.get("missing_count")) == 0
         and _int(intraday_status_payload.get("invalid_count")) == 0,
         "portfolio_position_count": _int(portfolio_summary.get("position_count"), len(portfolio_payload.get("positions") or [])),
-        "today_pnl": _float(portfolio_summary.get("daily_pnl")),
+        "today_pnl": portfolio_summary.get("daily_pnl") if portfolio_summary.get("daily_pnl_status") == "verified" else None,
+        "today_pnl_status": portfolio_summary.get("daily_pnl_status") or "unverified_legacy_pnl",
+        "previous_equity_date": portfolio_summary.get("previous_equity_date") or "",
+        "previous_total_equity": portfolio_summary.get("previous_total_equity"),
+        "cumulative_pnl": portfolio_summary.get("cumulative_pnl"),
         "total_return_pct": _float(portfolio_summary.get("total_return_pct")),
         "account_scale": portfolio_summary.get("account_scale") or "",
         "account_scale_note": portfolio_summary.get("account_scale_note") or "",
@@ -942,6 +987,27 @@ def _reference_confidence_report_lines(candidates: list[dict[str, Any]]) -> list
 
 def build_daily_workflow_report(payload: dict[str, Any]) -> str:
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else _build_summary(payload)
+    candidate_count_text = (
+        f"长线 {summary.get('long_candidate_count')} 只，打板 {summary.get('board_candidate_count')} 只"
+        if summary.get("long_candidate_count") is not None and summary.get("board_candidate_count") is not None
+        else f"缺失或未核验（{summary.get('candidate_count_status') or 'missing'}）"
+    )
+    candidate_source_text = (
+        f"当日正式候选 {summary.get('candidate_count_target_date') or ''}"
+        if summary.get("candidate_count_source") == "formal_candidate_batch"
+        else "旧研究候选（非正式候选）"
+    )
+    pnl_reason = {
+        "missing_previous_equity": "缺少前一交易日权益",
+        "previous_session_unverified": "交易日历不足，无法确认前一交易日",
+        "current_valuation_unverified": "本日估值证据不足",
+        "unverified_legacy_pnl": "旧报告未区分当日与累计口径",
+        "valuation_date_invalid": "估值日期无效",
+    }.get(summary.get("today_pnl_status"), "缺少可核对的权益记录")
+    today_pnl_text = (
+        str(summary["today_pnl"]) if summary.get("today_pnl") is not None
+        else f"未核验（{pnl_reason}）"
+    )
     theme = payload.get("theme_map_status") if isinstance(payload.get("theme_map_status"), dict) else {}
     provider_results = theme.get("provider_results") if isinstance(theme.get("provider_results"), list) else []
     lines = [
@@ -1046,13 +1112,16 @@ def build_daily_workflow_report(payload: dict[str, Any]) -> str:
         "",
         "## 复盘摘要",
         "",
-        f"- 策略候选数量：长线 {summary.get('long_candidate_count', 0)} 只，打板 {summary.get('board_candidate_count', 0)} 只。",
+        f"- 策略候选数量：{candidate_count_text}。",
+        f"- 候选来源：{candidate_source_text}。",
         f"- 条件计划数量：{summary.get('conditional_plan_count', 0)}。",
         f"- 盘中触发数量：{summary.get('execution_event_count', 0)}。",
         f"- 计划未触发数量：{summary.get('no_fill_count', 0)}。",
         f"- 缺少分钟线数量：{summary.get('missing_intraday_count', 0)}。",
         f"- 虚拟组合持仓数量：{summary.get('portfolio_position_count', 0)}。",
-        f"- 今日盈亏：{summary.get('today_pnl', 0)}。",
+        f"- 今日盈亏：{today_pnl_text}。",
+        f"- 前一交易日权益：{summary.get('previous_equity_date') or '缺失'} / {summary.get('previous_total_equity') if summary.get('previous_total_equity') is not None else '未核验'}。",
+        f"- 累计盈亏：{summary.get('cumulative_pnl') if summary.get('cumulative_pnl') is not None else '未核验'}。",
         f"- 累计收益率：{summary.get('total_return_pct', 0)}%。",
         "",
         "## 工作流步骤",
@@ -1964,12 +2033,7 @@ def run_daily_workflow(
         # Review only this invocation's target plan; older gaps are scanned,
         # never silently backfilled or given applied execution IDs.
         try:
-            ledger_state = PaperStateStore(AUTO_PAPER_PORTFOLIO_STATE_JSON, schema_version=API_SCHEMA_VERSION, max_backups=7).read({})
-            plan_review_payload = plan_review_snapshot(
-                PROJECT_ROOT, trade_date=review_target_date, checked_at=now_text(),
-                applied_execution_ids=list(ledger_state.get("applied_execution_ids") or []),
-                simulation_enabled=enable_intraday, write=True,
-            )
+            plan_review_payload = _review_due_plan_for_workflow(review_target_date, simulation_enabled=enable_intraday)
         except Exception as exc:  # noqa: BLE001 - an evidence failure stays visible
             plan_review_payload = {
                 "plan_review_summary": {"status": "blocked", "as_of": review_target_date,
@@ -2234,6 +2298,13 @@ def run_daily_workflow(
             "input_artifacts": input_artifacts,
             "disclaimer": DISCLAIMER,
         }
+        reported_counts = _reported_candidate_counts(payload)
+        payload["candidates_summary"].update({
+            "candidate_strategy_counts": {"long": reported_counts["long_candidate_count"],
+                                          "board": reported_counts["board_candidate_count"]},
+            "status": reported_counts["candidate_count_status"],
+            "source": reported_counts["candidate_count_source"],
+        })
         payload["summary"] = _build_summary(payload)
         payload["workflow_status"] = _workflow_status(steps, errors)
         payload["status"] = _payload_status(payload["workflow_status"])

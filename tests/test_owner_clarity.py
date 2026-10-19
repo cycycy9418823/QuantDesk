@@ -54,24 +54,36 @@ def test_maturity_uses_published_as_of_not_the_computer_clock(tmp_path, monkeypa
     after = decisions_response(tmp_path, monkeypatch, [record()], "2026-09-22")
     assert before["review_summary"]["groups"]["rule"]["mature_evaluable"] == 0
     group = after["review_summary"]["groups"]["rule"]
-    assert group["mature_evaluable"] == group["mature_correct"] == 1
+    assert group["mature_evaluable"] == group["mature_correct"] == 0
+    assert group["diagnostic_mature"] == 1
+    assert "verdict_before_maturity" in after["review_summary"]["record_context"]["early-rule"]["exclusion_reasons"]
     assert group["early_hits"] == 0
     assert before["records"] == after["records"], "A mature observation must not change the early hit"
 
 
 def test_sources_history_and_missing_evidence_never_mix_in_the_model_denominator(tmp_path, monkeypatch):
+    model = record("model", llm_used=True, decision_origin="model", llm_model="fixture-model",
+                   trade_date="2026-09-21", recorded_at_source="original", result_as_of="2026-09-22",
+                   verification={"kind": "stand_above", "n_sessions": 2, "due_date": "2026-09-22",
+                                 "source": "model_declared", "level": 21.73, "price_basis": "raw"},
+                   result_evidence=[{"kind": "window_hit", "price_basis": "raw",
+                                     "observed": [["2026-09-21", 21.74], ["2026-09-22", 21.80]]}],
+                   fill_evidence={"status": "confirmed", "trades": [{"plan_id": "fixture-plan"}]})
     rows = [
-        record("model", llm_used=True), record("rule"),
+        model, record("rule"),
         record("history", llm_used=True, backfill=True),
         record("unknown", llm_used=None),
-        record("missing", llm_used=True, result="已到期 · 证据不足", result_as_of="2026-09-22"),
-        record("rejected", llm_used=True, committed=False),
-        record("hold", llm_used=True, symbol="", result="不适用"),
+        record("missing", llm_used=True, decision_origin="model", result="已到期 · 证据不足", result_as_of="2026-09-22"),
+        record("rejected", llm_used=True, decision_origin="model", committed=False),
+        record("hold", llm_used=True, decision_origin="model", symbol="", result="不适用"),
     ]
     summary = decisions_response(tmp_path, monkeypatch, rows, "2026-09-22")["review_summary"]
     assert summary["historical_records"] == 1
-    for origin in ("model", "rule", "unknown"):
-        assert summary["groups"][origin]["mature_evaluable"] == 1
+    assert summary["groups"]["model"]["mature_evaluable"] == 1
+    for origin in ("rule", "unknown"):
+        assert summary["groups"][origin]["mature_evaluable"] == 0
+    assert summary["credible_model"]["denominator"] == 1
+    assert "实际纸面成交" in summary["denominator_note"]
     assert summary["groups"]["model"]["due_evidence_gap"] == 1
     assert summary["groups"]["model"]["unaccepted"] == 1
     assert summary["groups"]["model"]["not_applicable"] == 1
@@ -249,7 +261,11 @@ def test_glm_book_does_not_relabel_copied_kimi_history_as_glm_judgment():
             url === '/api/decision-board' ? {watchlist: [], events: []} : {filled_trades: []};
         await loadDecisionHistory();
         const rendered = node('decisionHistoryPanel').innerHTML;
-        assert.match(rendered, /Kimi 模型/);
+        assert.match(rendered, /Kimi 调用/);
+        assert.match(rendered, /意图来源未知/);
         assert.doesNotMatch(rendered, /GLM 模型/);
         assert.match(node('decisionHistoryNote').textContent, /GLM/);
+        payload.records[0].decision_origin = 'model';
+        await loadDecisionHistory();
+        assert.match(node('decisionHistoryPanel').innerHTML, /Kimi 模型/);
     """)

@@ -523,6 +523,8 @@ def build_plan(
     pick_reasons: dict[str, Any] | None = None,
     llm_sells: list[dict[str, Any]] | None = None,
     llm_directed: bool = False,
+    hold_only: bool = False,
+    independent_candidate: bool = False,
 ) -> dict[str, Any]:
     mandate = DEFAULT_MANDATE
     equity = float(ledger.get("equity") or mandate.initial_cash)
@@ -535,7 +537,7 @@ def build_plan(
     live_id = str(live.get("hypothesis_id")) if live else None
     hold_days = int(mandate.fallback_hold_days)
     llm_sell_map = {
-        str(row.get("symbol")): str(row.get("reason") or "")
+        str(row.get("symbol")): row
         for row in (llm_sells or [])
         if isinstance(row, dict) and row.get("symbol")
     }
@@ -543,7 +545,7 @@ def build_plan(
     # Exits must be considered whenever there is something to exit. Gating this on
     # a live rule-engine hypothesis would mean a self-directed trader could never
     # close a position it opened on its own reasoning.
-    if live_id or (llm_directed and held):
+    if not hold_only and (live_id or (llm_directed and (held or independent_candidate))):
         sell_count = 0
         for symbol, pos in held.items():
             if sell_count >= mandate.max_exits_per_day:
@@ -571,7 +573,7 @@ def build_plan(
             # force the exit, so the rule engine still terminates on its own.
             matured = held_days >= planned
             if llm_directed:
-                if not asked_to_sell and not broken:
+                if not asked_to_sell and (independent_candidate or not broken):
                     continue
             elif not matured and not broken:
                 continue
@@ -582,7 +584,7 @@ def build_plan(
             if session["minutes"] == "missing":
                 warnings.append(f"minutes_missing:{symbol}")
             why = (
-                llm_sell_map.get(symbol)
+                (llm_sell_map.get(symbol) or {}).get("reason")
                 or broken
                 or f"已经按计划拿了{held_days}天（打算{planned}天），明天开盘了结。"
             )
@@ -590,6 +592,8 @@ def build_plan(
                 {
                     "symbol": symbol,
                     "side": "sell",
+                    "decision_origin": "model" if asked_to_sell and llm_directed else "rule",
+                    "verification": deepcopy((llm_sell_map.get(symbol) or {}).get("verification")) if asked_to_sell else None,
                     "quantity": int(pos.get("quantity") or 0),
                     "ref_close": close,
                     "predicted_direction": "down",
@@ -654,6 +658,8 @@ def build_plan(
                 {
                     "symbol": symbol,
                     "side": "buy",
+                    "decision_origin": "model" if llm_directed and symbol in (pick_reasons or {}) else "rule",
+                    "verification": deepcopy(llm_pick.get("verification")),
                     "quantity": qty,
                     "ref_close": close,
                     "predicted_direction": _direction_from_score(score),
@@ -698,6 +704,7 @@ def build_plan(
         "boundary": dict(BOUNDARY),
         "role": "overnight_open_trader",
         "role_zh": mandate.persona_zh,
+        "decision_mode": "hold_only" if hold_only else "model" if llm_directed else "rule_research",
     }
 
 
@@ -1033,7 +1040,9 @@ def run_evening(
     lookback: int = 180,
     universe_limit: int = 240,
     network_news: bool | None = None,
+    prompt_candidate: str | None = None,
 ) -> dict[str, Any]:
+    pack = load_prompt_pack(candidate=prompt_candidate)
     runtime = paths
     runtime.ledger.parent.mkdir(parents=True, exist_ok=True)
     init_ledger(path=runtime.ledger)
@@ -1042,7 +1051,8 @@ def run_evening(
     as_of = str(calendar.get("as_of") or "")[:10]
     watch = load_watchlist(runtime.watchlist)
     held_names = list(position_map(ledger).keys())
-    recommendations = load_recommendations(require_fresh_for=as_of)
+    recommendations = (load_recommendations(require_fresh_for=as_of) if prompt_candidate is None
+                       else {"symbols": [], "rows": [], "warnings": []})
     recommended_names = list(recommendations.get("symbols") or [])
     focus_limit = min(max(int(universe_limit), 8), 80)
     symbols = focus_universe(
@@ -1163,7 +1173,8 @@ def run_evening(
     # LLM brain (optional): if a local endpoint is configured, let the trader
     # think and choose. It only reorders/replaces the buy candidates and gives
     # reasons; every quantity/limit/next-open/ledger rule below is unchanged.
-    # No endpoint or any failure => proposal is None => rule `ranked` stands.
+    # No usable model decision means hold only; research rules cannot impersonate
+    # the independent model. Prior-plan settlement and valuation happened above.
     pick_reasons: dict[str, Any] = {}
     llm_used = False
     llm_model = ""
@@ -1215,6 +1226,8 @@ def run_evening(
             {
                 "reuse_text": persisted_output.get("text"),
                 "reuse_model": str(persisted_output.get("model") or ""),
+                "reuse_prompt_stamp": {**(existing.get("llm") or {}), **{
+                    key: existing[key] for key in (*pack.version_stamp(), "effective_prompt_sha256") if key in existing}},
             }
             if llm_recovery_status == REUSABLE_ORIGINAL_OUTPUT
             else {}
@@ -1232,6 +1245,7 @@ def run_evening(
                     philosophy=philosophy,
                 ),
                 llm_diag,
+                **({"prompt_candidate": prompt_candidate} if prompt_candidate else {}),
                 **reuse_kwargs,
             )
         if proposal is not None:
@@ -1261,6 +1275,7 @@ def run_evening(
                         "reason": buy.get("reason") or "",
                         "hold_days": buy.get("hold_days") or 0,
                         "style": buy.get("style") or "",
+                        "verification": deepcopy(buy.get("verification")),
                     }
                 elif symbol:
                     dropped.append(symbol)
@@ -1286,6 +1301,8 @@ def run_evening(
         pick_reasons=pick_reasons,
         llm_sells=llm_sells,
         llm_directed=llm_used,
+        hold_only=not llm_used,
+        independent_candidate=prompt_candidate is not None,
     )
     # Persist whatever the trader said about itself tonight, so tomorrow it can
     # read its own mind back and the user can watch the style evolve.
@@ -1312,9 +1329,7 @@ def run_evening(
         "sells_requested": [str(row.get("symbol")) for row in llm_sells],
         "stance": llm_stance,
         "lesson": llm_lesson,
-        # Why the brain did not engage, when it did not. Recorded so a silent
-        # fallback to the rule engine is never mistaken for the AI's own decision.
-        "unavailable_reason": "" if llm_used else str(llm_diag.get("reason") or ""),
+        "unavailable_reason": "" if llm_used else str(llm_diag.get("reason") or "no_usable_model_decision"),
         "diagnostics": persistable_transport_diagnostics(llm_diag),
         # A2: the recovery verdict for this cycle, and the raw reply (when one
         # was actually obtained) so an interruption is reconstructed, never
@@ -1332,6 +1347,7 @@ def run_evening(
             else None
         ),
     }
+    plan["ledger_id"] = str(ledger.get("ledger_id") or "")
     response_evidence = persistable_response_evidence(llm_diag)
     if response_evidence:
         response_evidence["cycle"] = {
@@ -1349,11 +1365,13 @@ def run_evening(
             else:
                 response_evidence["history_status"] = "written"
         plan["llm"]["response_evidence"] = response_evidence
-    pack = load_prompt_pack()
-    plan["prompt_version"] = pack.prompt_version
-    plan["menu_version"] = pack.menu_version
-    plan["llm"]["prompt_version"] = pack.prompt_version
-    plan["llm"]["menu_version"] = pack.menu_version
+    prompt_stamp = dict(pack.version_stamp())
+    prompt_stamp.update({key: value for key, value in (llm_diag.get("prompt_stamp") or {}).items()})
+    if proposal is not None:
+        prompt_stamp.update({key: proposal[key] for key in (*prompt_stamp, "effective_prompt_sha256") if key in proposal})
+    plan.update(prompt_stamp)
+    plan["llm"].update(prompt_stamp)
+    plan["prompt_application"] = "model_response" if llm_used else "no_usable_model_response"
     if not llm_used and llm_diag.get("reason"):
         warnings.append(f"llm_unavailable:{llm_diag['reason']}")
     warnings.extend(list(plan.get("warnings") or []))
@@ -1366,7 +1384,7 @@ def run_evening(
             continue
         symbol = str(intent.get("symbol") or "")
         from_desk = symbol in recommended_set
-        by_llm = bool(intent.get("llm_reason")) or (symbol in pick_reasons and intent.get("side") == "buy")
+        by_llm = intent.get("decision_origin") == "model"
         if by_llm and from_desk:
             intent["pick_source"] = "llm_research_desk"
             intent["pick_source_zh"] = "AI选(来自研究台推荐)"
@@ -1374,8 +1392,8 @@ def run_evening(
             intent["pick_source"] = "llm_self_selected"
             intent["pick_source_zh"] = "AI自选"
         else:
-            intent["pick_source"] = "research_desk_recommendation" if from_desk else "self_selected"
-            intent["pick_source_zh"] = "研究台推荐" if from_desk else "自己选的"
+            intent["pick_source"] = "research_desk_recommendation" if from_desk else "rule_selected"
+            intent["pick_source_zh"] = "规则选择(研究台名单)" if from_desk else "固定规则选择"
         if from_desk:
             note = recommendation_note(recommendations.get("rows") or [], symbol)
             if note:
@@ -1386,18 +1404,28 @@ def run_evening(
         "count": len(recommended_names),
         "warnings": list(recommendations.get("warnings") or []),
         "advisory_only": True,
+        "included_in_menu": prompt_candidate is None,
     }
     warnings.extend(list(recommendations.get("warnings") or []))
     if preserve_existing_plan:
         # 保留当晚的裁定与意图：把既有计划的原字段搬进今晚的计划对象（不重新核对、不改内容），
         # 并连原模型异常一起留下——重启后的记录不得变成另一份、也不得丢掉原来的错误原因。
         plan["intents"] = deepcopy(list(existing.get("intents") or []))
+        plan["decision_mode"] = existing.get("decision_mode") or "preserved_existing_decision"
         plan["statement_rejections"] = deepcopy(existing.get("statement_rejections"))
         plan["statement_review"] = deepcopy(existing.get("statement_review"))
         kept_time = str(existing.get("recorded_at") or "").strip()
         if kept_time:
             plan["recorded_at"] = kept_time
         original_llm = dict(existing.get("llm") or {})
+        for key in (*pack.version_stamp(), "effective_prompt_sha256", "prompt_application"):
+            if key in existing:
+                plan[key] = deepcopy(existing[key])
+            else:
+                plan.pop(key, None)
+            plan["llm"].pop(key, None)
+            if key in original_llm:
+                plan["llm"][key] = deepcopy(original_llm[key])
         # Old plans without response evidence must stay without it; a replay
         # timestamp cannot stand in for the original response observation.
         plan["llm"].pop("response_evidence", None)
@@ -1463,7 +1491,7 @@ def run_evening(
         headline = f"明天（{trade_date}）按开盘预案做。"
         thought = (
             "今晚先看手里的票，理由还在就继续拿——计划天数到了不等于必须卖。"
-            f"没有大脑在线时按规则引擎的保守default走（{DEFAULT_MANDATE.fallback_hold_days}天）。"
+            "模型没有完成判断时只保留持仓，不由研究规则生成新交易。"
         )
     elif conviction == "probation" and method:
         headline = (
@@ -1480,6 +1508,9 @@ def run_evening(
         else:
             headline = f"明天（{trade_date}）先空仓。今晚没看出值得试的票。"
         thought = "现金也是决定。编故事硬做，不像新人，像赌。"
+    if not llm_used and not preserve_existing_plan:
+        headline = f"明天（{trade_date}）保留现有持仓，无新增交易。"
+        thought = f"模型未完成判断（{plan['llm']['unavailable_reason']}）；仅完成旧计划结算和已有持仓估值。"
     if llm_used:
         # The journal must say what was actually submitted. `picked` is the
         # LLM's proposal; account constraints may have kept only part of it
@@ -1540,6 +1571,8 @@ def run_evening(
     note["thought"] = thought
     note["role_zh"] = plan.get("role_zh")
     note["tomorrow_plan"] = {
+        "plan_id": plan.get("plan_id"),
+        "ledger_id": plan.get("ledger_id"),
         "trade_date": trade_date,
         "intents": plan.get("intents"),
         # 被拒的原提议随计划一起写进日记：最新计划隔天会被覆盖，只剩日记时仍要能还原
@@ -1557,6 +1590,9 @@ def run_evening(
     }
     note["prompt_version"] = plan.get("prompt_version")
     note["menu_version"] = plan.get("menu_version")
+    for key in (*pack.version_stamp(), "effective_prompt_sha256", "prompt_application"):
+        if key in plan:
+            note[key] = deepcopy(plan[key])
     from ai_trader.daytime import load_daytime_notes_for
 
     daytime_notes = load_daytime_notes_for(as_of, notes_path=runtime.daytime_notes)

@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -208,21 +209,56 @@ def last_backup_success(root: Path) -> str:
     return last
 
 
-def last_snapshot_complete(root: Path) -> str:
+def snapshot_quality(root: Path, target: str) -> dict:
+    """Keep archive coverage separate from the stricter, field-verified count."""
+    day = root / "data" / "snapshots" / target
+    data = load_json(day / "manifest.json") or {}
+
+    def count(key: str) -> int | None:
+        value = data.get(key)
+        if isinstance(value, bool):
+            return None
+        try:
+            number = int(value)
+            return number if number >= 0 and float(value) == number else None
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+    collected, completed = count("collected_slot_count"), count("completed_slot_count")
+    verified, expected = count("field_verified_complete_slot_count"), count("expected_slot_count")
+    paired = False
+    slots = data.get("field_verified_complete_slots")
+    if (expected and collected == completed == verified == expected
+            and isinstance(slots, list) and len(slots) == expected
+            and all(isinstance(slot, str) and re.fullmatch(r"\d{4}", slot) for slot in slots)
+            and len(set(slots)) == expected and data.get("trade_date") == target):
+        paired = True
+        for slot in slots:
+            csv_path = day / f"{slot}.csv"
+            metadata = load_json(day / f"{slot}.json") or {}
+            try:
+                if (metadata.get("trade_date") != target or metadata.get("slot_time") != slot
+                        or not csv_path.is_file() or csv_path.stat().st_size > 32 * 1024 * 1024
+                        or metadata.get("csv_sha256") != hashlib.sha256(csv_path.read_bytes()).hexdigest()):
+                    paired = False
+                    break
+            except OSError:
+                paired = False
+                break
+    return {"collected": collected, "completed": completed, "verified": verified,
+            "partial": count("partial_slot_count"), "expected": expected,
+            "archive_integrity_verified": paired}
+
+
+def last_snapshot_complete(root: Path, before: str | None = None) -> str:
     snap = root / "data" / "snapshots"
     if not snap.is_dir():
         return ""
     dates = sorted((p.name for p in snap.iterdir() if p.is_dir()), reverse=True)
     for day in dates:
-        man = snap / day / "manifest.json"
-        data = load_json(man)
-        if not data:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) or (before and day > before):
             continue
-        try:
-            collected = int(data.get("collected_slot_count") or 0)
-        except (TypeError, ValueError):
-            collected = 0
-        if collected >= 46:
+        if snapshot_quality(root, day)["archive_integrity_verified"]:
             return day
     return ""
 
@@ -352,20 +388,12 @@ def arrival_unknown_note(target: str, arrival: dict) -> str:
 
 
 def snapshot_cell(root: Path, target: str) -> tuple[str, str]:
-    man = root / "data" / "snapshots" / target / "manifest.json"
-    collected = 0
-    if man.is_file():
-        data = load_json(man)
-        if data is not None:
-            try:
-                collected = int(data.get("collected_slot_count") or 0)
-            except (TypeError, ValueError):
-                collected = 0
+    quality = snapshot_quality(root, target)
     files = snapshot_slot_files(root, target)
-    mark = "✓" if collected >= 46 else "✗"
-    # Both numbers are always shown: how many sheets were pulled and how many
-    # slots the manifest calls complete ("48张/完成 0" must stay readable).
-    cell = f"快照 {mark}{files}张/完成 {collected}"
+    mark = "✓" if quality["archive_integrity_verified"] and files >= quality["expected"] else "✗"
+    completed = quality["completed"] if quality["completed"] is not None else "未知"
+    verified = quality["verified"] if quality["verified"] is not None else "未知"
+    cell = f"快照 {mark}{files}张/覆盖完成 {completed}/字段核实 {verified}"
     notes: list[str] = []
     arrival = snapshot_arrival(root, target)
     received = arrival["local_received_at"]
@@ -383,9 +411,14 @@ def snapshot_cell(root: Path, target: str) -> tuple[str, str]:
             notes.append(f"上游采集/生成 {arrival['upstream_collected_at']}（不是发布时间）")
     if mark == "✓":
         return cell, " · ".join(notes)
-    prev = last_snapshot_complete(root)
-    prev_txt = prev or "从未成功"
-    notes.append(f"快照未拉回 {target}，上次完整 {prev_txt}")
+    prev = last_snapshot_complete(root, before=target)
+    prev_txt = prev or "无可核实记录"
+    if files:
+        notes.append(f"快照 {target} 已归档 {files} 张，完整字段或档案哈希仍未核实；上次完整 {prev_txt}")
+    else:
+        notes.append(f"快照未拉回 {target}，上次完整 {prev_txt}")
+    if quality["partial"] is not None:
+        notes.append(f"部分覆盖 {quality['partial']} 档；覆盖完成不等于报价日期、价格口径和价格字段完整")
     return cell, " · ".join(notes)
 
 
@@ -656,7 +689,7 @@ def rewrite_status(root: Path, header: str, section_line: str, explain: str) -> 
 
 def build_line(root: Path, target: str) -> tuple[str, list[str], bool]:
     trading, cal_note = is_trading_day(root, target)
-    explains: list[str] = []
+    explains: list[str] = [f"健康业务日期 {target}"]
     if cal_note:
         explains.append(cal_note)
     if not trading:

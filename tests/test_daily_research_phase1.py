@@ -1518,11 +1518,13 @@ def test_backtest_run_can_use_strategy_screening_handoff(monkeypatch, tmp_path) 
         "source": "candidate_pool",
     }
     monkeypatch.setattr(backtest_routes, "_strategy_screening_backtest_handoff", lambda max_symbols: (["000001"], handoff))
-    monkeypatch.setattr(
-        backtest_routes,
-        "_load_backtest_histories",
-        lambda max_symbols, symbols=None, candidate_rows_func=None: {"000001": frame},
-    )
+    loaded_window = {}
+
+    def load_histories(max_symbols, symbols=None, candidate_rows_func=None, *, start_date="", end_date=""):
+        loaded_window.update(start_date=start_date, end_date=end_date)
+        return {"000001": frame}
+
+    monkeypatch.setattr(backtest_routes, "_load_backtest_histories", load_histories)
 
     client = app.test_client()
     response = client.post("/api/backtest/run", json={"source": "strategy_screening", "strategy": "equal_weight_random", "max_symbols": 5})
@@ -1536,6 +1538,8 @@ def test_backtest_run_can_use_strategy_screening_handoff(monkeypatch, tmp_path) 
     assert payload["symbols"] == ["000001"]
     assert payload["backtest_handoff"]["status"] == "ready"
     assert payload["symbol_count"] == 1
+    assert loaded_window == {"start_date": payload["start_date"], "end_date": payload["end_date"]}
+    assert loaded_window["end_date"]
 
 
 def test_daily_research_frontend_has_local_echarts_and_no_cdn() -> None:

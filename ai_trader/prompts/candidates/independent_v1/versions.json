@@ -1,0 +1,9 @@
+{
+  "prompt_id": "evening_independent_candidate",
+  "prompt_version": "v2.0.0-candidate.1",
+  "prompt_file": "system.txt",
+  "menu_id": "evening_independent_menu_candidate",
+  "menu_version": "v2.0.0-candidate.1",
+  "menu_file": "menu.json",
+  "approval_status": "offline_candidate_not_approved"
+}

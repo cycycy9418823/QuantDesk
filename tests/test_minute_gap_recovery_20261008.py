@@ -122,8 +122,6 @@ def test_round_keeps_current_day_240_in_one_request_and_reports_actual_path(tmp_
 
 
 def test_existing_sina_single_response_is_not_cut_down_to_last_hour(monkeypatch):
-    from quantdesk.intraday import intraday_providers
-
     monkeypatch.setattr(collector, "_mootdx_minute_rows", lambda *a, **k: ([], "native_failed", {}))
     payload = [{"day": row["datetime"], **{key: row[key] for key in ("open", "high", "low", "close", "volume")}}
                for row in full_day()]
@@ -131,9 +129,9 @@ def test_existing_sina_single_response_is_not_cut_down_to_last_hour(monkeypatch)
 
     def http(url, **kwargs):
         urls.append(url)
-        return json.dumps(payload)
+        return json.dumps(payload), {}
 
-    monkeypatch.setattr(intraday_providers, "_http_get_text", http)
+    monkeypatch.setattr(collector, "_sina_http_get_text", http)
     rows, error, diagnostics = collector._live_minute_rows(
         "600000", offset=collector.MINUTE_OFFSET, now=NOW, monotonic=lambda: 0.0,
     )

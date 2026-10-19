@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from quantdesk.shared import now_text, read_json, short_error_text, write_json
+from quantdesk.research.sample_provenance import research_sample_context
 from quantdesk.version import API_SCHEMA_VERSION, APP_VERSION, PACKAGE_VERSION
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -101,6 +102,11 @@ def _extract_returns_with_source(backtest_result: Any) -> tuple[list[float], str
     """Return (returns, key they came from); ``""`` when nothing is extractable."""
 
     payload = backtest_result if isinstance(backtest_result, dict) else {}
+    if "trade_returns" in payload:
+        rows = payload.get("trade_returns")
+        # An explicitly empty closed-position series is evidence of zero
+        # completed positions. It must not turn into another kind of sample.
+        return (_extract_return_values(rows) if isinstance(rows, list) else []), "trade_returns"
     for key in ("trade_returns", "returns", "daily_returns", "window_returns"):
         rows = payload.get(key)
         if isinstance(rows, list):
@@ -130,6 +136,9 @@ def _trade_count(payload: dict[str, Any], returns: list[float], source: str) -> 
     and the sample cannot pass.
     """
 
+    if "closed_trade_count" in payload:
+        numeric = _as_float(payload.get("closed_trade_count"))
+        return (int(numeric) if numeric is not None and numeric >= 0 and numeric.is_integer() else None), "closed_trade_count"
     if source in _TRADE_LEVEL_RETURN_SOURCES:
         return len(returns), source
     metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
@@ -189,15 +198,15 @@ def _sharpe(values: list[float]) -> float:
     return statistics.mean(values) / std
 
 
-def compute_metric_summary(returns: list[float]) -> dict[str, float]:
+def compute_metric_summary(returns: list[float]) -> dict[str, Any]:
     if not returns:
-        return {"annual_return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0, "win_rate": 0.0}
+        return {"annual_return": None, "sample_compounded_return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0, "win_rate": 0.0}
     compounded = 1.0
     for value in returns:
         compounded *= 1.0 + value
-    annual_return = compounded - 1.0
     return {
-        "annual_return": annual_return,
+        "annual_return": None,
+        "sample_compounded_return": compounded - 1.0,
         "sharpe": _sharpe(returns),
         "max_drawdown": _max_drawdown(returns),
         "win_rate": sum(1 for value in returns if value > 0) / len(returns),
@@ -205,7 +214,7 @@ def compute_metric_summary(returns: list[float]) -> dict[str, float]:
 
 
 def _compounded_return(values: list[float]) -> float:
-    """复利累计收益（与 ``compute_metric_summary`` 的 annual_return 同口径）。"""
+    """复利累计收益（与 ``compute_metric_summary`` 的 sample_compounded_return 同口径）。"""
     compounded = 1.0
     for value in values:
         compounded *= 1.0 + value
@@ -273,14 +282,16 @@ def bootstrap_metric_confidence_intervals(
         return {
             "enabled": True,
             "iterations": int(iterations),
-            "annual_return_ci": [0.0, 0.0],
+            "annual_return_ci": [None, None],
+            "sample_compounded_return_ci": [None, None],
+            "annualization_status": "unavailable_without_observation_frequency",
             "sharpe_ci": [0.0, 0.0],
             "max_drawdown_ci": [0.0, 0.0],
             "win_rate_ci": [0.0, 0.0],
             "status": "warning",
             "warnings": ["insufficient_sample"],
         }
-    metrics: dict[str, list[float]] = {"annual_return": [], "sharpe": [], "max_drawdown": [], "win_rate": []}
+    metrics: dict[str, list[float]] = {"sample_compounded_return": [], "sharpe": [], "max_drawdown": [], "win_rate": []}
     for _ in range(max(1, int(iterations or 1))):
         resample = [sample[rng.randrange(len(sample))] for _ in sample]
         summary = compute_metric_summary(resample)
@@ -289,7 +300,9 @@ def bootstrap_metric_confidence_intervals(
     return {
         "enabled": True,
         "iterations": int(iterations),
-        "annual_return_ci": [round(_percentile(metrics["annual_return"], 0.025), 8), round(_percentile(metrics["annual_return"], 0.975), 8)],
+        "annual_return_ci": [None, None],
+        "sample_compounded_return_ci": [round(_percentile(metrics["sample_compounded_return"], 0.025), 8), round(_percentile(metrics["sample_compounded_return"], 0.975), 8)],
+        "annualization_status": "unavailable_without_observation_frequency",
         "sharpe_ci": [round(_percentile(metrics["sharpe"], 0.025), 8), round(_percentile(metrics["sharpe"], 0.975), 8)],
         "max_drawdown_ci": [round(_percentile(metrics["max_drawdown"], 0.025), 8), round(_percentile(metrics["max_drawdown"], 0.975), 8)],
         "win_rate_ci": [round(_percentile(metrics["win_rate"], 0.025), 8), round(_percentile(metrics["win_rate"], 0.975), 8)],
@@ -339,6 +352,7 @@ def run_backtest_statistical_validation(
     report_path: str | Path = DEFAULT_REPORT_PATH,
 ) -> dict[str, Any]:
     payload, source = _load_backtest_result_with_source(backtest_result, backtest_result_path)
+    sample_context = research_sample_context(payload)
     returns, return_source = _extract_returns_with_source(payload)
     source["return_source"] = return_source
     # Kept for reference only. The permutation test compares the compounded
@@ -356,6 +370,28 @@ def run_backtest_statistical_validation(
     if len(returns) < MIN_RETURNS_FOR_VALIDATION:
         warnings.append("insufficient_sample")
     insufficient_reasons: list[str] = []
+    selected_rows = payload.get(return_source)
+    if return_source == "trade_returns" and not isinstance(selected_rows, list):
+        insufficient_reasons.append("invalid_authoritative_trade_returns")
+    elif isinstance(selected_rows, list):
+        expected_count = len(selected_rows) - 1 if return_source == "equity_curve" else len(selected_rows)
+        if len(returns) != max(0, expected_count):
+            insufficient_reasons.append("invalid_return_observations_excluded")
+    if "closed_trade_count" in payload:
+        if trade_count is None:
+            insufficient_reasons.append("invalid_closed_trade_count")
+        elif return_source != "trade_returns" or trade_count != len(returns):
+            insufficient_reasons.append("closed_trade_count_return_count_mismatch")
+        closed_rows = payload.get("closed_trades")
+        if isinstance(closed_rows, list) and trade_count != len(closed_rows):
+            insufficient_reasons.append("closed_trade_records_count_mismatch")
+    return_evidence = payload.get("return_evidence") if isinstance(payload.get("return_evidence"), dict) else {}
+    if return_evidence.get("complete_fill_history") is False:
+        insufficient_reasons.append("incomplete_fill_history")
+    if return_evidence.get("cost_coverage_complete") is False:
+        insufficient_reasons.append("incomplete_historical_cost_coverage")
+    if insufficient_reasons:
+        warnings.extend(str(item) for item in return_evidence.get("warnings", []))
     if returns:
         if len(returns) < MIN_RETURNS_FOR_VALIDATION:
             insufficient_reasons.append(f"return_count_below_{MIN_RETURNS_FOR_VALIDATION}")
@@ -389,6 +425,7 @@ def run_backtest_statistical_validation(
         "package_version": PACKAGE_VERSION,
         "api_schema_version": API_SCHEMA_VERSION,
         "task_type": "backtest_statistical_validation",
+        **sample_context,
         "status": status,
         "symbol": str(symbol or payload.get("symbol") or ""),
         "target_date": str(target_date or payload.get("target_date") or payload.get("date") or ""),
@@ -403,12 +440,19 @@ def run_backtest_statistical_validation(
         "backtest_result_source": source,
         "reported_metric": reported_metric,
         "actual_metric_definition": "compounded_return_of_the_validated_sample",
+        "return_evidence": return_evidence,
+        "metric_definitions": {
+            "sample_compounded_return": "compound of the sample observations, not annualized or portfolio-equivalent",
+            "sharpe": "mean / standard deviation per sample observation, not annualized",
+            "annual_return": "unavailable: trade observations have no fixed daily frequency",
+            "resampling_assumption": "observations treated as exchangeable; overlap and serial dependence not controlled",
+        },
         "iterations": int(iterations),
         "seed": int(seed),
         "metric_summary": metric_summary,
         "permutation_test": permutation,
         "bootstrap_ci": bootstrap,
-        "warnings": [short_error_text(item) for item in dict.fromkeys(warnings) if item],
+        "warnings": [sample_context["sample_limitation"], *[short_error_text(item) for item in dict.fromkeys(warnings) if item]],
         "interpretation": _interpret_result(status, permutation, len(returns)),
         "generated_at": now_text(),
         "disclaimer": DISCLAIMER,
@@ -434,6 +478,7 @@ def summarize_statistical_validation(payload: dict[str, Any]) -> dict[str, Any]:
     permutation = payload.get("permutation_test") if isinstance(payload.get("permutation_test"), dict) else {}
     bootstrap = payload.get("bootstrap_ci") if isinstance(payload.get("bootstrap_ci"), dict) else {}
     return {
+        **research_sample_context(payload),
         "status": payload.get("status") or "missing",
         "sample_size": int(payload.get("sample_size") or 0),
         "trade_count": payload.get("trade_count"),
@@ -444,6 +489,7 @@ def summarize_statistical_validation(payload: dict[str, Any]) -> dict[str, Any]:
         "permutation_status": permutation.get("status"),
         "bootstrap_status": bootstrap.get("status"),
         "bootstrap_ci_summary": {
+            "sample_compounded_return_ci": bootstrap.get("sample_compounded_return_ci") or [],
             "annual_return_ci": bootstrap.get("annual_return_ci") or [],
             "sharpe_ci": bootstrap.get("sharpe_ci") or [],
             "max_drawdown_ci": bootstrap.get("max_drawdown_ci") or [],
@@ -465,6 +511,9 @@ def build_statistical_validation_report(payload: dict[str, Any]) -> str:
             DISCLAIMER,
             "",
             f"- status: `{payload.get('status') or '-'}`",
+            f"- sample role: `{summary['sample_role']}`; out-of-sample: `{summary['out_of_sample_validation']}`",
+            f"- sample window: `{summary['sample_window']}`",
+            summary["sample_limitation"],
             f"- sample_size: `{payload.get('sample_size') or 0}`",
             f"- trade_count: `{payload.get('trade_count')}` (需 >= {MIN_TRADES_FOR_VALIDATION})",
             f"- negative_return_count: `{payload.get('negative_return_count')}`",
@@ -474,7 +523,7 @@ def build_statistical_validation_report(payload: dict[str, Any]) -> str:
             f"- iterations: `{payload.get('iterations') or 0}`",
             f"- seed: `{payload.get('seed') or 0}`",
             f"- p_value: `{summary.get('p_value')}`",
-            f"- annual_return_ci: `{summary.get('bootstrap_ci_summary', {}).get('annual_return_ci')}`",
+            f"- sample_compounded_return_ci（非年化、非组合收益）: `{summary.get('bootstrap_ci_summary', {}).get('sample_compounded_return_ci')}`",
             f"- sharpe_ci: `{summary.get('bootstrap_ci_summary', {}).get('sharpe_ci')}`",
             f"- interpretation: {summary.get('interpretation') or '-'}",
             "",

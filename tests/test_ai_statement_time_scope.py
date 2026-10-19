@@ -293,7 +293,8 @@ def test_market_note_uses_each_symbol_claims_own_period(
 
     result = apply_gate_to_plan(plan, daily_dir=daily)
 
-    assert bool(plan["intents"]) is accepted
+    # 2AI-1：点评按每句自己的时段核对，结论只标注在点评上，不再拦下买入。
+    assert len(plan["intents"]) == 1
     assert result.market_note_ok is accepted
 
 
@@ -309,8 +310,9 @@ def test_symbol_period_missing_history_cannot_fall_back_to_today(tmp_path: Path)
 
     result = apply_gate_to_plan(plan, daily_dir=daily)
 
-    assert plan["intents"] == []
-    hit = result.rejections[0]["statement_rejections"][0]
+    # 2AI-1：点评缺历史只记"未核验"，不拦买入。
+    assert len(plan["intents"]) == 1
+    hit = result.market_note_rejections[0]
     assert hit["actual"] is None
     assert hit["evidence_status"] == "unverified"
 

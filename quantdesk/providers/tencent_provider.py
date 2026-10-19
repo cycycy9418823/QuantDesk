@@ -8,13 +8,14 @@ quotes are never reused as daily or intraday bars.
 from __future__ import annotations
 
 import json
+import math
 import re
 import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
@@ -304,8 +305,50 @@ def _daily_key(adjust: str) -> tuple[str, str]:
     return "qfqday", "qfq"
 
 
-def _parse_daily_payload(payload: dict[str, Any], tencent_symbol: str, symbol: str, key: str, adjust: str) -> tuple[pd.DataFrame, list[str]]:
+def _validate_original_daily_rows(rows: list[Any]) -> None:
+    """Reject corrupt original rows before slicing dates, dropping or deduping."""
+    prefix = "strict_input:tencent_daily:"
+    seen: set[str] = set()
+    for item in rows:
+        if not isinstance(item, (list, tuple)) or len(item) < 6:
+            raise RuntimeError(prefix + "malformed_row")
+        day = item[0]
+        try:
+            valid_date = isinstance(day, str) and date.fromisoformat(day).isoformat() == day
+        except ValueError:
+            valid_date = False
+        if not valid_date:
+            raise RuntimeError(prefix + "invalid_date")
+        if day in seen:
+            raise RuntimeError(prefix + "duplicate_date")
+        seen.add(day)
+        numbers: list[float] = []
+        for value in item[1:6]:
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError(prefix + "invalid_ohlcv") from exc
+            if isinstance(value, bool) or not math.isfinite(number) or number < 0:
+                raise RuntimeError(prefix + "invalid_ohlcv")
+            numbers.append(number)
+        opening, close, high, low, _volume = numbers
+        if min(opening, close, high, low) <= 0 or high < max(opening, close, low) or low > min(opening, close, high):
+            raise RuntimeError(prefix + "invalid_ohlc")
+        if len(item) > 6 and item[6] not in (None, ""):
+            try:
+                amount = float(item[6])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError(prefix + "invalid_amount") from exc
+            if isinstance(item[6], bool) or not math.isfinite(amount) or amount < 0:
+                raise RuntimeError(prefix + "invalid_amount")
+
+
+def _parse_daily_payload(payload: dict[str, Any], tencent_symbol: str, symbol: str, key: str, adjust: str,
+                         *, strict_input: bool = False) -> tuple[pd.DataFrame, list[str]]:
     warnings: list[str] = []
+    if strict_input and (not isinstance(payload, dict) or not isinstance(payload.get("data"), dict)
+                         or not isinstance(payload["data"].get(tencent_symbol), dict)):
+        raise RuntimeError("strict_input:tencent_daily:symbol_payload_missing")
     symbol_payload = (payload.get("data") or {}).get(tencent_symbol) or {}
     rows = symbol_payload.get(key)
     effective_adjust = "raw" if adjust == "none" else adjust
@@ -314,7 +357,11 @@ def _parse_daily_payload(payload: dict[str, Any], tencent_symbol: str, symbol: s
         warnings.append(f"Tencent did not return {key}; fallback to day data.")
         effective_adjust = "raw"
     if not isinstance(rows, list):
+        if strict_input:
+            raise RuntimeError("strict_input:tencent_daily:rows_missing")
         return pd.DataFrame(), warnings + ["Tencent daily payload did not contain kline rows."]
+    if strict_input:
+        _validate_original_daily_rows(rows)
     normalized_rows: list[dict[str, Any]] = []
     for item in rows:
         if not isinstance(item, (list, tuple)) or len(item) < 6:
@@ -351,6 +398,7 @@ def fetch_daily_bars(
     network: bool = False,
     timeout: int = 8,
     adjust: str = "qfq",
+    strict_input: bool = False,
 ) -> dict[str, Any]:
     """Fetch daily K-line bars from Tencent fqkline endpoint."""
 
@@ -388,7 +436,8 @@ def fetch_daily_bars(
     url = KLINE_URL.format(param=urllib.parse.quote(",".join(param_parts), safe=","))
     try:
         payload = json.loads(_decode_response(_http_get_bytes(url, timeout=timeout)))
-        frame, warnings = _parse_daily_payload(payload, converted["tencent_symbol"], norm, key, normalized_adjust)
+        frame, warnings = _parse_daily_payload(payload, converted["tencent_symbol"], norm, key, normalized_adjust,
+                                               **({"strict_input": True} if strict_input else {}))
         result["warnings"].extend(warnings)
         result["warnings"].append("provider_return_window_limited")
         if frame.empty:

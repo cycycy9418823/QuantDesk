@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 import os
 import tempfile
 import threading
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -658,7 +659,8 @@ def fetch_mootdx_daily(symbol: str, start_date: str, end_date: str, *, network: 
         raise RuntimeError(str(exc)) from exc
 
 
-def fetch_tencent_daily(symbol: str, start_date: str, end_date: str, *, network: bool = False) -> tuple[pd.DataFrame, list[str]]:
+def fetch_tencent_daily(symbol: str, start_date: str, end_date: str, *, network: bool = False,
+                        strict_input: bool = False) -> tuple[pd.DataFrame, list[str]]:
     if not network:
         return _network_disabled_frame("tencent_daily", symbol)
     try:
@@ -670,6 +672,7 @@ def fetch_tencent_daily(symbol: str, start_date: str, end_date: str, *, network:
             end_date,
             network=True,
             adjust="none",
+            **({"strict_input": True} if strict_input else {}),
         )
         if not payload.get("ok"):
             reason = payload.get("failed_reason") or "; ".join(payload.get("errors") or []) or payload.get("status") or "tencent_daily failed"
@@ -727,12 +730,59 @@ def _baostock_daily_symbol(symbol: str) -> str:
     )
 
 
+def _validate_original_baostock_rows(
+    frame: pd.DataFrame, provider_code: str, start_date: str, end_date: str,
+) -> None:
+    """Validate recovery evidence before normalization can discard conflicts."""
+    prefix = "strict_input:baostock_daily:"
+    required = {"date", "code", "open", "high", "low", "close", "volume", "amount", "tradestatus"}
+    if not frame.columns.is_unique or not required.issubset(frame.columns):
+        raise RuntimeError(prefix + "malformed_columns")
+    seen: set[str] = set()
+    for row in frame.to_dict(orient="records"):
+        day = row["date"]
+        try:
+            valid_date = isinstance(day, str) and date.fromisoformat(day).isoformat() == day
+        except ValueError:
+            valid_date = False
+        if not valid_date or not display_date(start_date) <= day <= display_date(end_date):
+            raise RuntimeError(prefix + "invalid_or_out_of_range_date")
+        if day in seen:
+            raise RuntimeError(prefix + "duplicate_date")
+        seen.add(day)
+        if not isinstance(row["code"], str) or row["code"].strip().lower() != provider_code:
+            raise RuntimeError(prefix + "symbol_mismatch")
+        status = str(row["tradestatus"]).strip()
+        if status not in {"0", "1"}:
+            raise RuntimeError(prefix + "invalid_tradestatus")
+        numbers: dict[str, float] = {}
+        for column in ("open", "high", "low", "close", "volume", "amount"):
+            value = row[column]
+            if status == "0" and value in (None, ""):
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError(prefix + "invalid_" + column) from exc
+            if isinstance(value, bool) or not math.isfinite(number) or number < 0:
+                raise RuntimeError(prefix + "invalid_" + column)
+            numbers[column] = number
+        if status == "0":
+            if numbers.get("volume", 0) or numbers.get("amount", 0):
+                raise RuntimeError(prefix + "trade_and_halt_conflict")
+        elif (min(numbers[name] for name in ("open", "high", "low", "close")) <= 0
+              or numbers["high"] < max(numbers["open"], numbers["close"], numbers["low"])
+              or numbers["low"] > min(numbers["open"], numbers["close"], numbers["high"])):
+            raise RuntimeError(prefix + "invalid_ohlc")
+
+
 def _fetch_baostock_daily_locked(
     symbol: str,
     start_date: str,
     end_date: str,
     *,
     network: bool = False,
+    strict_input: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Return real trading bars plus explicit BaoStock suspension evidence.
 
@@ -787,6 +837,8 @@ def _fetch_baostock_daily_locked(
                 + ",".join(missing_columns)
             )
         provider_code = _baostock_daily_symbol(symbol)
+        if strict_input:
+            _validate_original_baostock_rows(frame, provider_code, start_date, end_date)
         returned_codes = {
             str(value or "").strip().lower()
             for value in frame["code"].tolist()
@@ -846,6 +898,7 @@ def fetch_baostock_daily(
     end_date: str,
     *,
     network: bool = False,
+    strict_input: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
     # Thread lock first (cheap, same-process), then the cross-process file lock:
     # both are required because the daily pools fan out with spawned subprocesses
@@ -861,6 +914,7 @@ def fetch_baostock_daily(
                     start_date,
                     end_date,
                     network=network,
+                    **({"strict_input": True} if strict_input else {}),
                 )
         except TimeoutError as exc:
             # Surface the contention as a provider failure rather than crashing
@@ -918,7 +972,10 @@ def fetch_sina_daily(
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(str(exc)) from exc
 
-def fetch_daily(provider_name: str, symbol: str, start_date: str, end_date: str, *, network: bool = False) -> tuple[pd.DataFrame, list[str]]:
+def fetch_daily(provider_name: str, symbol: str, start_date: str, end_date: str, *, network: bool = False,
+                strict_input: bool = False) -> tuple[pd.DataFrame, list[str]]:
+    if strict_input and provider_name not in {"baostock_daily", "tencent_daily"}:
+        raise RuntimeError(f"strict_input:unsupported_provider:{provider_name}")
     if provider_name == "local_existing":
         frame, warnings = read_local_daily_with_warnings(symbol)
         if not frame.empty:
@@ -934,9 +991,11 @@ def fetch_daily(provider_name: str, symbol: str, start_date: str, end_date: str,
     if provider_name == "mootdx_daily":
         return fetch_mootdx_daily(symbol, start_date, end_date, network=network)
     if provider_name == "baostock_daily":
-        return fetch_baostock_daily(symbol, start_date, end_date, network=network)
+        return fetch_baostock_daily(symbol, start_date, end_date, network=network,
+                                    **({"strict_input": True} if strict_input else {}))
     if provider_name == "tencent_daily":
-        return fetch_tencent_daily(symbol, start_date, end_date, network=network)
+        return fetch_tencent_daily(symbol, start_date, end_date, network=network,
+                                  **({"strict_input": True} if strict_input else {}))
     if provider_name == "sina_daily":
         return fetch_sina_daily(symbol, start_date, end_date, network=network)
     raise RuntimeError(f"unknown provider: {provider_name}")

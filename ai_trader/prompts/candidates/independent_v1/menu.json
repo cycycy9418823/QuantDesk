@@ -1,0 +1,15 @@
+{
+  "id": "evening_independent_menu_candidate",
+  "version": "v2.0.0-candidate.1",
+  "note": "Offline candidate only. No strategy recommendations, rule rankings or strategy-evidence notes enter this menu. The observed universe remains a bounded local sample, not all A shares.",
+  "slots": [
+    {"id": "decision_date", "source": "as_of"},
+    {"id": "trade_date", "source": "trade_date"},
+    {"id": "account", "fields": ["equity", "cash", "holdings_count", "mandate_note"]},
+    {"id": "stance", "optional": true},
+    {"id": "style_scoreboard", "optional": true},
+    {"id": "holdings", "optional": true},
+    {"id": "candidates", "source": "bounded local daily-price universe"},
+    {"id": "candidate_facts", "source": "explicit local period and price-basis evidence"}
+  ]
+}

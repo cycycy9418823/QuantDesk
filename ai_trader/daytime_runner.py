@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -223,10 +224,22 @@ def run_slot(
     screen["source_reason"] = quotes["reason"]
     screen["source_path"] = quotes["path"]
 
+    screen_text = render_text(screen)
     decision = daytime_decide.decide_slot(
         project, profile=profile, now=current, clock=clock, paths=runtime, llm=llm,
         minute_fetcher=minute_fetcher, write=write, screen=screen,
-        screen_text=render_text(screen))
+        screen_text=screen_text)
+    from ai_trader.minute_focus import build_minute_focus, write_minute_focus
+
+    observed_at = daytime_fill._stamp(decision.get("at")) or current
+    focus = build_minute_focus(
+        runtime=runtime, profile=profile, decision=decision, quote_rows=quote_rows,
+        visible_symbols=re.findall(r"(?<!\d)[0-9]{6}(?!\d)", screen_text), now=observed_at)
+    if write:
+        try:
+            write_minute_focus(runtime, focus)
+        except OSError as exc:
+            focus["write_error"] = type(exc).__name__
     idle = daytime_fill.dry_mode() if dry is None else bool(dry)
     if idle_first_day and not idle:
         idle = is_first_trading_day(runtime, as_of=current.strftime("%Y-%m-%d"), root=project)
@@ -271,6 +284,7 @@ def run_slot(
         "evidence_error": fill.get("evidence_error"),
         "dry_state": dry_state,
         "decision": decision, "fill": fill,
+        "minute_focus": focus,
     }
 
 

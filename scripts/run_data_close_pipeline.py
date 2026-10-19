@@ -1540,11 +1540,66 @@ def _benchmark_target_covered(stage: Mapping[str, Any] | None) -> bool | None:
     return covered is True
 
 
-def _checkpoint_data_incomplete(doc: Mapping[str, Any]) -> bool:
+def _universe_retry_window(target: str, invocation_started: str) -> bool:
+    """Use only the existing same-day evening scheduled opportunity."""
+    try:
+        stamp = datetime.fromisoformat(invocation_started)
+        if stamp.tzinfo is None:
+            return False
+        local = stamp.astimezone(SHANGHAI)
+        return local.date().isoformat() == target and (local.hour, local.minute) >= (18, 30)
+    except (TypeError, ValueError):
+        return False
+
+
+def _universe_retry_due(doc: Mapping[str, Any], *, target: str, invocation_started: str) -> bool:
+    """Old usable membership does not mean today's refresh succeeded."""
+    if doc.get("target_date") != target or not _universe_retry_window(target, invocation_started):
+        return False
+    stages = doc.get("stages")
+    stage = stages.get("universe") if isinstance(stages, Mapping) else None
+    if not isinstance(stage, Mapping) or stage.get("status") != "completed_with_warnings":
+        return False
+    proof = stage.get("degraded_proof")
+    if not isinstance(proof, Mapping) or proof.get("degradation_reason") != "universe_refresh_failed_used_last_accepted":
+        return False
+    roster = proof.get("accepted_roster")
+    if not isinstance(roster, Mapping) or roster.get("quality") != "approved_source":
+        return False
+    try:
+        roster_day = datetime.fromisoformat(str(roster.get("latest_updated_at") or "")).date().isoformat()
+        completed = datetime.fromisoformat(str(stage.get("completed_at") or ""))
+        if completed.tzinfo is None:
+            return False
+        completed = completed.astimezone(SHANGHAI)
+        return (roster_day < target and completed.date().isoformat() == target
+                and (completed.hour, completed.minute) < (18, 30))
+    except (TypeError, ValueError):
+        return False
+
+
+def _universe_retry_consumed(root: Path, *, target: str) -> bool:
+    """The existing attempt archive records consumption before the stage call."""
+    for path in (root / ATTEMPTS_DIR_RELATIVE).glob("*/manifest.json"):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict) or doc.get("target_date") != target:
+            continue
+        retry = doc.get("universe_evening_retry")
+        if isinstance(retry, dict) and retry.get("consumed") is True:
+            return True
+    return False
+
+
+def _checkpoint_data_incomplete(doc: Mapping[str, Any], *, universe_retry: bool = False) -> bool:
     from quantdesk.pipeline_terminal import SUCCESS_STATUSES, classify_pipeline_status
 
     stages = doc.get("stages") or {}
     if not isinstance(stages, dict):
+        return True
+    if universe_retry:
         return True
     # A benchmark phase reporting that the target day is not in the local index
     # files leaves the afternoon claim incomplete no matter what the overall
@@ -1569,6 +1624,7 @@ def _checkpoint_data_incomplete(doc: Mapping[str, Any]) -> bool:
 def _find_scheduled_checkpoint(
     root: Path, *, target: str, config_hash: str, incomplete: bool,
     require_config_hash: bool = True,
+    universe_retry_at: str | None = None,
 ) -> str:
     runs = root / CHECKPOINT_DIR_RELATIVE
     if not runs.is_dir():
@@ -1586,7 +1642,18 @@ def _find_scheduled_checkpoint(
             continue
         if require_config_hash and str(doc.get("config_hash") or "") not in {"", config_hash}:
             continue
-        if bool(_checkpoint_data_incomplete(doc)) != incomplete:
+        retry_universe = bool(universe_retry_at and _universe_retry_due(
+            doc, target=target, invocation_started=universe_retry_at,
+        ))
+        if retry_universe:
+            # A retry never grants permission to trust stale/tampered proof.
+            stage = doc["stages"]["universe"]
+            retry_universe = (
+                stage.get("stage_version") == _stage_version("universe")
+                and stage.get("input_manifest") == _input_manifest_for("universe", root, target)
+                and stage.get("output_manifest") == _output_manifest_for("universe", root)
+            )
+        if bool(_checkpoint_data_incomplete(doc, universe_retry=retry_universe)) != incomplete:
             continue
         # A previous policy is evidence to reject or explicitly recover, not
         # permission to silently start every stage again (including alerts).
@@ -1786,6 +1853,17 @@ def run_pipeline(
 
         _write_attempt(root, report, terminal=False)
 
+        universe_retry_already_consumed = (
+            trigger == "scheduled" and _universe_retry_consumed(root, target=target)
+        )
+        if universe_retry_already_consumed:
+            report["universe_evening_retry_previously_consumed"] = True
+            report["alert_policy"] = "preview_only_on_roster_retry"
+        universe_retry_allowed = (
+            trigger == "scheduled" and (only_stages is None or "universe" in only_stages)
+            and _universe_retry_window(target, invocation_started)
+            and not universe_retry_already_consumed
+        )
         # Round-6b: resume_run_id gets the SAME validation as run_id - a
         # path-like resume id could read a forged checkpoint from outside the
         # runs/ namespace and skip stages.
@@ -1793,6 +1871,7 @@ def run_pipeline(
             incomplete_id = _find_scheduled_checkpoint(
                 root, target=target, config_hash=config_hash, incomplete=True,
                 require_config_hash=False,
+                universe_retry_at=invocation_started if universe_retry_allowed else None,
             )
             if incomplete_id:
                 resume_run_id = incomplete_id
@@ -1854,6 +1933,16 @@ def run_pipeline(
                 _publish(root, report)
                 return report
         completed: dict[str, dict[str, Any]] = dict((resumed or {}).get("stages") or {})
+        retry_universe = bool(universe_retry_allowed and resumed and _universe_retry_due(
+            resumed, target=target, invocation_started=invocation_started,
+        ))
+        if retry_universe:
+            plan = report["recovery_plan"]
+            plan["reused_stages"] = [name for name in plan["reused_stages"] if name != "universe"]
+            if "universe" not in plan["stages_to_run"]:
+                plan["stages_to_run"].insert(0, "universe")
+            plan["reason_codes"].append("old_roster_refresh_gets_one_evening_retry")
+            plan["notification_policy"] = "no_push_during_roster_retry"
 
         runners = stage_runner or {
             "universe": stage_universe,
@@ -1891,6 +1980,13 @@ def run_pipeline(
                 pass
             elif (
                 prev
+                and name == "universe"
+                and retry_universe
+            ):
+                report["reason_codes"].append("universe_failed_refresh_evening_retry")
+                prev = None
+            elif (
+                prev
                 and name == "market_refresh"
                 and _benchmark_target_covered(prev) is False
             ):
@@ -1906,6 +2002,16 @@ def run_pipeline(
                 prev["reused_from_checkpoint"] = True
                 report["stages"][name] = prev
                 continue
+            if name == "universe" and universe_retry_already_consumed:
+                # A consumed retry may have left a normal failed checkpoint.
+                # That generic recovery path must not become another fetch.
+                report["stages"][name] = StageResult(
+                    stage=name, status="blocked", started_at=_now_iso(),
+                    reason_codes=["universe_evening_retry_already_consumed"],
+                    payload={"prior_stage_status": (prev or {}).get("status", "missing")},
+                ).to_dict()
+                blocked_reasons.append("universe_retry_already_consumed")
+                continue
             # upstream contract gates: any failed upstream stage blocks the
             # remaining DATA stages; health_alert always runs.
             if (name != "health_alert" and blocked_reasons) or writer_still_alive:
@@ -1917,6 +2023,12 @@ def run_pipeline(
 
             runner = runners[name]
             report["current_stage"] = name
+            if name == "universe" and retry_universe:
+                report["universe_evening_retry"] = {
+                    "target_date": target, "source_run_id": resume_run_id,
+                    "attempt_id": attempt_id, "started_at": _now_iso(), "consumed": True,
+                }
+                report["alert_policy"] = "preview_only_on_roster_retry"
             _write_attempt(root, report, terminal=False)
             input_before = _input_manifest_for(name, root, target)
             stage_kwargs: dict[str, Any] = {
@@ -1945,7 +2057,10 @@ def run_pipeline(
                     **stage_kwargs,
                 )
             elif name == "health_alert":
-                result = runner(root, push=alert_push, target=target, **stage_kwargs)
+                retry_local_only = bool(report.get("universe_evening_retry") or universe_retry_already_consumed)
+                if retry_local_only:
+                    stage_kwargs.update(alert_network=False, alert_push=False)
+                result = runner(root, push=alert_push and not retry_local_only, target=target, **stage_kwargs)
             else:
                 result = runner(root, target=target, **stage_kwargs)
             if not result.completed_at:

@@ -49,11 +49,11 @@ def native_failure(monkeypatch):
 def serve(monkeypatch, payload):
     requests = []
 
-    def get(url, *, timeout):
+    def get(url, *, timeout, monotonic):
         requests.append((url, timeout))
-        return json.dumps(payload)
+        return json.dumps(payload), {}
 
-    monkeypatch.setattr(providers, "_http_get_text", get)
+    monkeypatch.setattr(collector, "_sina_http_get_text", get)
     return requests
 
 
@@ -141,11 +141,11 @@ def test_no_fallback_after_total_deadline(monkeypatch):
 def test_late_fallback_cannot_report_success(monkeypatch, native_failure):
     clock = Clock()
 
-    def late(url, *, timeout):
+    def late(url, *, timeout, monotonic):
         clock.value = 8.1
-        return json.dumps(bars())
+        return json.dumps(bars()), {}
 
-    monkeypatch.setattr(providers, "_http_get_text", late)
+    monkeypatch.setattr(collector, "_sina_http_get_text", late)
     rows, error, evidence = collector._live_minute_rows("600000", offset=60, now=NOW, monotonic=clock)
     assert rows == [] and error
     assert evidence["fallback_error"].startswith("TimeoutError:")
@@ -155,11 +155,11 @@ def test_late_fallback_cannot_report_success(monkeypatch, native_failure):
 def test_fallback_failure_leaves_only_remaining_time_for_native(monkeypatch, native_failure):
     clock = Clock()
 
-    def fail(url, *, timeout):
+    def fail(url, *, timeout, monotonic):
         clock.value = 3.0
         raise ConnectionError("fixture Sina outage")
 
-    monkeypatch.setattr(providers, "_http_get_text", fail)
+    monkeypatch.setattr(collector, "_sina_http_get_text", fail)
     rows, error, evidence = collector._live_minute_rows("600000", offset=60, now=NOW, monotonic=clock)
     assert rows == [] and error and len(native_failure) == 2
     assert native_failure[0][1]["timeout_seconds"] == 2.0
@@ -170,7 +170,7 @@ def test_fallback_failure_leaves_only_remaining_time_for_native(monkeypatch, nat
 
 def test_bj_keeps_native_mapping(monkeypatch, native_failure):
     requests = serve(monkeypatch, bars())
-    rows, error, _ = collector._live_minute_rows("920010", offset=60, now=NOW)
+    rows, error, _ = collector._live_minute_rows("920010", offset=60, now=NOW, monotonic=lambda: 0.0)
     assert rows == [] and error and requests == []
     assert len(native_failure) == 1 and native_failure[0][1]["timeout_seconds"] == 8
 

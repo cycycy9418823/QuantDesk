@@ -260,9 +260,13 @@ function renderProjectStatusPayload(data, { stale = false } = {}) {
         `更新者：${data.document_updater || "未提供"} · 来源：${data.source_kind || "STATUS.md"} · 可读≠系统健康`
     );
     const healthLine = data.health_line || "未提供";
-    setText("projectStatusHealth", healthLine);
+    const freshness = data.health_freshness || {};
+    const freshnessWarning = ["stale", "missing", "unknown"].includes(freshness.status);
+    const healthDisplay = freshnessWarning
+        ? `${healthLine}\n${freshness.warning || "健康行日期或更新证据不足，请核对来源。"}` : healthLine;
+    setText("projectStatusHealth", healthDisplay);
     if (health) {
-        health.classList.toggle("has-red", /✗|红/.test(healthLine));
+        health.classList.toggle("has-red", /✗|红/.test(healthLine) || freshnessWarning);
     }
     setText("projectStatusExplain", `红格解释：${data.health_explanation || "未提供"}`);
     const phase = data.phase || {};
@@ -1303,13 +1307,12 @@ function buildReviewItems(board, ai, decisions = null, profile = "default") {
 }
 
 function decisionOriginLabel(row) {
-    if (row.llm_used === false) return "固定规则";
+    if (row.decision_origin === "rule" || row.llm_used === false) return "固定规则";
     if (row.llm_used !== true) return "来源未知";
     const model = String(row.llm_model || "").toLowerCase();
-    if (model.includes("kimi") || model.includes("moonshot")) return "Kimi 模型";
-    if (model.includes("glm")) return "GLM 模型";
-    if (model.includes("deepseek")) return "DeepSeek 模型";
-    return "模型（名称未明确）";
+    const name = model.includes("kimi") || model.includes("moonshot") ? "Kimi"
+        : model.includes("glm") ? "GLM" : model.includes("deepseek") ? "DeepSeek" : String(row.llm_model || "名称未知");
+    return row.decision_origin === "model" ? `${name} 模型` : `${name} 调用 · 意图来源未知`;
 }
 
 function renderDecisionOutcomeSummary(source) {
@@ -1329,8 +1332,10 @@ function renderDecisionOutcomeSummary(source) {
         const unknown = group.maturity_unknown > 0 ? `；另有 ${numberText(group.maturity_unknown)} 条观察日期不明` : "";
         return `<article class="owner-review-card"><strong>${escapeHtml(group.label || "来源未知")}</strong>
             <div class="owner-review-number">${mature}<small>条</small></div>
-            <p>观察期已结束的个股结果</p><p class="section-note">${result}${unknown}</p>
+            <p>计入可信准确率分母的到期记录</p><p class="section-note">${result}${unknown}</p>
             <dl><dt>提前命中，还在观察</dt><dd>${numberText(group.early_hits)} 条</dd>
+                <dt>证据条件不足，未计入</dt><dd>${numberText(group.excluded)} 条</dd>
+                <dt>原判定到期记录（仅展示）</dt><dd>${numberText(group.diagnostic_mature)} 条</dd>
                 <dt>尚在等待结果</dt><dd>${numberText(group.pending)} 条</dd>
                 <dt>到期缺证据</dt><dd>${numberText(group.due_evidence_gap)} 条</dd>
                 <dt>未接收 / 陈述不符</dt><dd>${numberText(group.unaccepted)} / ${numberText(group.statement_mismatch)} 条</dd>
@@ -1340,7 +1345,8 @@ function renderDecisionOutcomeSummary(source) {
     });
     return `<div class="owner-review-summary">
         <p class="section-note">核对截至 ${escapeHtml(summary.as_of || "日期未知")}。
-        提前满足条件先记“命中”；截止日以后，再归入完整观察期的统计。模型和固定规则分开看。</p>
+        提前满足条件只记观察证据，未到期不判“对”；历史原判定保留展示。模型和固定规则分开看。</p>
+        <p class="section-note">${escapeHtml(summary.denominator_note || "可信分母需要模型来源、事前声明、实际纸面成交和完整到期证据；缺证记录不计成绩。")}</p>
         ${originNote}
         <div class="owner-review-grid">${rows.join("")}</div>
     </div>`;
@@ -1356,6 +1362,9 @@ function renderAiDecisionRecord(row, index) {
         ["AI 档位", row.profile_label],
         ["判断来源", originLabel],
         ["观察进度", row.review_context?.label || "尚无观察期说明"],
+        ["实际纸面成交", row.review_context?.fill_status === "confirmed" ? "已按计划编号核实" : "未确认"],
+        ["计入可信分母", row.review_context?.in_accuracy_denominator === true ? "是" : "否"],
+        ["未计入原因", (row.review_context?.exclusion_labels || []).join("；") || row.review_context?.label],
         ["当时判断", row.judgment], ["风格", row.style], ["计划持有交易日", row.planned_hold_days],
         ["验证条件", verification.text], ["验证价位", verification.level], ["到期日", verification.due_date],
         ["条件来源", verification.source === "derived_from_declared_horizon" ? "程序推导条件，非 AI 事前声明" : verification.source],
@@ -1363,7 +1372,9 @@ function renderAiDecisionRecord(row, index) {
         ["程序核对结果", row.result], ["结果截至", row.result_as_of],
         ["记录类型", historical ? "事后复盘" : "事前记录"], ["落盘时间", row.recorded_at],
         ["整理时间", row.structured_at], ["决策已接收", row.committed === true ? "是" : row.committed === false ? "否" : null],
-        ["提示词版本", row.prompt_version], ["数据菜单版本", row.menu_version], ["记录编号", row.decision_id],
+        ["提示词版本", row.prompt_version], ["数据菜单版本", row.menu_version],
+        ["提示词内容哈希", row.prompt_sha256], ["菜单内容哈希", row.menu_sha256],
+        ["实际输入哈希", row.effective_prompt_sha256], ["记录编号", row.decision_id],
     ];
     return `<details class="review-decision">
         <summary class="report-row review-row">
@@ -4984,11 +4995,12 @@ function renderRiskNotifications(data) {
         <div class="metric-row">
             <div class="metric-box"><span>防护诊断</span><strong>${escapeHtml(humanStatus(guardrails.status || "missing"))}</strong></div>
             <div class="metric-box"><span>特征审计</span><strong>${escapeHtml(humanStatus(guardrails.feature_quality_status || "missing"))}</strong></div>
-            <div class="metric-box"><span>统计校验</span><strong>${escapeHtml(humanStatus(guardrails.statistical_validation_status || "missing"))}</strong></div>
+            <div class="metric-box"><span>统计校验（当前样本）</span><strong>${escapeHtml(humanStatus(guardrails.statistical_validation_status || "missing"))}</strong></div>
             <div class="metric-box"><span>诊断股票</span><strong>${escapeHtml(safeText((diagnostics.symbols || []).length ?? 0))}</strong></div>
             <div class="metric-box"><span>警告</span><strong>${escapeHtml(safeText(guardrails.warning_count ?? 0))}</strong></div>
             <div class="metric-box"><span>失败项</span><strong>${escapeHtml(safeText(guardrails.failed_count ?? 0))}</strong></div>
         </div>
+        ${renderResearchSampleScope(diagnostics.stats_validation || {})}
         <div class="gap-panel">${guardWarningHtml || "暂无防护诊断警告；若状态为缺失，请先运行每日流程并开启防护诊断。"}</div>
         <p class="panel-disclaimer">Research Only / Paper Account Only / No Broker Route / Live Execution Locked / QMT Order Route Locked / Not Investment Advice / Not Position Advice.</p>
     `;
@@ -5216,6 +5228,19 @@ async function runBacktest() {
     }
 }
 
+function renderResearchSampleScope(data) {
+    const source = data && typeof data === "object" ? data : {};
+    const evidence = source.research_evidence || {};
+    const sampleRole = source.sample_role || evidence.sample_role;
+    const validation = source.out_of_sample_validation || evidence.out_of_sample_validation;
+    const sampleText = sampleRole === "in_sample" ? "样本内研究" : "样本范围未声明";
+    const validationText = validation === "not_established"
+        ? "样本外验证未建立" : "样本外验证状态未知，尚未建立";
+    const limitation = source.sample_limitation || evidence.sample_limitation
+        || "尚未建立样本外验证；历史筛选或统计通过不代表策略已验证。";
+    return `<div class="section-note research-sample-scope">${escapeHtml(sampleText)} · ${escapeHtml(validationText)}<br>${escapeHtml(safeText(limitation))}</div>`;
+}
+
 function renderBacktest(data) {
     const panel = document.getElementById("backtestPanel");
     const note = document.getElementById("backtestNote");
@@ -5239,7 +5264,6 @@ function renderBacktest(data) {
     const curveEnd = curvePoints.length ? curvePointDate(curvePoints[curvePoints.length - 1]) : "";
     const startDate = safeText(curveStart || data.start_date || data.period_start || params.start_date || (startInput && startInput.value) || "2015-01-01");
     const endDate = safeText(curveEnd || data.end_date || data.period_end || params.end_date || (endInput && endInput.value) || "最新");
-    const configNote = (data.params || data.request) ? "" : "（当前为默认演示配置，非本项目正式评估；正式成绩单以三账户回放为准）";
     const warn = data.assumptions && data.assumptions.warning
         ? `<div class="gap-panel" style="margin:0 0 12px">${escapeHtml(safeText(data.assumptions.warning))}</div>`
         : "";
@@ -5257,8 +5281,9 @@ function renderBacktest(data) {
         </div>`;
     panel.innerHTML = `
         <div class="quant-summary-head">
-            <strong>回测结果 · ${escapeHtml(safeText(data.strategy))}</strong>
-            <div class="section-note">区间：${escapeHtml(startDate)} → ${escapeHtml(endDate)}；${escapeHtml(safeText(data.message_for_ui || ""))}（${escapeHtml(safeText(data.generated_at || ""))}）${escapeHtml(configNote)}</div>
+            <strong>历史研究回测 · ${escapeHtml(safeText(data.strategy))}</strong>
+            <div class="section-note">区间：${escapeHtml(startDate)} → ${escapeHtml(endDate)}；${escapeHtml(safeText(data.message_for_ui || ""))}（${escapeHtml(safeText(data.generated_at || ""))}）</div>
+            ${renderResearchSampleScope(data)}
         </div>
         ${warn}
         ${priceBasisHtml}
@@ -5469,7 +5494,7 @@ function renderStrategyScreeningStatus(data) {
     const message = safeText((data && data.message_for_ui) || summary.message_for_ui || "策略筛选漏斗状态已读取。");
     panel.innerHTML = `
         <div class="quant-summary-head">
-            <strong>漏斗状态 <span class="health-badge ${statusTone}">${escapeHtml(status)}</span></strong>
+            <strong>研究筛选漏斗状态 <span class="health-badge ${statusTone}">${escapeHtml(status)}</span></strong>
             <div class="section-note">${escapeHtml(message)}</div>
         </div>
         <div class="metric-row">
@@ -5484,7 +5509,8 @@ function renderStrategyScreeningStatus(data) {
         </div>
         ${warningHtml}
         <div class="theme-map-subpanel">
-            <h3>策略排行预览</h3>
+            <h3>策略排行预览 · 历史研究筛选</h3>
+            ${renderResearchSampleScope(summary)}
             <table class="compact-table">
                 <thead><tr><th>排名</th><th>策略</th><th>状态</th><th>年化</th><th>回撤</th><th>夏普</th></tr></thead>
                 <tbody>${topHtml || `<tr><td colspan="6">暂无排行结果；后台完成后刷新可见。</td></tr>`}</tbody>

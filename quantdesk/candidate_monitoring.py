@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from quantdesk.backtest_metrics import downside_sortino
+
 import math
 from datetime import datetime
 from pathlib import Path
@@ -110,9 +112,7 @@ def metrics_from_returns(returns: pd.Series) -> dict[str, Any]:
     annualized = float(equity.iloc[-1] ** (1.0 / years) - 1.0) if years > 0 else None
     std = float(ret.std(ddof=0))
     sharpe = float(ret.mean() / std * math.sqrt(252)) if std > 0 else None
-    downside = ret[ret < 0]
-    downside_std = float(downside.std(ddof=0)) if len(downside) else 0.0
-    sortino = float(ret.mean() / downside_std * math.sqrt(252)) if downside_std > 0 else None
+    sortino = downside_sortino(ret.tolist())
     drawdown = equity / equity.cummax() - 1.0
     month_ret = (1.0 + ret).resample("ME").prod() - 1.0
     month_equity = (1.0 + month_ret).cumprod()

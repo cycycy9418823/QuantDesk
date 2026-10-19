@@ -33,6 +33,10 @@ from ai_trader.paths import (
     CyclePaths,
 )
 from ai_trader.prompt_pack import load_prompt_pack
+from ai_trader.evaluation_contract import (
+    EXCLUSION_LABELS, complete_outcome_evidence, declared_verification,
+    decision_origin, eligibility, with_fill_evidence,
+)
 from quantdesk.price_basis import PRICE_BASIS_RAW, validate_price_frame_set
 from quantdesk.trading_calendar import is_trade_day, load_a_share_trading_calendar
 from quantdesk.utils import atomic_write_json
@@ -51,10 +55,11 @@ RESULT_UNVERIFIED = "未核验"
 PAGE_ORDER = {
     RESULT_WRONG: 0,
     RESULT_MISMATCH: 1,
-    RESULT_EXPIRED_NO_EVIDENCE: 2,
-    RESULT_PENDING: 3,
-    RESULT_RIGHT: 4,
-    RESULT_NA: 5,
+    RESULT_UNVERIFIED: 2,
+    RESULT_EXPIRED_NO_EVIDENCE: 3,
+    RESULT_PENDING: 4,
+    RESULT_RIGHT: 5,
+    RESULT_NA: 6,
 }
 STYLE_HOLD_DAYS = {
     "打板": 2,
@@ -78,6 +83,16 @@ _CLAUSE_BOUNDARY = re.compile(r"[，,；;。！？!?\n]|但是|但|然而|不过
 _FUTURE_TIME = {"明天", "明日", "后天", "次日", "往后", "未来"}
 _PREDICTION_CONTEXT = re.compile(r"预计|预判|预期|目标价?|将会?|有望|看涨|看跌")
 _INTENT_FACT_FIELDS = ("llm_reason", "reason", "thesis", "recommendation_note")
+# Any percent / point / yuan number the specific recognisers above did not claim
+# is still a factual-looking statement. It is recorded as "未核验" instead of
+# being let through as if it had been checked (charter §2 invariant 3).
+_FACT_NUMBER = re.compile(r"(?<![\d.])([+\-]?\d+(?:\.\d+)?)\s*(?:%|％|个百分点|个点|元)")
+# Clauses that state a plan or condition (stop-loss, give-up gap, target) are
+# not claims about what already happened, so the catch-all leaves them alone.
+_PLAN_CONTEXT = re.compile(r"放弃|止损|止盈|目标|打算|计划|如果|若|一旦|挂单|买点|卖点|加仓|减仓|仓位")
+# The program appends news headlines to ``reason`` as "消息：…。"; that is outside
+# text, not the trader's own statement, and is not checked as one.
+_NEWS_SEGMENT = re.compile(r"消息：[^。]*。?")
 TZ_SHANGHAI = timezone(timedelta(hours=8))
 _DAILY_PRICE_CONSUMER = "paper_execution"
 @dataclass(frozen=True)
@@ -114,6 +129,11 @@ def statement_gate_summary(gate: StatementGateResult) -> dict[str, Any]:
         "original_sell_count": sum(row.get("side") == "sell" for row in gate.original_intents),
         "accepted_intent_count": len(gate.accepted_intents),
         "rejected_intent_count": sum(row.get("side") in {"buy", "sell"} for row in gate.rejections),
+        # 照常放行、但理由里有核不了/说错的说法的意图（目前只有卖出）。
+        "flagged_intents": [
+            {"symbol": row.get("symbol"), "side": row.get("side"), "label": row.get("statement_label")}
+            for row in gate.accepted_intents if row.get("statement_flags")
+        ],
         "market_note_ok": gate.market_note_ok,
         "market_note_status": gate.market_note_status,
         "market_note_rejections": deepcopy(gate.market_note_rejections),
@@ -216,6 +236,8 @@ def _intent_fact_texts(intent: dict[str, Any]) -> list[str]:
     fields = ("reason",) if intent.get("side") == "sell" else _INTENT_FACT_FIELDS
     for key in fields:
         value = str(intent.get(key) or "").strip()
+        if key == "reason":
+            value = _NEWS_SEGMENT.sub("", value).strip()
         if value and value not in texts:
             texts.append(value)
     return texts
@@ -729,7 +751,34 @@ def _verify_fact_text(
         if actual is None or not _price_close_enough(claimed, float(actual)):
             hits.append(_mismatch(f"claimed_{kind}", f"陈述{scope.evidence_date}{label}{claimed}，日线{label}{actual}",
                                   actual=actual, **extra, **({"evidence_status": "unverified"} if actual is None else {})))
+    # Catch-all: a percent/point/yuan number none of the recognisers above claimed
+    # is never treated as checked. Forecasts and plan/condition clauses are skipped.
+    for match in _FACT_NUMBER.finditer(text):
+        pos = match.start(1)
+        if any(start <= pos < end for start, end, _, _ in claims):
+            continue
+        scope = _claim_scope(text, pos, decision_date)
+        clause = _clause_around(text, pos)
+        if scope.forecast or _PLAN_CONTEXT.search(clause):
+            continue
+        checked += 1
+        hits.append(_mismatch(
+            "claimed_unrecognized",
+            f"“{match.group(0)}”这句说法程序认不出该怎么核对，未核验。",
+            claimed_text=match.group(0),
+            clause=clause[:80],
+            evidence_status="unverified",
+            claim_indeterminate=True,
+            evidence_date=scope.evidence_date,
+        ))
     return hits, checked
+
+
+def _clause_around(text: str, pos: int) -> str:
+    starts = [item.end() for item in _CLAUSE_BOUNDARY.finditer(text, 0, pos)]
+    start = starts[-1] if starts else 0
+    following = _CLAUSE_BOUNDARY.search(text, pos)
+    return text[start: following.start() if following else len(text)]
 
 
 def verify_intent_against_daily(
@@ -881,10 +930,12 @@ def gate_plan_statements(plan: dict[str, Any], *, daily_dir: Path,
                                                   daily_dir=daily_dir, name_to_symbol=name_to_symbol)
     accepted: list[dict[str, Any]] = []
     rejections: list[dict[str, Any]] = []
-    llm_used = bool(llm.get("used"))
     for intent in plan.get("intents") or []:
         if not isinstance(intent, dict):
             continue
+        # 按买卖分开的闸门（所有者规则 2）：每条意图只看**它自己**的理由。盘面点评的命中只做标注
+        # （market_note_status / market_note_rejections），不再并到当晚每一条意图上——
+        # 以前点评里一个认不出的数字（如「920627一周68%」）就会把当晚全部买卖都拦下。
         hits = verify_intent_against_daily(
             intent,
             decision_date=decision_date,
@@ -892,8 +943,16 @@ def gate_plan_statements(plan: dict[str, Any], *, daily_dir: Path,
             market_note="",
             name_to_symbol=name_to_symbol,
         )
-        if llm_used:
-            hits.extend(note_hits)
+        if hits and str(intent.get("side") or "") == "sell":
+            # 卖出照常放行：核不了/说错的卖出理由只标注，不拦单（卖出只减仓，不新增风险）。
+            row = dict(intent)
+            row["statement_flags"] = hits
+            row["statement_unverified"] = [
+                hit for hit in hits if hit.get("evidence_status") == "unverified"
+            ]
+            row["statement_label"] = _flag_label(hits)
+            accepted.append(row)
+            continue
         if hits:
             # 既有语义：只要有一句核对不上就不放行（s2、时间语义、反编造的固定期望都钉在这里）。
             # T11 只做**标注分层**：把"未核验"与"确定不符"的命中都随拒绝行留下，让记录与页面
@@ -928,7 +987,32 @@ def gate_plan_statements(plan: dict[str, Any], *, daily_dir: Path,
     )
 
 
+STATEMENT_FLAG_UNVERIFIED = "含未核验说法"
+STATEMENT_FLAG_MISMATCH = "含与数据不符说法"
+
+
+def _flag_label(hits: list[dict[str, Any]]) -> str:
+    """放行的卖出带着什么说法：未核验 / 与数据不符（两者都有就都写上）。"""
+
+    labels = []
+    if any(hit.get("evidence_status") == "unverified" for hit in hits):
+        labels.append(STATEMENT_FLAG_UNVERIFIED)
+    if any(hit.get("evidence_status") != "unverified" for hit in hits):
+        labels.append(STATEMENT_FLAG_MISMATCH)
+    return "、".join(labels)
+
+
 def _verification_for_intent(intent: dict[str, Any], *, trade_date: str) -> dict[str, Any]:
+    declared = declared_verification(intent.get("verification"))
+    if declared is not None:
+        window = trade_days_from(trade_date, declared["n_sessions"])
+        relation = "站上或等于" if declared["kind"] == "stand_above" else "跌破"
+        return {
+            **declared,
+            "source": "model_declared" if intent.get("decision_origin") == "model" else "declared_unconfirmed",
+            "due_date": window[-1] if window else "",
+            "text": f"{declared['n_sessions']}个交易日内原始收盘价{relation}{declared['level']}；到期核对完整区间",
+        }
     n_days = _hold_days(intent)
     level = _f(intent.get("ref_close"))
     side = str(intent.get("side") or "buy")
@@ -971,6 +1055,9 @@ def build_decision_record(
     stamp = pack.version_stamp()
     recorded_prompt = str(plan.get("prompt_version") or llm.get("prompt_version") or "").strip()
     recorded_menu = str(plan.get("menu_version") or llm.get("menu_version") or "").strip()
+    for key in ("prompt_id", "menu_id"):
+        recorded_id = str(plan.get(key) or llm.get(key) or "").strip()
+        stamp[key] = recorded_id if backfill else recorded_id or stamp[key]
     if backfill:
         stamp["prompt_version"] = recorded_prompt
         stamp["menu_version"] = recorded_menu
@@ -1045,7 +1132,10 @@ def build_decision_record(
         "schema": SCHEMA,
         "disclaimer": DISCLAIMER,
         "decision_id": decision_id,
+        "plan_id": str(plan.get("plan_id") or ""),
+        "ledger_id": str(plan.get("ledger_id") or ""),
         "recorded_at": recorded_at,
+        "recorded_at_source": "original" if explicit_recorded else "missing" if backfill else "capture",
         "structured_at": structured_at or _now_iso(),
         "backfill": bool(backfill),
         "provenance": "historical_review" if backfill else "prior_record",
@@ -1064,12 +1154,20 @@ def build_decision_record(
         "result_evidence": mismatches,
         # 未核验（主体/事实无法绑定日线）随记录保留：既不算已核对，也不算确定矛盾（T11）。
         "statement_unverified": deepcopy(intent.get("statement_unverified") or []),
+        # 照常放行的卖出带的说法标注（"含未核验说法"等）；没有就是空串。
+        "statement_label": str(intent.get("statement_label") or ""),
+        "statement_flags": deepcopy(intent.get("statement_flags") or []),
         "prompt_id": stamp["prompt_id"],
         "prompt_version": stamp["prompt_version"],
         "menu_id": stamp["menu_id"],
         "menu_version": stamp["menu_version"],
-        "llm_used": bool(llm.get("used")),
+        **{key: str(plan.get(key) or llm.get(key) or "") for key in (
+            "prompt_sha256", "menu_sha256", "effective_prompt_sha256", "prompt_selection",
+            "prompt_approval_status", "prompt_builder_version")},
+        "prompt_provenance": "recorded" if recorded_prompt and recorded_menu else "current_default_unconfirmed" if not backfill else "unknown",
+        "llm_used": llm.get("used") if isinstance(llm.get("used"), bool) else None,
         "llm_model": str(llm.get("model") or ""),
+        "decision_origin": str(intent.get("decision_origin") or ("rule" if llm.get("used") is False else "unknown")),
         "committed": bool(plan.get("committed", True)) and result not in {RESULT_MISMATCH, RESULT_UNVERIFIED},
     }
 
@@ -1164,7 +1262,7 @@ def write_decision_records(path: Path, records: list[dict[str, Any]]) -> None:
     _atomic_write_bytes(path, payload.encode("utf-8"))
 
 
-def _judgment_fingerprint(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
+def _judgment_fingerprint(row: dict[str, Any]) -> tuple[str, ...]:
     verification = row.get("verification") if isinstance(row.get("verification"), dict) else {}
     return (
         str(row.get("judgment") or ""),
@@ -1172,6 +1270,9 @@ def _judgment_fingerprint(row: dict[str, Any]) -> tuple[str, str, str, str, str]
         str(verification.get("n_sessions") or ""),
         str(verification.get("level") or ""),
         str(row.get("planned_hold_days") or ""),
+        str(verification.get("source") or ""),
+        str(verification.get("price_basis") or ""),
+        str(verification.get("due_date") or ""),
     )
 
 
@@ -1189,8 +1290,16 @@ def upsert_decision_records(path: Path, incoming: Iterable[dict[str, Any]]) -> l
         incoming_row = dict(row)
         if old and _judgment_fingerprint(old) != _judgment_fingerprint(incoming_row):
             incoming_row["revises"] = key
-            incoming_row["decision_id"] = f"{key}_rev_{sha1(str(incoming_row.get('structured_at') or _now_iso()).encode('utf-8')).hexdigest()[:8]}"
-            by_id[str(incoming_row["decision_id"])] = incoming_row
+            fingerprint = json.dumps(_judgment_fingerprint(incoming_row), ensure_ascii=False)
+            incoming_row["decision_id"] = f"{key}_rev_{sha1(fingerprint.encode('utf-8')).hexdigest()[:12]}"
+            # Rebuilding the same judgment must preserve its first recorded copy,
+            # including older revisions whose ids were based on a run timestamp.
+            duplicate = any(
+                item.get("revises") == key and _judgment_fingerprint(item) == _judgment_fingerprint(incoming_row)
+                for item in by_id.values()
+            )
+            if not duplicate:
+                by_id[str(incoming_row["decision_id"])] = incoming_row
             continue
         if old and old.get("result") in {RESULT_MISMATCH, RESULT_UNVERIFIED}:
             continue
@@ -1205,6 +1314,19 @@ def upsert_decision_records(path: Path, incoming: Iterable[dict[str, Any]]) -> l
             incoming_row["recorded_at"] = old.get("recorded_at") or incoming_row.get("recorded_at")
             incoming_row["judgment"] = old.get("judgment") or incoming_row.get("judgment")
             incoming_row["verification"] = old.get("verification") or incoming_row.get("verification")
+        if old:
+            # New schema fields cannot retroactively certify an old call. Fill
+            # evidence is joined separately from the read-only ledger below.
+            for field_name in (
+                "plan_id", "ledger_id", "recorded_at_source", "provenance", "backfill", "seen",
+                "decision_origin", "llm_used", "llm_model", "prompt_id", "prompt_version",
+                "menu_id", "menu_version", "prompt_sha256", "menu_sha256", "effective_prompt_sha256",
+                "prompt_selection", "prompt_approval_status", "prompt_builder_version", "prompt_provenance",
+            ):
+                if field_name in old:
+                    incoming_row[field_name] = deepcopy(old[field_name])
+                else:
+                    incoming_row.pop(field_name, None)
         by_id[key] = incoming_row
     records = list(by_id.values())
     records.sort(key=lambda item: (str(item.get("decision_date") or ""), str(item.get("decision_id") or "")))
@@ -1299,13 +1421,15 @@ def score_decision(record: dict[str, Any], *, daily_dir: Path, as_of: str) -> di
         elif close >= float(level):
             hit = True
             break
-    if hit:
+    due_passed = bool(due) and as_of >= due
+    if hit and not due_passed:
         return _apply_verdict(
-            updated, RESULT_RIGHT, as_of,
-            [{"kind": "window_hit", "level": level, "observed": observed[: n_days]}],
+            updated, RESULT_PENDING, as_of,
+            [{"kind": "early_hit", "level": level, "observed": observed,
+              "have": len(observed), "need": n_days, "due_date": due,
+              "note": "提前命中只记观察证据，到期前不判对"}],
             recheck_only=recheck_only,
         )
-    due_passed = bool(due) and as_of >= due
     if len(observed) < n_days:
         if due_passed:
             return _apply_verdict(
@@ -1319,8 +1443,9 @@ def score_decision(record: dict[str, Any], *, daily_dir: Path, as_of: str) -> di
             recheck_only=recheck_only,
         )
     return _apply_verdict(
-        updated, RESULT_WRONG, as_of,
-        [{"kind": "window_miss", "level": level, "observed": observed}],
+        updated, RESULT_RIGHT if hit else RESULT_WRONG, as_of,
+        [{"kind": "window_hit" if hit else "window_miss", "level": level, "observed": observed,
+          "due_date": due, "price_basis": "raw"}],
         recheck_only=recheck_only,
     )
 
@@ -1363,8 +1488,7 @@ def _review_date(value: Any) -> date | None:
 
 
 def decision_review_summary(records: list[dict[str, Any]], *, as_of: Any) -> dict[str, Any]:
-    """Describe published outcomes without rescoring, mutating, or using today's clock."""
-
+    """Keep historical verdicts visible; count only evidenced, mature model calls."""
     cutoff = _review_date(as_of)
     labels = {"model": "模型判断", "rule": "固定规则", "unknown": "来源未知"}
     groups: dict[str, dict[str, Any]] = {}
@@ -1374,15 +1498,20 @@ def decision_review_summary(records: list[dict[str, Any]], *, as_of: Any) -> dic
             "mature_correct": 0 if cutoff else None, "mature_wrong": 0 if cutoff else None,
             "early_hits": 0 if cutoff else None, "pending": 0 if cutoff else None,
             "due_evidence_gap": 0, "maturity_unknown": 0, "unaccepted": 0,
-            "not_applicable": 0, "statement_mismatch": 0, "accuracy": None,
+            "not_applicable": 0, "statement_mismatch": 0, "statement_unverified": 0, "accuracy": None,
+            "excluded": 0, "diagnostic_mature": 0, "eligible_before_maturity": 0,
             # T21：补证后的重评单独计数（原观察期样本不受影响，分母真实）。
             "rechecked": 0, "rechecked_correct": 0, "rechecked_wrong": 0, "recheck_gap": 0,
         }
     contexts: dict[str, dict[str, Any]] = {}
     historical = 0
+    exclusion_counts: dict[str, int] = {}
     for row in records:
-        origin = "model" if row.get("llm_used") is True else "rule" if row.get("llm_used") is False else "unknown"
+        origin = decision_origin(row)
         group = groups[origin]
+        contract = eligibility(row)
+        exclusion_reasons = list(contract["exclusion_reasons"])
+        in_denominator = False
         verification = row.get("verification") if isinstance(row.get("verification"), dict) else {}
         due = _review_date(verification.get("due_date"))
         result_at = _review_date(row.get("result_as_of"))
@@ -1399,22 +1528,36 @@ def decision_review_summary(records: list[dict[str, Any]], *, as_of: Any) -> dic
             elif result == RESULT_MISMATCH:
                 phase, note = "statement_mismatch", "陈述与数据不符，不计预测成绩"
                 group[phase] += 1
+            elif result == RESULT_UNVERIFIED:
+                phase, note = "statement_unverified", "陈述未核验，不计预测成绩"
+                group[phase] += 1
             elif not row.get("symbol") or result == RESULT_NA or verification.get("kind") == "none":
                 phase, note = "not_applicable", "本条没有可评价的个股条件"
                 group[phase] += 1
             elif cutoff is None or due is None or (result_at and result_at > cutoff):
                 group["maturity_unknown"] += 1
             elif due > cutoff:
-                if result == RESULT_RIGHT and result_at is not None:
+                early = any(isinstance(item, dict) and item.get("kind") == "early_hit"
+                            for item in row.get("result_evidence") or [])
+                if (result == RESULT_RIGHT and result_at is not None) or early:
                     phase, note = "early_hit", "提前命中，观察期尚未结束"
                     group["early_hits"] += 1
                 else:
                     phase, note = "pending", "仍在观察期内"
                     group[phase] += 1
             elif result in (RESULT_RIGHT, RESULT_WRONG) and result_at is not None:
-                phase, note = "mature_evaluable", "观察期已结束，已有核对结果"
-                group[phase] += 1
-                group["mature_correct" if result == RESULT_RIGHT else "mature_wrong"] += 1
+                group["diagnostic_mature"] += 1
+                if result_at < due:
+                    exclusion_reasons.append("verdict_before_maturity")
+                if not complete_outcome_evidence(row):
+                    exclusion_reasons.append("outcome_evidence_incomplete")
+                if not exclusion_reasons:
+                    phase, note = "mature_evaluable", "模型事前声明、实际纸面成交及到期完整证据已确认"
+                    in_denominator = True
+                    group[phase] += 1
+                    group["mature_correct" if result == RESULT_RIGHT else "mature_wrong"] += 1
+                else:
+                    phase, note = "diagnostic_only", "保留原判定；不计可信模型成绩"
             else:
                 phase, note = "due_evidence_gap", "观察期已结束，结果或证据尚未齐全"
                 group[phase] += 1
@@ -1428,19 +1571,39 @@ def decision_review_summary(records: list[dict[str, Any]], *, as_of: Any) -> dic
                         phase, note = "rechecked", "补证后重评；原判定与原编号不变"
                     elif verdict is None:
                         group["recheck_gap"] += 1
+            if contract["eligible"]:
+                group["eligible_before_maturity"] += 1
+            if exclusion_reasons:
+                group["excluded"] += 1
+        for reason in set(exclusion_reasons):
+            exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
         decision_id = row.get("decision_id")
         if isinstance(decision_id, str) and decision_id:
             contexts[decision_id] = {
                 "origin": origin, "origin_label": labels[origin], "observation_status": phase,
                 "label": note, "due_date": due.isoformat() if due else None,
+                "model": str(row.get("llm_model") or ""),
+                "in_accuracy_denominator": in_denominator,
+                "exclusion_reasons": exclusion_reasons,
+                "exclusion_labels": [EXCLUSION_LABELS[reason] for reason in exclusion_reasons],
+                "fill_status": (row.get("fill_evidence") or {}).get("status", "unconfirmed"),
             }
     for group in groups.values():
         if group["mature_evaluable"]:
             group["accuracy"] = group["mature_correct"] / group["mature_evaluable"]
+    denominator_note = (
+        "可信准确率分母仅含：模型逐项判断、实际模型名称、带时区的事前记录、模型明确声明的"
+        "原始价格验证条件、按计划编号核实的实际纸面成交，以及观察期结束后的完整日线证据。"
+        "规则判断、来源未知、程序推导条件、提前命中、缺证与历史补写保留展示，均不计入。"
+    )
     return {
         "as_of": cutoff.isoformat() if cutoff else None, "maturity_known": cutoff is not None,
         "historical_records": historical, "groups": groups, "record_context": contexts,
-        "note": "提前命中保留原判定；观察期结束后才计入到期样本。模型、固定规则与来源未知分别统计。",
+        "exclusion_counts": exclusion_counts,
+        "credible_model": {"denominator": groups["model"]["mature_evaluable"],
+                           "correct": groups["model"]["mature_correct"], "accuracy": groups["model"]["accuracy"]},
+        "denominator_note": denominator_note,
+        "note": "提前命中只记观察；旧记录原判定保持不变。" + denominator_note,
     }
 
 
@@ -1462,6 +1625,7 @@ def render_owner_page(
     html_path: Path,
     md_path: Path,
     intents: list[dict[str, Any]] | None = None,
+    as_of: str | None = None,
 ) -> None:
     ordered = _sort_for_page(records)
     live = [row for row in ordered if not _is_backfill(row)]
@@ -1469,19 +1633,28 @@ def render_owner_page(
     live_counts = _count_results(live)
     review_counts = _count_results(review)
     names = _result_names()
+    review_summary = decision_review_summary(records, as_of=as_of)
+    credible = review_summary["credible_model"]
+    accuracy = credible["accuracy"]
+    accuracy_text = "证据不足" if accuracy is None else f"{accuracy:.1%}"
+    credible_text = (f"可信模型到期样本 {credible['denominator'] if credible['denominator'] is not None else '未知'}"
+                     f" · 正确 {credible['correct'] if credible['correct'] is not None else '未知'} · 准确率 {accuracy_text}")
     lines = [
         f"# C 线决策对照 · {DISCLAIMER}",
         "",
-        VERIFICATION_DERIVED_NOTE + "。错的排前面。价格只对照 `data/daily/`。这不是订单。",
+        "未存模型验证条件的旧记录：" + VERIFICATION_DERIVED_NOTE + "。价格只对照 `data/daily/`。这不是订单。",
         "历史复盘没有事前落盘时间，不与当晚预判混算对/错。",
+        review_summary["denominator_note"],
+        credible_text,
+        "下列原始结果计数只用于核对历史，不代表模型准确率。",
         "",
         "事前记录："
         + " · ".join(f"{name} {live_counts.get(name, 0)}" for name in names),
         "历史复盘："
         + " · ".join(f"{name} {review_counts.get(name, 0)}" for name in names),
         "",
-        "| 结果 | 来源 | 决策日 | 代码 | 方向 | 风格/天数 | 判断 | 验证条件 | 版本 | 落盘时刻 |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| 结果 | 来源 | 决策日 | 代码 | 方向 | 风格/天数 | 判断 | 验证条件 | 版本 | 落盘时刻 | 评估资格 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     html_rows: list[str] = []
     for row in ordered:
@@ -1490,14 +1663,17 @@ def render_owner_page(
         hold = row.get("planned_hold_days") or ""
         ver = str((row.get("verification") or {}).get("text") or "")
         version = f"{row.get('prompt_version') or '未知'}/{row.get('menu_version') or '未知'}"
-        origin = "历史复盘" if _is_backfill(row) else "事前"
+        context = review_summary["record_context"].get(str(row.get("decision_id") or ""), {})
+        origin = ("历史复盘" if _is_backfill(row) else "事前") + " / " + str(context.get("origin_label") or "来源未知")
+        evaluation_note = "计入可信分母" if context.get("in_accuracy_denominator") else "；".join(
+            context.get("exclusion_labels") or [context.get("label") or "证据不足"])
         recorded = str(row.get("recorded_at") or "未知")
         judgment = str(row.get("judgment") or "").replace("|", "\\|").replace("\n", " ")
         if len(judgment) > 80:
             judgment = judgment[:77] + "…"
         lines.append(
             f"| {result} | {origin} | {row.get('decision_date')} | {row.get('symbol') or '—'} | "
-            f"{row.get('side')} | {style}/{hold} | {judgment} | {ver} | {version} | {recorded} |"
+            f"{row.get('side')} | {style}/{hold} | {judgment} | {ver} | {version} | {recorded} | {evaluation_note} |"
         )
         color = {
             RESULT_WRONG: "#8b1e1e",
@@ -1520,6 +1696,7 @@ def render_owner_page(
             f"<td>{html.escape(ver)}</td>"
             f"<td>{html.escape(version)}</td>"
             f"<td>{html.escape(recorded)}</td>"
+            f"<td>{html.escape(evaluation_note)}</td>"
             "</tr>"
         )
     intent_rows = list(intents or [])
@@ -1554,18 +1731,20 @@ def render_owner_page(
         "table{border-collapse:collapse;width:100%}td,th{border:1px solid #444;padding:6px 8px;font-size:14px;vertical-align:top}"
         "th{text-align:left;background:#222}h1{font-size:20px}</style></head><body>"
         f"<h1>C 线决策对照 · {html.escape(DISCLAIMER)}</h1>"
-        f"<p><strong>{html.escape(VERIFICATION_DERIVED_NOTE)}</strong></p>"
+        f"<p>未存模型验证条件的旧记录：<strong>{html.escape(VERIFICATION_DERIVED_NOTE)}</strong></p>"
+        f"<p>{html.escape(review_summary['denominator_note'])}</p>"
+        f"<p><strong>{html.escape(credible_text)}</strong></p>"
         "<p>错的排前面。它会对照 <code>data/daily/</code> 核对当晚说的价格和涨跌。"
         "对不上的决策会被拒收，不会当成有效判断。这不是订单。"
         "历史复盘没有事前落盘时间，不对入当晚对/错统计。</p>"
-        "<p>事前记录："
+        "<p>下列原始结果计数用于核对历史，不代表模型准确率。</p><p>事前记录："
         + " · ".join(f"{html.escape(name)} {live_counts.get(name, 0)}" for name in names)
         + "</p><p>历史复盘："
         + " · ".join(f"{html.escape(name)} {review_counts.get(name, 0)}" for name in names)
         + "</p>"
         "<table><thead><tr>"
         "<th>结果</th><th>来源</th><th>决策日</th><th>代码</th><th>方向</th><th>风格/天数</th>"
-        "<th>判断</th><th>验证条件</th><th>提示词/菜单</th><th>落盘时刻</th>"
+        "<th>判断</th><th>验证条件</th><th>提示词/菜单</th><th>落盘时刻</th><th>评估资格</th>"
         "</tr></thead><tbody>"
         + "".join(html_rows)
         + "</tbody></table>"
@@ -1718,6 +1897,8 @@ def plan_from_journal_row(row: dict[str, Any]) -> dict[str, Any]:
     llm = row.get("llm") if isinstance(row.get("llm"), dict) else {}
     rejected = tomorrow.get("statement_rejections") or row.get("statement_rejections") or []
     return {
+        "plan_id": str(tomorrow.get("plan_id") or row.get("plan_id") or ""),
+        "ledger_id": str(tomorrow.get("ledger_id") or row.get("ledger_id") or ""),
         "decision_date": _as_day(row.get("as_of")),
         "trade_date": _as_day(tomorrow.get("trade_date") or row.get("trade_date")),
         "intents": list(tomorrow.get("intents") or []),
@@ -1731,6 +1912,9 @@ def plan_from_journal_row(row: dict[str, Any]) -> dict[str, Any]:
         "committed": True,
         "prompt_version": row.get("prompt_version") or llm.get("prompt_version"),
         "menu_version": row.get("menu_version") or llm.get("menu_version"),
+        **{key: row.get(key) or llm.get(key) for key in (
+            "prompt_id", "menu_id", "prompt_sha256", "menu_sha256", "effective_prompt_sha256",
+            "prompt_selection", "prompt_approval_status", "prompt_builder_version")},
     }
 
 
@@ -1828,8 +2012,21 @@ def refresh_owner_outputs(
     as_of: str,
     extra_manifest: dict[str, Any] | None = None,
     intents: list[dict[str, Any]] | None = None,
+    ledger_path: Path | None = None,
 ) -> dict[str, Any]:
     scored = score_decision_log(records, daily_dir=daily_dir, as_of=as_of)
+    if ledger_path is not None:
+        from ai_trader.ledger import LedgerMissingError, load_ledger
+
+        try:
+            book = load_ledger(ledger_path, missing_ok=False)
+            ledger_status = "ok"
+        except LedgerMissingError:
+            book, ledger_status = None, "missing"
+        except (OSError, ValueError, RuntimeError):
+            book, ledger_status = None, "unreadable"
+        scored = with_fill_evidence(scored, book, ledger_status=ledger_status)
+    review_summary = decision_review_summary(scored, as_of=as_of)
     write_decision_records(paths["log"], scored)
     latest = {
         "schema": SCHEMA,
@@ -1837,15 +2034,17 @@ def refresh_owner_outputs(
         "as_of": as_of,
         "count": len(scored),
         "records": scored,
+        "review_summary": review_summary,
     }
     atomic_write_json(paths["latest"], latest)
-    render_owner_page(scored, html_path=paths["html"], md_path=paths["md"], intents=intents)
+    render_owner_page(scored, html_path=paths["html"], md_path=paths["md"], intents=intents, as_of=as_of)
     manifest = git_run_manifest()
     manifest.update(
         {
             "as_of": as_of,
             "daily_dir": str(daily_dir),
             "record_count": len(scored),
+            "review_summary": review_summary,
             "counts": {
                 name: sum(1 for row in scored if row.get("result") == name and not _is_backfill(row))
                 for name in _result_names()
@@ -1879,7 +2078,8 @@ def record_evening_and_refresh_page(
     from ai_trader.daytime_intent import load_daytime_intents_for
 
     intents = load_daytime_intents_for(as_of, intents_path=runtime.daytime_intents)
-    return refresh_owner_outputs(merged, paths=paths, daily_dir=daily_dir, as_of=as_of, intents=intents)
+    return refresh_owner_outputs(merged, paths=paths, daily_dir=daily_dir, as_of=as_of, intents=intents,
+                                 ledger_path=runtime.ledger)
 
 
 def _attach_post_night_recheck(
@@ -1986,6 +2186,7 @@ def ingest_state(
         daily_dir=daily_dir,
         as_of=day,
         extra_manifest={"source": "ingest_state", "rejection_count": len(all_rejections)},
+        ledger_path=state / "ledger.json",
     )
     payload["rejection_count"] = len(all_rejections)
     return payload

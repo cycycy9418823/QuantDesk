@@ -389,7 +389,9 @@ def test_spawn_from_runpy_main_matches_owned_stage_entry(tmp_path):
     outer = tmp_path / "outer.py"
     outer.write_text("import runpy, sys\nrunpy.run_path(sys.argv[1], run_name='__main__')\n", encoding="utf-8")
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    entries = [env.get("QUANTDESK_TEST_FENCE_BOOTSTRAP", ""), str(Path(__file__).resolve().parents[1]),
+               *env.get("PYTHONPATH", "").split(os.pathsep)]
+    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(value for value in entries if value))
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     result = subprocess.run([sys.executable, "-B", str(outer), str(inner)], cwd=tmp_path,
                             env=env, capture_output=True, text=True, timeout=25)

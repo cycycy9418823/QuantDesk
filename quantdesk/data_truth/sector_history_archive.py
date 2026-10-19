@@ -972,6 +972,68 @@ def verify_snapshot_self_hash(snapshot: Mapping[str, Any]) -> bool:
     return declared == f"sha256:{recomputed}"
 
 
+def read_sector_membership_as_of(history_root: Path, *, as_of: str) -> dict[str, Any]:
+    """Expose last known membership without upgrading it to a current capture."""
+    root = Path(history_root)
+    requested = _parse_day(as_of)
+    context: dict[str, Any] = {"requested_as_of": as_of, "snapshot_date": None,
+        "observed_at": None, "age_calendar_days": None, "freshness": "missing",
+        "evidence_kind": "missing", "eligible_for_requested_day": False,
+        "source_path": None, "snapshot_hash": None, "reason_codes": []}
+    if requested is None or not root.exists():
+        return {"snapshot": {}, "observation": context}
+    candidates = sorted(((_parse_day(path.parent.name), path) for path in root.glob("*/snapshot.json")
+        if _parse_day(path.parent.name) is not None and _parse_day(path.parent.name) <= requested), reverse=True)
+    rejected: list[str] = []
+    for snapshot_day, path in candidates:
+        reason = ""
+        if (path.parent / "revocation.json").exists():
+            rejected.append(f"{snapshot_day}:revoked")
+            continue
+        try:
+            if path.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError("snapshot_too_large")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or not verify_snapshot_self_hash(payload):
+                raise ValueError("snapshot_hash_unverified")
+            if (_parse_day(payload.get("target_date")) != snapshot_day
+                    or _parse_day(payload.get("usable_from")) != snapshot_day
+                    or _parse_day(payload.get("captured_at")) != snapshot_day):
+                raise ValueError("snapshot_date_conflict")
+            if payload.get("evidence_eligible") is not True or payload.get("status") != "passed":
+                raise ValueError("snapshot_not_eligible")
+            rows = payload.get("sector_membership")
+            if not isinstance(rows, list) or not rows:
+                raise ValueError("membership_missing")
+            symbols: set[str] = set()
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("membership_row_invalid")
+                symbol = str(row.get("symbol") or "")
+                observed = _parse_day(row.get("observed_at"))
+                effective = _parse_day(row.get("effective_from"))
+                if (not symbol or symbol in symbols or observed is None or effective is None
+                        or observed != snapshot_day or effective > snapshot_day):
+                    raise ValueError("membership_ambiguous_or_future")
+                symbols.add(symbol)
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            reason = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+        if reason:
+            rejected.append(f"{snapshot_day}:{reason}")
+            continue
+        same_day = snapshot_day == requested
+        context.update(snapshot_date=snapshot_day.isoformat(), observed_at=payload.get("captured_at"),
+            age_calendar_days=(requested - snapshot_day).days,
+            freshness="same_day" if same_day else "prior_snapshot",
+            evidence_kind="same_day_observation" if same_day else "last_known_membership_proxy",
+            eligible_for_requested_day=same_day, source_path=str(path.resolve()),
+            snapshot_hash=payload["snapshot_hash"], reason_codes=[*rejected,
+                *([] if same_day else ["membership_not_observed_on_requested_day", "intervening_membership_changes_unknown"])])
+        return {"snapshot": payload, "observation": context}
+    context.update(freshness="blocked" if rejected else "missing", reason_codes=rejected)
+    return {"snapshot": {}, "observation": context}
+
+
 def load_forward_sector_snapshot(
     history_root: Path,
     *,
@@ -979,31 +1041,23 @@ def load_forward_sector_snapshot(
 ) -> dict[str, Any]:
     """Load the newest eligible archived snapshot whose usable date is <= as_of."""
 
-    root = Path(history_root)
-    as_of_day = _parse_day(as_of)
-    if as_of_day is None or not root.exists():
+    loaded = read_sector_membership_as_of(history_root, as_of=as_of)
+    payload, observation = loaded["snapshot"], loaded["observation"]
+    if not payload:
         return {}
-    candidates: list[tuple[date, Path]] = []
-    for path in root.glob("*/snapshot.json"):
-        day = _parse_day(path.parent.name)
-        if day is not None and day <= as_of_day:
-            candidates.append((day, path))
-    for _, path in sorted(candidates, reverse=True):
-        if (path.parent / "revocation.json").exists():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if payload.get("evidence_eligible") is True and payload.get("status") == "passed":
-            payload["loaded_from"] = str(path.resolve())
-            return payload
-    return {}
+    # Return a view, leaving the sealed original object accessible and unedited
+    # through read_sector_membership_as_of for callers needing hash verification.
+    view = {**payload, "loaded_from": observation["source_path"], "as_of_observation": observation}
+    if not observation["eligible_for_requested_day"]:
+        view.update(status="partial", evidence_eligible=False, pit_eligible=False,
+                    sector_rankings=[], evidence_kind="last_known_membership_proxy")
+    return view
 
 
 __all__ = [
     "archive_forward_sector_snapshot",
     "capture_current_sector_membership",
     "load_forward_sector_snapshot",
+    "read_sector_membership_as_of",
     "write_sector_snapshot_revocation",
 ]

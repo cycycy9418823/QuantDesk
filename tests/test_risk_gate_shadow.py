@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
 import json
 import math
@@ -639,19 +640,27 @@ def test_next_day_execution_validates_lifecycle_at_candidate_cutoff(
     history_dir = tmp_path / "data" / "sector_history"
     snapshot = history_dir / signal_date / "snapshot.json"
     snapshot.parent.mkdir(parents=True)
-    snapshot.write_text(
-        json.dumps(
+    snapshot_payload = {
+        "status": "passed",
+        "target_date": signal_date,
+        "usable_from": signal_date,
+        "captured_at": f"{signal_date}T15:46:00+08:00",
+        "evidence_eligible": True,
+        "pit_eligible": True,
+        "sector_membership": [
             {
-                "sector_membership": [
-                    {
-                        "symbol": "600000",
-                        "sector": "bank",
-                        "effective_from": signal_date,
-                        "observed_at": f"{signal_date}T15:46:00",
-                    }
-                ]
+                "symbol": "600000",
+                "sector": "bank",
+                "effective_from": signal_date,
+                "observed_at": f"{signal_date}T15:46:00+08:00",
+                "source": "synthetic_fixture",
             }
-        ),
+        ],
+    }
+    sealed_bytes = (json.dumps(snapshot_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    snapshot_payload["snapshot_hash"] = "sha256:" + hashlib.sha256(sealed_bytes).hexdigest()
+    snapshot.write_text(
+        json.dumps(snapshot_payload),
         encoding="utf-8",
     )
     monkeypatch.setattr(lifecycle, "SECTOR_HISTORY_DIR", history_dir)

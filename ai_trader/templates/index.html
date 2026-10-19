@@ -88,7 +88,7 @@
 <body>
   <div class="wrap">
     <h1>AI 纸面交易员</h1>
-    <p class="sub">收盘后复盘的新人短线波段股民：先看手里的票，故事还在就拿着；新开打算拿几天；开盘追得太凶就放弃。不是打板，不是盘中盯盘，不用最高最低成交。</p>
+    <p class="sub">独立纸面研究账户：查看已保存持仓、晚间计划与核对证据。风格和期限以每条原始判断为准；所有建议均为研究输出·未验证。</p>
     <div class="badges">
       <span class="badge">Research Only</span>
       <span class="badge">Paper Account Only</span>
@@ -98,20 +98,24 @@
       <span class="badge">Not Position Advice</span>
       <span class="badge">次日开盘成交 · 预设点次日验收</span>
       <span class="badge">默认联网拉公告 · --offline 可关</span>
-      <span class="badge">方法未过门也可开观察仓</span>
-      <span class="badge">不是打板 · 开盘太疯就放弃</span>
-      <span class="badge">按故事拿几天 · 不按名单换血</span>
+      <span class="badge">模型不可用：维持原仓或现金</span>
+      <span class="badge">盘中能力受账本信任级别限制</span>
     </div>
     <div class="actions">
-      <button id="runBtn" type="button">今晚复盘（验收今天 + 布置明天）</button>
       <button id="refreshBtn" class="secondary" type="button">刷新</button>
     </div>
+    <p class="note">本页只读：晚间复盘（验收今天 + 布置明天）由每晚 20:20 计划任务执行，页面上不能触发，也不会改账。</p>
     <p id="statusLine" class="note">正在读取快照…</p>
     <div class="row" id="kpis"></div>
     <div class="card" style="margin-bottom:16px">
       <h2>今日评估</h2>
       <p id="headline" class="note"></p>
       <p id="thought" class="note"></p>
+    </div>
+    <div class="card" style="margin-bottom:16px">
+      <h2>模型分钟关注建议</h2>
+      <p id="minuteFocus" class="note">正在读取关注建议…</p>
+      <p class="note">仅展示模型明确提出的数据关注。采集器还须显式启用并核验第3级授权；这里不表示已升级采集，也不是订单。</p>
     </div>
     <div class="row" style="grid-template-columns: 1fr 1fr">
       <div class="card">
@@ -179,13 +183,21 @@
     </section>
 
   <script>
-    const money = (n) => Number(n || 0).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+    // Missing numbers stay missing ("—"); never coerce them to 0 and invent a P&L.
+    const num = (n) => (n === null || n === undefined || n === "" ? NaN : Number(n));
+    const money = (n) => Number.isFinite(num(n))
+      ? num(n).toLocaleString("zh-CN", { maximumFractionDigits: 2 })
+      : "—";
     const pct = (n) => (Number(n || 0) * 100).toFixed(2) + "%";
+    // Ledger / journal / model text is data, never markup: escape before innerHTML.
+    const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
     function clsPnl(n) { return Number(n) > 0 ? "up" : Number(n) < 0 ? "down" : ""; }
     function render(data) {
       const j = data.journal || {};
       const acc = j.account || data.ledger || {};
-      const pnl = acc.pnl ?? ((acc.equity || 0) - 100000);
+      const pnl = acc.pnl ?? (Number.isFinite(num(acc.equity)) ? num(acc.equity) - 100000 : null);
       const netTag = data.network_news === false ? "离线公告" : "已允许联网拉公告";
       const convTag = data.conviction === "probation"
         ? "观察仓·未验证"
@@ -198,7 +210,7 @@
         ["现金", money(acc.cash)],
         ["持仓市值", money(acc.market_value)],
         ["相对10万盈亏", money(pnl)],
-      ].map(([k, v], i) => `<div class="card"><div class="kpi">${k}<strong class="${i===3?clsPnl(pnl):""}">${v}</strong></div></div>`).join("");
+      ].map(([k, v], i) => `<div class="card"><div class="kpi">${esc(k)}<strong class="${i===3?clsPnl(pnl):""}">${esc(v)}</strong></div></div>`).join("");
       document.getElementById("headline").textContent = j.headline || "";
       document.getElementById("thought").textContent = j.thought || "";
       const plan = (j.tomorrow_plan || data.plan || {});
@@ -209,8 +221,8 @@
         (plan.prediction_note || data.prediction_note || "没有明日计划。")
       );
       document.getElementById("planBody").innerHTML = intents.length ? intents.map(it =>
-        `<tr><td>${it.side || ""}</td><td>${it.symbol || ""}</td><td>${it.preset_touch_price ?? "—"}</td><td>${it.predicted_direction || ""}</td><td>${it.conviction === "probation" || conviction === "probation" ? "观察仓·未验证" : (it.conviction || conviction || "live")}</td></tr>`
-      ).join("") : `<tr><td colspan="5">明日空仓 / 无指令</td></tr>`;
+        `<tr><td>${esc(it.side || "")}</td><td>${esc(it.symbol || "")}</td><td>${esc(it.preset_touch_price ?? "—")}</td><td>${esc(it.predicted_direction || "")}</td><td>${esc(it.conviction === "probation" || conviction === "probation" ? "观察仓·未验证" : (it.conviction || conviction || "live"))}</td></tr>`
+      ).join("") : `<tr><td colspan="5">无新增交易意图，持仓见账本</td></tr>`;
       const review = j.last_review || data.review || {};
       const summary = review.score_summary || {};
       document.getElementById("reviewNote").textContent = review.plan_id
@@ -218,41 +230,80 @@
         : "还没有上一笔计划可验收。";
       const cards = review.scorecard || [];
       document.getElementById("reviewBody").innerHTML = cards.length ? cards.map(c =>
-        `<tr><td>${c.symbol || ""}</td><td>${c.open_fill || ""} ${c.fill_price ?? ""}</td><td>${c.direction_hit ? "对" : "错"}</td><td>${c.touch_hit ? "触及" : "未触及"}</td></tr>`
+        `<tr><td>${esc(c.symbol || "")}</td><td>${esc(c.open_fill || "")} ${esc(c.fill_price ?? "")}</td><td>${c.direction_hit ? "对" : "错"}</td><td>${c.touch_hit ? "触及" : "未触及"}</td></tr>`
       ).join("") : `<tr><td colspan="4">无验收行</td></tr>`;
       const methods = data.hypotheses || j.methods || [];
       document.getElementById("methods").innerHTML = methods.length ? methods.map(m =>
-        `<tr><td>${m.title || m.hypothesis_id}</td><td class="status">${m.status}</td><td>${m.holdout_mean_net==null?"—":pct(m.holdout_mean_net)}</td></tr>`
+        `<tr><td>${esc(m.title || m.hypothesis_id)}</td><td class="status">${esc(m.status)}</td><td>${m.holdout_mean_net==null?"—":esc(pct(m.holdout_mean_net))}</td></tr>`
       ).join("") : `<tr><td colspan="3">还没有方法记录</td></tr>`;
       const lessons = j.lessons || [];
-      document.getElementById("lessons").innerHTML = lessons.map(x => `<li>${x}</li>`).join("") || "<li>暂无</li>";
+      document.getElementById("lessons").innerHTML = lessons.map(x => `<li>${esc(x)}</li>`).join("") || "<li>暂无</li>";
       const pos = (data.ledger && data.ledger.positions) || [];
       document.getElementById("positions").innerHTML = pos.length ? pos.map(p =>
-        `<tr><td>${p.symbol}</td><td>${p.quantity}</td><td>${money(p.market_value)}</td><td>${p.thesis || p.hypothesis_id || "—"}</td></tr>`
-      ).join("") : `<tr><td colspan="4">空仓</td></tr>`;
+        `<tr><td>${esc(p.symbol)}</td><td>${esc(p.quantity)}</td><td>${esc(money(p.market_value))}</td><td>${esc(p.thesis || p.hypothesis_id || "—")}</td></tr>`
+      ).join("") : `<tr><td colspan="4">${data.ledger_status && data.ledger_status !== "ok" ? "持仓未知，账本不可用" : "空仓"}</td></tr>`;
       const acts = data.actions || j.actions || [];
       document.getElementById("acts").innerHTML = acts.length ? acts.map(a =>
-        `<tr><td>${a.action || a.side || ""}</td><td>${a.symbol || ""}</td><td>${a.status || ""}</td><td>${a.reason || ""}</td></tr>`
+        `<tr><td>${esc(a.action || a.side || "")}</td><td>${esc(a.symbol || "")}</td><td>${esc(a.status || "")}</td><td>${esc(a.reason || "")}</td></tr>`
       ).join("") : `<tr><td colspan="4">无动作</td></tr>`;
     }
+    // Every request goes through here: a non-2xx answer becomes an Error that
+    // carries the HTTP status, so no caller can paint an error body as data.
+    async function fetchJson(url, opts) {
+      const res = await fetch(url, opts);
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (_) { data = null; }
+      if (!res.ok) {
+        const parts = [];
+        if (data && typeof data === "object") {
+          if (data.reason) parts.push(String(data.reason));
+          if (typeof data.detail === "string" && data.detail) parts.push(data.detail);
+        } else if (text) {
+          parts.push(text.slice(0, 200));
+        }
+        const err = new Error("HTTP " + res.status + (parts.length ? "：" + parts.join(" · ") : ""));
+        err.status = res.status;
+        throw err;
+      }
+      if (data === null || typeof data !== "object") {
+        const err = new Error("HTTP " + res.status + "：返回的不是 JSON");
+        err.status = res.status;
+        throw err;
+      }
+      return data;
+    }
+    function clearView() {
+      ["kpis", "methods", "lessons", "planBody", "reviewBody", "positions", "acts"].forEach((id) => {
+        document.getElementById(id).innerHTML = "";
+      });
+      ["headline", "thought", "planNote", "reviewNote"].forEach((id) => {
+        document.getElementById(id).textContent = "";
+      });
+    }
     async function loadSnap() {
-      const res = await fetch("/api/snapshot");
-      render(await res.json());
+      try {
+        render(await fetchJson("/api/snapshot"));
+      } catch (err) {
+        clearView();
+        document.getElementById("statusLine").textContent =
+          "快照读取失败（" + err.message + "），本页不显示任何账户数字。";
+      }
+      await loadMinuteFocus();
+    }
+    async function loadMinuteFocus() {
+      const host = document.getElementById("minuteFocus");
+      if (!host) return;
+      try {
+        const focus = await fetchJson("/api/minute-focus");
+        const symbols = Array.isArray(focus.symbols) ? focus.symbols.join("、") : "";
+        host.textContent = `${focus.status || "未知"} · ${focus.model || "未记录模型"} · ${symbols || "无关注代码"}。`
+          + `${focus.reason || ""} ${focus.generated_at || ""}${focus.expires_at ? " 至 " + focus.expires_at : ""}`;
+      } catch (err) {
+        host.textContent = "关注建议读取失败（" + err.message + "）。";
+      }
     }
     document.getElementById("refreshBtn").onclick = loadSnap;
-    document.getElementById("runBtn").onclick = async () => {
-      const btn = document.getElementById("runBtn");
-      btn.disabled = true;
-      btn.textContent = "正在验收今天并布置明天…可能要一两分钟";
-      try {
-        const res = await fetch("/api/cycle", { method: "POST" });
-        render(await res.json());
-      } catch (err) {
-        document.getElementById("statusLine").textContent = "复盘失败：" + err;
-      }
-      btn.disabled = false;
-      btn.textContent = "今晚复盘（验收今天 + 布置明天）";
-    };
     loadSnap();
 
     // --- chat -------------------------------------------------------------
@@ -289,11 +340,11 @@
 
     async function loadChat() {
       try {
-        const resp = await fetch("/api/chat");
-        const data = await resp.json();
+        const data = await fetchJson("/api/chat");
         renderChat(data.messages);
       } catch (err) {
-        if (chatStatus) chatStatus.textContent = "聊天记录读取失败。";
+        if (chatLog) chatLog.innerHTML = "";
+        if (chatStatus) chatStatus.textContent = "聊天记录读取失败（" + err.message + "）。";
       }
     }
 
@@ -307,23 +358,25 @@
       chatSend.disabled = true;
       if (chatStatus) chatStatus.textContent = "它在想…";
       try {
-        const resp = await fetch("/api/chat", {
+        const data = await fetchJson("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ question }),
         });
-        const data = await resp.json();
-        if (!resp.ok || !data.ok) {
-          // Distinguish "brain unavailable" from "it had nothing to say".
-          const reason = data.reason || data.error || "unknown";
-          chatStatus.textContent = "它没能回答（" + reason + "）。";
+        if (!data.ok) {
+          chatStatus.textContent = "它没能回答（HTTP 200：" + (data.reason || data.error || "unknown") + "）。";
         } else {
           chatInput.value = "";
           chatStatus.textContent = "";
           await loadChat();
         }
       } catch (err) {
-        if (chatStatus) chatStatus.textContent = "请求失败：" + err;
+        // Distinguish "brain unavailable" (HTTP status) from "request never arrived".
+        if (chatStatus) {
+          chatStatus.textContent = err.status
+            ? "它没能回答（" + err.message + "）。"
+            : "请求失败（" + err.message + "）。";
+        }
       } finally {
         chatSend.disabled = false;
       }

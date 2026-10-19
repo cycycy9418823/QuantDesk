@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from quantdesk.backtest_metrics import downside_sortino
+
 import hashlib
 import json
 import math
@@ -483,12 +485,8 @@ def _sharpe(returns: list[float]) -> float:
     return float(series.mean() / series.std(ddof=0) * math.sqrt(12))
 
 
-def _sortino(returns: list[float]) -> float:
-    series = pd.Series(returns, dtype="float64")
-    downside = series[series < 0]
-    if len(series) < 2 or downside.std(ddof=0) == 0:
-        return 0.0
-    return float(series.mean() / downside.std(ddof=0) * math.sqrt(12))
+def _sortino(returns: list[float]) -> float | None:
+    return downside_sortino(returns, periods_per_year=12.0)
 
 
 def _yearly_returns(equity_rows: list[dict[str, Any]]) -> dict[str, float]:

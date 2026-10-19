@@ -79,7 +79,7 @@ class SlotDecision:
 
     @property
     def model_used(self) -> bool:
-        return any(call.ok for call in self.calls)
+        return self.status == "decided" and any(call.ok for call in self.calls)
 
     @property
     def elapsed_ms(self) -> int:
@@ -311,6 +311,8 @@ def decide_slot(
         screen_text = render_text(screen)
     call_model = llm or _default_llm
     payload: dict[str, Any] | None = None
+    decision_model = ""
+    want_minutes_model = ""
 
     if not decision.slot:
         decision.status, decision.reason = "skipped", "slot_unknown"
@@ -325,6 +327,8 @@ def decide_slot(
             if payload is None:
                 decision.status, decision.reason = "skipped", "bad_json"
             else:
+                decision_model = call.model
+                want_minutes_model = call.model
                 decision.want_minutes = parse_want_minutes(payload)
                 decision.note = str(payload.get("note") or "")[:200]
                 if decision.want_minutes and minute_fetcher is not None and minute_bars is None:
@@ -346,6 +350,10 @@ def decide_slot(
                         payload = None
                     else:
                         payload = second_payload
+                        decision_model = second.model
+                        if "want_minutes" in second_payload:
+                            decision.want_minutes = parse_want_minutes(second_payload)
+                            want_minutes_model = second.model
                 if payload is not None:
                     orders, parse_rejections = parse_orders(payload)
                     decision.orders = orders
@@ -368,7 +376,7 @@ def decide_slot(
 
     plan = plan_override if plan_override is not None else _read_json(runtime.plan_latest)
     overnight = _overnight_thesis(plan)
-    model = next((call.model for call in decision.calls if call.model), "")
+    model = decision_model
     as_of = current.strftime("%Y-%m-%d")
     recorded = to_shanghai_datetime(read_clock())
     intents = [{
@@ -393,7 +401,8 @@ def decide_slot(
         "model_calls": len(decision.calls),
         "calls": [{"ok": call.ok, "elapsed_ms": call.elapsed_ms, "prompt_chars": call.prompt_chars,
                    "model": call.model, "error": call.error} for call in decision.calls],
-        "want_minutes": decision.want_minutes, "orders_accepted": len(decision.orders),
+        "want_minutes": decision.want_minutes, "want_minutes_model": want_minutes_model,
+        "orders_accepted": len(decision.orders),
         "orders_rejected": len(decision.rejected), "rejected": decision.rejected,
         "note": decision.note,
     }

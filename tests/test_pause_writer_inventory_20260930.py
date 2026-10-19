@@ -96,9 +96,11 @@ def test_failed_resume_preserves_only_failed_record(tmp_path):
 
 
 def test_original_first_three_inventory_order_preserved():
-    assert control.WRITER_TASKS[:3]==('QuantDesk Data Close Pipeline','QuantDesk AI Trader Evening','QuantDesk Snapshot Collector')
+    # The real task is "QuantDesk A0 Snapshot Collector"; the review routine and
+    # weekly wide pool are writers too (fix 1E).
+    assert control.WRITER_TASKS[:3]==('QuantDesk Data Close Pipeline','QuantDesk AI Trader Evening','QuantDesk A0 Snapshot Collector')
     assert set(NEW_WRITERS).issubset(control.WRITER_TASKS)
-    assert len(control.WRITER_TASKS)==6
+    assert len(control.WRITER_TASKS)==8
 
 
 def test_resume_preview_does_not_enable_or_change_record(tmp_path):

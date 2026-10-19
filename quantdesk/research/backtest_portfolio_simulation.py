@@ -192,7 +192,7 @@ def simulate_portfolio_backtest(
                     continue
                 executed_price = requested_price * (1 - config.slippage_bps / 10_000)
                 gross = shares * executed_price
-                sell_costs = trade_costs_for("sell", gross, config)
+                sell_costs = trade_costs_for("sell", gross, config, trade_date=date)
                 commission = float(sell_costs["commission"])
                 stamp_duty = float(sell_costs["stamp_duty"])
                 transfer_fee = float(sell_costs["transfer_fee"])
@@ -253,6 +253,7 @@ def simulate_portfolio_backtest(
                         total_cost=commission + stamp_duty + transfer_fee + slippage_cost,
                         reason=reason,
                         blocked=False,
+                        extra=cost_assumption_fields(sell_costs),
                     )
                 )
                 del positions[symbol]
@@ -326,7 +327,7 @@ def simulate_portfolio_backtest(
                 else:
                     executed_price = requested_price * (1 - config.slippage_bps / 10_000)
                     gross = trim_shares * executed_price
-                    sell_costs = trade_costs_for("sell", gross, config)
+                    sell_costs = trade_costs_for("sell", gross, config, trade_date=date)
                     commission = float(sell_costs["commission"])
                     stamp_duty = float(sell_costs["stamp_duty"])
                     transfer_fee = float(sell_costs["transfer_fee"])
@@ -381,6 +382,7 @@ def simulate_portfolio_backtest(
                                 total_cost=commission + stamp_duty + transfer_fee + slippage_cost,
                                 reason=reason,
                                 blocked=False,
+                                extra=cost_assumption_fields(sell_costs),
                             )
                         )
                         action = "SELL"
@@ -471,7 +473,7 @@ def simulate_portfolio_backtest(
                     buy_shares = min(buy_shares, max_shares_by_liquidity)
                 while buy_shares >= lot_size:
                     gross = buy_shares * executed_price
-                    buy_costs = trade_costs_for("buy", gross, config)
+                    buy_costs = trade_costs_for("buy", gross, config, trade_date=date)
                     commission = float(buy_costs["commission"])
                     transfer_fee = float(buy_costs["transfer_fee"])
                     if gross + commission + transfer_fee <= cash:
@@ -515,7 +517,7 @@ def simulate_portfolio_backtest(
                     )
                     continue
                 gross = buy_shares * executed_price
-                buy_costs = trade_costs_for("buy", gross, config)
+                buy_costs = trade_costs_for("buy", gross, config, trade_date=date)
                 commission = float(buy_costs["commission"])
                 transfer_fee = float(buy_costs["transfer_fee"])
                 slippage_cost = abs(executed_price - requested_price) * buy_shares
@@ -577,7 +579,7 @@ def simulate_portfolio_backtest(
                         total_cost=commission + transfer_fee + slippage_cost,
                         reason=reason,
                         blocked=False,
-                        extra={"liquidity_amount_source": liquidity_amount_source},
+                        extra={"liquidity_amount_source": liquidity_amount_source, **cost_assumption_fields(buy_costs)},
                     )
                 )
                 rebalance_rows.append(

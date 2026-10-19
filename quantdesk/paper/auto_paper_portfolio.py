@@ -8,10 +8,12 @@ advice.
 from __future__ import annotations
 
 import copy
+import hashlib
 import html
 import json
+import math
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -55,8 +57,10 @@ from quantdesk.paper.conditional_trade_plan import (
     conditional_trade_plan_latest,
 )
 from quantdesk.paper.delist_liquidation import apply_delisting_liquidation
-from quantdesk.paper.matching import POLICY_DAILY_APPROX, ensure_declared_fill_policy
-from quantdesk.paper.market_rules import lot_size_for_symbol, round_down_to_lot
+from quantdesk.paper.matching import POLICY_DAILY_APPROX, POLICY_NEXT_OPEN, ensure_declared_fill_policy, policy_header
+from quantdesk.paper.market_rules import lot_size_for_symbol, order_quantity_rule, round_down_to_lot
+from quantdesk.paper import snapshot_open_fill as open_fill
+from quantdesk.paper import strategy_fill_journal as fill_journal
 from quantdesk.paper.portfolio_contracts import (
     ACCEPTANCE_CAPITAL,
     ACCEPTANCE_SCENARIO,
@@ -70,7 +74,7 @@ from quantdesk.paper.position_management_engine import (
     simulate_conditional_plan_file,
 )
 from quantdesk.paper.state_store import PaperStateStore
-from quantdesk.price_basis import classify_frame_price_basis
+from quantdesk.price_basis import classify_frame_price_basis, validate_price_frame_set
 from quantdesk.plan_review_receipts import (
     bind_plan_replay_receipt,
     inspect_plan_minute_inputs,
@@ -88,7 +92,8 @@ from quantdesk.risk.risk_gate_shadow import (
     summarize_shadow_records,
     write_shadow_summary,
 )
-from quantdesk.shared import normalize_symbol, now_text
+from quantdesk.shared import normalize_symbol, now_text, utc_now_iso
+from quantdesk.trading_calendar import load_a_share_trading_calendar
 from quantdesk.theme_sector_engine import THEME_MAP_PATH, load_theme_map
 from quantdesk.theme_sector_engine import normalize_symbol as normalize_theme_symbol
 from quantdesk.update_task_lock import UpdateLockHeld, acquire_update_lock, release_update_lock
@@ -370,8 +375,13 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _write_auto_paper_state(state: dict[str, Any]) -> dict[str, Any]:
-    ensure_declared_fill_policy(state, policy_id=POLICY_DAILY_APPROX)
+    ensure_declared_fill_policy(state, policy_id=_declared_strategy_policy(state))
     return _auto_paper_state_store().write(reconcile_paper_account(state))
+
+
+def _declared_strategy_policy(state: dict[str, Any]) -> str:
+    return (POLICY_NEXT_OPEN if state.get("strategy_fill_mode") == open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT
+            else POLICY_DAILY_APPROX)
 
 
 def _write_auto_paper_latest(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -499,7 +509,7 @@ def _attach_bound_replay_review(
         if original.get("status") != "passed" or original.get("plan") != source_plan:
             payload["plan_replay_receipt"] = {"status": "legacy_unbound", "reason_codes": ["replay_source_archive_not_proven"]}
             return
-        checked_at = now_text()
+        checked_at = utc_now_iso()
         bound = bind_plan_replay_receipt(
             root, source_plan, replay_receipt, checked_at=checked_at,
             intraday_dir=INTRADAY_DIR / "1m", input_evidence=input_evidence,
@@ -1050,7 +1060,7 @@ def _load_state(initial_cash: float) -> dict[str, Any]:
     data.setdefault("credit_limit", profile.credit_limit)
     data.setdefault("credit_used", 0.0)
     data.setdefault("simulated_interest", 0.0)
-    ensure_declared_fill_policy(data, policy_id=POLICY_DAILY_APPROX)
+    ensure_declared_fill_policy(data, policy_id=_declared_strategy_policy(data))
     return reconcile_paper_account(data)
 
 
@@ -1528,7 +1538,10 @@ def _summary(state: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, 
         "market_value": round(market_value, 2),
         "total_equity": round(total_equity, 2),
         "total_return_pct": round((total_equity / initial_cash - 1.0) * 100.0, 2) if initial_cash else 0.0,
-        "daily_pnl": round(total_equity - initial_cash, 2),
+        "cumulative_pnl": round(total_equity - initial_cash, 2),
+        "daily_pnl": None,
+        "daily_return_pct": None,
+        "daily_pnl_status": "missing_previous_equity",
         "realized_pnl": round(realized_pnl, 2),
         "closed_realized_pnl": round(closed_realized_pnl, 2),
         "partial_realized_pnl": round(partial_realized_pnl, 2),
@@ -1546,14 +1559,117 @@ def _summary(state: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def _with_daily_pnl(
+    summary: dict[str, Any], *, valuation_date: str,
+    previous_state: dict[str, Any] | None = None,
+    history: dict[str, Any] | None = None,
+    calendar: dict[str, Any] | None = None,
+    valuation_valid: bool = True,
+) -> dict[str, Any]:
+    """Separate cumulative PnL from an evidenced previous-session equity change.
+
+    Same-day reruns always use the same previous session, never the equity
+    already marked earlier today. Missing calendar/equity evidence stays null.
+    This is reporting only; it never updates cash, fills, or valuation prices.
+    """
+    result = dict(summary)
+    result.update(daily_pnl=None, daily_return_pct=None,
+                  previous_total_equity=None, previous_equity_date="",
+                  daily_pnl_status="missing_previous_equity", daily_pnl_source="")
+    if not valuation_valid:
+        result["daily_pnl_status"] = "current_valuation_unverified"
+        return result
+    try:
+        target = date.fromisoformat(valuation_date)
+    except (TypeError, ValueError):
+        result["daily_pnl_status"] = "valuation_date_invalid"
+        return result
+    cal = calendar if calendar is not None else load_a_share_trading_calendar(
+        _archive_project_root() / "data/calendar/a_share_trading_calendar.csv"
+    )
+    sessions = cal.get("is_open_by_date") or {}
+    if sessions.get(target.isoformat()) is not True:
+        result["daily_pnl_status"] = "previous_session_unverified"
+        return result
+    previous = target - timedelta(days=1)
+    for _ in range(370):
+        if previous.isoformat() not in sessions:
+            result["daily_pnl_status"] = "previous_session_unverified"
+            return result
+        if sessions[previous.isoformat()] is True:
+            break
+        previous -= timedelta(days=1)
+    else:
+        result["daily_pnl_status"] = "previous_session_unverified"
+        return result
+    previous_date = previous.isoformat()
+    result["previous_equity_date"] = previous_date
+
+    def number(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        value = safe_float(value, None)
+        return value if value is not None and math.isfinite(value) else None
+
+    prior = previous_state or {}
+    reference = prior.get("daily_pnl_reference") or {}
+    equity = None
+    if (isinstance(reference, dict) and reference.get("valuation_date") == valuation_date
+            and reference.get("previous_equity_date") == previous_date):
+        equity = number(reference.get("previous_total_equity"))
+        result["daily_pnl_source"] = "persisted_previous_session_reference"
+    if equity is None:
+        loaded = history if history is not None else read_json_safe(AUTO_PAPER_PORTFOLIO_HISTORY_JSON, {})
+        items = loaded.get("items", []) if isinstance(loaded, dict) else []
+        matches = [row for row in items if isinstance(row, dict)
+                   and str(row.get("valuation_date") or row.get("generated_at") or "")[:10] == previous_date]
+        matches.sort(key=lambda row: str(row.get("generated_at") or ""))
+        if matches:
+            # The latest record for that session is authoritative; do not skip
+            # a damaged latest record to silently revive an older amount.
+            row = matches[-1]
+            recorded, cash, market = (number(row.get(key)) for key in ("total_equity", "cash", "market_value"))
+            if (row.get("portfolio_review_valid") is not False and recorded is not None
+                    and cash is not None and market is not None and abs(recorded - cash - market) <= 0.011):
+                equity = recorded
+                result["daily_pnl_source"] = "previous_session_history"
+    if (equity is None and prior.get("valuation_date") == previous_date
+            and prior.get("portfolio_review_valid") is not False):
+        cash, market = number(prior.get("cash")), number(prior.get("market_value"))
+        if cash is not None and market is not None:
+            equity = cash + market
+            result["daily_pnl_source"] = "previous_session_state"
+    current_equity = number(result.get("total_equity"))
+    if equity is None or current_equity is None:
+        result["daily_pnl_source"] = ""
+        return result
+    result.update(previous_total_equity=round(equity, 2),
+                  daily_pnl=round(current_equity - equity, 2), daily_pnl_status="verified",
+                  daily_return_pct=round((current_equity / equity - 1.0) * 100.0, 4) if equity > 0 else None)
+    return result
+
+
+def _daily_pnl_reference(summary: dict[str, Any], valuation_date: str) -> dict[str, Any]:
+    if summary.get("daily_pnl_status") != "verified":
+        return {}
+    return {"valuation_date": valuation_date, "previous_equity_date": summary["previous_equity_date"],
+            "previous_total_equity": summary["previous_total_equity"]}
+
+
 def _append_history(latest: dict[str, Any]) -> dict[str, Any]:
     history = read_json_safe(AUTO_PAPER_PORTFOLIO_HISTORY_JSON, {})
     if not isinstance(history, dict):
         history = {}
     items = history.get("items") if isinstance(history.get("items"), list) else []
+    transaction = latest.get("strategy_journal_transaction")
+    if transaction and any(item.get("strategy_journal_transaction") == transaction for item in items):
+        return history
     summary = latest.get("summary") if isinstance(latest.get("summary"), dict) else {}
     items.append({
         "generated_at": latest.get("generated_at"),
+        "valuation_date": latest.get("valuation_date"),
+        "portfolio_review_valid": latest.get("portfolio_review_valid"),
+        **({"strategy_journal_transaction": transaction} if transaction else {}),
         "mode": latest.get("mode"),
         "strategy": latest.get("strategy"),
         "cash": summary.get("cash"),
@@ -1590,6 +1706,11 @@ def _write_report(
         "",
         "## 组合摘要",
         "",
+        *([
+            "- 撮合方式：下一交易日 09:30 归档开盘价；开盘前须有已记录意向。",
+            "- 验证状态：研究输出·未验证；原始开盘价是纸面代理成交价，未证明真实流动性。",
+            f"- 待核验意向：{len(latest.get('pending_orders') or [])} 笔；成交与拒绝见追加流水。",
+        ] if latest.get("strategy_fill_mode") == open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT else []),
         f"- 当前现金：{summary.get('cash', 0)}",
         f"- 持仓市值：{summary.get('market_value', 0)}",
         f"- 总权益：{summary.get('total_equity', 0)}",
@@ -1877,6 +1998,7 @@ def _run_conditional_auto_paper_update(
     previous_positions = [dict(row) for row in state.get("positions") or []]
     previous_actions = list(state.get("daily_actions") or state.get("actions") or [])
     previous_total_equity = _total_equity_from_state(state)
+    previous_valuation_state = copy.deepcopy(state)
     freshness_gate = (
         evaluate_paper_review_freshness(state, target_date=review_target_date, daily_dir=DAILY_DIR)
         if review_target_date else evaluate_data_freshness()
@@ -1891,8 +2013,9 @@ def _run_conditional_auto_paper_update(
         yesterday_review = build_yesterday_holding_review(previous_positions, enriched_positions, actions, decision_review, freshness_gate)
         summary = _summary(state_for_latest, actions)
         summary["previous_total_equity"] = round(previous_total_equity, 2)
-        summary["daily_pnl"] = 0.0
-        summary["daily_return_pct"] = 0.0
+        summary["daily_pnl"] = None
+        summary["daily_return_pct"] = None
+        summary["daily_pnl_status"] = "current_valuation_unverified"
         latest = {
             "ok": True,
             "exists": True,
@@ -2205,10 +2328,8 @@ def _run_conditional_auto_paper_update(
     latest_state["yesterday_holding_review"] = yesterday_review
     latest_state["daily_actions"] = actions
     latest_state["actions"] = actions
-    summary = _summary(latest_state, actions)
-    summary["previous_total_equity"] = round(previous_total_equity, 2)
-    summary["daily_pnl"] = round((summary.get("total_equity") or 0) - previous_total_equity, 2)
-    summary["daily_return_pct"] = round((summary["daily_pnl"] / previous_total_equity) * 100.0, 2) if previous_total_equity else 0.0
+    summary = _with_daily_pnl(_summary(latest_state, actions), valuation_date=decision_date,
+                              previous_state=previous_valuation_state)
     latest = {
         "ok": True,
         "exists": True,
@@ -2217,6 +2338,7 @@ def _run_conditional_auto_paper_update(
         "generated_at": now_text(),
         "quantity_per_stock": round_down_to_lot(quantity_per_stock),
         "source": "conditional_position_management",
+        "valuation_date": decision_date,
         "input_source": candidate_input_source,
         "candidate_intake": candidate_intake,
         "warnings": list(candidate_intake.get("reason_codes") or []),
@@ -2353,6 +2475,344 @@ def _run_conditional_auto_paper_update(
     return latest
 
 
+def _snapshot_daily_quotes(symbols: list[str], decision_date: str) -> dict[str, dict[str, Any]]:
+    """Read original frames, validate the set, then select an exact as-of row."""
+
+    frames: dict[str, pd.DataFrame] = {}
+    paths: dict[str, Path] = {}
+    hashes: dict[str, str] = {}
+    read_errors: dict[str, str] = {}
+    for symbol in dict.fromkeys(symbols):
+        path = DAILY_DIR / f"{normalize_symbol(symbol)}.csv"
+        paths[symbol] = path
+        if path.is_file():
+            # The hash binds the exact bytes parsed here, not a later reread.
+            import io
+
+            try:
+                raw = path.read_bytes()
+                hashes[symbol] = hashlib.sha256(raw).hexdigest()
+                frames[symbol] = pd.read_csv(io.BytesIO(raw), dtype={"symbol": str})
+            except (OSError, ValueError) as exc:
+                frames[symbol] = pd.DataFrame()
+                read_errors[symbol] = f"snapshot_signal_daily_unreadable:{type(exc).__name__}"
+        else:
+            frames[symbol] = pd.DataFrame()
+    if not frames:
+        return {}
+    # Use the executable raw-price gate for both signal references and marks;
+    # the contract's paper_valuation entry describes adjustment metadata only.
+    gate = validate_price_frame_set(frames, consumer="paper_execution")
+    quotes = {}
+    for symbol, frame in frames.items():
+        quote: dict[str, Any] = {"source": str(paths[symbol]), "source_sha256": hashes.get(symbol, ""),
+                                 "date": "", "price": None, "valid": False, "price_basis": "raw",
+                                 "warnings": []}
+        if not gate["eligible"]:
+            quote["warnings"] = ["snapshot_signal_price_set_blocked", *gate["reason_codes"]]
+            if symbol in read_errors:
+                quote["warnings"].append(read_errors[symbol])
+        elif "date" not in frame:
+            quote["warnings"] = ["snapshot_signal_date_missing"]
+        else:
+            dates = pd.to_datetime(frame["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            selected = frame.loc[dates == decision_date]
+            if len(selected) != 1:
+                quote["warnings"] = ["snapshot_signal_daily_row_missing_or_ambiguous"]
+            else:
+                row = selected.iloc[0].to_dict()
+                valid, reason = daily_bar_validity_from_row(row)
+                valid = valid and all(safe_float(row.get(field), None) is not None
+                                      for field in ("open", "high", "low", "close", "volume"))
+                price = safe_float(row.get("close"), None)
+                quote.update(date=decision_date, price=price,
+                             valid=bool(valid and price is not None and price > 0),
+                             source_row={key: (None if pd.isna(value) else value) for key, value in row.items()})
+                if not quote["valid"]:
+                    quote["warnings"] = [f"snapshot_signal_daily_invalid:{reason}"]
+        quotes[symbol] = quote
+    return quotes
+
+
+def _snapshot_failure(reason: str) -> dict[str, Any]:
+    return {"ok": False, "status": "blocked", "error": reason,
+            "strategy_fill_mode": open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT,
+            "ledger_write": False, "warnings": [reason], **_paper_action_boundary(),
+            "disclaimer": DISCLAIMER, "broker_boundary": BROKER_BOUNDARY}
+
+
+def _publish_snapshot_result(result: dict[str, Any]) -> dict[str, Any]:
+    latest = _write_auto_paper_latest(result)
+    history = _append_history(latest)
+    latest["history_path"] = _display_path(AUTO_PAPER_PORTFOLIO_HISTORY_JSON)
+    latest["history_count"] = len(history.get("items") or [])
+    latest["report_path"] = _display_path(_write_report(latest))
+    return _write_auto_paper_latest(latest)
+
+
+def _run_next_open_snapshot_update(
+    *, mode: str, initial_cash: float, quantity: int, strategy: str,
+    decision_date: str, candidates: list[dict[str, Any]], intake: dict[str, Any],
+    dry_run: bool, force_reset: bool, snapshot_root: Path | None, journal_path: Path | None,
+) -> dict[str, Any]:
+    """Opt-in after-close workflow; legacy matching never enters this path."""
+
+    snapshot_root = Path(snapshot_root) if snapshot_root is not None else PROJECT_ROOT / "data/snapshots"
+    journal_path = Path(journal_path) if journal_path is not None else AUTO_PAPER_PORTFOLIO_STATE_JSON.with_suffix(".fills.jsonl")
+    ledger_existed = AUTO_PAPER_PORTFOLIO_STATE_JSON.exists()
+    if force_reset and (ledger_existed or journal_path.exists()):
+        return _snapshot_failure("snapshot_reset_requires_new_ledger_and_journal")
+    try:
+        # Do not let the legacy store recover a backup behind the journal's back.
+        current = json.loads(AUTO_PAPER_PORTFOLIO_STATE_JSON.read_text(encoding="utf-8")) if ledger_existed else None
+        if current is not None and (not isinstance(current, dict) or _paper_state_shape_errors(current)):
+            return _snapshot_failure("snapshot_ledger_invalid")
+        recovered = fill_journal.recoverable_state(journal_path, current)
+        if not recovered["records"] and current and current.get("pending_orders"):
+            return _snapshot_failure("snapshot_pending_orders_have_no_journal_proof")
+        if current and current.get("strategy_fill_mode") == open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT and not recovered["records"]:
+            return _snapshot_failure("snapshot_journal_missing_for_active_ledger")
+        state = copy.deepcopy(recovered["state"] if recovered["state"] is not None else reconcile_paper_account(_empty_state(initial_cash)))
+        if any(str(row.get("entry_date") or row.get("buy_date") or "")[:10] > decision_date
+               for row in state.get("positions") or []):
+            return _snapshot_failure("snapshot_position_entry_is_in_future")
+        transaction_id = f"update:{decision_date}"
+        if recovered["records"] and recovered["records"][-1]["transaction_id"] == transaction_id:
+            result = copy.deepcopy(recovered["records"][-1]["result"])
+            result.update(idempotent_replay=True, journal_recovery_status=recovered["status"], dry_run=bool(dry_run))
+            if not dry_run:
+                if recovered["status"].startswith("recovered_"):
+                    _auto_paper_state_store().write(state)
+                return _publish_snapshot_result(result)
+            return result
+        if str(state.get("snapshot_decision_date") or "") > decision_date:
+            return _snapshot_failure("snapshot_decision_date_would_go_backwards")
+        recorded_at = utc_now_iso()
+        observed = open_fill.aware_timestamp(recorded_at)
+        calendar = load_a_share_trading_calendar(PROJECT_ROOT / "data/calendar/a_share_trading_calendar.csv")
+        next_date = open_fill.next_trading_day(decision_date, calendar)
+        lower = datetime.combine(date.fromisoformat(decision_date), time(15), open_fill.SHANGHAI)
+        upper = datetime.combine(date.fromisoformat(next_date), time(9, 30), open_fill.SHANGHAI)
+        if not lower <= observed < upper:
+            return _snapshot_failure("snapshot_signal_recording_window_closed")
+        if not dry_run and recovered["status"].startswith("recovered_"):
+            _auto_paper_state_store().write(state)
+    except (OSError, ValueError, TypeError) as exc:
+        return _snapshot_failure(f"snapshot_journal_or_clock_invalid:{exc}")
+
+    before = copy.deepcopy(state)
+    positions = copy.deepcopy(state.get("positions") or [])
+    closed = copy.deepcopy(state.get("closed_positions") or [])
+    cash = float(state["cash"])
+    events: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
+    warnings = [*state.get("warnings", []), *intake.get("reason_codes", []),
+                "next_open_snapshot_opt_in_unvalidated", "raw_open_paper_proxy_liquidity_unverified"]
+    if state.get("strategy_fill_mode") != open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT:
+        old_header = {key: value for key, value in state.items() if key.startswith("fill_policy")}
+        transition = {"from": old_header, "to": POLICY_NEXT_OPEN, "recorded_at": recorded_at,
+                      "opening_state_sha256": fill_journal.state_digest(before),
+                      "scope": "future_fills_only", "inherited_history_status": "legacy_unverified" if ledger_existed else "empty_book"}
+        # An explicit, journaled policy transition; old rows and opening state stay intact.
+        state.update(policy_header(POLICY_NEXT_OPEN))
+        state["fill_policy_transition"] = transition
+        state["fill_policy_scope"] = "future_fills_since_opening_checkpoint"
+        events.append({"event_type": "policy_transition", **transition})
+        if ledger_existed:
+            warnings.append("inherited_strategy_history_not_reconstructed_or_relabelled")
+    state["strategy_fill_mode"] = open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT
+    pending = copy.deepcopy(state.get("pending_orders") or [])
+    remaining: list[dict[str, Any]] = []
+    due = [row for row in pending if str(row.get("fill_date") or "") == decision_date]
+    snapshot = open_fill.load_open_snapshot(snapshot_root, decision_date) if due else {}
+    basis_gate = open_fill.snapshot_price_gate(snapshot, [row["symbol"] for row in due]) if due else {}
+    # Preserve signal order within each side; opening sells release cash before buys.
+    for order in sorted(pending, key=lambda item: 0 if item.get("side") == "sell" else 1):
+        fill_date = str(order.get("fill_date") or "")
+        if fill_date > decision_date:
+            remaining.append(order)
+            continue
+        if fill_date < decision_date:
+            evaluated = {"ok": False, "status": "expired", "reason_code": "missed_only_fill_session",
+                         "reason": "已错过唯一成交日；不补做历史成交、不顺延。"}
+        else:
+            evaluated = open_fill.evaluate_open_fill(order, snapshot, decision_date,
+                                                      calendar=calendar, observed_at=recorded_at)
+            if evaluated["ok"] and not basis_gate.get("eligible"):
+                evaluated.update(ok=False, status="rejected", reason_code="snapshot_universe_price_basis_blocked",
+                                 reason="请求集合中存在未知或非原始价格；整组不成交。", price=None)
+        key = _position_key(order)
+        position = next((row for row in positions if _position_key(row) == key), None)
+        requested = safe_float(order.get("quantity"), None)
+        error = ""
+        if evaluated["ok"]:
+            if requested is None or isinstance(order.get("quantity"), bool) or requested != int(requested):
+                error = "invalid_order_quantity"
+            else:
+                error = order_quantity_rule(order["symbol"], int(requested),
+                                             held_shares=position.get("quantity") if position and order["side"] == "sell" else None,
+                                             name=order.get("name"))
+            if not error and order["side"] == "buy" and position:
+                error = "already_held_at_open"
+            if not error and order["side"] == "sell":
+                entry = str((position or {}).get("entry_date") or (position or {}).get("buy_date") or "")[:10]
+                if not position or int(requested) != safe_int(position.get("quantity"), 0):
+                    error = "sell_quantity_does_not_match_holding"
+                elif not entry or entry >= decision_date:
+                    error = "t_plus_one_sell_blocked"
+            if error:
+                evaluated.update(ok=False, status="rejected", reason_code=error, reason=error, price=None)
+        amounts: dict[str, Any] = {}
+        price = evaluated.get("price") if evaluated["ok"] else None
+        if evaluated["ok"]:
+            q = int(requested)
+            costs = compute_trade_costs(side=order["side"], gross=price * q)
+            if order["side"] == "buy":
+                flow = buy_cash_outflow(price=price, quantity=q)
+                if flow["cash_out"] > cash:
+                    evaluated.update(ok=False, status="rejected", reason_code="insufficient_open_cash",
+                                     reason="开盘价与原费用合计超过可用现金，本单不成交。", price=None)
+                    price = None
+                else:
+                    cash -= flow["cash_out"]
+                    position = _make_position(order.get("candidate") or order, q, price, decision_date, flow)
+                    position.update(entry_fill_policy=POLICY_NEXT_OPEN, entry_fill_mode=open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT,
+                                    entry_fill_evidence=copy.deepcopy(evaluated["evidence"]),
+                                    entry_order_id=order["order_id"], zero_pnl_explanation="")
+                    positions.append(position)
+                    action = _buy_action(order, q, price, decision_date, cash)
+                    amounts = {**costs, "gross": flow["gross"], "cash_delta": -flow["cash_out"]}
+            else:
+                sold = _close_position(position, price, decision_date, order.get("reason") or "次日开盘纸面退出")
+                sold.update(exit_fill_policy=POLICY_NEXT_OPEN, exit_fill_mode=open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT,
+                            exit_fill_evidence=copy.deepcopy(evaluated["evidence"]), exit_order_id=order["order_id"])
+                flow = sell_cash_inflow(price=price, quantity=q, avg_cost=float(position["entry_price"]))
+                cash += flow["cash_in"]
+                closed.append(sold)
+                positions.remove(position)
+                action = _sell_action(position, price, decision_date, order.get("reason") or "次日开盘纸面退出")
+                amounts = {**costs, "gross": flow["gross"], "cash_delta": flow["cash_in"]}
+            if evaluated["ok"]:
+                action.update(order_id=order["order_id"], signal_date=order["signal_date"],
+                              fill_date=decision_date, fill_model=open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT,
+                              fill_policy=POLICY_NEXT_OPEN, fill_evidence=copy.deepcopy(evaluated["evidence"]),
+                              total_fee=costs["total_fee"], fill_quality="raw_open_paper_proxy", liquidity_verified=False)
+                actions.append(action)
+        if not evaluated["ok"]:
+            action = _block_action(order, str(evaluated.get("reason") or evaluated["reason_code"]), decision_date)
+            action.update(order_id=order["order_id"], status=evaluated["status"], reason_code=evaluated["reason_code"])
+            actions.append(action)
+            warnings.append(f"{order['order_id']}:{evaluated['reason_code']}")
+        events.append(open_fill.fill_journal_row(order, status=evaluated["status"], decision_date=decision_date,
+                                                 reason_code=evaluated.get("reason_code", ""), reason=evaluated.get("reason", ""),
+                                                 price=price, quantity=int(requested) if evaluated["ok"] else 0,
+                                                 evidence=evaluated.get("evidence"), limits=evaluated.get("limits"),
+                                                 amounts=amounts, recorded_at=recorded_at))
+
+    symbols = [normalize_symbol(row.get("symbol")) for row in [*positions, *candidates]]
+    quotes = _snapshot_daily_quotes(symbols, decision_date)
+    factors = _load_auto_adjustment_factors(symbols)
+    candidate_keys = {_position_key(row) for row in candidates}
+    pending_keys = {_position_key(row) for row in remaining}
+    calendar_evidence = {"is_open_by_date": {key: value for key, value in calendar["is_open_by_date"].items()
+                                            if decision_date <= key <= next_date}}
+
+    def queue(side: str, row: dict[str, Any], q: int, price: float, reason: str) -> None:
+        order = open_fill.make_pending_order(side, row, signal_date=decision_date, fill_date=next_date,
+                                              quantity=q, reason=reason, reference_price=price,
+                                              candidate=row if side == "buy" else None, recorded_at=recorded_at)
+        order["session_calendar_evidence"] = copy.deepcopy(calendar_evidence)
+        order["signal_evidence"] = copy.deepcopy(quotes[normalize_symbol(row["symbol"])])
+        remaining.append(order)
+        pending_keys.add(_position_key(order))
+        events.append({"event_type": "order_submitted", "order": copy.deepcopy(order)})
+        actions.append({**_block_action(row, reason, decision_date), "action": f"pending_{side}",
+                        "action_label": "待下一交易日开盘核验", "quantity": q,
+                        "order_id": order["order_id"], "fill_date": next_date, "price": None,
+                        "signal_reference_price": price, "status": "pending"})
+
+    marked = []
+    valuation_valid = True
+    for position in positions:
+        quote = quotes[_position_key(position)[0]]
+        warnings.extend(quote["warnings"])
+        if not quote["valid"]:
+            valuation_valid = False
+            marked.append(position)
+            actions.append(_block_action(position, "当日原始价格缺失或未核验，保留旧估值；不生成卖出意向。", decision_date))
+            continue
+        price = float(quote["price"])
+        reason = "仍在正式候选，继续纸面观察。" if _position_key(position) in candidate_keys else "未进入正式候选，保留退出观察。"
+        marked_position = _mark_position(copy.deepcopy(position), price, decision_date, reason,
+                                         adjustment_factors=factors, quote=quote)
+        marked_position["zero_pnl_explanation"] = ""
+        marked.append(marked_position)
+        events.append({"event_type": "valuation", "symbol": position["symbol"],
+                       "strategy_type": position["strategy_type"], "quote": quote})
+        entry = safe_float(position.get("entry_price"), None)
+        if entry and price <= entry * 0.92 and _position_key(position) not in pending_keys:
+            queue("sell", position, int(position["quantity"]), price,
+                  "沿用收盘回撤超过 8% 的复核规则；只记录下一交易日开盘卖出意向。")
+        else:
+            actions.append(_hold_action(marked_position, price, decision_date, reason))
+    positions = marked
+    held_keys = {_position_key(row) for row in positions}
+    for candidate in candidates:
+        key = _position_key(candidate)
+        if key in held_keys or key in pending_keys:
+            continue
+        quote = quotes[key[0]]
+        warnings.extend(quote["warnings"])
+        rule = order_quantity_rule(candidate["symbol"], quantity, name=candidate.get("name"))
+        reference = _candidate_price(candidate)
+        if (not quote["valid"] or rule or reference is None
+                or abs(reference - float(quote["price"] or 0)) > 0.0001):
+            actions.append(_block_action(candidate, rule or "正式候选参考价与当日原始价格证据未对齐，不记录待成交意向。", decision_date))
+            continue
+        queue("buy", candidate, quantity, float(quote["price"]),
+              "正式候选只生成待成交意向；现金与涨跌停于下一交易日真实开盘证据到达后检查。")
+
+    state.update(cash=round(cash, 2), positions=positions, closed_positions=closed, pending_orders=remaining,
+                 updated_at=recorded_at, snapshot_decision_date=decision_date, valuation_date=decision_date,
+                 portfolio_review_valid=valuation_valid, actions=actions, daily_actions=actions,
+                 warnings=list(dict.fromkeys(warnings)))
+    state = reconcile_paper_account(state)
+    summary = _with_daily_pnl(_summary(state, actions), valuation_date=decision_date, previous_state=before,
+                              valuation_valid=valuation_valid, calendar=calendar)
+    state["daily_pnl_reference"] = _daily_pnl_reference(summary, decision_date)
+    if any(event.get("status") == "filled" for event in events):
+        state["last_trade_date"] = decision_date
+    result = {"ok": True, "exists": True, "mode": mode, "strategy": strategy, "generated_at": recorded_at,
+              "valuation_date": decision_date, "strategy_fill_mode": open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT,
+              "strategy_journal_transaction": transaction_id, "fill_journal_path": str(journal_path),
+              "fill_policy": POLICY_NEXT_OPEN, "fill_policy_scope": state["fill_policy_scope"],
+              "validation_status": "研究输出·未验证", "summary": summary, "positions": positions,
+              "closed_positions": closed, "realized_reductions": state.get("realized_reductions", []),
+              "legacy_realized_adjustment": state.get("legacy_realized_adjustment", 0),
+              "pending_orders": remaining, "actions": actions, "daily_actions": actions,
+              "decision_audit": build_decision_audit(actions), "warnings": state["warnings"],
+              "portfolio_review_valid": valuation_valid, "source": "formal_candidate_daily_batch",
+              "input_source": str(intake.get("input_source") or ""), "auto_candidate_count": len(candidates),
+              "candidate_intake": {key: value for key, value in intake.items() if key != "batch"},
+              "snapshot_outcomes": [event for event in events if event["event_type"] == "order_outcome"],
+              "dry_run": bool(dry_run), "journal_recovery_status": recovered["status"],
+              "disclaimer": DISCLAIMER, "broker_boundary": BROKER_BOUNDARY, **_paper_action_boundary()}
+    # Even a preview must satisfy the same economic checks; it simply writes nothing.
+    try:
+        fill_journal.validate_transaction(before, state, events)
+        if not dry_run:
+            committed = fill_journal.commit_transaction(journal_path, before=before, after=state, events=events,
+                                                         transaction_id=transaction_id, recorded_at=recorded_at,
+                                                         result=result, ledger_existed=ledger_existed)
+            _auto_paper_state_store().write(committed["state"])
+            result = _publish_snapshot_result(result)
+    except (OSError, ValueError, TypeError) as exc:
+        failure = _snapshot_failure(f"snapshot_transaction_incomplete:{exc}")
+        failure["journal_may_require_recovery"] = not dry_run
+        return failure
+    return result
+
+
 def _run_auto_paper_portfolio_unlocked(
     *,
     mode: str = "init",
@@ -2381,9 +2841,17 @@ def _run_auto_paper_portfolio_unlocked(
     publish_next_plan: bool = True,
     review_target_date: str = "",
     candidate_mode: str = "formal",
+    strategy_fill_mode: str | None = None,
+    snapshot_root: Path | None = None,
+    fill_journal_path: Path | None = None,
 ) -> dict[str, Any]:
     """Initialize or update the persistent automatic paper portfolio."""
 
+    fill_mode, fill_mode_warnings = open_fill.resolve_strategy_fill_mode(strategy_fill_mode)
+    if fill_mode == open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT and (
+        enable_intraday_swing or build_conditional_plan or simulate_conditional_plan or risk_gate_enforced
+    ):
+        return _snapshot_failure("snapshot_mode_incompatible_with_conditional_or_enforced_risk_path")
     _SHADOW_UNRECORDED.clear()  # one run's unrecorded shadow failures, not a previous run's
     mode = "update" if str(mode) == "update" else "init"
     quantity = round_down_to_lot(quantity_per_stock)
@@ -2441,8 +2909,16 @@ def _run_auto_paper_portfolio_unlocked(
             "broker_boundary": BROKER_BOUNDARY,
         }
     loaded_update_state: dict[str, Any] | None = None
+    if fill_mode == open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT:
+        return _run_next_open_snapshot_update(
+            mode=mode, initial_cash=initial_cash, quantity=quantity, strategy=strategy,
+            decision_date=candidate_target, candidates=candidates, intake=intake,
+            dry_run=dry_run, force_reset=force_reset, snapshot_root=snapshot_root, journal_path=fill_journal_path,
+        )
     if mode == "update":
         loaded_update_state = _load_state(initial_cash)
+        if loaded_update_state.get("strategy_fill_mode") == open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT:
+            return _snapshot_failure("snapshot_ledger_requires_explicit_snapshot_mode")
         reconciliation = loaded_update_state.get("accounting_reconciliation")
         if (
             isinstance(reconciliation, dict)
@@ -2530,6 +3006,7 @@ def _run_auto_paper_portfolio_unlocked(
         if mode == "init"
         else loaded_update_state or _load_state(initial_cash)
     )
+    previous_valuation_state = copy.deepcopy(state)
     delist_liquidation = {
         "ok": True,
         "liquidated": 0,
@@ -2549,6 +3026,7 @@ def _run_auto_paper_portfolio_unlocked(
     actions: list[dict[str, Any]] = []
     actions.extend(delist_liquidation.get("actions") or [])
     warnings: list[str] = [str(item) for item in state.get("warnings") or []] + list(intake.get("reason_codes") or [])
+    warnings.extend(fill_mode_warnings)
     cash_value = safe_float(state.get("cash"), None)
     if cash_value is None:
         cash = 0.0
@@ -2959,11 +3437,19 @@ def _run_auto_paper_portfolio_unlocked(
     yesterday_review = build_yesterday_holding_review(previous_positions, positions, actions, decision_review, freshness_gate)
     warnings = list(dict.fromkeys(str(item) for item in warnings))
     summary_for_state = _summary({**state, "cash": round(cash, 2), "positions": positions, "closed_positions": closed_positions}, actions)
+    if mode == "update":
+        summary_for_state = _with_daily_pnl(
+            summary_for_state, valuation_date=decision_date,
+            previous_state=previous_valuation_state,
+            valuation_valid=bool(freshness_gate.get("can_review_yesterday_positions", True)),
+        )
     trade_actions = {"buy", "add", "breakout_add", "reduce_half", "take_profit", "sell", "sell_all", "stop_loss"}
     state.update({
         "schema_version": API_SCHEMA_VERSION,
         "app_version": APP_VERSION,
         "updated_at": now_text(),
+        "valuation_date": decision_date,
+        "daily_pnl_reference": _daily_pnl_reference(summary_for_state, decision_date),
         "initial_cash": safe_float(state.get("initial_cash"), initial_cash) or initial_cash,
         "cash": round(cash, 2),
         "total_return_pct": summary_for_state["total_return_pct"],
@@ -2989,9 +3475,10 @@ def _run_auto_paper_portfolio_unlocked(
         "generated_at": now_text(),
         "quantity_per_stock": quantity,
         "source": "formal_candidate_daily_batch",
+        "valuation_date": decision_date,
         "input_source": auto_strategy_input_source,
         "candidate_intake": {key: value for key, value in intake.items() if key != "batch"},
-        "summary": _summary(state, actions),
+        "summary": summary_for_state,
         "positions": positions,
         "closed_positions": closed_positions,
         "realized_reductions": state.get("realized_reductions") or [],
@@ -3105,15 +3592,25 @@ def run_auto_paper_portfolio(
     publish_next_plan: bool = True,
     review_target_date: str = "",
     candidate_mode: str = "formal",
+    strategy_fill_mode: str | None = None,
+    snapshot_root: Path | None = None,
+    fill_journal_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run the automatic paper portfolio with a local advisory state-file lock."""
 
+    fill_mode, _ = open_fill.resolve_strategy_fill_mode(strategy_fill_mode)
     if candidate_mode not in {"formal", "legacy_diagnostic"}:
         raise ValueError("candidate_mode must be formal or legacy_diagnostic")
     dry_run = bool(dry_run or candidate_mode == "legacy_diagnostic")
     existing_profile_state: dict[str, Any] = {}
     if AUTO_PAPER_PORTFOLIO_STATE_JSON.exists() and not force_reset:
-        existing_profile_state = _auto_paper_state_store().read(default={})
+        if fill_mode == open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT:
+            try:
+                existing_profile_state = json.loads(AUTO_PAPER_PORTFOLIO_STATE_JSON.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return _snapshot_failure("snapshot_ledger_unreadable")
+        else:
+            existing_profile_state = _auto_paper_state_store().read(default={})
     if isinstance(existing_profile_state, dict) and existing_profile_state.get("initial_cash"):
         capital_profile = resolve_paper_capital_profile(
             existing_state=existing_profile_state,
@@ -3160,6 +3657,9 @@ def run_auto_paper_portfolio(
             publish_next_plan=publish_next_plan,
             review_target_date=review_target_date,
             candidate_mode=candidate_mode,
+            strategy_fill_mode=fill_mode,
+            snapshot_root=snapshot_root,
+            fill_journal_path=fill_journal_path,
         )
     finally:
         if lock_info is not None:

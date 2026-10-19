@@ -4,8 +4,10 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import random
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +20,7 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 
 from quantdesk.csv_io import read_csv_frame
+from quantdesk.research.sample_provenance import research_sample_context
 from quantdesk.paper.market_rules import round_notional_down_to_lot_quantity
 from quantdesk.paper.trade_costs import (
     DEFAULT_COMMISSION_RATE,
@@ -33,7 +36,7 @@ RESULT_JSON = ROOT / "results" / "strategy_screening_funnel_latest.json"
 REPORT_MD = ROOT / "reports" / "strategy_screening_funnel_latest.md"
 DISCLAIMER = "Research-only fast screening. No broker, no real orders, no automatic trading, not investment advice."
 RANDOM_SEED = 20260528
-FEATURE_CACHE_VERSION = "strategy_screening_features_v1"
+FEATURE_CACHE_VERSION = "strategy_screening_features_csv_v2"
 
 
 @dataclass(frozen=True)
@@ -149,7 +152,7 @@ def feature_cache_fingerprint(data_root: Path, min_history_days: int, max_symbol
             stat = path.stat()
         except OSError:
             continue
-        entries.append({"name": path.name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+        entries.append({"name": path.name, "size": stat.st_size, "sha256": _file_sha256(path)})
     meta = {
         "cache_version": FEATURE_CACHE_VERSION,
         "data_root": str(data_root.resolve()).replace("\\", "/"),
@@ -160,6 +163,83 @@ def feature_cache_fingerprint(data_root: Path, min_history_days: int, max_symbol
         "entries": entries,
     }
     return stable_hash(meta), meta
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _feature_cache_directory(args: argparse.Namespace) -> Path:
+    output = _resolve_project_path(getattr(args, "output_dir", None), "results")
+    configured = getattr(args, "cache_dir", None)
+    if not configured:
+        return output / "cache"
+    path = Path(str(configured))
+    return path if path.is_absolute() else output / path
+
+
+def _read_feature_cache(path: Path, fingerprint: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    if metadata.get("schema") != FEATURE_CACHE_VERSION or metadata.get("fingerprint") != fingerprint:
+        raise ValueError("feature_cache_schema_or_input_mismatch")
+    digest = metadata.get("csv_sha256", "")
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ValueError("feature_cache_invalid_digest")
+    csv_path = path.with_name(f"{path.stem}_{digest}.csv")
+    if _file_sha256(csv_path) != digest:
+        raise ValueError("feature_cache_content_mismatch")
+    dtypes = metadata.get("dtypes")
+    columns = metadata.get("columns")
+    allowed = {"float32", "float64", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "bool"}
+    if not isinstance(dtypes, dict) or not isinstance(columns, list) or set(columns) != set(dtypes):
+        raise ValueError("feature_cache_invalid_columns")
+    if dtypes.get("date") not in {"datetime64[ns]", "datetime64[us]"} or dtypes.get("symbol") not in {"object", "str", "string"}:
+        raise ValueError("feature_cache_invalid_identity_columns")
+    if any(kind not in allowed for name, kind in dtypes.items() if name not in {"date", "symbol"}):
+        raise ValueError("feature_cache_unsupported_dtype")
+    frame = pd.read_csv(csv_path, dtype={k: v for k, v in dtypes.items() if k != "date"}, float_precision="round_trip")
+    frame["date"] = pd.to_datetime(frame["date"], errors="raise").astype(dtypes["date"])
+    if list(frame.columns) != columns or len(frame) != metadata.get("rows") or frame[["date", "symbol"]].isna().any().any():
+        raise ValueError("feature_cache_shape_or_identity_mismatch")
+    summary = metadata.get("data_quality_summary")
+    if not isinstance(summary, dict):
+        raise ValueError("feature_cache_invalid_data_quality")
+    return frame, summary
+
+
+def _write_feature_cache(path: Path, fingerprint: str, frame: pd.DataFrame, summary: dict[str, Any]) -> None:
+    """Publish the receipt last; truncated writes never become a usable cache."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending: list[Path] = []
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=path.parent, suffix=".tmp", delete=False) as handle:
+            temporary_csv = Path(handle.name)
+            pending.append(temporary_csv)
+            frame.to_csv(handle, index=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        digest = _file_sha256(temporary_csv)
+        csv_path = path.with_name(f"{path.stem}_{digest}.csv")
+        os.replace(temporary_csv, csv_path)
+        metadata = {"schema": FEATURE_CACHE_VERSION, "fingerprint": fingerprint,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "csv_sha256": digest,
+                    "rows": len(frame), "columns": list(frame.columns),
+                    "dtypes": {column: str(dtype) for column, dtype in frame.dtypes.items()},
+                    "data_quality_summary": summary}
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as handle:
+            temporary_json = Path(handle.name)
+            pending.append(temporary_json)
+            json.dump(metadata, handle, ensure_ascii=False, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_json, path)
+    finally:
+        for item in pending:
+            item.unlink(missing_ok=True)
 
 
 def _resolve_project_path(value: Any, default: str) -> Path:
@@ -195,14 +275,9 @@ def sharpe_ratio(returns: list[float]) -> float | None:
 
 
 def sortino_ratio(returns: list[float]) -> float | None:
-    series = pd.Series(returns, dtype="float64").dropna()
-    downside = series[series < 0]
-    if len(series) < 2 or len(downside) < 2:
-        return 0.0
-    std = float(downside.std(ddof=0))
-    if std < 1e-12:
-        return None
-    return float(series.mean() / std * math.sqrt(252))
+    from quantdesk.backtest_metrics import downside_sortino
+
+    return downside_sortino(returns)
 
 
 def yearly_returns_from_equity(rows: list[dict[str, Any]]) -> dict[str, float]:
@@ -427,9 +502,9 @@ def load_or_build_features(args: argparse.Namespace, data_root: Path) -> tuple[p
     max_symbols = positive_int(getattr(args, "max_symbols", 0), 0)
     min_history_days = int(getattr(args, "min_history_days", 180) or 180)
     cache_enabled = truthy(getattr(args, "feature_cache", "false"))
-    cache_dir = _resolve_project_path(getattr(args, "cache_dir", "results/cache"), "results/cache")
-    fingerprint, meta = feature_cache_fingerprint(data_root, min_history_days, max_symbols)
-    cache_path = cache_dir / f"strategy_screening_features_{fingerprint[:16]}.pkl"
+    cache_dir = _feature_cache_directory(args)
+    fingerprint, meta = feature_cache_fingerprint(data_root, min_history_days, max_symbols) if cache_enabled else ("", {})
+    cache_path = cache_dir / f"strategy_screening_features_{fingerprint[:16]}.json"
     cache_info: dict[str, Any] = {
         "enabled": cache_enabled,
         "status": "disabled",
@@ -439,16 +514,12 @@ def load_or_build_features(args: argparse.Namespace, data_root: Path) -> tuple[p
     }
     if cache_enabled and cache_path.exists():
         try:
-            cached = pd.read_pickle(cache_path)
-            if isinstance(cached, dict) and cached.get("fingerprint") == fingerprint:
-                features = cached.get("features")
-                dq = cached.get("data_quality_summary")
-                if isinstance(features, pd.DataFrame) and isinstance(dq, dict):
-                    cache_info["status"] = "hit"
-                    return features, dq, cache_info
-            cache_info["status"] = "stale"
+            features, dq = _read_feature_cache(cache_path, fingerprint)
+            cache_info["status"] = "hit"
+            return features, dq, cache_info
         except Exception as exc:  # noqa: BLE001 - cache is an optimization only
             cache_info["status"] = "read_failed"
+            cache_info["read_status"] = "read_failed_rebuilt_from_daily"
             cache_info["error"] = f"{type(exc).__name__}: {exc}"
 
     panel, dq = load_daily_data(data_root, min_history_days, max_symbols=max_symbols)
@@ -458,16 +529,10 @@ def load_or_build_features(args: argparse.Namespace, data_root: Path) -> tuple[p
     features = compute_factors(panel)
     if cache_enabled:
         try:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            pd.to_pickle(
-                {
-                    "fingerprint": fingerprint,
-                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "data_quality_summary": dq,
-                    "features": features,
-                },
-                cache_path,
-            )
+            after, _ = feature_cache_fingerprint(data_root, min_history_days, max_symbols)
+            if after != fingerprint:
+                raise ValueError("daily_inputs_changed_during_feature_build_cache_not_written")
+            _write_feature_cache(cache_path, fingerprint, features, dq)
             cache_info["status"] = "miss_written"
         except Exception as exc:  # noqa: BLE001 - screening can continue without cache writes
             cache_info["status"] = "write_failed"
@@ -1092,18 +1157,33 @@ def run_screening(args: argparse.Namespace) -> dict[str, Any]:
     if not data_root.is_absolute():
         data_root = ROOT / data_root
     features, dq, cache_info = load_or_build_features(args, data_root)
-    warnings = []
+    start = str(getattr(args, "start_date", "") or "")
+    end = str(getattr(args, "end_date", "") or "")
+    if start and end and pd.Timestamp(start) > pd.Timestamp(end):
+        raise ValueError("screening_start_date_after_end_date")
+    if not features.empty:
+        if start:
+            features = features[features["date"] >= pd.Timestamp(start)]
+        if end:
+            features = features[features["date"] <= pd.Timestamp(end)]
+    sample_context = research_sample_context({"sample_role": "in_sample", "sample_window": {
+        "requested_start": start, "requested_end": end,
+        "observed_start": str(features["date"].min().date()) if not features.empty else "",
+        "observed_end": str(features["date"].max().date()) if not features.empty else "",
+    }})
+    warnings = [sample_context["sample_limitation"]]
     if features.empty:
         return {
             "ok": False,
             "status": "failed",
             "task_type": "strategy_screening_funnel",
+            **sample_context,
             "data_quality_summary": dq,
             "performance": {
                 "elapsed_seconds": round(time.perf_counter() - started, 3),
                 "feature_cache": cache_info,
             },
-            "warnings": ["no_usable_csv"],
+            "warnings": [*warnings, "no_usable_csv_in_requested_window"],
         }
     close_wide = features.pivot(index="date", columns="symbol", values="close").sort_index().ffill()
     open_wide = features.pivot(index="date", columns="symbol", values="open").sort_index()
@@ -1142,6 +1222,7 @@ def run_screening(args: argparse.Namespace) -> dict[str, Any]:
         else:
             r["information_ratio"] = None
         r.pop("_equity_rows", None)
+        r.update(sample_context)
         results.append(r)
     candidate, watch, rejected, invalid, duplicated = classify_results(results, bool(bench_info.get("benchmark_available")))
     if len([g for g in duplicated if len(g) >= 5]) > 0:
@@ -1166,6 +1247,7 @@ def run_screening(args: argparse.Namespace) -> dict[str, Any]:
         "ok": status != "failed",
         "status": status,
         "task_type": task_type,
+        **sample_context,
         "data_quality_summary": dq,
         "performance": {
             "elapsed_seconds": round(time.perf_counter() - started, 3),
@@ -1175,7 +1257,7 @@ def run_screening(args: argparse.Namespace) -> dict[str, Any]:
         },
         "benchmark_summary": {
             **bench_info,
-            **benchmark_metrics(bench_df, [dq["min_date"], dq["max_date"]] if dq["min_date"] else []),
+            **benchmark_metrics(bench_df, [sample_context["sample_window"]["observed_start"], sample_context["sample_window"]["observed_end"]]),
         },
         "experiment_setup": {
             "initial_cash": float(args.initial_cash),
@@ -1304,6 +1386,10 @@ def render_markdown(payload: dict[str, Any]) -> str:
         "",
         DISCLAIMER,
         "",
+        str(payload.get("sample_limitation") or ""),
+        f"- sample role: `{payload.get('sample_role') or 'unspecified'}`; out-of-sample: `{payload.get('out_of_sample_validation') or 'not_established'}`",
+        f"- sample window: `{payload.get('sample_window') or {}}`",
+        "",
         "## 1. Executive Summary",
         f"- total strategies tested: `{len(payload.get('strategy_results') or [])}`",
         f"- candidate count: `{len(payload.get('candidate_pool') or [])}`",
@@ -1406,7 +1492,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-strategies", type=int, default=0)
     p.add_argument("--max-symbols", type=int, default=0, help="Limit local daily CSV symbols before loading. 0 keeps full local universe.")
     p.add_argument("--feature-cache", default="false", help="true/false; cache computed factor panel under --cache-dir.")
-    p.add_argument("--cache-dir", default="results/cache")
+    p.add_argument("--cache-dir", default=None, help="Default: <output-dir>/cache. Relative paths are under output-dir; absolute paths explicitly override it. CSV + SHA receipt only; legacy pickle caches are ignored.")
     p.add_argument("--mimo-retest", default="false")
     p.add_argument("--json", default="false")
     p.add_argument("--summary", nargs="?", const="true", default="false")
@@ -1419,6 +1505,7 @@ def main(argv: list[str] | None = None) -> int:
     if truthy(args.summary):
         best = (payload.get("leaderboard") or [{}])[0]
         summary = {
+            **research_sample_context(payload),
             "ok": payload.get("ok"),
             "status": payload.get("status"),
             "task_type": payload.get("task_type"),

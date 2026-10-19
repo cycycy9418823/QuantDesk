@@ -13,6 +13,7 @@ from typing import Any
 from quantdesk.agent.agent_policy_guard import detect_forbidden_trading_advice
 from quantdesk.data_update_orchestrator import build_stale_data_warning
 from quantdesk.research.backtest_statistical_validation import summarize_statistical_validation
+from quantdesk.research.sample_provenance import research_sample_context
 from quantdesk.research.feature_quality_audit import summarize_feature_quality
 from quantdesk.research.parameter_sensitivity_audit import summarize_parameter_sensitivity
 from quantdesk.shared import normalize_symbol, now_text, read_json, short_error_text, write_json
@@ -248,7 +249,7 @@ def normalize_statistical_validation_for_observation(payload: dict[str, Any]) ->
     summary = summarize_statistical_validation(payload)
     warnings = summary.get("warnings") if isinstance(summary.get("warnings"), list) else []
     p_value = summary.get("p_value")
-    risk_notes: list[str] = []
+    risk_notes: list[str] = [summary["sample_limitation"]]
     if "insufficient_sample" in warnings or int(summary.get("sample_size") or 0) < 8:
         risk_notes.append("当前统计样本不足，不能据此判断策略稳定性。")
     if summary.get("permutation_status") != "passed":
@@ -257,6 +258,7 @@ def normalize_statistical_validation_for_observation(payload: dict[str, Any]) ->
         "exists": True,
         "status": summary.get("status") or "unknown",
         "sample_size": summary.get("sample_size"),
+        **research_sample_context(summary),
         "p_value": p_value,
         "permutation_status": summary.get("permutation_status"),
         "bootstrap_status": summary.get("bootstrap_status"),

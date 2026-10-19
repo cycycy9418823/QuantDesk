@@ -47,6 +47,9 @@ from quantdesk.price_basis import (  # noqa: E402
     validate_price_frame_set,
 )
 from quantdesk.scope_policy import resolve_scope, scope_fields  # noqa: E402
+from quantdesk.research.backtest_return_evidence import closed_trade_return_evidence  # noqa: E402
+from quantdesk.research.sample_provenance import SAMPLE_LIMITATION, research_sample_context  # noqa: E402
+from quantdesk.backtest_loaders import local_full_a_backtest_scope, validate_backtest_history_sources, align_backtest_research_basis  # noqa: E402
 from quantdesk.shared import normalize_symbol, now_text, truthy, write_json  # noqa: E402
 from quantdesk.trading_calendar import resolve_target_complete_trade_date  # noqa: E402
 from quantdesk.version import API_SCHEMA_VERSION, APP_VERSION, PACKAGE_VERSION  # noqa: E402
@@ -146,56 +149,9 @@ def _synthetic_daily_histories(symbols: list[str], *, end_date: str) -> dict[str
 
 
 def _read_daily(symbol: str, daily_dir: Path, *, start_date: str = "", end_date: str = "") -> tuple[pd.DataFrame, str]:
-    normalized = normalize_symbol(symbol)
-    candidates = [daily_dir / f"{normalized}.csv", daily_dir / f"{normalized}_qfq.csv"]
-    path = next((item for item in candidates if item.exists()), None)
-    if path is None:
-        return pd.DataFrame(), "daily_file_missing"
-    frame = read_csv_frame(path)
-    csv_read_warnings = [str(item) for item in frame.attrs.get("warnings", []) if item]
-    read_warning = ";".join(csv_read_warnings)
-    if frame.empty:
-        return pd.DataFrame(), read_warning or "daily_file_empty"
-    frame = frame.rename(columns={col: DAILY_ALIASES.get(str(col), str(col)) for col in frame.columns}).copy()
-    frame = frame.loc[:, ~frame.columns.duplicated()]
-    _observed_basis, basis_reason = classify_frame_price_basis(frame)
-    if basis_reason:
-        return pd.DataFrame(), ";".join(item for item in (basis_reason, read_warning) if item)
-    if "date" not in frame.columns or "close" not in frame.columns:
-        return pd.DataFrame(), read_warning or "daily_required_columns_missing"
-    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-    for column in ("open", "high", "low", "close", "prev_close", "volume", "amount", "pct_chg", "turnover"):
-        if column in frame.columns:
-            frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    for column in ("open", "high", "low"):
-        if column not in frame.columns:
-            frame[column] = frame["close"]
-    if "prev_close" not in frame.columns:
-        frame["prev_close"] = frame["close"].shift(1)
-    frame = frame.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date", keep="last")
-    frame = frame[frame["close"] > 0]
-    # data/daily is adjust=raw: the price columns carry split/dividend cliffs that
-    # are not real moves. Repair AFTER sorting (the back-adjustment anchors on the
-    # latest bar) and BEFORE the date window is applied, so the factor covering a
-    # corporate action outside the window is still accounted for.
-    repaired, ca_info = repair_corporate_actions(frame)
-    if ca_info.get("unverifiable"):
-        return pd.DataFrame(), ";".join(
-            item for item in ("corporate_action_unverifiable", read_warning) if item
-        )
-    frame = repaired
-    if ca_info.get("ca_bars"):
-        # prev_close was derived from the unrepaired series above; a cliff would
-        # otherwise leave a fake gap in it.
-        frame["prev_close"] = frame["close"].shift(1)
-        read_warning = ";".join(
-            item for item in (read_warning, f"corporate_action_repaired:{ca_info['ca_bars']}") if item
-        )
-    if start_date:
-        frame = frame[frame["date"] >= pd.to_datetime(start_date, errors="coerce")]
-    if end_date:
-        frame = frame[frame["date"] <= pd.to_datetime(end_date, errors="coerce")]
-    return frame.reset_index(drop=True), read_warning
+    from quantdesk.backtest_loaders import read_backtest_daily
+
+    return read_backtest_daily(normalize_symbol(symbol), daily_dir, start_date=start_date, end_date=end_date)
 
 
 def _execution_price_evidence(basis: str) -> dict[str, Any]:
@@ -214,7 +170,7 @@ def _price_policy_validation_with_load_blocks(
     histories: dict[str, pd.DataFrame],
     load_blocks: dict[str, str],
 ) -> dict[str, Any]:
-    audit = validate_price_frame_set(histories, consumer="backtest")
+    audit = validate_backtest_history_sources(histories)
     if not load_blocks:
         return audit
 
@@ -331,6 +287,8 @@ def _write_report(payload: dict[str, Any]) -> None:
         f"- strategy: `{payload.get('strategy')}`",
         f"- network: `{str(payload.get('network')).lower()}`",
         f"- date_range: `{payload.get('start_date') or '-'} -> {payload.get('end_date') or '-'}`",
+        f"- sample role: `{payload.get('sample_role') or 'unspecified'}`; out-of-sample: `{payload.get('out_of_sample_validation') or 'not_established'}`",
+        research_sample_context(payload)["sample_limitation"],
         f"- loaded_symbols: `{', '.join(data_gate.get('loaded_symbols') or []) or '-'}`",
         f"- missing_symbols: `{', '.join(data_gate.get('missing_symbols') or []) or '-'}`",
         "",
@@ -477,17 +435,18 @@ def _warning_payload(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run local QuantDesk backtest from existing data/daily CSV files.")
     parser.add_argument("--symbols", default="")
-    parser.add_argument("--scope", default="current_analysis_pool", choices=["current_analysis_pool", "low_price_included", "specified_symbols", "local_daily_cache"])
+    parser.add_argument("--scope", default="full_a", choices=["full_a", "current_analysis_pool", "low_price_included", "specified_symbols", "local_daily_cache"])
     parser.add_argument("--strategy", default="ma_breakout")
     parser.add_argument("--start-date", default="")
     parser.add_argument("--end-date", default="")
     parser.add_argument("--mode", choices=["single", "portfolio"], default="single")
+    parser.add_argument("--historical-costs", choices=["true", "false"], default="true", help="Use dated A-share tax/transfer schedules; false reproduces the fixed legacy research assumptions.")
     parser.add_argument("--network", default="false")
     parser.add_argument("--enable-network", action="store_true")
     parser.add_argument("--no-network", action="store_true")
     parser.add_argument("--json", nargs="?", const="true", default="false")
     parser.add_argument("--summary", nargs="?", const="true", default="false", help="Print compact operator summary while still writing full latest JSON.")
-    parser.add_argument("--max-symbols", type=int, default=80)
+    parser.add_argument("--max-symbols", type=int, default=0, help="Explicit local sample cap; 0 includes the full locally known A-share universe.")
     parser.add_argument("--daily-dir", default=str(DAILY_DIR.relative_to(PROJECT_ROOT)))
     parser.add_argument("--pit-universe", nargs="?", const="true", default="false", help="Explicitly enable point-in-time universe filtering. Defaults to false.")
     parser.add_argument("--official-limits", nargs="?", const="true", default="true", help="Use official limit-price/suspension metadata when data/metadata tables exist. Defaults to true; rows without coverage fall back to the heuristic with per-trade annotation.")
@@ -532,7 +491,12 @@ def main(argv: list[str] | None = None) -> int:
         }
         warnings.append("synthetic_test_data: test/demo only; not formal market evidence")
     else:
-        scope = resolve_scope(symbols=args.symbols, scope=args.scope, max_symbols=args.max_symbols, project_root=PROJECT_ROOT)
+        scope = (
+            local_full_a_backtest_scope(PROJECT_ROOT, daily_dir, max_symbols=args.max_symbols)
+            if args.scope == "full_a" and not args.symbols
+            else resolve_scope(symbols=args.symbols, scope=args.scope, max_symbols=args.max_symbols, project_root=PROJECT_ROOT)
+        )
+        warnings.extend(scope.get("warnings") or [])
         selected_symbols = _parse_symbols(args.symbols) or list(scope.get("symbols") or [])
     pit_universe_requested = truthy(args.pit_universe)
     pit_listings: pd.DataFrame | None = None
@@ -595,6 +559,8 @@ def main(argv: list[str] | None = None) -> int:
                 if reason:
                     load_warnings.append(f"{symbol}:{reason}")
 
+    histories = align_backtest_research_basis(histories)
+    source_attrs = {symbol: dict(frame.attrs) for symbol, frame in histories.items()}
     if pit_universe_requested and pit_listings is not None and pit_status.get("pit_universe"):
         pit_parts: list[pd.DataFrame] = []
         original_columns: dict[str, list[str]] = {}
@@ -629,6 +595,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"pit_per_date_rows_excluded:{pit_filter_audit['excluded_row_count']}"
             )
 
+    for symbol, frame in histories.items():
+        frame.attrs.update(source_attrs.get(symbol, {}))
     price_policy_validation = _price_policy_validation_with_load_blocks(
         histories,
         price_load_blocks,
@@ -688,6 +656,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     config = PortfolioBacktestConfig() if args.mode == "portfolio" else BacktestConfig()
+    config.historical_costs = truthy(args.historical_costs)
     official_limits_enabled = truthy(getattr(args, "official_limits", "true"))
     if official_limits_enabled:
         from quantdesk.research.official_limit_metadata import (
@@ -744,6 +713,10 @@ def main(argv: list[str] | None = None) -> int:
         chart_warnings.extend(str(item) for item in (monthly_chart.get("warnings") or []))
     except Exception as exc:  # noqa: BLE001
         chart_warnings.append(f"chart_render_failed:{exc}")
+    return_data = closed_trade_return_evidence(result.trades)
+    warnings.extend(return_data["return_evidence"]["warnings"])
+    if return_data["return_evidence"]["warnings"] and status == "passed":
+        status = "warning"
     payload = {
         "ok": True,
         "schema_version": API_SCHEMA_VERSION,
@@ -764,9 +737,13 @@ def main(argv: list[str] | None = None) -> int:
         **scope_fields(scope),
         "start_date": args.start_date,
         "end_date": args.end_date,
+        **research_sample_context({"sample_role": "in_sample", "start_date": args.start_date, "end_date": args.end_date}),
         "metrics": _metrics_dict(result),
+        **return_data,
         "trades": json_safe(result.trades[:200]),
         "trade_count": len(result.trades),
+        "trades_preview_limit": 200,
+        "trade_count_definition": "fill_records_including_blocked; use closed_trade_count for completed positions",
         "equity_curve_summary": _equity_summary(result.equity_curve),
         "assumptions": assumptions,
         "price_adjustment": adjustment_info["price_adjustment"],
@@ -800,7 +777,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "artifact_paths": {key: _rel(path) for key, path in artifact_paths.items()},
         "charts": charts,
-        "warnings": warnings + load_warnings[:20] + chart_warnings,
+        "warnings": [SAMPLE_LIMITATION, *warnings, *load_warnings[:20], *chart_warnings],
         "suggested_next_action": "python scripts/qd.py walk-forward --network false" if status == "passed" else "Fill local data/daily CSV files, then rerun backtest",
         "output_paths": {"json": _rel(RESULT_JSON), "report": _rel(REPORT_MD)},
         "generated_at": now_text(),

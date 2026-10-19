@@ -496,7 +496,7 @@ def test_keep_without_formal_alpha_evidence_is_not_validated(tmp_path: Path) -> 
     assert alpha["formal_evidence"] is False
 
 
-def test_formal_tradable_alpha_evidence_can_validate_alpha(tmp_path: Path) -> None:
+def test_legacy_formal_alpha_contract_is_preserved_but_cannot_validate_current_alpha(tmp_path: Path) -> None:
     source = tmp_path / "results" / "factor" / "formal.json"
     source.parent.mkdir(parents=True)
     source.write_text('{"evidence":"formal"}', encoding="utf-8")
@@ -552,8 +552,10 @@ def test_formal_tradable_alpha_evidence_can_validate_alpha(tmp_path: Path) -> No
     )
 
     alpha = payload["dispositions"]["strategy_alpha"]
-    assert alpha["status"] == "validated"
-    assert alpha["formal_evidence"] is True
+    assert alpha["status"] == "not_validated"
+    assert alpha["formal_evidence"] is False
+    assert alpha["legacy_evidence_contract_matched"] is True
+    assert alpha["workflow_status"] == "retired"
 
 
 def test_formal_alpha_requires_matching_provenance_hash(tmp_path: Path) -> None:

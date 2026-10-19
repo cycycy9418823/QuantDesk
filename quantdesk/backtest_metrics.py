@@ -17,6 +17,25 @@ DISCLAIMER = (
 )
 
 
+def downside_sortino(
+    returns: Sequence[float], *, periods_per_year: float = 252.0, target: float = 0.0
+) -> float | None:
+    """Use target downside deviation over *all* observations, not loss volatility.
+
+    A constant loss still carries downside risk. No downside observations make
+    the ratio undefined; return None rather than a fabricated zero or infinity.
+    ``target`` is a per-period minimum acceptable return.
+    """
+    values = [float(value) for value in returns if math.isfinite(float(value))]
+    if not values or not math.isfinite(periods_per_year) or periods_per_year <= 0:
+        return None
+    excess = [value - target for value in values]
+    deviation = math.sqrt(sum(min(value, 0.0) ** 2 for value in excess) / len(excess))
+    if deviation <= 0:
+        return None
+    return (sum(excess) / len(excess)) / deviation * math.sqrt(periods_per_year)
+
+
 @dataclass
 class TradeRecord:
     symbol: str = ""

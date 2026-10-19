@@ -7,6 +7,7 @@ the desk is healthy.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -192,6 +193,65 @@ def _page_scope_note(root: Path) -> str:
     return ""
 
 
+def health_freshness(root: Path, parsed: dict[str, Any], read_at: str) -> dict[str, Any]:
+    """Check the recorded business date against the local 22:30 health cycle."""
+    result: dict[str, Any] = {"status": "unknown", "expected_trade_date": None,
+        "observed_trade_date": None, "generated_at": None, "warning": "健康记录日期无法核实"}
+    try:
+        current = datetime.fromisoformat(read_at).astimezone(SHANGHAI)
+        generated = datetime.fromisoformat(str(parsed.get("document_updated_at") or ""))
+        generated = generated.replace(tzinfo=SHANGHAI) if generated.tzinfo is None else generated.astimezone(SHANGHAI)
+    except ValueError:
+        return result
+    result["generated_at"] = generated.isoformat()
+    if generated > current:
+        result["warning"] = "健康记录标注了未来生成时间，不能视为当前状态"
+        return result
+    blob = f"{parsed.get('health_line', '')}\n{parsed.get('health_explanation', '')}"
+    explicit = re.search(r"健康业务日期\s*(\d{4}-\d{2}-\d{2})", blob)
+    # Legacy health_line output used the current local date as its default.
+    # A manual document edit cannot establish a health observation timestamp.
+    observed = explicit.group(1) if explicit else generated.date().isoformat() if parsed.get("document_updater") == "health_line" else None
+    result["observed_trade_date"] = observed
+    if not parsed.get("health_line") or parsed.get("health_line") == "未提供":
+        result.update(status="missing", warning="健康行缺失，无法确认最近运行结果")
+        return result
+    try:
+        path = root / "data" / "calendar" / "a_share_trading_calendar.csv"
+        sessions: dict[str, bool] = {}
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                day = date.fromisoformat(row.get("date", "")).isoformat()
+                flag = str(row.get("is_open", "")).strip().lower()
+                if flag not in {"true", "false", "1", "0"}:
+                    raise ValueError("calendar_flag_unknown")
+                opened = flag in {"true", "1"}
+                if day in sessions and sessions[day] != opened:
+                    raise ValueError("calendar_date_conflict")
+                sessions[day] = opened
+        today = current.date().isoformat()
+        if today not in sessions:
+            raise ValueError("calendar_day_missing")
+        due_today = sessions[today] and (current.hour, current.minute) >= (22, 30)
+        available = sorted(day for day, opened in sessions.items() if opened and (day < today or (day == today and due_today)))
+        if not available:
+            raise ValueError("calendar_previous_session_missing")
+        expected = available[-1]
+        result["expected_trade_date"] = expected
+    except (OSError, ValueError, KeyError):
+        result["warning"] = "本地交易日历缺失或未覆盖当前日期，健康记录新鲜度未核实"
+        return result
+    if observed is None:
+        result["warning"] = "记录未注明健康业务日期，文档修改时间不能代替运行时间"
+    elif observed > today or observed > generated.date().isoformat():
+        result["warning"] = "健康业务日期与生成时间不符，不能视为当前状态"
+    elif observed < expected or generated < datetime.fromisoformat(expected + "T22:30:00+08:00"):
+        result.update(status="stale", warning=f"健康记录已过期：应覆盖 {expected}，记录截至 {observed}")
+    else:
+        result.update(status="current" if due_today else "not_due", warning="")
+    return result
+
+
 def _empty_payload(*, read_at: str, error: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ok": False,
@@ -211,6 +271,8 @@ def _empty_payload(*, read_at: str, error: str, extra: dict[str, Any] | None = N
         "health_line": "",
         "health_explanation": "",
         "health_trade_date_label": "记录未明确标注",
+        "health_freshness": {"status": "missing", "expected_trade_date": None,
+            "observed_trade_date": None, "generated_at": None, "warning": "健康记录不可读，无法确认最近运行结果"},
         "phase": {},
         "sections": [],
         "line_progress": {},
@@ -399,6 +461,7 @@ def read_project_status(project_root: str | Path) -> dict[str, Any]:
         "health_line": parsed["health_line"],
         "health_explanation": parsed["health_explanation"],
         "health_trade_date_label": parsed["health_trade_date_label"],
+        "health_freshness": health_freshness(root, parsed, read_at),
         "phase": parsed["phase"],
         "sections": parsed["sections"],
         "line_progress": parsed["line_progress"],
@@ -462,7 +525,10 @@ def read_runtime_observations(project_root: str | Path, *, report_date: str | No
         if used is True:
             message = "模型已回应；判断未被接收" if plan.get("committed") is False else "模型已回应"
         elif used is False:
-            message = f"{detail}；固定规则接管" if reason else "本轮未使用模型，由固定规则判断"
+            if plan.get("decision_mode") == "hold_only":
+                message = f"{detail}；维持已有持仓，本轮无新增交易意图"
+            else:
+                message = f"{detail}；固定规则接管" if reason else "本轮未使用模型，由固定规则判断"
         else:
             message = "尚无可确认的模型回应记录，不能当作成功或零成交"
         profiles[profile] = {

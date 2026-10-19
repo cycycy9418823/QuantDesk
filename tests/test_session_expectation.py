@@ -289,7 +289,7 @@ def test_local_suspension_metadata_requires_explicit_unconflicted_full_day_proof
     ]
 
 
-def test_provider_success_marks_only_returned_normalized_requested_codes(tmp_path: Path) -> None:
+def test_provider_success_retains_only_returned_normalized_requested_codes(tmp_path: Path) -> None:
     _prepare_root(tmp_path)
     calls: list[str] = []
 
@@ -312,8 +312,8 @@ def test_provider_success_marks_only_returned_normalized_requested_codes(tmp_pat
     )
 
     assert calls == ["20260715"]
-    assert payload["per_symbol"]["000031"]["classification"] == "verified_full_day_suspension"
-    assert payload["per_symbol"]["000031"]["reason"] == "akshare_exact_date_suspension"
+    assert payload["per_symbol"]["000031"]["classification"] == "unknown"
+    assert payload["per_symbol"]["000031"]["reason"] == "provider_halt_interval_unverified"
     assert payload["per_symbol"]["000032"]["classification"] == "unknown"
     evidence = payload["source_evidence"]["provider"]
     assert evidence["status"] == "success"
@@ -321,6 +321,8 @@ def test_provider_success_marks_only_returned_normalized_requested_codes(tmp_pat
     assert evidence["read_ok"] is True
     assert evidence["count"] == 3
     assert evidence["matched_count"] == 1
+    assert evidence["verified_count"] == 0
+    assert set(evidence["records_by_symbol"]) == {"000031"}
     assert len(evidence["sha256"]) == 64
 
 

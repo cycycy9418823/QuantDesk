@@ -161,6 +161,7 @@ class BacktestConfig:
     stamp_duty_rate: float = DEFAULT_STAMP_TAX_RATE
     transfer_fee_rate: float = DEFAULT_TRANSFER_FEE_RATE
     cost_profile: str = "current_a_share"
+    historical_costs: bool = False
     slippage_bps: float = 5
     lot_size: int = 100
     max_position_pct: float = 1.0
@@ -468,7 +469,7 @@ def safe_number(value: object, default: float = np.nan) -> float:
     return default
 
 
-def trade_costs_for(side: str, gross_amount: float, config: BacktestConfig) -> dict[str, float | str]:
+def trade_costs_for(side: str, gross_amount: float, config: BacktestConfig, *, trade_date: object = None) -> dict[str, float | str]:
     """Return unified A-share cost components for a simulated backtest fill.
 
     Backtest price slippage is still represented by the executed-price offset,
@@ -486,26 +487,57 @@ def trade_costs_for(side: str, gross_amount: float, config: BacktestConfig) -> d
             "total_fee": 0.0,
             "fee_model": TRADE_COST_MODEL,
         }
-    return compute_trade_costs(
+    stamp_rate = float(config.stamp_duty_rate)
+    transfer_rate = float(getattr(config, "transfer_fee_rate", 0.0))
+    schedule = "explicit_fixed_research_assumptions"
+    day = pd.to_datetime(trade_date, errors="coerce") if trade_date is not None else pd.NaT
+    if config.historical_costs:
+        if pd.isna(day):
+            raise ValueError("historical_costs_require_execution_date")
+        date_text = day.strftime("%Y-%m-%d")
+        schedule = "dated_a_share_20150801_onward"
+        if math.isclose(stamp_rate, DEFAULT_STAMP_TAX_RATE, rel_tol=0, abs_tol=1e-12):
+            stamp_rate = 0.001 if date_text < "2023-08-28" else 0.0005
+        if date_text >= "2015-08-01":
+            if math.isclose(transfer_rate, DEFAULT_TRANSFER_FEE_RATE, rel_tol=0, abs_tol=1e-12):
+                transfer_rate = 0.00002 if date_text < "2022-04-29" else 0.00001
+        else:
+            schedule = "partial_historical_transfer_schedule_unavailable_before_20150801"
+        if date_text < "2008-09-19":
+            schedule = "partial_historical_stamp_and_transfer_schedule_unavailable"
+    costs = compute_trade_costs(
         side=side,
         gross=float(gross_amount),
         config=TradeCostConfig(
             commission_rate=float(config.commission_rate),
             min_commission=float(config.min_commission),
-            stamp_tax_rate=float(config.stamp_duty_rate),
-            transfer_fee_rate=float(getattr(config, "transfer_fee_rate", 0.0)),
+            stamp_tax_rate=stamp_rate,
+            transfer_fee_rate=transfer_rate,
             slippage_bps=0.0,
             apply_min_commission=float(config.commission_rate) > 0,
         ),
     )
+    return {**costs, "cost_schedule": schedule, "stamp_duty_rate": stamp_rate,
+            "transfer_fee_rate": transfer_rate, "execution_date": day.strftime("%Y-%m-%d") if pd.notna(day) else ""}
 
 
-def commission_for(gross_amount: float, config: BacktestConfig) -> float:
-    return float(trade_costs_for("buy", gross_amount, config)["commission"])
+def cost_assumption_fields(costs: dict[str, float | str]) -> dict[str, object]:
+    """Carry the dated cost assumptions into every successful simulated fill."""
+    schedule = str(costs.get("cost_schedule") or "unspecified")
+    return {
+        "cost_schedule": schedule,
+        "cost_coverage_complete": not schedule.startswith("partial_"),
+        "stamp_duty_rate": costs.get("stamp_duty_rate"),
+        "transfer_fee_rate": costs.get("transfer_fee_rate"),
+    }
 
 
-def sell_taxes_for(gross_amount: float, config: BacktestConfig) -> float:
-    costs = trade_costs_for("sell", gross_amount, config)
+def commission_for(gross_amount: float, config: BacktestConfig, *, trade_date: object = None) -> float:
+    return float(trade_costs_for("buy", gross_amount, config, trade_date=trade_date)["commission"])
+
+
+def sell_taxes_for(gross_amount: float, config: BacktestConfig, *, trade_date: object = None) -> float:
+    costs = trade_costs_for("sell", gross_amount, config, trade_date=trade_date)
     return float(costs["stamp_duty"]) + float(costs["transfer_fee"])
 
 def blocked_reason_counts(trades: list[dict[str, object]] | pd.DataFrame) -> dict[str, int]:
@@ -667,7 +699,8 @@ def row_is_st(row: pd.Series | None) -> bool:
 
 
 def effective_board_rules(symbol: str, config: BacktestConfig, row: pd.Series | None = None) -> object | None:
-    return classify_board(symbol, is_st=row_is_st(row)) if config.use_board_rules else None
+    day = _col_get(row, "date", None) if row is not None else None
+    return classify_board(symbol, is_st=row_is_st(row), trade_date=day) if config.use_board_rules else None
 
 
 def effective_limit_pcts(
@@ -698,7 +731,8 @@ def limit_up_blocked(
     if not math.isfinite(change_pct):
         return False
     if config.use_board_rules:
-        return board_is_limit_up(change_pct=change_pct / 100.0, symbol=symbol, is_st=row_is_st(row))
+        rules = effective_board_rules(symbol, config, row)
+        return change_pct >= float(rules.limit_up_pct) - 0.2
     return change_pct >= float(config.limit_up_pct)
 
 
@@ -712,7 +746,8 @@ def limit_down_blocked(
     if not math.isfinite(change_pct):
         return False
     if config.use_board_rules:
-        return board_is_limit_down(change_pct=change_pct / 100.0, symbol=symbol, is_st=row_is_st(row))
+        rules = effective_board_rules(symbol, config, row)
+        return change_pct <= float(rules.limit_down_pct) + 0.2
     return change_pct <= float(config.limit_down_pct)
 
 
@@ -754,7 +789,7 @@ def official_limit_up_blocked(row: pd.Series, config: BacktestConfig) -> bool | 
     ``limit_price_source`` column).
     """
 
-    up_limit = safe_number(_col_get(row, "official_up_limit", np.nan))
+    up_limit = _official_limit_in_execution_basis(row, "official_up_limit")
     if not math.isfinite(up_limit) or up_limit <= 0:
         return None
     price = _execution_basis_price(row, config)
@@ -764,13 +799,28 @@ def official_limit_up_blocked(row: pd.Series, config: BacktestConfig) -> bool | 
 
 
 def official_limit_down_blocked(row: pd.Series, config: BacktestConfig) -> bool | None:
-    down_limit = safe_number(_col_get(row, "official_down_limit", np.nan))
+    down_limit = _official_limit_in_execution_basis(row, "official_down_limit")
     if not math.isfinite(down_limit) or down_limit <= 0:
         return None
     price = _execution_basis_price(row, config)
     if not math.isfinite(price) or price <= 0:
         return None
     return bool(price <= down_limit + 1e-9)
+
+
+def _official_limit_in_execution_basis(row: pd.Series, key: str) -> float:
+    """Official limits are raw; compare them to the same restated-price basis."""
+    value = safe_number(_col_get(row, key, np.nan))
+    raw_close = safe_number(_col_get(row, "raw_close", np.nan))
+    close = safe_number(_col_get(row, "close", np.nan))
+    if math.isfinite(raw_close) and raw_close > 0 and math.isfinite(close) and close > 0:
+        return value * close / raw_close
+    basis = str(row.get("adjust") or row.get("price_basis") or "").lower()
+    if basis in {"qfq", "hfq"}:
+        # The existing labelled heuristic remains available; an unscaled raw
+        # official number must never pretend to be a same-basis comparison.
+        return np.nan
+    return value
 
 
 def limit_up_blocked_for_execution(
@@ -1209,7 +1259,7 @@ def simulate_single_asset_backtest(
                     buy_shares = min(buy_shares, max_shares_by_liquidity)
                 while buy_shares >= lot_size:
                     gross = buy_shares * executed_price
-                    buy_costs = trade_costs_for("buy", gross, config)
+                    buy_costs = trade_costs_for("buy", gross, config, trade_date=date)
                     commission = float(buy_costs["commission"])
                     transfer_fee = float(buy_costs["transfer_fee"])
                     if gross + commission + transfer_fee <= cash:
@@ -1255,7 +1305,7 @@ def simulate_single_asset_backtest(
                     trades.append(trade)
                 else:
                     gross = buy_shares * executed_price
-                    buy_costs = trade_costs_for("buy", gross, config)
+                    buy_costs = trade_costs_for("buy", gross, config, trade_date=date)
                     commission = float(buy_costs["commission"])
                     transfer_fee = float(buy_costs["transfer_fee"])
                     slippage_cost = abs(executed_price - requested_price) * buy_shares
@@ -1280,6 +1330,7 @@ def simulate_single_asset_backtest(
                         total_cost=commission + transfer_fee + slippage_cost,
                         reason=reason,
                         blocked=False,
+                        extra=cost_assumption_fields(buy_costs),
                     )
                     trade.update(
                         {
@@ -1358,7 +1409,7 @@ def simulate_single_asset_backtest(
                 executed_price = requested_price * (1 - config.slippage_bps / 10_000)
                 sell_shares = shares
                 gross = sell_shares * executed_price
-                sell_costs = trade_costs_for("sell", gross, config)
+                sell_costs = trade_costs_for("sell", gross, config, trade_date=date)
                 commission = float(sell_costs["commission"])
                 stamp_duty = float(sell_costs["stamp_duty"])
                 transfer_fee = float(sell_costs["transfer_fee"])
@@ -1382,6 +1433,7 @@ def simulate_single_asset_backtest(
                     total_cost=commission + stamp_duty + transfer_fee + slippage_cost,
                     reason=reason,
                     blocked=False,
+                    extra=cost_assumption_fields(sell_costs),
                 )
                 trade.update(
                     {

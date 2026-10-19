@@ -97,8 +97,10 @@ def test_summary_keeps_no_intent_and_unverified_separate(tmp_path):
         gate_rejected=bool(result.rejections), statement_review=no_intents["statement_review"])
     assert "买入" not in headline and "盘面陈述" in headline
     assert no_intents["statement_review"]["original_intent_count"] == 0
-    plan = {"decision_date": DAYS[-1], "intents": [{"symbol": "920371", "side": "buy", "ref_close": 11.37}],
-            "llm": {"used": True, "market_note": "920371+13.7%"}}
+    # 2AI-1：点评只标注，所以把核不了的说法放进这笔买入自己的理由里。
+    plan = {"decision_date": DAYS[-1], "intents": [{"symbol": "920371", "side": "buy", "ref_close": 11.37,
+                                                     "llm_reason": "920371+13.7%"}],
+            "llm": {"used": True, "market_note": "观望"}}
     original = deepcopy(plan["intents"])
     result = decision_log.apply_gate_to_plan(plan, daily_dir=tmp_path)
     assert plan["statement_review"]["original_intents"] == original

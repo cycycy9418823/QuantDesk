@@ -15,10 +15,12 @@ asserts the seven protected ledgers keep their hashes).
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -28,6 +30,7 @@ REASON_LABELS = {
     "ai_position": "AI 持仓",
     "plan": "当晚已提交计划",
     "ai_watchlist": "AI 自选",
+    "ai_minute_focus": "AI 当日分钟关注建议（已授权读取）",
     "research_candidate_long": "研究台多头候选",
     "research_candidate_board": "研究台打板候选",
 }
@@ -111,17 +114,87 @@ def _symbols_from_candidates(payload: dict[str, Any]) -> list[str]:
     return out
 
 
+def _read_ai_focus(root: Path, now: datetime | None) -> tuple[list[dict[str, Any]], list[str]]:
+    """Consumption needs its own opt-in and the existing level-3 authority."""
+    try:
+        from ai_trader.daytime_fill import daytime_trust
+        from ai_trader.paths import PROFILE_NAMES, ledger_id_for_profile
+    except ImportError:
+        return [], ["ai_minute_focus_contract_unavailable"]
+    shanghai = ZoneInfo("Asia/Shanghai")
+    current = now or datetime.now(shanghai)
+    current = current.replace(tzinfo=shanghai) if current.tzinfo is None else current.astimezone(shanghai)
+    entries: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for profile in ("", *PROFILE_NAMES):
+        name = profile or "default"
+        folder = root / "state" / (f"ai_trader_{profile}" if profile else "ai_trader")
+        if profile and not folder.is_dir():
+            continue
+        payload, error = _read_json(folder / "minute_focus.json")
+        if error:
+            warnings.append(f"ai_minute_focus:{name}:{error}")
+            continue
+        ledger, error = _read_json(folder / "ledger.json")
+        trust = daytime_trust(ledger)
+        if error or trust["level"] < 3 or not trust["authorized_by"] or not trust["authorized_at"]:
+            warnings.append(f"ai_minute_focus:{name}:level_3_authorization_required")
+            continue
+        expected_id = ledger_id_for_profile(profile)
+        if (payload.get("schema") != "ai_minute_focus.v1" or payload.get("profile") != name
+                or payload.get("ledger_id") != expected_id or ledger.get("ledger_id") != expected_id):
+            warnings.append(f"ai_minute_focus:{name}:identity_or_schema_mismatch")
+            continue
+        if (payload.get("source") != "model_want_minutes" or payload.get("model_used") is not True
+                or not str(payload.get("model") or "").strip() or payload.get("status") != "active"):
+            warnings.append(f"ai_minute_focus:{name}:active_model_request_required")
+            continue
+        try:
+            generated = datetime.fromisoformat(str(payload.get("generated_at") or ""))
+            expires = datetime.fromisoformat(str(payload.get("expires_at") or ""))
+            if (generated.utcoffset() != timedelta(hours=8) or expires.utcoffset() != timedelta(hours=8)
+                    or payload.get("as_of") != current.date().isoformat()
+                    or generated.date() != current.date() or expires.date() != current.date()
+                    or not generated <= current < expires
+                    or not timedelta(0) < expires - generated <= timedelta(minutes=30)
+                    or expires > current.replace(hour=15, minute=0, second=0, microsecond=0)):
+                raise ValueError("date_or_expiry_invalid")
+            slot = str(payload.get("slot") or "")
+            if not re.fullmatch(r"[0-9]{4}", slot):
+                raise ValueError("slot_invalid")
+            slot_at = generated.replace(hour=int(slot[:2]), minute=int(slot[2:]), second=0, microsecond=0)
+            # The slot labels the pre-model observation bucket, not completion.
+            # Its five minutes plus the producer's <=300s response freshness
+            # window can cross one bucket boundary without becoming stale.
+            if not 0 <= (generated - slot_at).total_seconds() < 600:
+                raise ValueError("slot_stale_or_future")
+        except (TypeError, ValueError):
+            warnings.append(f"ai_minute_focus:{name}:date_slot_or_expiry_unverified")
+            continue
+        symbols = payload.get("symbols")
+        if (not isinstance(symbols, list) or not 0 < len(symbols) <= 10
+                or any(not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}", symbol) for symbol in symbols)
+                or len(set(symbols)) != len(symbols)):
+            warnings.append(f"ai_minute_focus:{name}:symbols_invalid")
+            continue
+        entries.extend({"symbol": symbol, "profile": name, "model": payload["model"],
+                        "ledger_id": expected_id, "source": "model_want_minutes",
+                        "path": str(folder / "minute_focus.json"), "expires_at": payload["expires_at"]}
+                       for symbol in symbols)
+    return entries, warnings
+
+
 def build_dynamic_scope(
     project_root: Path | None = None,
     *,
     now: datetime | None = None,
     extra_symbols: Sequence[Mapping[str, Any]] | None = None,
     max_symbols: int = MAX_MINUTE_SYMBOLS,
+    read_ai_minute_focus: bool = False,
 ) -> dict[str, Any]:
     """Return the deduplicated minute-data scope with per-symbol provenance."""
 
     root = Path(project_root or PROJECT_ROOT)
-    _ = now  # reserved: the scope itself is time-independent by design
     warnings: list[str] = []
     entries: dict[str, dict[str, Any]] = {}
 
@@ -152,6 +225,13 @@ def build_dynamic_scope(
         warnings.append(err)
     for sym in _symbols_from_watchlist(watchlist):
         _add(sym, "ai_watchlist", "high")
+
+    if read_ai_minute_focus is True:
+        focus, focus_warnings = _read_ai_focus(root, now)
+        warnings.extend(focus_warnings)
+        for row in focus:
+            _add(row["symbol"], "ai_minute_focus", "high")
+            entries[row["symbol"]].setdefault("focus_provenance", []).append(row)
 
     long_payload, err = _read_json(root / "results" / "auto_long_candidates_latest.json")
     if err:
@@ -190,6 +270,7 @@ def build_dynamic_scope(
         },
         "warnings": warnings,
         "read_only": True,
+        "ai_minute_focus_read_enabled": read_ai_minute_focus is True,
     }
 
 

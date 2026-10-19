@@ -45,6 +45,7 @@ class IsolatedProject:
         self.temp_parent = temp_parent.resolve()
         self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
         self.root: Path | None = None
+        self._startup_fixture: Path | None = None
 
     def start(self) -> "IsolatedProject":
         if self.root is not None:
@@ -72,6 +73,7 @@ class IsolatedProject:
             self._temporary_directory.cleanup()
         self._temporary_directory = None
         self.root = None
+        self._startup_fixture = None
 
     def subprocess_env(self) -> dict[str, str]:
         if self.root is None:
@@ -79,16 +81,20 @@ class IsolatedProject:
         pycache = self.root / "test_runtime" / "pycache" / uuid.uuid4().hex
         pycache.mkdir(parents=True, exist_ok=False)
         env = os.environ.copy()
+        bootstrap = env.get("QUANTDESK_TEST_FENCE_BOOTSTRAP", "")
+        entries = ([bootstrap] if bootstrap else []) + [str(self.root)]
+        entries += [entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+                    if entry and entry not in entries and Path(entry).resolve() != self.source_root]
+        if self._startup_fixture is not None:
+            env["QUANTDESK_TEST_STARTUP_FIXTURE"] = str(self._startup_fixture)
+        else:
+            env.pop("QUANTDESK_TEST_STARTUP_FIXTURE", None)
         env.update(
             {
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONPYCACHEPREFIX": str(pycache),
-                "PYTHONPATH": os.pathsep.join([
-                    str(self.root),
-                    *[entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep)
-                      if entry and Path(entry).resolve() != self.source_root],
-                ]),
+                "PYTHONPATH": os.pathsep.join(entries),
             }
         )
         return env
@@ -98,7 +104,14 @@ class IsolatedProject:
         if self.root is None:
             raise RuntimeError("isolated project has not been started")
         copied = self.root / "_quantdesk_startup_fixture.py"
+        if self._startup_fixture is not None:
+            raise RuntimeError("isolated project already has a startup fixture")
         shutil.copyfile(fixture, copied)
+        self._startup_fixture = copied
+        if os.environ.get("QUANTDESK_TEST_FENCE_BOOTSTRAP"):
+            # The inherited bootstrap restores every fence and then loads this
+            # fixture in every descendant. Do not shadow it with sitecustomize.
+            return
         inherited = getattr(sys.modules.get("sitecustomize"), "__file__", None)
         lines = ["import runpy"]
         if inherited:

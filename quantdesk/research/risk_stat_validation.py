@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from quantdesk.csv_io import read_csv_frame
+from quantdesk.backtest_metrics import downside_sortino
 from quantdesk.research.backtest_overfitting import deflated_sharpe_ratio, minimum_track_record_length
 from quantdesk.research.market_impact import estimate_impact_bps
 from quantdesk.risk.var import historical_var
@@ -51,26 +52,32 @@ def _load_equity_csv(path: str | Path, portfolio_name: str = "combo_50_50") -> t
         filtered = df[df["portfolio_name"].astype(str).eq(portfolio_name)].copy()
         if filtered.empty:
             warnings.append(f"portfolio_name_missing:{portfolio_name}")
+            return pd.DataFrame(), warnings
         else:
             df = filtered
-    if "date" not in df.columns:
-        warnings.append("missing_date_column")
-    if "daily_return" not in df.columns and "equity" in df.columns:
-        equity = pd.to_numeric(df["equity"], errors="coerce")
-        df["daily_return"] = equity.ffill().pct_change(fill_method=None).fillna(0.0)
-        warnings.append("daily_return_derived_from_equity")
-    required = {"date", "equity", "daily_return"}
+    required = {"date", "equity"}
     missing = sorted(required - set(df.columns))
     if missing:
         warnings.append(f"missing_required_columns:{','.join(missing)}")
         return pd.DataFrame(), warnings
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["equity"] = pd.to_numeric(df["equity"], errors="coerce")
+    if df["date"].isna().any() or df["date"].dt.normalize().duplicated().any():
+        return pd.DataFrame(), [*warnings, "invalid_or_duplicate_equity_date"]
+    if not np.isfinite(df["equity"]).all() or (df["equity"] <= 0).any():
+        return pd.DataFrame(), [*warnings, "invalid_equity_value"]
+    df = df.sort_values("date").reset_index(drop=True)
+    derived = "daily_return" not in df.columns
+    if derived:
+        # Sort before differencing; the first value is an opening level, not
+        # an observed zero-return day. Missing values are never forward filled.
+        df["daily_return"] = df["equity"].pct_change(fill_method=None)
+        warnings.append("daily_return_derived_from_equity")
     df["daily_return"] = pd.to_numeric(df["daily_return"], errors="coerce")
-    bad_numeric = int(df[["equity", "daily_return"]].replace([np.inf, -np.inf], np.nan).isna().sum().sum())
+    observations = df["daily_return"].iloc[1:] if derived else df["daily_return"]
+    bad_numeric = int((~np.isfinite(observations)).sum())
     if bad_numeric:
-        warnings.append(f"bad_numeric_values:{bad_numeric}")
-    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["date", "equity", "daily_return"]).sort_values("date")
+        return pd.DataFrame(), [*warnings, f"bad_numeric_values:{bad_numeric}"]
     return df.reset_index(drop=True), warnings
 
 
@@ -95,20 +102,21 @@ def _max_drawdown(equity: pd.Series) -> dict[str, Any]:
     }
 
 
-def _annualized_metrics(returns: pd.Series, equity: pd.Series) -> dict[str, float]:
+def _annualized_metrics(returns: pd.Series, equity: pd.Series) -> dict[str, float | None]:
     clean = pd.to_numeric(returns, errors="coerce").dropna()
     if clean.empty:
         return {"annualized_return": 0.0, "sharpe": 0.0, "sortino": 0.0, "volatility": 0.0}
-    final_nav = _finite_float(equity.dropna().iloc[-1], 1.0) if not equity.dropna().empty else 1.0
+    # Equity may be cash-valued (100000), not a unit NAV. The return series is
+    # scale invariant and includes its stated first observation.
+    final_nav = float((1.0 + clean).prod())
     annualized = final_nav ** (252 / max(len(clean), 1)) - 1 if final_nav > 0 else -1.0
     vol = float(clean.std(ddof=0) * np.sqrt(252))
     sharpe = float(clean.mean() / clean.std(ddof=0) * np.sqrt(252)) if clean.std(ddof=0) > 0 else 0.0
-    downside = clean[clean < 0].std(ddof=0)
-    sortino = float(clean.mean() / downside * np.sqrt(252)) if downside > 0 else 0.0
+    sortino = downside_sortino(clean.tolist())
     return {
         "annualized_return": round(float(annualized), 6),
         "sharpe": round(sharpe, 6),
-        "sortino": round(sortino, 6),
+        "sortino": round(sortino, 6) if sortino is not None else None,
         "volatility": round(vol, 6),
     }
 
@@ -162,8 +170,8 @@ def build_risk_stat_validation(
         equity = pd.Series(dtype=float)
     else:
         status = "warning" if warnings else "passed"
-        returns = pd.to_numeric(df["daily_return"], errors="coerce").fillna(0.0)
-        equity = pd.to_numeric(df["equity"], errors="coerce").ffill()
+        returns = pd.to_numeric(df["daily_return"], errors="coerce").dropna()
+        equity = pd.to_numeric(df["equity"], errors="coerce")
     metrics = _annualized_metrics(returns, equity)
     dd = _max_drawdown(equity.reset_index(drop=True))
     var_95 = historical_var(returns, confidence=0.95, lookback=min(500, len(returns))) if len(returns) else {"error": "no_returns"}
@@ -175,13 +183,22 @@ def build_risk_stat_validation(
         for series in (low, rev):
             std = series.std(ddof=0)
             sharpe_candidates.append(float(series.mean() / std * np.sqrt(252)) if std > 0 else 0.0)
+    dsr = deflated_sharpe_ratio(sharpe_candidates, T=len(returns), observed_sharpe=metrics["sharpe"])
+    if not math.isfinite(dsr):
+        warnings.append("deflated_sharpe_unavailable:insufficient_or_degenerate_sample")
     validation = {
-        "deflated_sharpe_ratio": deflated_sharpe_ratio(sharpe_candidates, T=max(len(returns), 2)),
+        "deflated_sharpe_ratio": dsr if math.isfinite(dsr) else None,
         "minimum_track_record_length_years": minimum_track_record_length(metrics["sharpe"]),
+        "sharpe_input_units": "annualized_252_observations_per_year",
+        "deflated_sharpe_output_units": "probability",
+        "trial_family": "reported_portfolio_and_components_only",
+        "unrecorded_searches_controlled": False,
     }
     impact = _impact_proxy(df, order_notional, daily_amount, metrics["volatility"])
     if impact.get("status") == "warning":
         warnings.append(str(impact.get("warning")))
+    if status == "passed" and warnings:
+        status = "warning"
     return {
         "task_id": "risk_stat_validation",
         "status": status,
@@ -190,6 +207,7 @@ def build_risk_stat_validation(
         "portfolio_name": portfolio_name,
         "source_files": [str(_project_path(equity_csv))],
         "row_count": int(len(df)),
+        "return_observation_count": int(len(returns)),
         "date_start": str(df["date"].min().date()) if not df.empty else "",
         "date_end": str(df["date"].max().date()) if not df.empty else "",
         "metrics": {**metrics, **dd},

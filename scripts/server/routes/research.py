@@ -10,6 +10,7 @@ import pandas as pd
 from flask import Blueprint, Flask, jsonify
 
 from quantdesk.csv_io import read_csv_frame
+from quantdesk.research.sample_provenance import research_sample_context
 from scripts.server.helpers.util import clean_payload, read_json_file
 
 
@@ -262,6 +263,10 @@ def create_research_blueprint(deps: ResearchRouteDeps) -> Blueprint:
             workflow = read_json_file(project_root / "results" / "daily_workflow_latest.json")
             workflow = workflow if isinstance(workflow, dict) else {}
             guardrails = workflow.get("guardrail_summary") if isinstance(workflow.get("guardrail_summary"), dict) else {}
+            active_diagnostics = dict(guardrails.get("active_diagnostics") or {})
+            stats_diagnostic = active_diagnostics.get("stats_validation")
+            stats_diagnostic = dict(stats_diagnostic) if isinstance(stats_diagnostic, dict) else {}
+            active_diagnostics["stats_validation"] = {**stats_diagnostic, **research_sample_context(stats_diagnostic)}
             risk_snapshot = workflow.get("risk_alert_snapshot") if isinstance(workflow.get("risk_alert_snapshot"), dict) else {}
             risk_latest = read_json_file(project_root / "results" / "risk_alerts_latest.json")
             if not risk_snapshot and isinstance(risk_latest, dict):
@@ -322,7 +327,7 @@ def create_research_blueprint(deps: ResearchRouteDeps) -> Blueprint:
                     "failed_count": guardrails.get("failed_count") or 0,
                     "feature_quality_status": guardrails.get("feature_quality_status") or "",
                     "statistical_validation_status": guardrails.get("statistical_validation_status") or "",
-                    "active_diagnostics": guardrails.get("active_diagnostics") or {},
+                    "active_diagnostics": active_diagnostics,
                     "warnings": (guardrails.get("warnings") or [])[:8],
                 },
                 "research_only": True,

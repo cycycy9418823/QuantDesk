@@ -313,10 +313,18 @@ def test_full_exit_realized_pnl_survives_save_and_load(tmp_path: Path, monkeypat
     assert len(reloaded["closed_positions"]) == 1
 
 
-def _production_latest_money(source_value: str, state: dict, actions: list[dict]) -> dict:
+def _production_latest_money(source_value: str, state: dict, actions: list[dict]) -> list[dict]:
     syntax = ast.parse(Path(paper.__file__).read_text(encoding="utf-8-sig"))
-    dictionaries = [node for node in ast.walk(syntax) if isinstance(node, ast.Dict)]
-    real = next(
+    function_name = {
+        "conditional_position_management": "_run_conditional_auto_paper_update",
+        "formal_candidate_daily_batch": "_run_auto_paper_portfolio_unlocked",
+    }[source_value]
+    function = next(
+        node for node in syntax.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    dictionaries = [node for node in ast.walk(function) if isinstance(node, ast.Dict)]
+    publications = [
         node
         for node in dictionaries
         if any(
@@ -326,7 +334,8 @@ def _production_latest_money(source_value: str, state: dict, actions: list[dict]
             and value.value == source_value
             for key, value in zip(node.keys, node.values)
         )
-    )
+    ]
+    assert publications, f"{function_name} must publish {source_value}"
     fields = {
         "summary",
         "positions",
@@ -334,17 +343,16 @@ def _production_latest_money(source_value: str, state: dict, actions: list[dict]
         "realized_reductions",
         "legacy_realized_adjustment",
     }
-    pairs = [
-        (key, value)
-        for key, value in zip(real.keys, real.values)
-        if isinstance(key, ast.Constant) and key.value in fields
-    ]
-    expression = ast.Expression(ast.Dict(keys=[key for key, _ in pairs], values=[value for _, value in pairs]))
-    ast.fix_missing_locations(expression)
-    return eval(
-        compile(expression, "actual_latest_money_projection", "eval"),
-        {},
-        {
+    snapshots = []
+    for real in publications:
+        pairs = [
+            (key, value)
+            for key, value in zip(real.keys, real.values)
+            if isinstance(key, ast.Constant) and key.value in fields
+        ]
+        expression = ast.Expression(ast.Dict(keys=[key for key, _ in pairs], values=[value for _, value in pairs]))
+        ast.fix_missing_locations(expression)
+        context = {
             "state": state,
             "state_for_latest": state,
             "actions": actions,
@@ -353,9 +361,11 @@ def _production_latest_money(source_value: str, state: dict, actions: list[dict]
             "enriched_positions": state.get("positions") or [],
             "closed_positions": state.get("closed_positions") or [],
             "summary": paper._summary(state, actions),
+            "summary_for_state": paper._summary(state, actions),
             "_summary": paper._summary,
-        },
-    )
+        }
+        snapshots.append(eval(compile(expression, "actual_latest_money_projection", "eval"), {}, context))
+    return snapshots
 
 
 def _assert_latest_keeps_sale_detail(state: dict, written: dict, *, partial: float) -> None:
@@ -386,12 +396,12 @@ def test_latest_publication_keeps_partial_reduction_detail(tmp_path: Path, monke
         "conditional_position_management",
         "formal_candidate_daily_batch",
     ):
-        snapshot = _production_latest_money(source, state, result["actions"])
-        written = paper._write_auto_paper_latest(snapshot)
-        _assert_latest_keeps_sale_detail(state, written, partial=93.90)
-    stale = _production_latest_money("conditional_position_management", state, [])
-    written_stale = paper._write_auto_paper_latest(stale)
-    _assert_latest_keeps_sale_detail(state, written_stale, partial=93.90)
+        for snapshot in _production_latest_money(source, state, result["actions"]):
+            written = paper._write_auto_paper_latest(snapshot)
+            _assert_latest_keeps_sale_detail(state, written, partial=93.90)
+    for stale in _production_latest_money("conditional_position_management", state, []):
+        written_stale = paper._write_auto_paper_latest(stale)
+        _assert_latest_keeps_sale_detail(state, written_stale, partial=93.90)
     assert (tmp_path / "state" / "book.json").read_bytes() == before
 
 
@@ -777,11 +787,11 @@ def test_latest_publication_keeps_full_exit_without_fake_reduction(tmp_path: Pat
     paper._write_auto_paper_state(result["state"])
     state = paper._load_state(10000.0)
     monkeypatch.setattr(paper, "AUTO_PAPER_PORTFOLIO_LATEST_JSON", tmp_path / "latest.json")
-    snapshot = _production_latest_money("conditional_position_management", state, result["actions"])
-    written = paper._write_auto_paper_latest(snapshot)
-    _assert_latest_keeps_sale_detail(state, written, partial=0.0)
-    assert written["realized_reductions"] == []
-    assert len(written["closed_positions"]) == 1
+    for snapshot in _production_latest_money("conditional_position_management", state, result["actions"]):
+        written = paper._write_auto_paper_latest(snapshot)
+        _assert_latest_keeps_sale_detail(state, written, partial=0.0)
+        assert written["realized_reductions"] == []
+        assert len(written["closed_positions"]) == 1
 def _production_stale_projection(state: dict, actions: list[dict]) -> dict:
     """从生产源码里取出**陈旧观察**分支的 latest 投影（含资金字段），原样喂给发布 writer。
 

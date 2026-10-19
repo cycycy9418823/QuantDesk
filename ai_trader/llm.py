@@ -1,7 +1,6 @@
-"""LLM brain for the independent AI paper trader (optional, fail-open-to-rules).
+"""LLM brain for the independent AI paper trader (failure means hold only).
 
-The trader can run purely on rules (researcher.py). When a local
-Anthropic-compatible endpoint is configured, this module lets the trader
+Rule research remains separate. When an authorised compatible endpoint is configured, this module lets the trader
 *think*: it proposes which names to buy and why, in the trader's persona.
 
 Hard contract:
@@ -9,8 +8,8 @@ Hard contract:
   returns candidate picks + reasons; overnight.build_plan still applies every
   lot/cash/turnover/limit/next-open constraint and the ledger stays truthful.
 - ANY failure (no config, network error, timeout, bad JSON) returns None so the
-  nightly run silently falls back to the rule engine. It must never raise or
-  hang the cycle.
+  nightly run records the failure and creates no new trade intents. Previously
+  declared plans can still settle and existing positions can still be valued.
 - The token is read from env or the gitignored state/ai_trader/llm.env. It is
   never logged, never written to journals/results.
 """
@@ -27,11 +26,13 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping
 
 from ai_trader.paths import STATE_DIR, active_profile, profile_env_file
-from ai_trader.prompt_pack import load_prompt_pack
+from ai_trader.prompt_pack import PromptPack, load_prompt_pack
+from ai_trader.evaluation_contract import declared_verification
 from ai_trader import llm_transport
 
 DEFAULT_MODEL = "claude-opus-5"
@@ -805,9 +806,10 @@ def _call(
     return _call_anthropic_compatible(system, user, cfg, diagnostics)
 
 
-def _build_prompt(context: dict[str, Any]) -> tuple[str, str]:
+def _build_prompt(context: dict[str, Any], *, pack: PromptPack | None = None) -> tuple[str, str]:
     persona = str(context.get("persona_zh") or "一个自己拿主意的 A 股散户")
-    pack = load_prompt_pack()
+    pack = pack or load_prompt_pack()
+    allowed = {slot.get("id") for slot in pack.menu.get("slots", []) if isinstance(slot, dict)}
     system = pack.render_system(persona)
     lines = [
         f"今天(决策日)：{context.get('as_of')}，为次日 {context.get('trade_date')} 开盘布置。",
@@ -837,13 +839,13 @@ def _build_prompt(context: dict[str, Any]) -> tuple[str, str]:
             "计划持有天数到了不等于必须卖——理由还在就继续拿。"
         )
     recs = context.get("recommendations") or []
-    if recs:
+    if recs and "recommendations" in allowed:
         lines.append("研究台今日推荐(可选可不选)：" + "；".join(recs))
     methods = context.get("method_results") or []
-    if methods:
+    if methods and "method_results" in allowed:
         lines.append("你自己几个老套路的成本后样本外表现(负=不灵)：" + "；".join(methods))
     evidence = context.get("evidence_notes") or []
-    if evidence:
+    if evidence and "evidence_notes" in allowed:
         lines.append("本地历史检验已知的事实(供你参考,不是命令)：" + "；".join(evidence))
     cands = context.get("candidates") or []
     lines.append(f"可选候选(只能从这里选，共{len(cands)}只，附近期涨跌)：")
@@ -865,12 +867,13 @@ def propose_picks(
     *,
     reuse_text: str | None = None,
     reuse_model: str = "",
+    prompt_candidate: str | None = None,
+    reuse_prompt_stamp: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Ask the configured LLM for its plan. None => caller uses rules.
+    """Ask the configured LLM for its plan. None => caller holds existing assets.
 
     Pass ``diagnostics`` to learn *why* None came back; silent degradation to the
-    rule engine is otherwise invisible, and the user cannot tell whether they are
-    watching the AI think or a hardcoded ranking.
+    safe hold decision remains distinguishable from the model choosing to hold.
 
     ``reuse_text`` replays a *persisted original* response during recovery
     (A2): the model is never called again and the saved reply is re-parsed as it
@@ -881,7 +884,7 @@ def propose_picks(
         diagnostics = {}
     # A caller may reuse its diagnostics dict; old replies/status must not leak
     # into a new failed call. Only fields owned by this invocation are reset.
-    for key in ("response_evidence", "reason", "transport", "transport_detail", "http_status", "output_tokens", "reused_persisted_response"):
+    for key in ("response_evidence", "prompt_stamp", "reason", "transport", "transport_detail", "http_status", "output_tokens", "reused_persisted_response"):
         diagnostics.pop(key, None)
     evidence: dict[str, Any] = {
         "source": "persisted_replay" if reuse_text is not None else "model_response",
@@ -889,11 +892,17 @@ def propose_picks(
         "parse_stage": "not_started",
     }
     diagnostics["response_evidence"] = evidence
+    pack = load_prompt_pack(candidate=prompt_candidate)
+    stamp = pack.version_stamp()
     if reuse_text is not None:
         text = reuse_text
         model = reuse_model
         _record_model_response(diagnostics, raw_text=text, content_type="str")
         evidence["requested_model"] = reuse_model
+        # Recovery may not pretend that today's prompt files produced an old
+        # persisted response. Unknown original stamp fields remain unknown.
+        stamp = {key: str((reuse_prompt_stamp or {}).get(key) or "") for key in stamp}
+        stamp["effective_prompt_sha256"] = str((reuse_prompt_stamp or {}).get("effective_prompt_sha256") or "")
         if diagnostics is not None:
             diagnostics["reused_persisted_response"] = True
     else:
@@ -903,7 +912,10 @@ def propose_picks(
                 diagnostics["reason"] = "not_enabled_or_unconfigured"
             evidence["parse_stage"] = "configuration"
             return None
-        system, user = _build_prompt(context)
+        system, user = _build_prompt(context, pack=pack)
+        stamp["effective_prompt_sha256"] = sha256(json.dumps(
+            {"system": system, "user": user}, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        diagnostics["prompt_stamp"] = dict(stamp)
         evidence["requested_model"] = str(cfg.get("model") or "")
         evidence["call_state"] = "attempted"
         text = _call(system, user, cfg, diagnostics)
@@ -960,6 +972,7 @@ def propose_picks(
                 "style": str(row.get("style") or "").strip(),
                 "hold_days": hold_days,
                 "conviction": str(row.get("conviction") or "").strip(),
+                "verification": declared_verification(row.get("verification")),
             }
         )
     sells: list[dict[str, Any]] = []
@@ -969,7 +982,8 @@ def propose_picks(
         symbol = re.sub(r"[^0-9]", "", str(row.get("symbol") or ""))
         if len(symbol) != 6:
             continue
-        sells.append({"symbol": symbol, "reason": str(row.get("reason") or "").strip()})
+        sells.append({"symbol": symbol, "reason": str(row.get("reason") or "").strip(),
+                      "verification": declared_verification(row.get("verification"))})
     stance_raw = parsed.get("stance")
     stance: dict[str, Any] = {}
     if isinstance(stance_raw, dict):
@@ -981,7 +995,6 @@ def propose_picks(
             ] if isinstance(styles, list) else [],
             "reasoning": str(stance_raw.get("reasoning") or "").strip(),
         }
-    pack = load_prompt_pack()
     evidence["parse_stage"] = "accepted"
     return {
         "model": model,
@@ -991,8 +1004,7 @@ def propose_picks(
         "lesson": str(parsed.get("lesson") or "").strip(),
         "avoid": [str(x) for x in (parsed.get("avoid") or []) if x],
         "market_note": str(parsed.get("market_note") or "").strip(),
-        "prompt_version": pack.prompt_version,
-        "menu_version": pack.menu_version,
+        **stamp,
         # The unparsed model reply is persisted so an interrupted cycle can be
         # honestly reconstructed (or reported missing) instead of re-decided.
         "raw_response": text,

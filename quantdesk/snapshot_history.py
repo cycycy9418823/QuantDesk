@@ -51,7 +51,9 @@ SNAPSHOT_COLUMNS = (
     "quote_time",
     "source",
     "fetched_at",
+    "price_basis",
 )
+LEGACY_SNAPSHOT_COLUMNS = SNAPSHOT_COLUMNS[:-1]
 _ALIASES = {
     "代码": "symbol",
     "股票代码": "symbol",
@@ -269,6 +271,28 @@ def _valid_price(value: Any) -> bool:
         return False
 
 
+def _quote_field_quality(rows: Sequence[Mapping[str, Any]], trade_date: str) -> dict[str, Any]:
+    """Field evidence independent of archive/slot completion conventions."""
+
+    missing_date = sum(not str(row.get("quote_date") or "").strip() for row in rows)
+    wrong_date = sum(bool(str(row.get("quote_date") or "").strip())
+                     and str(row.get("quote_date")) != trade_date for row in rows)
+    missing_time = sum(not str(row.get("quote_time") or "").strip() for row in rows)
+    unknown_basis = sum(str(row.get("price_basis") or "").lower() != "raw" for row in rows)
+    missing_price = sum(not _valid_price(row.get("price")) for row in rows)
+    return {
+        "quote_date_missing_count": missing_date,
+        "quote_date_mismatch_count": wrong_date,
+        "quote_time_missing_count": missing_time,
+        "price_basis_unverified_count": unknown_basis,
+        "price_missing_count": missing_price,
+        "quality_status": "partial" if not rows or any((missing_date, wrong_date, missing_time,
+                                                        unknown_basis, missing_price)) else "complete",
+        "quote_date_basis": "provider_date_or_empty",
+        "price_basis_contract": "explicit_provider_declaration_or_empty",
+    }
+
+
 def _load_symbols(root: Path, symbols: Iterable[Any] | None) -> list[str]:
     source: Iterable[Any]
     if symbols is not None:
@@ -344,6 +368,7 @@ def normalize_snapshot_rows(
             "quote_time": str(mapped.get("quote_time") or ""),
             "source": source,
             "fetched_at": stamp,
+            "price_basis": str(mapped.get("price_basis") or ""),
         }
         rows.append(row)
     rows.sort(key=lambda row: row["symbol"])
@@ -408,7 +433,9 @@ def _sina_direct_fetch(
         if not payload:
             break
         pages_read += 1
-        rows.extend(item for item in payload if isinstance(item, Mapping))
+        # This live quote endpoint supplies unadjusted exchange prices. Keep
+        # date/time exactly as supplied (ticktime alone does not prove a date).
+        rows.extend(dict(item, price_basis="raw") for item in payload if isinstance(item, Mapping))
         if len(payload) < 100:
             break
     if not rows:
@@ -562,6 +589,13 @@ def _provider_stage(
         hint = _response_format_hint(exc)
         if hint:
             evidence["response_format"] = hint
+        if isinstance(exc, SnapshotProviderError):
+            # Do not launch another source while a timed-out child is still
+            # unaccounted for. Otherwise retain its PID/deadline evidence when
+            # the alternate source succeeds.
+            if any(item.get("process_reaped") is False for item in exc.provider_errors):
+                raise
+            return ProviderRows([], source=name, provider_errors=exc.provider_errors), evidence
         return None, evidence
     return value, {
         "source": name,
@@ -647,6 +681,7 @@ def _sina_hq_fetch(
     *,
     clock: Callable[[], float] = time_module.monotonic,
     budget_seconds: float = SINA_HQ_MAX_SECONDS,
+    batch_size: int | None = None,
 ) -> tuple[ProviderRows, str]:
     """Use the already supported dated HQ source, one bounded batch at a time."""
     source = "sina.hq_batch"
@@ -660,11 +695,12 @@ def _sina_hq_fetch(
     if keys and clock() < deadline:
         from quantdesk.data_providers import fetch_spot_sina_batch
 
-        for start in range(0, len(keys), SINA_HQ_BATCH_SIZE):
+        width = max(1, min(500, int(batch_size or SINA_HQ_BATCH_SIZE)))
+        for start in range(0, len(keys), width):
             remaining = deadline - clock()
             if remaining <= 0:
                 break
-            chunk = keys[start:start + SINA_HQ_BATCH_SIZE]
+            chunk = keys[start:start + width]
             result = None
             for attempt in (1, 2):
                 remaining = deadline - clock()
@@ -729,6 +765,87 @@ def _sina_hq_fetch(
         evidence.append({"source": source, "stage": "timeout", "outcome": "budget_exhausted",
                          "error_type": "BudgetExhausted", "message": "hq_shared_deadline_exhausted",
                          "returned_count": len(rows), "requested_count": len(keys)})
+    return ProviderRows(rows, source=source, warnings=warnings, provider_errors=evidence), source
+
+
+def resilient_network_fetch(
+    symbols: Sequence[str],
+    *,
+    budget_seconds: float = PROVIDER_TOTAL_BUDGET_SECONDS,
+    clock: Callable[[], float] = time_module.monotonic,
+    primary: Callable[..., Any] | None = None,
+    secondary: Callable[..., Any] | None = None,
+    trade_date: str = "",
+) -> tuple[ProviderRows, str]:
+    """Try two bounded quote endpoints before archiving one real capture.
+
+    HQ receives at most 30 seconds and at most one third of the shared budget;
+    empty, failed or incomplete HQ responses leave the rest for the list
+    endpoint. Responses are never merged across capture times. Every failed
+    attempt remains attached even when the alternate endpoint succeeds.
+    """
+
+    allowance = min(150.0, max(0.0, float(budget_seconds)))
+    deadline = clock() + allowance
+    expected = {normalize_symbol(value) for value in symbols}
+    evidence: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    best: tuple[list[Mapping[str, Any]], str] = ([], "sina.hq_batch")
+    best_score = (-1, -1)
+
+    def hq(*, budget_seconds: float) -> Any:
+        return _sina_hq_fetch(symbols, clock=clock, budget_seconds=budget_seconds, batch_size=500)
+
+    def direct(*, budget_seconds: float) -> Any:
+        return _sina_direct_fetch(clock=clock, budget_seconds=budget_seconds)
+
+    sources = (("sina.hq_batch", primary or hq), ("sina.spot_direct", secondary or direct))
+    for index, (name, fetch) in enumerate(sources):
+        remaining = max(0.0, deadline - clock())
+        window = min(30.0, allowance / 3.0, remaining) if index == 0 else remaining
+        if window <= 0:
+            evidence.append({"source": name, "stage": "skipped", "outcome": "budget_exhausted",
+                             "error_type": "BudgetExhausted", "message": "shared_snapshot_deadline"})
+            continue
+        result, stage = _provider_stage(name, fetch, clock=clock, budget_seconds=window)
+        stage["budget_seconds"] = window
+        payload, source, notices, details = _fetch_result(result) if result is not None else ([], name, [], [])
+        records = _records(payload)
+        observed = {normalize_symbol(row.get("symbol") or row.get("code") or row.get("代码"))
+                    for row in records}
+        coverage = len(expected & observed) if expected else len(observed)
+        usable = set()
+        stale_dates = 0
+        for row in records:
+            code = normalize_symbol(row.get("symbol") or row.get("code") or row.get("代码"))
+            quoted_date = str(row.get("quote_date") or row.get("date") or row.get("日期") or "")
+            stale = bool(trade_date and quoted_date and quoted_date != trade_date)
+            stale_dates += int(stale)
+            if not stale and _valid_price(row.get("price", row.get("trade", row.get("最新价")))):
+                usable.add(code)
+        usable_coverage = len(expected & usable) if expected else len(usable)
+        stage.update(row_count=len(records), coverage_count=coverage, expected_symbol_count=len(expected),
+                     usable_quote_count=usable_coverage, non_current_quote_date_count=stale_dates)
+        if records and not usable:
+            stage.update(outcome="unusable", error_type="NoUsableQuotes", message="no_positive_current_or_undated_quote")
+        elif records and (not expected or expected <= observed):
+            stage["outcome"] = "ok"
+        elif records:
+            stage.update(outcome="partial", error_type="IncompleteCoverage",
+                         message=f"returned {coverage}/{len(expected)} requested identities")
+        elif stage.get("outcome") == "ok":
+            stage.update(outcome="empty", error_type="EmptyResponse", message="provider_returned_no_usable_rows")
+        if stage.get("duration_ms", 0) / 1000.0 > window or clock() > deadline:
+            stage.update(outcome="overrun", error_type="BudgetExhausted", message="shared_snapshot_deadline")
+        evidence.extend([stage, *details])
+        warnings.extend(notices)
+        score = (usable_coverage, coverage)
+        if records and score > best_score:
+            best, best_score = (records, source or name), score
+        if stage["outcome"] == "ok":
+            break
+        warnings.append(f"{name}:{stage['outcome']}:{coverage}/{len(expected)}")
+    rows, source = best
     return ProviderRows(rows, source=source, warnings=warnings, provider_errors=evidence), source
 
 
@@ -907,27 +1024,47 @@ def _akshare_provider(function_name: str) -> Any:
 
 def fetch_snapshot_in_process(
     symbols: Sequence[str] = (), *, network: bool = False, budget_seconds: float = 150.0,
+    trade_date: str = "",
 ) -> ProviderRows:
-    """Bound the existing provider chain without dropping its fallback sources.
+    """Run the dated HQ-first quote chain with interruptible provider stages.
 
     Only the parent collector writes an archive. The child returns quote data
     over stdout and is terminated if the whole request exceeds its allowance.
-    The synchronous API retains its finite-budget skip policy; its explicit
-    unbounded mode is used only inside this externally bounded process.
+    The original deadline includes process setup/imports and child cleanup;
+    both endpoints share what remains. HQ has a separate interruptible phase
+    so a slow stream cannot consume the time reserved for the list fallback.
+    The session date is only a comparison target, never a value used to fill
+    a missing provider quote date.
     """
     if not network:
         return ProviderRows([], source="offline", warnings=["network_not_authorized"], provider_errors=[])
-    import os
-    import subprocess
+    return _fetch_snapshot_worker(symbols, budget_seconds=budget_seconds, trade_date=trade_date, mode="chain")
+
+
+def _fetch_snapshot_worker(
+    symbols: Sequence[str], *, budget_seconds: float, trade_date: str, mode: str,
+    outer_deadline: float | None = None,
+) -> ProviderRows:
+    """Fetch one chain or HQ phase, including startup and reaping in its budget."""
     import sys
 
-    allowance = min(240.0, max(0.0, float(budget_seconds)))
+    if mode not in {"chain", "hq"}:
+        raise ValueError("unknown_snapshot_worker_mode")
+    source = "sina.hq_batch" if mode == "hq" else "existing_provider_chain"
+    allowance = min(30.0 if mode == "hq" else 240.0, max(0.0, float(budget_seconds)))
     started = time_module.monotonic()
     deadline = started + allowance
+    if outer_deadline is not None:
+        deadline = min(deadline, outer_deadline)
+        allowance = max(0.0, deadline - started)
+    # Leave time to kill/reap inside this phase, never add a new five-second
+    # cleanup timeout after it. The child receives both absolute deadlines.
+    cleanup_budget = min(1.0, allowance / 5.0)
+    fetch_deadline = deadline - cleanup_budget
     source_root = Path(__file__).resolve().parents[1]
     if allowance <= 0:
         raise SnapshotProviderError("snapshot_worker_budget_exhausted", provider_errors=[{
-            "source": "existing_provider_chain", "stage": "skipped", "outcome": "budget_exhausted",
+            "source": source, "stage": "skipped", "outcome": "budget_exhausted",
             "error_type": "BudgetExhausted", "duration_ms": 0,
         }])
     env = dict(os.environ)
@@ -942,17 +1079,33 @@ def fetch_snapshot_in_process(
     timed_out = False
     try:
         stdout, stderr = child.communicate(
-            json.dumps({"network": True, "symbols": list(symbols)}, ensure_ascii=False),
-            timeout=max(0.0, deadline - time_module.monotonic()),
+            json.dumps({
+                "network": True, "symbols": list(symbols), "deadline_monotonic": deadline,
+                "fetch_deadline_monotonic": fetch_deadline, "worker_mode": mode,
+                "trade_date": trade_date or _as_shanghai(None).date().isoformat(),
+            }, ensure_ascii=False),
+            timeout=max(0.0, fetch_deadline - time_module.monotonic()),
         )
     except subprocess.TimeoutExpired:
         timed_out = True
-        child.kill()
-        stdout, stderr = child.communicate(timeout=5)
+        try:
+            child.kill()
+        except ProcessLookupError:  # the HQ watchdog may have exited first
+            pass
+        try:
+            stdout, stderr = child.communicate(timeout=max(0.0, deadline - time_module.monotonic()))
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
     duration = int(round((time_module.monotonic() - started) * 1000))
-    stage = {"source": "existing_provider_chain", "stage": "isolated_fetch", "duration_ms": duration,
-             "runtime_pid": child.pid, "budget_seconds": allowance, "return_code": child.returncode}
-    if timed_out or time_module.monotonic() >= deadline:
+    stage = {"source": source, "stage": "isolated_fetch", "duration_ms": duration,
+             "runtime_pid": child.pid, "budget_seconds": allowance, "return_code": child.returncode,
+             "worker_mode": mode, "process_reaped": child.returncode is not None,
+             "deadline_monotonic": deadline, "fetch_deadline_monotonic": fetch_deadline,
+             "cleanup_budget_seconds": cleanup_budget}
+    if child.returncode is None:
+        stage.update(outcome="failed", error_type="ProcessCleanupTimeout", message="worker_not_reaped_within_phase")
+        raise SnapshotProviderError("snapshot_worker_cleanup_deadline_exhausted", provider_errors=[stage])
+    if timed_out or child.returncode == 124 or time_module.monotonic() >= deadline:
         stage.update(outcome="failed", error_type="TimeoutError", message="provider_worker_deadline_exhausted")
         raise SnapshotProviderError("snapshot_worker_deadline_exhausted", provider_errors=[stage])
     try:
@@ -1292,7 +1445,8 @@ def _slot_evidence(root: Path, trade_date: str, slot: str) -> dict[str, Any]:
         content = target.read_bytes()
         reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
         rows = list(reader)
-        if not isinstance(metadata, dict) or not rows or reader.fieldnames != list(SNAPSHOT_COLUMNS):
+        if (not isinstance(metadata, dict) or not rows
+                or reader.fieldnames not in (list(SNAPSHOT_COLUMNS), list(LEGACY_SNAPSHOT_COLUMNS))):
             raise ValueError("archive_schema_invalid")
         expected = metadata.get("expected_symbols")
         if not isinstance(expected, list) or expected != _load_symbols(root, expected):
@@ -1387,6 +1541,7 @@ def _slot_evidence(root: Path, trade_date: str, slot: str) -> dict[str, Any]:
             # evidence, but not a collection of this slot (DSR-05).
             "fetch_outside_slot": fetch_outside_slot,
             "source": metadata["source"],
+            **_quote_field_quality(rows, trade_date),
         }
         return {"status": "complete" if complete else "partial", "metadata": metadata, "quality": quality}
     except (OSError, UnicodeError, ValueError, TypeError, KeyError, csv.Error) as exc:
@@ -1411,6 +1566,10 @@ _DAY_SUMMARY_KEYS = (
     "archived_slot_count",
     "roster_coverage_ratio",
     "valid_quote_ratio",
+    "field_verified_complete_slot_count",
+    "field_partial_slot_count",
+    "quote_date_missing_count",
+    "price_basis_unverified_count",
 )
 
 
@@ -1492,6 +1651,7 @@ def _manifest(
     roster_den = sum(item["expected_symbol_count"] for item in archived_quality)
     quote_num = sum(item["valid_quote_count"] for item in archived_quality)
     quote_den = sum(item["row_count"] for item in archived_quality)
+    field_verified = [slot for slot in completed if slot_quality[slot]["quality_status"] == "complete"]
     return {
         "schema_version": "a0_snapshot_history_v1",
         "trade_date": trade_date,
@@ -1544,6 +1704,11 @@ def _manifest(
         "valid_quote_ratio": (quote_num / quote_den) if quote_den else None,
         "archived_slot_count": len(archived_quality),
         "slot_quality": slot_quality,
+        "field_verified_complete_slots": field_verified,
+        "field_verified_complete_slot_count": len(field_verified),
+        "field_partial_slot_count": len(archived_quality) - len(field_verified),
+        "quote_date_missing_count": sum(item["quote_date_missing_count"] for item in archived_quality),
+        "price_basis_unverified_count": sum(item["price_basis_unverified_count"] for item in archived_quality),
         "writer": "a0_history_only_snapshot_collector",
         "pipeline_input": False,
         "ai_input": False,
@@ -1563,6 +1728,7 @@ def collect_market_snapshot(
     slot_time: str | None = None,
     dry_run: bool = False,
     lock: bool = True,
+    provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Collect one slot, returning a truthful result without downstream side effects."""
 
@@ -1596,6 +1762,7 @@ def collect_market_snapshot(
         "pipeline_input": False,
         "ai_input": False,
         "latest_overwrite": False,
+        "producer_provenance": dict(provenance or {}),
     }
     if dry_run:
         base.update(status="dry_run", reason_codes=["dry_run_no_provider_or_write"])
@@ -1826,6 +1993,8 @@ def _collect_locked(
         "pipeline_input": False,
         "ai_input": False,
         "latest_overwrite": False,
+        "producer_provenance": dict(base.get("producer_provenance") or {}),
+        **_quote_field_quality(rows, base["trade_date"]),
     }
     if status == "partial" or base.get("failure_detail"):
         # A capture that fell back to a secondary source keeps the failure
@@ -1905,12 +2074,48 @@ def _snapshot_worker_main() -> int:
     import contextlib
     import sys
 
+    watchdog = None
     try:
         request_payload = json.load(sys.stdin)
         if request_payload.get("network") is not True:
             raise ValueError("network_not_authorized")
+        mode = request_payload.get("worker_mode", "chain")
+        if mode not in {"chain", "hq"}:
+            raise ValueError("unknown_snapshot_worker_mode")
         with contextlib.redirect_stdout(sys.stderr):
-            value = default_network_fetch(request_payload.get("symbols") or (), budget_seconds=None)
+            # Python 3.10+ monotonic clocks share the same OS reference across
+            # processes, so imports cannot grant the child a fresh allowance.
+            deadline = request_payload.get("deadline_monotonic")
+            if deadline is None:
+                deadline = time_module.monotonic() + PROVIDER_TOTAL_BUDGET_SECONDS
+            deadline = min(float(deadline), float(request_payload.get("fetch_deadline_monotonic", deadline)))
+            deadline = min(deadline, time_module.monotonic() + (30.0 if mode == "hq" else PROVIDER_TOTAL_BUDGET_SECONDS))
+            remaining = max(0.0, deadline - time_module.monotonic())
+            symbols = request_payload.get("symbols") or ()
+            trade_date = str(request_payload.get("trade_date") or _as_shanghai(None).date().isoformat())
+            if remaining <= 0:
+                raise SnapshotProviderError("snapshot_worker_budget_exhausted", provider_errors=[])
+            import threading
+
+            # Start before any lazy provider import/call. Both the HQ child
+            # and the chain interpreter exit even if a Windows venv launcher
+            # is killed first. Raising in a thread cannot cancel urllib.read().
+            watchdog = threading.Timer(max(0.0, deadline - time_module.monotonic()), os._exit, args=(124,))
+            watchdog.daemon = True
+            watchdog.start()
+            if mode == "hq":
+                value = _sina_hq_fetch(symbols, budget_seconds=max(0.0, deadline - time_module.monotonic()), batch_size=500)
+            else:
+                def isolated_hq(*, budget_seconds: float) -> ProviderRows:
+                    return _fetch_snapshot_worker(
+                        symbols, budget_seconds=budget_seconds, trade_date=trade_date,
+                        mode="hq", outer_deadline=deadline,
+                    )
+
+                value = resilient_network_fetch(
+                    symbols, budget_seconds=max(0.0, deadline - time_module.monotonic()),
+                    trade_date=trade_date, primary=isolated_hq,
+                )
             rows, source, warnings, provider_errors = _fetch_result(value)
         output = {"ok": True, "rows": _records(rows), "source": source,
                   "warnings": warnings, "provider_errors": provider_errors}
@@ -1919,7 +2124,11 @@ def _snapshot_worker_main() -> int:
         output = {"ok": False, "error_type": type(exc).__name__, "message": _sanitize_error_text(exc),
                   "provider_errors": list(getattr(exc, "provider_errors", []) or [])}
         code = 1
-    print(json.dumps(output, ensure_ascii=False, default=str))
+    try:
+        print(json.dumps(output, ensure_ascii=False, default=str), flush=True)
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
     return code
 
 

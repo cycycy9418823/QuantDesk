@@ -86,8 +86,8 @@ def test_cycle_does_not_touch_quantdesk_ledger(tmp_path: Path) -> None:
     assert payload["conviction"] == "probation"
     assert payload["network_news"] is False
     assert payload["live_method"] is None
-    assert payload["plan"]["intents"]
-    assert payload["plan"]["intents"][0]["conviction"] == "probation"
+    assert payload["plan"]["intents"] == []
+    assert payload["plan"]["decision_mode"] == "hold_only"
     assert runtime.philosophy.parent == tmp_path / "runtime"
     assert _hash_if_exists(PHILOSOPHY_PATH) == philosophy_before
 

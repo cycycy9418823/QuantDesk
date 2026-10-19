@@ -324,16 +324,18 @@ def test_alpha_requires_every_provenance_field(tmp_path: Path) -> None:
 
     for weakened in weakened_variants:
         assert _alpha_status(tmp_path, [weakened])["status"] == "not_validated"
+        assert _alpha_status(tmp_path, [weakened])["legacy_evidence_contract_matched"] is False
 
 
-def test_dedicated_provenance_bound_alpha_evidence_validates_alpha(tmp_path: Path) -> None:
-    """The positive control: the explicit writer path still works."""
+def test_retired_alpha_keeps_legacy_contract_diagnostic_without_current_validation(tmp_path: Path) -> None:
+    """The positive legacy control is still checked but grants no current edge."""
 
     alpha = _alpha_status(tmp_path, [_alpha_verdict(tmp_path)])
 
-    assert alpha["status"] == "validated"
-    assert alpha["formal_evidence"] is True
-    assert alpha["reason_codes"] == []
+    assert alpha["status"] == "not_validated"
+    assert alpha["formal_evidence"] is False
+    assert alpha["legacy_evidence_contract_matched"] is True
+    assert "formal_alpha_workflow_retired" in alpha["reason_codes"]
 
 
 def test_factor_adjudication_loader_never_flips_alpha(tmp_path: Path) -> None:

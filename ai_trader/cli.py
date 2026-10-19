@@ -43,6 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
     app = sub.add_parser("app", help="打开8001教室页")
     app.add_argument("--host", default="127.0.0.1")
     app.add_argument("--port", type=int, default=8001)
+    app.add_argument("--allow-remote", action="store_true", help="显式允许非回环绑定；默认仅本机访问")
+    comparison = sub.add_parser("compare-prompts", help="离线比较活动提示词与候选；不调用模型或改账本")
+    comparison.add_argument("--context-json", required=True)
+    comparison.add_argument("--out-dir", required=True)
+    comparison.add_argument("--candidate", choices=["independent_v1"], default="independent_v1")
     decisions = sub.add_parser(
         "decisions",
         help="C线：把已有20:20日记核成可对账记录并刷新对照页，不调模型、不改菜单、不跑周期",
@@ -88,7 +93,15 @@ def main(argv: list[str] | None = None) -> int:
             _print({"ok": True, "status": "not_started", "ledger": load_ledger(profile_paths().ledger)})
         return 0
     if args.command == "app":
-        run_app(host=args.host, port=args.port)
+        run_app(host=args.host, port=args.port, allow_remote=args.allow_remote)
+        return 0
+    if args.command == "compare-prompts":
+        from ai_trader.prompt_comparison import write_prompt_comparison
+
+        context = json.loads(Path(args.context_json).read_text(encoding="utf-8"))
+        if not isinstance(context, dict):
+            raise SystemExit("--context-json 必须是本地 JSON 对象")
+        _print(write_prompt_comparison(context, Path(args.out_dir), candidate=args.candidate))
         return 0
     if args.command == "decisions":
         runtime = profile_paths()

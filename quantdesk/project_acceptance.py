@@ -116,7 +116,6 @@ def _load_factor_verdicts(root: Path) -> list[dict[str, Any]]:
     for relative in (
         "results/round22_factor_adjudication/adjudication_latest.json",
         "results/round23_reversal_factor/adjudication_latest.json",
-        "results/alpha_adjudication/alpha_latest.json",
     ):
         payload = _read_json(root / relative)
         if payload.get("task_type") == "formal_tradable_alpha_adjudication":
@@ -408,15 +407,14 @@ def build_project_acceptance(
         as_of,
         project_root=root,
     )
-    alpha_validated = any(
+    legacy_alpha_contract_matched = any(
         _is_formal_tradable_alpha_verdict(item, project_root=root) for item in verdicts
     )
-    strategy_status = "validated" if alpha_validated else "not_validated"
-    strategy_reasons = (
-        []
-        if alpha_validated
-        else ["no_formal_tradable_alpha_signal_passed_adjudication"]
-    )
+    # Retired evidence is checked for archive diagnostics, never current validity.
+    strategy_status = "not_validated"
+    strategy_reasons = ["formal_alpha_workflow_retired", "no_current_out_of_sample_acceptance"]
+    if not legacy_alpha_contract_matched:
+        strategy_reasons.append("no_formal_tradable_alpha_signal_passed_adjudication")
 
     return {
         "schema_version": PROJECT_ACCEPTANCE_SCHEMA_VERSION,
@@ -454,7 +452,9 @@ def build_project_acceptance(
             "strategy_alpha": {
                 "status": strategy_status,
                 "reason_codes": strategy_reasons,
-                "formal_evidence": bool(alpha_validated),
+                "formal_evidence": False,
+                "workflow_status": "retired",
+                "legacy_evidence_contract_matched": legacy_alpha_contract_matched,
             },
             "cloud_deployment": {
                 "status": "deferred",

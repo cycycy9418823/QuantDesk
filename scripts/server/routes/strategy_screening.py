@@ -17,6 +17,7 @@ from typing import Any, Callable, MutableMapping
 from flask import Blueprint, Flask, jsonify, request
 
 from quantdesk.paper.trade_costs import DEFAULT_COMMISSION_RATE, DEFAULT_SLIPPAGE_BPS, DEFAULT_STAMP_TAX_RATE
+from quantdesk.research.sample_provenance import research_sample_context
 from scripts.server.helpers.util import clean_payload, finite_float, safe_int
 
 
@@ -44,6 +45,7 @@ def compact_strategy_screening_result(payload: dict[str, Any]) -> dict[str, Any]
     leaderboard = payload.get("leaderboard") if isinstance(payload.get("leaderboard"), list) else []
     handoff = payload.get("backtest_handoff") if isinstance(payload.get("backtest_handoff"), dict) else {}
     return {
+        **research_sample_context(payload),
         "exists": bool(payload),
         "ok": payload.get("ok"),
         "status": payload.get("status") or "",
@@ -71,6 +73,7 @@ def compact_strategy_screening_result(payload: dict[str, Any]) -> dict[str, Any]
         },
         "top_strategies": [
             {
+                **research_sample_context(item),
                 "strategy": item.get("strategy") or "",
                 "status": item.get("status") or "",
                 "annualized_return_net": finite_float(item.get("annualized_return_net")),
@@ -196,12 +199,12 @@ def run_strategy_screening_worker(
             commission_rate=_float_param_or_default(params, "commission_rate", DEFAULT_COMMISSION_RATE),
             stamp_tax_rate=_float_param_or_default(params, "stamp_tax_rate", DEFAULT_STAMP_TAX_RATE),
             slippage_bps=_float_param_or_default(params, "slippage_bps", DEFAULT_SLIPPAGE_BPS),
-            output_dir=str(params.get("output_dir") or "results"),
-            report_dir=str(params.get("report_dir") or "reports"),
-            max_strategies=int(params.get("max_strategies") or 8),
-            max_symbols=int(params.get("max_symbols") or 600),
+            output_dir=str(deps.project_root() / "results"),
+            report_dir=str(deps.project_root() / "reports"),
+            max_strategies=int(params.get("max_strategies", 8)),
+            max_symbols=int(params.get("max_symbols", 600)),
             feature_cache=str(params.get("feature_cache") if params.get("feature_cache") is not None else "true"),
-            cache_dir=str(params.get("cache_dir") or "results/cache"),
+            cache_dir=None,
             mimo_retest=str(params.get("mimo_retest") or "false"),
             json="true",
             summary="true",
@@ -261,6 +264,8 @@ def create_strategy_screening_blueprint(deps: StrategyScreeningRouteDeps) -> Blu
         if state.get("running"):
             return jsonify(clean_payload(strategy_screening_status(deps))), 202
         body = request.get_json(silent=True) or {}
+        if any(body.get(key) not in (None, "") for key in ("cache_dir", "output_dir", "report_dir")):
+            return jsonify({"ok": False, "status": "invalid_request", "error": "screening_output_paths_are_server_managed"}), 400
         full_scan = deps.request_truthy(body.get("full_scan"))
         full_strategies = deps.request_truthy(body.get("full_strategies"))
         try:
@@ -286,7 +291,7 @@ def create_strategy_screening_blueprint(deps: StrategyScreeningRouteDeps) -> Blu
             "max_symbols": max_symbols,
             "max_strategies": max_strategies,
             "feature_cache": "true" if body.get("feature_cache") is None else str(body.get("feature_cache")),
-            "cache_dir": str(body.get("cache_dir") or "results/cache"),
+            "cache_dir": None,
             "mimo_retest": str(body.get("mimo_retest") or "false"),
             "full_scan_requested": full_scan,
             "full_strategies_requested": full_strategies,

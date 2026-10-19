@@ -46,6 +46,7 @@ import requests  # noqa: E402
 from quantdesk.data_truth.daily_bar_validity import daily_bar_validity_from_row  # noqa: E402
 from quantdesk.interprocess_lock import interprocess_file_lock  # noqa: E402
 from quantdesk.process_deadline import ProcessDeadlineResult, run_process_tasks_until_deadline  # noqa: E402
+from quantdesk.universe_refresh import discover_daily_universe_symbols  # noqa: E402
 from scripts.run_data_close_pipeline import (  # noqa: E402
     MarketWriterLease, MarketWriterUnauthorized, _market_refresh_progress_path,
 )
@@ -78,6 +79,7 @@ _OPTIONAL_DEADLINE: ContextVar[float | None] = ContextVar("daily_refresh_deadlin
 _BARS_DEADLINE: ContextVar[float | None] = ContextVar("daily_refresh_bars_deadline", default=None)
 BARS_PUBLISH_RESERVE_SECONDS = 90.0
 OPTIONAL_PUBLISH_RESERVE_SECONDS = 60.0
+_DISCOVERY_SNAPSHOT_ROOTS: tuple[Path, ...] = ()
 
 
 def _now_iso() -> str:
@@ -624,6 +626,12 @@ def family_bars_and_valuation(
         session.close()
     pagination = dict(getattr(rows, "pagination", {}) or {})
     list_row_count = len(rows)
+    roster = _load_universe_symbols()
+    discovery = discover_daily_universe_symbols(
+        PROJECT_ROOT, target, known_symbols=[*roster, *(str(row.get("code") or "") for row in rows)],
+        snapshot_roots=_DISCOVERY_SNAPSHOT_ROOTS,
+    )
+    request_universe = list(dict.fromkeys([*roster, *discovery["symbols"]]))
     # A list whose pagination did not end cleanly is truncated, not complete.
     list_truncated = bool(rows) and bool(pagination) and pagination.get("complete") is not True
     dated_only = not rows
@@ -631,13 +639,12 @@ def family_bars_and_valuation(
     if dated_only:
         # The dated HQ endpoint supplies its own OHLCV and session timestamp.
         # A list outage must not prevent using that existing independent path.
-        roster = _load_universe_symbols()
-        if not roster:
+        if not request_universe:
             return {"ok": False, "status": "failed", "reason": "snapshot_empty_and_universe_missing", "fetched": 0}
         lease.assert_active()
-        quotes = _dated_close_quotes(roster)
+        quotes = _dated_close_quotes(request_universe)
         rows = []
-        for code in roster:
+        for code in request_universe:
             quote = quotes.get(code) or {}
             if not quote:
                 continue
@@ -662,7 +669,10 @@ def family_bars_and_valuation(
     review: dict[str, Any] = {}
     warnings: list[str] = (["snapshot_list_empty:using_dated_hq", "valuation_not_updated:list_unavailable"]
                            if dated_only else [])
-    universe = _load_universe_symbols()
+    warnings.extend(discovery["warnings"])
+    if discovery["symbols"]:
+        warnings.append(f"universe_discovery_new_request_targets:{len(discovery['symbols'])}")
+    universe = request_universe
     missing = sorted(set(universe) - set(symbols))
     if not universe:
         warnings.append("universe_file_missing_or_unreadable:" + str(UNIVERSE_FILE))
@@ -876,6 +886,7 @@ def family_bars_and_valuation(
         "flagged_for_review": review, "missing_in_snapshot": missing,
         "universe_diff_requery": diff_outcomes,
         "universe_diff_requery_limit": UNIVERSE_DIFF_REQUERY_LIMIT,
+        "universe_discovery": discovery,
         "quote_batch_diagnostics": getattr(quotes, "batch_diagnostics", []),
         "contract": "Missing or invalid data remains missing; no suspension is inferred.",
     }, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8"), lease=lease)
@@ -890,6 +901,8 @@ def family_bars_and_valuation(
         "ok": bool(usable), "status": status,
         "list_rows": list_row_count, "list_pagination": pagination, "list_truncated": list_truncated,
         "list_gap_fill": gap_fill,
+        "universe_discovery": discovery,
+        "roster_symbol_count": len(roster), "request_universe_count": len(request_universe),
         "bars_deadline": {"hit": deadline_hit, "unprocessed_count": len(unprocessed),
                           "unprocessed_sample": unprocessed[:20], "not_requested_count": len(not_requested)},
         "snapshot_rows": len(rows), "dated_close_quotes": accepted_quotes, "bars": stats,
@@ -1120,6 +1133,7 @@ def family_quarterly(network: bool, force: bool, *, lease: MarketWriterLease) ->
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _DISCOVERY_SNAPSHOT_ROOTS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--enable-network", action="store_true")
     parser.add_argument("--network", default="false")
@@ -1134,7 +1148,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pipeline-run-id", default="")
     parser.add_argument("--max-refresh-seconds", type=float, default=None)
     parser.add_argument("--refresh-attempt-id", default="")
+    parser.add_argument("--discovery-snapshot-root", type=Path, action="append", default=[],
+                        help="Explicit read-only project root for same-day verified discovery snapshots.")
     args = parser.parse_args(argv)
+    _DISCOVERY_SNAPSHOT_ROOTS = tuple(args.discovery_snapshot_root)
     if args.max_refresh_seconds is not None and (not math.isfinite(args.max_refresh_seconds) or args.max_refresh_seconds < 0):
         parser.error("--max-refresh-seconds must be finite and nonnegative")
     from quantdesk.shared import truthy

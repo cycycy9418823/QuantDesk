@@ -209,9 +209,11 @@ def test_market_note_fake_pct_rejects_llm_plan(tmp_path: Path) -> None:
         ],
     }
     gated = apply_gate_to_plan(plan, daily_dir=daily)
-    assert plan["intents"] == []
-    assert gated.rejections
-    assert gated.rejections[0]["statement_rejections"][0]["label"] == RESULT_MISMATCH
+    # 2AI-1（所有者规则 2）：点评里的假涨幅只标注在点评上，不拦理由本身没问题的买入。
+    assert len(plan["intents"]) == 1
+    assert gated.rejections == []
+    assert gated.market_note_rejections[0]["label"] == RESULT_MISMATCH
+    assert plan["statement_review"]["market_note_ok"] is False
 
 
 def test_structured_record_has_versions_and_condition(tmp_path: Path) -> None:
@@ -269,7 +271,10 @@ def test_score_stand_above_right_wrong_pending(tmp_path: Path) -> None:
     }
     pending = score_decision(dict(base), daily_dir=daily, as_of="2026-09-01")
     assert pending["result"] == RESULT_PENDING
-    right = score_decision(dict(base), daily_dir=daily, as_of="2026-09-02")
+    early = score_decision(dict(base), daily_dir=daily, as_of="2026-09-02")
+    assert early["result"] == RESULT_PENDING
+    assert early["result_evidence"][0]["kind"] == "early_hit"
+    right = score_decision(early, daily_dir=daily, as_of="2026-09-03")
     assert right["result"] == RESULT_RIGHT
     miss_plan = dict(base)
     miss_plan["verification"] = {"kind": "stand_above", "n_sessions": 2, "level": 20.0}
@@ -421,8 +426,10 @@ def test_gate_rejects_false_facts_in_reason_and_integer_price(tmp_path: Path) ->
         "intents": [{"symbol": "600000", "side": "sell", "ref_close": 10.04, "reason": "今天收盘18.88"}],
     }
     gated = apply_gate_to_plan(sell_plan, daily_dir=daily)
-    assert sell_plan["intents"] == []
-    assert gated.rejections
+    # 2AI-1（所有者规则 2）：卖出照常放行，带"含与数据不符说法"标注。
+    assert len(sell_plan["intents"]) == 1
+    assert sell_plan["intents"][0]["statement_label"] == "含与数据不符说法"
+    assert gated.rejections == []
     integer_plan = {
         "decision_date": "2026-09-04",
         "intents": [{"symbol": "600000", "side": "buy", "ref_close": 10.04, "llm_reason": "今天收盘18元"}],

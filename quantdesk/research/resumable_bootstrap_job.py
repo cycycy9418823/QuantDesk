@@ -28,7 +28,7 @@ from quantdesk.research.backtest_statistical_validation import bootstrap_metric_
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_VERSION = "resumable_bootstrap_job_v1"
-IMPLEMENTATION_VERSION = "1"
+IMPLEMENTATION_VERSION = "2"
 DEFAULT_ITERATIONS = 500
 DEFAULT_SEED = 42
 MAX_INPUT_BYTES = 1_048_576
@@ -273,24 +273,32 @@ def _existing_outputs(job_dir: Path, checkpoint: dict[str, Any]) -> dict[str, An
 
 
 def _validate_bootstrap(value: Any, iterations: int, rows: int) -> None:
-    intervals = ("annual_return_ci", "sharpe_ci", "max_drawdown_ci", "win_rate_ci")
+    intervals = ("sample_compounded_return_ci", "sharpe_ci", "max_drawdown_ci", "win_rate_ci")
     if (
         not isinstance(value, dict)
-        or set(value) != {"enabled", "iterations", "status", "warnings", *intervals}
+        or set(value) != {"enabled", "iterations", "status", "warnings", "annual_return_ci", "annualization_status", *intervals}
         or value["enabled"] is not True or type(value["iterations"]) is not int
         or value["iterations"] != iterations
         or value["status"] != ("warning" if rows < 8 else "passed")
         or value["warnings"] != (["insufficient_sample"] if rows < 8 else [])
+        or value["annual_return_ci"] != [None, None]
+        or value["annualization_status"] != "unavailable_without_observation_frequency"
     ):
         raise JobError("computation_output_schema_mismatch")
     for name in intervals:
         bounds = value[name]
+        if name == "sample_compounded_return_ci" and rows < 8:
+            if bounds != [None, None]:
+                raise JobError("computation_output_schema_mismatch", name)
+            continue
         if (
             not isinstance(bounds, list) or len(bounds) != 2
             or any(type(bound) not in (int, float) or not math.isfinite(bound) for bound in bounds)
             or bounds[0] > bounds[1]
         ):
             raise JobError("computation_output_schema_mismatch", name)
+    if rows >= 8 and value["sample_compounded_return_ci"][0] < -1:
+        raise JobError("computation_output_schema_mismatch", "sample_compounded_return_ci")
     if not -1 <= value["max_drawdown_ci"][0] <= value["max_drawdown_ci"][1] <= 0:
         raise JobError("computation_output_schema_mismatch", "max_drawdown_ci")
     if not 0 <= value["win_rate_ci"][0] <= value["win_rate_ci"][1] <= 1:
@@ -341,7 +349,8 @@ def _result(binding: dict[str, Any], values: list[float], bootstrap: dict[str, A
         "row_count": len(values), "bootstrap": bootstrap,
         "research_only": True, "validation_status": "研究输出·未验证",
         "interpretation": {
-            "annual_return_ci": "Cumulative sample return interval; not annualized.",
+            "annual_return_ci": "Unavailable without observation frequency; the fixed return sample is not annualized.",
+            "sample_compounded_return_ci": "Cumulative sample return interval; not annualized. Unavailable with fewer than eight observations.",
             "sharpe_ci": "Sample mean divided by sample population standard deviation; not annualized.",
             "passed": "Computation completed; not evidence of proven strategy effectiveness or future returns.",
             "persistence": "Resume requires the selected job directory to survive; temporary-directory persistence is not guaranteed.",

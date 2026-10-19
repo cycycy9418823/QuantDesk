@@ -1,30 +1,51 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
+import os
+import re
 import sys
+import time
+_ENTRY_STARTED_MONOTONIC = time.monotonic()
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence, TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
-import pandas as pd
+if TYPE_CHECKING:
+    import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from quantdesk.config import load_config  # noqa: E402
-from quantdesk.csv_io import read_csv_frame  # noqa: E402
 from quantdesk.utils import atomic_write_json  # noqa: E402
+from quantdesk.process_deadline import ProcessDeadlineResult  # noqa: E402
 
 DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_UNIVERSE_PATH = DATA_DIR / "universe" / "a_share_symbols.csv"
 DEFAULT_STATUS_PATH = DATA_DIR / "cache" / "a_share_universe_status.json"
 DEFAULT_FALLBACK_SYMBOLS = ["600000", "000001", "600519", "300750"]
+UNIVERSE_SOURCE_PROVIDERS = (
+    "stock_info_a_code_name", "baostock.query_stock_basic", "stock_zh_a_spot", "stock_zh_a_spot_em",
+)
+DEFAULT_ROSTER_PROVIDERS = ("sina.spot_direct", "baostock.query_stock_basic", "stock_info_a_code_name")
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def read_csv_frame(path: str | Path, **kwargs: Any) -> Any:
+    """Keep parent CSV loading out of cold provider-worker imports."""
+    from quantdesk.csv_io import read_csv_frame as read
+
+    return read(path, **kwargs)
 
 
 def now_text() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(SHANGHAI).isoformat(timespec="seconds")
 
 
 def normalize_symbol(value: object) -> str:
@@ -56,33 +77,345 @@ def normalize_universe_frame(df: pd.DataFrame, source: str) -> list[dict[str, st
     if not code_col:
         return []
     rows: list[dict[str, str]] = []
+    seen: set[str] = set()
     for _, row in df.iterrows():
-        _add_symbol(rows, row.get(code_col), row.get(name_col) if name_col else "", source)
+        symbol = normalize_symbol(row.get(code_col))
+        if symbol and symbol not in seen:
+            rows.append({"symbol": symbol, "name": str(row.get(name_col) or "") if name_col else "", "source": source})
+            seen.add(symbol)
     return rows
 
 
-def fetch_universe_from_akshare() -> tuple[list[dict[str, str]], str, dict[str, str]]:
-    provider_errors: dict[str, str] = {}
-    try:
-        import akshare as ak  # type: ignore
-    except Exception as exc:
-        provider_errors["akshare_import"] = str(exc)
-        return [], "", provider_errors
+class UniverseSourceRows(list):
+    """Observed source membership is evidence even when no roster is published."""
 
-    providers = [
-        ("stock_info_a_code_name", lambda: ak.stock_info_a_code_name()),
-        ("stock_zh_a_spot_em", lambda: ak.stock_zh_a_spot_em()),
-        ("stock_zh_a_spot", lambda: ak.stock_zh_a_spot()),
-    ]
-    for provider_name, fetcher in providers:
+    def __init__(self, rows: Sequence[dict[str, str]] = (), *, complete: bool = False) -> None:
+        super().__init__(rows)
+        self.complete = bool(complete)
+        self.attempts: list[dict[str, Any]] = []
+        self.source_snapshots: list[dict[str, Any]] = []
+
+
+def _provider_error_text(exc: BaseException) -> str:
+    """Keep upstream diagnosis without persisting proxy credentials or keys."""
+    message = " ".join(str(exc).split())
+    message = re.sub(r"(https?://)[^\s/@]+@", r"\1<redacted>@", message, flags=re.IGNORECASE)
+    message = re.sub(r"((?:key|token|sendkey|password|secret|api_key)=)[^&\s]+",
+                     r"\1<redacted>", message, flags=re.IGNORECASE)
+    return f"{type(exc).__name__}:{message}"[:500]
+
+
+def _baostock_completion_evidence(
+    result: Any, before: tuple[object, int | None, object], *, page_size: int,
+) -> tuple[bool, str]:
+    """SDK False also means failed pagination, sometimes with error_code == 0."""
+    if str(getattr(result, "error_code", "")) != "0":
+        return False, "provider_error"
+    data = getattr(result, "data", None)
+    cursor = getattr(result, "cur_row_num", None)
+    page_text = str(getattr(result, "cur_page_num", ""))
+    size_text = str(getattr(result, "per_page_count", ""))
+    before_page, before_count, before_cursor = before
+    if (not isinstance(data, list) or type(cursor) is not int
+            or not re.fullmatch(r"[0-9]+", page_text)
+            or not re.fullmatch(r"[0-9]+", str(before_page))
+            or not re.fullmatch(r"[0-9]+", size_text)):
+        return False, "unverified_pagination_state"
+    page, prior_page = int(page_text), int(str(before_page))
+    if page < 1 or prior_page < 1 or int(size_text) != page_size:
+        return False, "invalid_pagination_metadata"
+    count = len(data)
+    if cursor != count:
+        return False, "unconsumed_page"
+    # An empty/blank failed continuation leaves the exhausted full page intact.
+    if count == page_size:
+        return False, "full_page_without_terminal_response"
+    if before_count == page_size and before_cursor == page_size:
+        if count == 0 and cursor == 0 and page == prior_page + 1:
+            return True, "successful_empty_terminal_page"
+        return False, "terminal_page_not_advanced"
+    if (page, count, cursor) != (prior_page, before_count, before_cursor):
+        return False, "unverified_terminal_transition"
+    if count == 0:
+        return (True, "successful_empty_initial_page") if page == 1 else (False, "unverified_empty_page")
+    if count < page_size:
+        return True, "consumed_short_terminal_page"
+    # The SDK also documents a > page-size, single-response/no-pagination path.
+    return True, "consumed_unpaged_response"
+
+
+def _universe_source_worker(provider: str, context: dict[str, Any]) -> dict[str, Any]:
+    """Only fetch in a killable worker; canonical publication stays in parent."""
+    def phase(name: str) -> None:
+        if context.get("report_phases"):
+            print("QD_ROSTER_PHASE " + json.dumps({"phase": name, "at": time.monotonic(), "pid": os.getpid()}),
+                  file=sys.stderr, flush=True)
+
+    phase("provider_import")
+    if provider == "sina.spot_direct":
+        from quantdesk.universe_refresh import build_default_fetchers
+        import requests
+
+        def request_get(url: str, **kwargs: Any) -> Any:
+            remaining = float(context["fetch_deadline_monotonic"]) - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("roster_source_deadline_exhausted")
+            kwargs["timeout"] = min(float(kwargs.get("timeout", 5)), remaining)
+            return requests.get(url, **kwargs)
+
+        # Membership needs no market-clock-derived quote date. Only identities
+        # and terminal pagination evidence leave this worker.
+        fetch = build_default_fetchers(request_get=request_get, clock=lambda: "", retries=0, timeout_seconds=5.0)["sina"]
+        phase("provider_call")
+        frame = fetch(target_date=datetime.now(SHANGHAI).date().isoformat())
+        phase("normalize")
+        complete = frame.attrs.get("pagination_complete") is True
+        return {"rows": normalize_universe_frame(frame, provider), "response_complete": complete,
+                "pagination_complete": complete, "completion_evidence": "terminal_page",
+                "observed_pages": frame.attrs.get("observed_pages"), "expected_pages": frame.attrs.get("expected_pages"),
+                "provider_status": frame.attrs.get("provider_status"),
+                "provider_warning": _provider_error_text(RuntimeError(frame.attrs["provider_warning"])) if frame.attrs.get("provider_warning") else ""}
+    if provider == "baostock.query_stock_basic":
+        import baostock as bs  # type: ignore
+        from baostock.common.contants import BAOSTOCK_PER_PAGE_COUNT  # type: ignore
+        import pandas as pd
+
+        phase("provider_call")
+        login = bs.login()
+        if str(login.error_code) != "0":
+            raise RuntimeError(f"baostock_login:{login.error_code}")
         try:
-            rows = normalize_universe_frame(fetcher(), provider_name)
-            if rows:
-                return rows, provider_name, provider_errors
-            provider_errors[provider_name] = "provider returned empty universe"
+            result = bs.query_stock_basic()
+            if str(result.error_code) != "0":
+                raise RuntimeError(f"baostock_query:{result.error_code}")
+            records = []
+            while True:
+                page_data = getattr(result, "data", None)
+                before = (getattr(result, "cur_page_num", None),
+                          len(page_data) if isinstance(page_data, list) else None,
+                          getattr(result, "cur_row_num", None))
+                if not result.next():
+                    break
+                record = dict(zip(result.fields, result.get_row_data()))
+                # Exclude indices/funds and explicitly delisted instruments.
+                if record.get("type") == "1" and record.get("status") == "1":
+                    records.append({"code": record.get("code"), "name": record.get("code_name")})
+            complete, evidence = _baostock_completion_evidence(result, before, page_size=BAOSTOCK_PER_PAGE_COUNT)
+            phase("normalize")
+            return {"rows": normalize_universe_frame(pd.DataFrame(records), provider),
+                    "response_complete": complete, "pagination_complete": complete,
+                    "completion_evidence": evidence,
+                    "provider_warning": "" if complete else _provider_error_text(
+                        RuntimeError(f"baostock_response_incomplete:{evidence}"))}
+        finally:
+            phase("provider_cleanup")
+            bs.logout()
+    if provider not in UNIVERSE_SOURCE_PROVIDERS:
+        raise ValueError("unapproved_universe_provider")
+    import akshare as ak  # type: ignore
+
+    phase("provider_call")
+    frame = getattr(ak, provider)()
+    phase("normalize")
+    return {"rows": normalize_universe_frame(frame, provider), "response_complete": True,
+            "completion_evidence": "provider_return"}
+
+
+def _run_roster_source_process(
+    worker: Callable[..., Any], tasks: Sequence[str], *, context: dict[str, Any],
+    max_workers: int, timeout_seconds: float,
+) -> ProcessDeadlineResult:
+    """One source owns one phase; its cleanup consumes the same absolute budget."""
+    import subprocess
+
+    if worker is not _universe_source_worker or len(tasks) != 1 or max_workers != 1:
+        raise ValueError("roster_worker_requires_one_source")
+    started = time.monotonic()
+    deadline = min(started + max(0.0, timeout_seconds), float(context["deadline_monotonic"]))
+    allowance = max(0.0, deadline - started)
+    if allowance <= 0:
+        return ProcessDeadlineResult({}, {0: "total_budget_exhausted"}, [0], True, [])
+    cleanup_budget = min(1.0, allowance / 5.0)
+    fetch_deadline = deadline - cleanup_budget
+    script = Path(__file__).resolve()
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    child = subprocess.Popen(
+        [sys.executable, "-B", str(script), "--source-worker"], cwd=str(script.parents[1]), env=env,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    timed_out = False
+    try:
+        stdout, stderr = child.communicate(json.dumps({"provider": tasks[0], "network": True,
+            "context": {**context, "fetch_deadline_monotonic": fetch_deadline, "report_phases": True}}),
+            timeout=max(0.0, fetch_deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            child.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = child.communicate(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+    phases = []
+    for line in stderr.splitlines():
+        if line.startswith("QD_ROSTER_PHASE "):
+            try:
+                phases.append(json.loads(line[len("QD_ROSTER_PHASE "):]))
+            except (ValueError, TypeError):
+                continue
+    evidence = {"runtime_pid": child.pid, "return_code": child.returncode, "process_reaped": child.returncode is not None,
+                "deadline_monotonic": deadline, "fetch_deadline_monotonic": fetch_deadline,
+                "cleanup_budget_seconds": cleanup_budget, "duration_seconds": time.monotonic() - started,
+                "last_phase": phases[-1]["phase"] if phases else "startup", "phase_events": phases}
+    if child.returncode is None:
+        payload = {"worker_error": "worker_not_reaped_within_phase"}
+    elif timed_out or child.returncode == 124 or time.monotonic() >= deadline:
+        payload = {"worker_error": "provider_deadline_exhausted"}
+    else:
+        try:
+            payload = json.loads(stdout)
+            if not isinstance(payload, dict):
+                raise ValueError("provider_result_not_object")
+            if child.returncode and not payload.get("worker_error"):
+                payload["worker_error"] = f"worker_exit:{child.returncode}"
+        except (ValueError, TypeError) as exc:
+            payload = {"worker_error": _provider_error_text(exc)}
+    payload["process_evidence"] = evidence
+    return ProcessDeadlineResult({0: payload}, {}, [], timed_out, [child.pid])
+
+
+def _universe_worker_main() -> int:
+    """Private stdin/stdout protocol; no CSV or status writes in this process."""
+    import contextlib
+    import threading
+
+    watchdog = None
+    try:
+        request = json.load(sys.stdin)
+        if request.get("network") is not True:
+            raise ValueError("network_not_authorized")
+        context = request["context"]
+        remaining = float(context["fetch_deadline_monotonic"]) - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("worker_startup_exhausted_phase")
+        # Starts before pandas, requests, SDK, or the provider helper imports.
+        # It also caps a real interpreter behind a Windows venv launcher.
+        watchdog = threading.Timer(remaining, os._exit, args=(124,))
+        watchdog.daemon = True
+        watchdog.start()
+        with contextlib.redirect_stdout(sys.stderr):
+            payload = _universe_source_worker(str(request["provider"]), context)
+        code = 0
+    except Exception as exc:
+        payload, code = {"worker_error": _provider_error_text(exc)}, 1
+    try:
+        print(json.dumps(payload, ensure_ascii=False, default=str), flush=True)
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+    return code
+
+
+def fetch_universe_from_akshare(
+    *, budget_seconds: float = 35.0, minimum_rows: int = 5000,
+    providers: Sequence[str] | None = None, clock: Callable[[], float] = time.monotonic,
+    runner: Callable[..., Any] | None = None,
+) -> tuple[UniverseSourceRows, str, dict[str, str]]:
+    """Bound each source so one stalled endpoint cannot consume all retries.
+
+    Two independent responses are sought when time permits. Partial lists are
+    retained as discovery evidence, never promoted to a complete roster.
+    """
+    order = list(providers if providers is not None else DEFAULT_ROSTER_PROVIDERS)
+    runner = runner or _run_roster_source_process
+    deadline = clock() + max(0.0, min(90.0, float(budget_seconds)))
+    result = UniverseSourceRows()
+    provider_errors: dict[str, str] = {}
+    best_provider = ""
+    successes = 0
+    for index, provider in enumerate(order):
+        left = max(0.0, deadline - clock())
+        if providers is not None:
+            # Preserve explicit diagnostic source orders; normal operation no
+            # longer rotates four cold SDKs through quarter-sized windows.
+            allowance = min(20.0 if provider == "sina.spot_direct" else 12.0, left / max(1, len(order) - index))
+        elif index == 0:
+            allowance = min(20.0, left * 0.65)
+        elif provider == "baostock.query_stock_basic":
+            allowance = min(12.0, left)
+        else:
+            allowance = min(15.0, left) if left >= 8.0 else 0.0
+        attempt: dict[str, Any] = {"provider": provider, "budget_seconds": allowance}
+        result.attempts.append(attempt)
+        if allowance <= 0:
+            attempt.update(status="not_attempted", error="total_budget_exhausted")
+            provider_errors[provider] = "total_budget_exhausted"
+            continue
+        started = clock()
+        try:
+            batch = runner(_universe_source_worker, [provider], context={"deadline_monotonic": min(deadline, started + allowance)}, max_workers=1,
+                           timeout_seconds=allowance)
+            if batch.failures or batch.unfinished_indices or 0 not in batch.results:
+                raise RuntimeError(batch.failures.get(0) or "provider_deadline_exhausted")
+            payload = batch.results[0]
+            # Explicit runner injection retains the old list contract for SDK
+            # fixtures. A direct paginated result always needs terminal proof.
+            metadata = payload if isinstance(payload, dict) else {}
+            if metadata.get("process_evidence"):
+                attempt["process_evidence"] = metadata["process_evidence"]
+            if metadata.get("provider_warning"):
+                attempt["provider_warning"] = metadata["provider_warning"]
+            if metadata.get("worker_error"):
+                raise RuntimeError(str(metadata["worker_error"]))
+            rows = metadata.get("rows") if metadata else payload
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError("provider_invalid_rows")
+            if clock() >= deadline:
+                raise TimeoutError("total_budget_exhausted")
+            # The worker normalizes live source rows. No cache is admitted here.
+            codes = sorted({str(row.get("symbol") or "") for row in rows})
+            if not codes or any(len(code) != 6 or not code.isdigit() for code in codes):
+                raise ValueError("provider_empty_or_invalid_symbols")
+            if any(row.get("source") != provider for row in rows):
+                raise ValueError("provider_attribution_mismatch")
+            response_complete = (metadata.get("response_complete") is True if metadata else provider in UNIVERSE_SOURCE_PROVIDERS)
+            if provider == "sina.spot_direct":
+                response_complete = response_complete and metadata.get("pagination_complete") is True
+            complete = response_complete and len(codes) >= minimum_rows
+            observed_at = now_text()
+            result.source_snapshots.append({
+                "source": provider, "observed_at": observed_at, "symbols": codes,
+                "row_count": len(codes), "status": "complete" if complete else "partial",
+                "response_complete": response_complete, "pagination_complete": metadata.get("pagination_complete"),
+                "completion_evidence": metadata.get("completion_evidence", "provider_return"),
+                "observed_pages": metadata.get("observed_pages"), "expected_pages": metadata.get("expected_pages"),
+                "symbols_sha256": hashlib.sha256(json.dumps(codes, separators=(",", ":")).encode()).hexdigest(),
+                "contract": "Observed current source membership; not dated price or suspension evidence.",
+            })
+            attempt.update(status="complete" if complete else "partial", row_count=len(codes), response_complete=response_complete)
+            if (complete, len(rows)) > (result.complete, len(result)):
+                result[:] = rows
+                result.complete = complete
+                best_provider = provider
+            if complete:
+                successes += 1
+            else:
+                provider_errors[provider] = (f"incomplete_roster:{len(codes)}<{minimum_rows}" if len(codes) < minimum_rows
+                                             else "incomplete_roster:pagination_or_response_unfinished")
         except Exception as exc:
-            provider_errors[provider_name] = str(exc)
-    return [], "", provider_errors
+            # The runner joins/terminates its own workers before returning.
+            error = _provider_error_text(exc)
+            provider_errors[provider] = error
+            attempt.update(status="failed", error=error)
+        attempt["duration_seconds"] = max(0.0, clock() - started)
+        if (attempt.get("process_evidence") or {}).get("process_reaped") is False:
+            break
+        if successes >= 2:
+            break
+    return result, best_provider, provider_errors
 
 
 def load_local_fallback_universe(config: dict[str, Any] | None = None) -> list[dict[str, str]]:
@@ -137,41 +470,98 @@ def resolve_output_paths(config: dict[str, Any] | None, output: str = "", status
     return output_path, status
 
 
-def write_universe_csv(path: Path, rows: list[dict[str, str]], *, limit: int = 0) -> None:
+def write_universe_csv(path: Path, rows: list[dict[str, str]], *, limit: int = 0, deadline_monotonic: float | None = None) -> None:
+    import pandas as pd
+
     path.parent.mkdir(parents=True, exist_ok=True)
     output_rows = sorted(rows, key=lambda item: item["symbol"])
     if limit and limit > 0:
         output_rows = output_rows[:limit]
     df = pd.DataFrame(output_rows, columns=["symbol", "name", "source"])
     df["updated_at"] = now_text()
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+            df.to_csv(handle, index=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise TimeoutError("roster_publication_deadline_exhausted")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
-def run_update_universe(args: argparse.Namespace) -> dict[str, Any]:
+def run_update_universe(args: argparse.Namespace, *, started_monotonic: float | None = None) -> dict[str, Any]:
+    started = time.monotonic() if started_monotonic is None else started_monotonic
+    budget = max(0.0, min(90.0, float(getattr(args, "budget_seconds", 35))))
+    deadline = started + budget
     config = load_config(args.config or None)
     output_path, status_path = resolve_output_paths(config, args.output, args.status_path)
+    configured_output, _ = resolve_output_paths(config)
+    limited = bool(args.limit and args.limit > 0)
+    protected_outputs = {configured_output.resolve(), DEFAULT_UNIVERSE_PATH.resolve()}
+    preview_output = bool(args.output) and output_path.resolve() not in protected_outputs
+    limit_blocked = limited and not args.dry_run and not preview_output
+    if limited and preview_output and not args.status_path:
+        status_path = output_path.with_name(output_path.name + ".status.json")
     started_at = now_text()
-    rows, provider_used, provider_errors = fetch_universe_from_akshare()
+    previous = read_csv_frame(output_path, dtype=str) if output_path.is_file() else []
+    before_sha = hashlib.sha256(output_path.read_bytes()).hexdigest() if output_path.is_file() else ""
+    minimum_rows = max(5000, math.ceil(len(previous) * 0.95))
+    rows, provider_used, provider_errors = fetch_universe_from_akshare(
+        budget_seconds=max(0.0, deadline - time.monotonic() - min(2.0, budget / 10)), minimum_rows=minimum_rows,
+    )
+    attempts = list(getattr(rows, "attempts", []))
+    source_snapshots = list(getattr(rows, "source_snapshots", []))
     warnings: list[str] = []
-    if not rows:
-        rows = load_local_fallback_universe(config)
-        provider_used = "local_fallback_universe"
-        warnings.append("AKShare universe providers unavailable; used local cache/report/config symbols.")
-    if args.limit and args.limit > 0:
+    fresh_roster = rows.complete and len(rows) >= minimum_rows and time.monotonic() < deadline
+    fetched_count = len(rows)
+    if not fresh_roster:
+        warnings.append("fresh_universe_unavailable:existing_roster_bytes_and_updated_at_preserved")
+    if limit_blocked:
+        warnings.append("limited_roster_publish_refused:use_dry_run_or_explicit_nondefault_output")
+    if limited:
         rows = rows[: args.limit]
-    if not args.dry_run:
-        write_universe_csv(output_path, rows)
+    published = fresh_roster and not args.dry_run and not limit_blocked
+    if published:
+        try:
+            write_universe_csv(output_path, rows, deadline_monotonic=deadline)
+        except TimeoutError:
+            published = fresh_roster = False
+            warnings.append("roster_publication_deadline_exhausted:existing_roster_preserved")
+    if limit_blocked:
+        result_status = "limit_refused_preserved_existing"
+    elif not fresh_roster:
+        result_status = "failed_preserved_existing"
+    elif limited:
+        result_status = "preview_dry_run" if args.dry_run else "preview_written"
+    else:
+        result_status = "dry_run" if args.dry_run else "refreshed"
     status = {
+        "schema_version": "universe_update.v2",
         "started_at": started_at,
         "finished_at": now_text(),
         "provider_used": provider_used,
         "provider_errors": provider_errors,
-        "row_count": len(rows),
+        "row_count": len(rows) if fresh_roster and not limit_blocked else len(previous),
+        "fetched_row_count": fetched_count,
+        "minimum_complete_rows": minimum_rows,
+        "source_attempts": attempts,
+        "source_snapshots": source_snapshots,
+        "published": bool(published),
+        "full_roster_published": bool(published and not limited),
+        "preview": limited,
+        "status": result_status,
+        "previous_roster_sha256": before_sha,
+        "roster_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest() if output_path.is_file() else "",
         "output_path": str(output_path),
         "status_path": str(status_path),
         "dry_run": bool(args.dry_run),
+        "budget_seconds": budget,
+        "duration_seconds": max(0.0, time.monotonic() - started),
         "warnings": warnings,
-        "ok": bool(rows),
+        "ok": fresh_roster and not limit_blocked,
     }
     if not args.dry_run:
         atomic_write_json(status_path, status)
@@ -183,14 +573,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", default="", help="Optional config path.")
     parser.add_argument("--output", default="", help="Output CSV path, default data/universe/a_share_symbols.csv.")
     parser.add_argument("--status-path", default="", help="Universe update status JSON path.")
-    parser.add_argument("--limit", type=int, default=0, help="Limit rows written, useful for smoke tests.")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="Preview at most N rows; requires --dry-run or an explicit non-default --output.")
     parser.add_argument("--dry-run", action="store_true", help="Resolve universe without writing files.")
+    parser.add_argument("--budget-seconds", type=float, default=35.0, help="Shared bounded source-refresh budget (max 90s).")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    status = run_update_universe(args)
+    status = run_update_universe(args, started_monotonic=_ENTRY_STARTED_MONOTONIC if __name__ == "__main__" else None)
     print(
         f"update_a_share_universe finished: ok={status['ok']} provider={status['provider_used']} "
         f"rows={status['row_count']} output={status['output_path']}"
@@ -202,4 +594,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+    raise SystemExit(_universe_worker_main() if sys.argv[1:] == ["--source-worker"] else main())

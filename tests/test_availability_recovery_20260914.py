@@ -45,23 +45,31 @@ def paginated_source(monkeypatch, clock, delay):
 @pytest.mark.parametrize("delay", [0.1, 0.25, 0.5, 1.0])
 def test_full_market_normal_pagination_completes(monkeypatch, delay):
     clock = Clock()
-    expected = paginated_source(monkeypatch, clock, delay)
+    payload = paginated_source(monkeypatch, clock, delay)
+    expected = [dict(row, price_basis="raw") for row in payload]
     rows, source = history._sina_direct_fetch(clock=clock)
+    assert len(rows) == len(payload) == 5561
     assert rows == expected
+    assert all(row["price_basis"] == "raw" for row in rows)
+    assert all("price_basis" not in row for row in payload)
     assert source == "sina.spot_direct"
     assert clock() < 90
 
 
 def test_public_chain_keeps_slow_full_market_result(monkeypatch):
     clock = Clock()
-    expected = paginated_source(monkeypatch, clock, 0.5)
+    payload = paginated_source(monkeypatch, clock, 0.5)
+    expected = [dict(row, price_basis="raw") for row in payload]
     original = history._sina_direct_fetch
     monkeypatch.setattr(history, "_sina_direct_fetch",
                         lambda *, budget_seconds: original(clock=clock, budget_seconds=budget_seconds))
     rows, source = history.default_network_fetch(
-        [row["code"] for row in expected], clock=clock,
+        [row["code"] for row in payload], clock=clock,
     )
+    assert len(rows) == len(payload) == 5561
     assert list(rows) == expected
+    assert all(row["price_basis"] == "raw" for row in rows)
+    assert all("price_basis" not in row for row in payload)
     assert source == "sina.spot_direct"
 
 

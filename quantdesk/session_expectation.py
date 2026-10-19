@@ -17,6 +17,7 @@ from quantdesk.daily_session_evidence import (
     BSE_SOURCE,
     SOURCE as BAOSTOCK_SESSION_SOURCE,
     load_verified_no_session_dates,
+    validate_baostock_session_evidence,
 )
 from quantdesk.price_basis import PRICE_BASIS_RAW, PRICE_BASIS_UNKNOWN, classify_frame_price_basis, normalize_price_basis
 from quantdesk.shared import normalize_symbol
@@ -608,6 +609,75 @@ def _daily_info(
     }
 
 
+def _provider_full_day_interval(rows: list[dict[str, Any]], target: str) -> bool:
+    """Verify supplied halt timing; a matching code is only a lookup hint.
+
+    Eastmoney's date-filtered list includes intraday halts.  Its planned
+    resumption is not proof of the actual end of a halt.  Cover the opening
+    auction as well as continuous trading unless the provider explicitly
+    classifies this target date as a full-day halt.
+    """
+    def text(value: Any) -> str:
+        result = str(value).strip() if value is not None else ""
+        return "" if result.lower() in {"", "-", "--", "nan", "nat", "none", "null", "<na>"} else result
+
+    def timestamp(value: Any) -> pd.Timestamp | None:
+        raw = text(value)
+        if not re.match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", raw):
+            return None
+        try:
+            parsed = pd.Timestamp(raw)
+            if pd.isna(parsed):
+                return None
+            return parsed.tz_localize("Asia/Shanghai") if parsed.tzinfo is None else parsed.tz_convert("Asia/Shanghai")
+        except (TypeError, ValueError):
+            return None
+
+    auction_open = pd.Timestamp(f"{target} 09:15:00", tz="Asia/Shanghai")
+    continuous_open = pd.Timestamp(f"{target} 09:30:00", tz="Asia/Shanghai")
+    session_close = pd.Timestamp(f"{target} 15:00:00", tz="Asia/Shanghai")
+    full_day_labels = {"停牌一天", "停牌1天", "全天停牌", "full_day"}
+    if not rows:
+        return False
+    for row in rows:
+        start_text = text(row.get("停牌时间"))
+        start = timestamp(row.get("停牌时间"))
+        start_is_date = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_text))
+        start_date = _date_text(start_text)
+        if not start_date or (start is None and not start_is_date) or (start is not None and start > continuous_open):
+            return False
+        for key in ("trade_date", "日期", "交易日期"):
+            if text(row.get(key)) and _date_text(row[key]) != target:
+                return False
+        end_text = text(row.get("停牌截止时间"))
+        end = timestamp(end_text)
+        if end_text:
+            end_is_date = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_text))
+            end_date = _date_text(end_text)
+            if (end is None and not end_is_date) or not end_date or end_date < target or (end is not None and end < session_close):
+                return False
+        # A contradictory actual/planned return prevents a full-day claim;
+        # a future planned return cannot establish one by itself.
+        for key in ("复牌时间", "预计复牌时间"):
+            if text(row.get(key)):
+                resume = timestamp(row[key])
+                resume_date = _date_text(row[key])
+                date_only = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", text(row[key])))
+                if (resume is not None and resume < session_close) or (resume is None and not (date_only and resume_date > target)):
+                    return False
+        label = text(row.get("停牌期限"))
+        if label == "盘中停牌":
+            return False
+        # The installed AkShare adapter truncates these fields to dates.  An
+        # exact full-day label can still establish a day; date-only endpoints
+        # without that label never pretend to be observed trading-hour bounds.
+        explicit_full_day = label in full_day_labels and start_date == target
+        observed_interval = start is not None and start <= auction_open and end is not None and end >= session_close
+        if not (explicit_full_day or observed_interval):
+            return False
+    return True
+
+
 def _provider(
     target: str,
     symbols: set[str],
@@ -625,6 +695,9 @@ def _provider(
         "count": 0,
         "matched_count": 0,
         "normalizable_count": 0,
+        "verified_count": 0,
+        "verified_symbols": [],
+        "records_by_symbol": {},
         "error": "",
         "status": "skipped_network_disabled",
         "network_enabled": bool(network),
@@ -682,6 +755,22 @@ def _provider(
         if normalize_symbol(value)
     }
     matched = returned & symbols
+    records_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for row in frame.to_dict(orient="records"):
+        symbol = normalize_symbol(row.get(code_col))
+        if symbol in matched:
+            # Keep the returned facts so later consumers can audit the
+            # interval decision instead of having only a discarded-row hash.
+            records_by_symbol.setdefault(symbol, []).append(
+                {str(key): ("" if value is None else str(value)) for key, value in row.items()}
+            )
+    verified_symbols = sorted(
+        symbol for symbol, rows in records_by_symbol.items()
+        if _provider_full_day_interval(rows, target)
+    )
+    evidence["records_by_symbol"] = records_by_symbol
+    evidence["verified_symbols"] = verified_symbols
+    evidence["verified_count"] = len(verified_symbols)
     evidence["normalizable_count"] = int(len(returned))
     evidence["matched_count"] = int(len(matched))
     evidence["status"] = "success"
@@ -741,6 +830,7 @@ def build_session_expectation(
     network: bool = False,
     provider: Any = None,
     output_path: str | Path | None = None,
+    target_gap_session_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     target = _target_date(target_date)
     root, resolved_daily, resolved_metadata = _resolve_dirs(
@@ -820,6 +910,28 @@ def build_session_expectation(
             "records_sha256": evidence.get("records_sha256", ""),
         }
     local_suspensions.update(baostock_suspensions)
+    gap_session_rows: dict[str, dict[str, Any]] = {}
+    for symbol in normalized_symbols:
+        raw_evidence = (target_gap_session_evidence or {}).get(symbol)
+        if raw_evidence is None:
+            continue
+        verified = validate_baostock_session_evidence(
+            raw_evidence, expected_symbol=symbol,
+            expected_start_date=target, expected_end_date=target,
+        )
+        if not verified["valid"] or target not in verified["suspended_dates"]:
+            continue
+        gap_session_rows[symbol] = {
+            "source": BAOSTOCK_SESSION_SOURCE, "symbol": symbol, "target_date": target,
+            "tradestatus": "0", "reason": "target_gap_verified_tradestatus_zero",
+            "records_sha256": verified["evidence"]["records_sha256"],
+            "records": verified["evidence"]["records"],
+        }
+    local_suspensions.update(gap_session_rows)
+    source_evidence["target_gap_session_evidence"] = {
+        "source": "target_day_gap_recovery", "as_of": target,
+        "verified_count": len(gap_session_rows), "records_by_symbol": gap_session_rows,
+    }
     source_evidence["baostock_session_evidence"] = {
         "source": "verified_persisted_session_evidence",
         "path": str(
@@ -839,6 +951,7 @@ def build_session_expectation(
     provider_suspensions, source_evidence["provider"] = _provider(
         target, symbol_set, network=network, provider=provider
     )
+    verified_provider_suspensions = set(source_evidence["provider"].get("verified_symbols") or [])
     daily_status_payload = dict(daily_status or {})
     fresh_from_update = set(
         normalize_symbol(item)
@@ -1002,6 +1115,8 @@ def build_session_expectation(
                     "symbol": symbol,
                     "target_date": target,
                     "status": "returned_code",
+                    "full_day_verified": symbol in verified_provider_suspensions,
+                    "records": source_evidence["provider"].get("records_by_symbol", {}).get(symbol, []),
                 }
             )
         elif network:
@@ -1124,12 +1239,17 @@ def build_session_expectation(
                 refs,
             )
             continue
-        if symbol in provider_suspensions:
+        if symbol in verified_provider_suspensions:
             per_symbol[symbol] = _detail(
                 symbol,
                 "verified_full_day_suspension",
-                "akshare_exact_date_suspension",
+                "akshare_verified_full_day_interval",
                 refs,
+            )
+            continue
+        if symbol in provider_suspensions:
+            per_symbol[symbol] = _detail(
+                symbol, "unknown", "provider_halt_interval_unverified", refs,
             )
             continue
         if target_count and info["basis"] == PRICE_BASIS_RAW:

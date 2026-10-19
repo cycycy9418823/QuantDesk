@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import json
 import math
+from quantdesk.data_truth.sector_history_archive import read_sector_membership_as_of
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -170,12 +171,7 @@ def _load_membership(
     history_dir: Path,
     source_cache: dict[str, Any] | None = None,
 ) -> tuple[dict[str, dict], str | None]:
-    """Load the dated sector membership captured on ``as_of`` itself.
-
-    Only that date's own snapshot is consulted. Reading a neighbouring date's
-    capture would substitute one day's membership for another's, which is the
-    exact look-ahead the PIT archive exists to prevent.
-    """
+    """Read actual as-of membership; prior captures remain explicitly partial."""
 
     snapshot_path = Path(history_dir) / as_of / "snapshot.json"
     cache = source_cache if source_cache is not None else {}
@@ -192,14 +188,12 @@ def _load_membership(
                     if isinstance(row, Mapping)
                 }, (str(source_path) if source_path else None)
         return {}, None
-    if not snapshot_path.exists():
+    loaded = read_sector_membership_as_of(Path(history_dir), as_of=as_of)
+    payload, observation = loaded["snapshot"], loaded["observation"]
+    if not payload:
         cache[cache_key] = {"index": {}, "source_path": None}
         return {}, None
-    try:
-        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        cache[cache_key] = {"index": {}, "source_path": None}
-        return {}, None
+    snapshot_path = Path(observation["source_path"])
     rows = payload.get("sector_membership")
     if not isinstance(rows, list):
         cache[cache_key] = {"index": {}, "source_path": None}
@@ -210,7 +204,7 @@ def _load_membership(
             continue
         symbol = str(row.get("symbol") or "").strip()
         if symbol:
-            index[symbol] = dict(row)
+            index[symbol] = {**row, "_as_of_observation": observation}
     try:
         relative = snapshot_path.relative_to(PROJECT_ROOT)
         source_path = str(relative).replace("\\", "/")
@@ -367,8 +361,10 @@ def derive_candidate_evidence(
     pit_sector = str(row.get("sector") or "").strip()
     effective_from = _iso_day(row.get("effective_from"))
     observed_at = _iso_day(row.get("observed_at"))
+    observation = row.get("_as_of_observation") or {}
     sector_proven = bool(
         pit_sector
+        and observation.get("eligible_for_requested_day") is True
         and effective_from is not None
         and effective_from <= as_of_day
         and observed_at is not None
@@ -381,8 +377,9 @@ def derive_candidate_evidence(
         effective_from=effective_from,
         observed_at=observed_at,
         membership_source=str(row.get("source") or "") or None,
+        observation=observation,
         source_path=membership_path,
-        derivation="symbol lookup in the as_of date's own sector_history snapshot",
+        derivation="latest verified snapshot <= as_of; only a same-day capture can prove current membership",
     )
 
     # Criterion 5: amount_ma20 must be reproducible from canonical rows with
