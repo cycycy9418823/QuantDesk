@@ -207,6 +207,7 @@ def is_limit_up(
     symbol: str,
     is_st: bool = False,
     tolerance_bps: float = 20.0,
+    trade_date: Any = None,
 ) -> bool:
     """判断是否触及涨停。
 
@@ -220,13 +221,16 @@ def is_limit_up(
         是否 ST 股票。
     tolerance_bps : float
         涨停判定容差（基点），默认 20bps = 0.2%。
+    trade_date : str | date | None
+        交易日。给出时按当日板块规则判定（创业板 2020-08-24 前 10%、
+        主板 ST 2026-07-06 起 10%）；不给时保持旧的无日期默认。
 
     Returns
     -------
     bool
     """
     import math
-    rules = classify_board(symbol, is_st=is_st)
+    rules = classify_board(symbol, is_st=is_st, trade_date=trade_date)
     threshold = rules.limit_up_pct / 100.0 - tolerance_bps / 10_000
     return bool(math.isfinite(change_pct) and change_pct >= threshold)
 
@@ -237,15 +241,18 @@ def is_limit_down(
     symbol: str,
     is_st: bool = False,
     tolerance_bps: float = 20.0,
+    trade_date: Any = None,
 ) -> bool:
-    """判断是否触及跌停。"""
+    """判断是否触及跌停。``trade_date`` 语义同 :func:`is_limit_up`。"""
     import math
-    rules = classify_board(symbol, is_st=is_st)
+    rules = classify_board(symbol, is_st=is_st, trade_date=trade_date)
     threshold = rules.limit_down_pct / 100.0 + tolerance_bps / 10_000
     return bool(math.isfinite(change_pct) and change_pct <= threshold)
 
 
-def get_limit_pcts(symbol: str, is_st: bool = False) -> tuple[float, float]:
+def get_limit_pcts(
+    symbol: str, is_st: bool = False, *, trade_date: Any = None
+) -> tuple[float, float]:
     """返回 (limit_up_pct, limit_down_pct) 百分比值。
 
     Example
@@ -255,7 +262,7 @@ def get_limit_pcts(symbol: str, is_st: bool = False) -> tuple[float, float]:
     >>> get_limit_pcts("600000")
     (10.0, -10.0)
     """
-    rules = classify_board(symbol, is_st=is_st)
+    rules = classify_board(symbol, is_st=is_st, trade_date=trade_date)
     return rules.limit_up_pct, rules.limit_down_pct
 
 

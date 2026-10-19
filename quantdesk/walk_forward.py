@@ -271,7 +271,8 @@ def _simulate_trades(
                 has_ohlc
                 and change_pct is not None
                 and _is_one_word_bar(opens[i + 1], highs[i + 1], lows[i + 1], closes[i + 1])
-                and is_limit_up(change_pct=change_pct / 100.0, symbol=str(symbol or ""))
+                and is_limit_up(change_pct=change_pct / 100.0, symbol=str(symbol or ""),
+                                trade_date=dates[i + 1])
             ):
                 equity.append(cash + position * (closes[i + 1] if not pd.isna(closes[i + 1]) else closes[i]))
                 continue
@@ -294,7 +295,8 @@ def _simulate_trades(
                 has_ohlc
                 and change_pct is not None
                 and _is_one_word_bar(opens[i + 1], highs[i + 1], lows[i + 1], closes[i + 1])
-                and is_limit_down(change_pct=change_pct / 100.0, symbol=str(symbol or ""))
+                and is_limit_down(change_pct=change_pct / 100.0, symbol=str(symbol or ""),
+                                  trade_date=dates[i + 1])
             ):
                 equity.append(cash + position * (closes[i + 1] if not pd.isna(closes[i + 1]) else closes[i]))
                 continue
