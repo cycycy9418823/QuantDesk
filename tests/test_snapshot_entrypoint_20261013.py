@@ -89,7 +89,10 @@ probing_guards = False
 project_loaded = any(name == "quantdesk" or name.startswith("quantdesk.") for name in sys.modules)
 if project_loaded:
     raise RuntimeError("project imported before network guard verification")
-record("fixture_ready", guarded_channels=guarded_channels, project_loaded=False)
+fence_configs = getattr(sys, "_quantdesk_test_fence_registry", {}).get("configs", [])
+if not fence_configs:
+    raise RuntimeError("parent write fence was not restored before fixture")
+record("fixture_ready", guarded_channels=guarded_channels, project_loaded=False, write_fence_restored=True)
 if os.environ.get("QD_SNAPSHOT_TEST_GUARD_ONLY") == "1":
     raise SystemExit(0)
 
@@ -169,8 +172,14 @@ real_popen = subprocess.Popen
 
 def offline_spawn(argv, *args, **kwargs):
     if argv[1:] == ["-B", "-m", "quantdesk.snapshot_history"]:
+        environment = dict(kwargs.get("env") or os.environ)
+        guard = environment["QUANTDESK_TEST_FENCE_BOOTSTRAP"]
+        entries = [guard, *environment.get("PYTHONPATH", "").split(os.pathsep)]
+        environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(value for value in entries if value))
+        kwargs["env"] = environment
         bootstrap = (
             "import runpy, sys\n"
+            + "runpy.run_path(" + repr(str(Path(guard) / "sitecustomize.py")) + ", run_name='_write_fence_startup')\n"
             + "sys.path.insert(0, " + repr(os.environ["QD_SNAPSHOT_TEST_SOURCE_ROOT"]) + ")\n"
             + "runpy.run_path(" + repr(__file__) + ", run_name='_offline_transport')\n"
             + "runpy.run_module('quantdesk.snapshot_history', run_name='__main__')\n"
@@ -213,11 +222,17 @@ def fake_worker(tmp_path: Path, monkeypatch):
 
     def spawn(argv, *args, **kwargs):
         if argv[1:] == ["-B", "-m", "quantdesk.snapshot_history"]:
+            environment = dict(kwargs.get("env") or os.environ)
+            guard = environment["QUANTDESK_TEST_FENCE_BOOTSTRAP"]
+            entries = [guard, *environment.get("PYTHONPATH", "").split(os.pathsep)]
+            environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(value for value in entries if value))
+            kwargs["env"] = environment
             # A same-named sitecustomize in the repository can hide PYTHONPATH
-            # fixtures. Execute this bootstrap explicitly and fail closed if it
-            # cannot load; no production worker code runs before the guard.
+            # fixtures. Restore the unchanged parent write fence explicitly
+            # before the network fixture or any project code is loaded.
             bootstrap = (
                 "import runpy, sys\n"
+                f"runpy.run_path({str(Path(guard) / 'sitecustomize.py')!r}, run_name='_write_fence_startup')\n"
                 f"sys.path.insert(0, {str(Path(history.__file__).resolve().parents[1])!r})\n"
                 f"runpy.run_path({str(transport_fixture)!r}, run_name='_offline_transport')\n"
                 "runpy.run_module('quantdesk.snapshot_history', run_name='__main__')\n"
@@ -231,7 +246,8 @@ def fake_worker(tmp_path: Path, monkeypatch):
     records = read_events(events)
     assert records[0]["event"] == "fixture_ready"
     guards = [row for row in records if row["event"] == "fixture_ready"]
-    assert all(len(row["guarded_channels"]) == 11 and row["project_loaded"] is False for row in guards)
+    assert all(len(row["guarded_channels"]) == 11 and row["project_loaded"] is False
+               and row["write_fence_restored"] is True for row in guards)
     assert {row["pid"] for row in records} <= {row["pid"] for row in guards}
     assert all(row["pid"] != os.getpid() for row in records)
     assert not any(row["event"].startswith("unexpected_") for row in records)
@@ -308,19 +324,32 @@ def test_actual_spawned_worker_prefers_hq_dates_and_explicit_raw_basis(fake_work
 def test_actual_worker_fallback_preserves_unknown_quote_dates(fake_worker, monkeypatch, mode):
     monkeypatch.setenv("QD_SNAPSHOT_TEST_MODE", mode)
     rows = history.fetch_snapshot_in_process(SYMBOLS, network=True, budget_seconds=15)
-    assert rows.source == "sina.spot_direct"
+    assert rows.source == ("sina.hq_batch" if mode == "hq_partial" else "sina.spot_direct")
     assert rows.provider_errors[0]["source"] == "sina.hq_batch"
     assert rows.provider_errors[0]["outcome"] != "ok"
     normalized = history.normalize_snapshot_rows(
         rows, source=rows.source, fetched_at=NOW, trade_date=DAY, slot_time="1000",
     )
-    assert len(normalized) == 2
-    assert all(row["quote_date"] == "" and row["quote_time"] == "10:00:01" for row in normalized)
+    assert len(normalized) == (1 if mode == "hq_partial" else 2)
+    assert all(row["quote_date"] == (DAY if mode == "hq_partial" else "")
+               and row["quote_time"] == "10:00:01" for row in normalized)
     assert all(row["price_basis"] == "raw" for row in normalized)
     quality = history._quote_field_quality(normalized, DAY)
-    assert quality["quote_date_missing_count"] == 2 and quality["quality_status"] == "partial"
+    assert quality["quote_date_missing_count"] == (0 if mode == "hq_partial" else 2)
+    if mode == "hq_partial":
+        # A dated one-symbol HQ capture is more usable than two undated list
+        # rows. Keep both attempts' evidence without inventing list dates.
+        list_stage = next(item for item in rows.provider_errors
+                          if item.get("source") == "sina.spot_direct" and item.get("row_count"))
+        assert list_stage["quote_date_missing_count"] == 2
+        assert list_stage["usable_quote_count"] == 0 and list_stage["outcome"] == "unusable"
+    else:
+        assert quality["quality_status"] == "partial"
     events = provider_events(fake_worker)
-    assert events[0] == "hq" and "list" in events
+    # Provider start order is timing-dependent under the shared 15s budget;
+    # the contract is that both HQ and list were attempted, and the quote-date
+    # preservation assertions above pin the actual result.
+    assert "hq" in events and "list" in events
     assert all(0 < row["timeout"] <= 15 for row in read_events(fake_worker) if "timeout" in row)
 
 

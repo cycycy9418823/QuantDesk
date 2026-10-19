@@ -9,11 +9,14 @@ import json
 import math
 import os
 import re
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 CANON = Path(__file__).resolve().parents[2]
+if str(CANON) not in sys.path:
+    sys.path.insert(0, str(CANON))
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 HEADER_MARK = "# STATUS · 更新于"
 SECTION = "## 今日健康行"
@@ -156,6 +159,14 @@ def _raw_target_trade(path: Path, symbol: str, target: str) -> bool:
         return False
 
 
+def _same_run_no_session(root: Path, target: str, symbols: set[str]) -> set[str]:
+    """Reuse the total reconciliation's dated, strictly validated run evidence."""
+    from quantdesk.full_a_daily_reconciliation import resolve_run_session_evidence
+
+    evidence = resolve_run_session_evidence(root, target_date=target, universe_symbols=sorted(symbols))
+    return set(evidence.excluded_symbols) & symbols if evidence.present else set()
+
+
 def daily_cell(root: Path, target: str) -> tuple[str, str]:
     daily = root / "data" / "daily"
     symbols = _daily_roster(root)
@@ -168,16 +179,27 @@ def daily_cell(root: Path, target: str) -> tuple[str, str]:
     # printed, so a green mark can never swallow the number.
     gap = f"(缺{missing})" if missing else ""
     extras = [] if mark == "✓" else [f"日线缺口 {missing}/{universe}"]
+    verified = _same_run_no_session(root, target, symbols) if symbols else set()
+    verified_missing = verified & missing_symbols
     listed = _same_run_provider_list(root, target, symbols) if symbols else set()
-    listed_missing = listed & missing_symbols
-    label = f"；供应商停牌名单命中{len(listed_missing)}（全天状态待核）" if listed_missing else ""
-    if missing_symbols - listed_missing:
-        extras.append(f"日线缺口原因未核验{len(missing_symbols - listed_missing)}只")
+    listed_missing = (listed & missing_symbols) - verified_missing
+    label = ""
+    if verified_missing:
+        label += (f"；已核验当日无交易{len(verified_missing)}只"
+                  f"；待核验缺口{len(missing_symbols - verified_missing)}只")
+    if listed_missing:
+        label += f"；供应商停牌名单命中{len(listed_missing)}（全天状态待核）"
+    unknown = missing_symbols - verified_missing - listed_missing
+    if unknown:
+        extras.append(f"日线缺口原因未核验{len(unknown)}只")
     if not symbols:
         extras.append("日线名册缺失或不可读，数量未核验")
     conflicts = sorted(code for code in listed & current if _raw_target_trade(daily / f"{code}.csv", code, target))
     if conflicts:
         extras.append(f"停牌名单与当日raw成交证据冲突{len(conflicts)}只：{','.join(conflicts[:12])}；保留当日行情，不沿用停牌")
+    session_conflicts = sorted(code for code in verified & current if _raw_target_trade(daily / f"{code}.csv", code, target))
+    if session_conflicts:
+        extras.append(f"本轮无交易证据与当日raw成交证据冲突{len(session_conflicts)}只：{','.join(session_conflicts[:12])}；保留当日行情，不沿用无交易")
     return f"日线 {mark}{have}/{universe}{gap}{label}", "\n".join(extras)
 
 
@@ -524,13 +546,15 @@ def minute_cell(root: Path, target: str) -> tuple[str, str]:
         missing = int(data.get("missing_count") or 0)
     except (TypeError, ValueError):
         requested = fresh = missing = 0
+    raw_counts = [data.get(key) for key in ("requested_count", "fresh_count", "missing_count")]
+    counts_verified = all(type(value) is int and value >= 0 for value in raw_counts) and fresh + missing == requested
     blocked = sum(
         1
         for row in (data.get("provider_status") or [])
         if isinstance(row, dict) and row.get("status") == "storage_blocked"
     )
-    as_of = str(data.get("target_date") or "")[:10]
-    mark = "✓" if requested and missing == 0 and blocked == 0 and as_of and as_of >= target else "✗"
+    as_of = _plain_day(data.get("target_date"))
+    mark = "✓" if counts_verified and requested and missing == 0 and blocked == 0 and as_of == target else "✗"
     counts = f"{fresh}/{requested}"
     gap = []
     if missing:
@@ -541,6 +565,8 @@ def minute_cell(root: Path, target: str) -> tuple[str, str]:
     if mark == "✓":
         return cell, ""
     detail = f"分钟数据日 {as_of or '缺失'}"
+    if not counts_verified:
+        detail += "，数量关系未核验"
     if gap:
         detail += "，" + "，".join(gap)
     return cell, detail
@@ -551,9 +577,9 @@ def strategy_cell(root: Path, target: str) -> tuple[str, str]:
     data = load_json(path) or {}
     generated = str(data.get("generated_at") or "")
     intake = data.get("candidate_intake") if isinstance(data.get("candidate_intake"), dict) else {}
-    as_of = str(intake.get("as_of") or "")[:10]
-    mark = "✓" if as_of and as_of >= target else "✗"
-    extra = "" if mark == "✓" else f"策略账数据日 {as_of or '缺失'}，生成 {generated or '缺失'}"
+    as_of = _plain_day(data.get("valuation_date"))
+    mark = "✓" if as_of == target and data.get("ok") is True and data.get("portfolio_review_valid") is not False else "✗"
+    extra = "" if mark == "✓" else f"策略账估值日 {as_of or '缺失'}，候选资料日 {intake.get('as_of') or '缺失'}，生成 {generated or '缺失'}；估值/复盘未核验"
     return f"策略账 {mark}", extra
 
 
@@ -562,6 +588,7 @@ def ai_cell(root: Path, target: str) -> tuple[str, str]:
     parts: list[str] = []
     missing: list[str] = []
     stale = False
+    counts_unverified = False
     model_unverified = False
     for label, rel in AI_LEDGERS:
         path = root / rel
@@ -570,19 +597,24 @@ def ai_cell(root: Path, target: str) -> tuple[str, str]:
             missing.append(rel)
             parts.append(f"{label} 缺失")
             continue
-        as_of = str(data.get("as_of") or "")[:10]
+        as_of = _plain_day(data.get("as_of"))
+        if not isinstance(data.get("trades"), list) or any(
+                not isinstance(item, dict) or not _plain_day(item.get("date")) for item in data.get("trades", [])
+                if isinstance(data.get("trades"), list)):
+            counts_unverified = True
+            parts.append(f"{label} 成交记录未核验，笔数未知")
         trades = data.get("trades") if isinstance(data.get("trades"), list) else []
         n = 0
         for item in trades:
             if isinstance(item, dict) and str(item.get("date") or "")[:10] == target:
                 n += 1
         fills += n
-        if not as_of or as_of < target:
+        if as_of != target:
             stale = True
         parts.append(f"{label} {as_of or '缺失'} {n}笔")
         journal = load_json(path.with_name("journal_latest.json")) or {}
         llm = journal.get("llm") if isinstance(journal.get("llm"), dict) else {}
-        if str(journal.get("as_of") or "")[:10] != target or type(llm.get("used")) is not bool:
+        if _plain_day(journal.get("as_of")) != target or type(llm.get("used")) is not bool:
             model_unverified = True
             parts.append(f"{label} 当日模型参与未核验（journal缺失、陈旧或llm.used不明）")
         elif llm["used"] is False:
@@ -590,8 +622,8 @@ def ai_cell(root: Path, target: str) -> tuple[str, str]:
             parts.append(f"{label} 规则回退（模型未参与）")
     if missing:
         return f"AI账 ✗{fills}笔", f"AI账本缺失 {missing[0]}"
-    mark = "✗" if stale else ("△" if model_unverified else "✓")
-    return f"AI账 {mark}{fills}笔", " · ".join(parts)
+    mark = "✗" if stale or counts_unverified else ("△" if model_unverified else "✓")
+    return f"AI账 {mark}{'笔数未知' if counts_unverified else str(fills) + '笔'}", " · ".join(parts)
 
 
 def review_cell(root: Path, target: str) -> tuple[str, str]:
@@ -602,7 +634,12 @@ def review_cell(root: Path, target: str) -> tuple[str, str]:
         data = load_json(root / rel)
         if data is None:
             return "核对 ✗", f"核对记录缺失 {rel}"
-        as_of = str(data.get("as_of") or "")[:10]
+        as_of = _plain_day(data.get("as_of"))
+        valid_results = {"对", "错", "未到期", "陈述与数据不符", "已到期 · 证据不足", "不适用", "未核验"}
+        if not isinstance(data.get("records"), list) or any(
+                not isinstance(item, dict) or not _plain_day(item.get("decision_date")) or item.get("result") not in valid_results
+                for item in data.get("records", []) if isinstance(data.get("records"), list)):
+            return "核对 ✗", f"核对记录未核验 {rel}，不符数量未知"
         recs = data.get("records") if isinstance(data.get("records"), list) else []
         n = 0
         for item in recs:
@@ -613,7 +650,8 @@ def review_cell(root: Path, target: str) -> tuple[str, str]:
         counts.append(n)
         as_ofs.append(as_of)
         labels.append(label)
-    if any(not item or item < target for item in as_ofs):
+    observed_today = datetime.now(SHANGHAI).date().isoformat()
+    if any(not item or item < target or item > observed_today for item in as_ofs):
         lag = min((item for item in as_ofs if item), default="缺失")
         return "核对 ✗", f"核对记录截至 {lag}"
     total = sum(counts)
@@ -701,12 +739,7 @@ def append_health_history(
     root: Path, *, target: str, header: str, line: str,
     explains: list[str], trading: bool,
 ) -> Path:
-    """Write the day's health line; rerunning the same day replaces only that day.
-
-    This exists because STATUS.md is overwritten every run, so it cannot answer
-    "was the health line red for 10 consecutive days?". The history file is the
-    durable answer; a failed write must be surfaced by the caller, never hidden.
-    """
+    """Write the day's health line; rerunning the same day replaces only that day."""
 
     path = health_history_path(root, target)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -781,8 +814,6 @@ def main(argv: list[str] | None = None) -> int:
                 explains=explains, trading=trading,
             ))
         except OSError as exc:
-            # The daily STATUS line is still written, but a missing history is
-            # evidence loss and must be visible in the payload/log.
             payload["history_error"] = f"{type(exc).__name__}:{exc}"
         log = log_path(root)
         log.parent.mkdir(parents=True, exist_ok=True)

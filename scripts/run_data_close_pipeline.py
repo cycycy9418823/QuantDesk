@@ -1191,7 +1191,16 @@ def stage_health_alert(
 
 
 def _stage_version(stage: str) -> str:
-    revision = 5 if stage == "market_refresh" else 4 if stage == "universe" else 3 if stage in {"research_chain", "reconcile"} else 2
+    # reconcile moved to revision 4 when it started consuming the chain's
+    # published no-session evidence (chain_latest) as a resume input: a stage
+    # completed under revision 3 must be re-run rather than reused.
+    revision = (
+        5 if stage == "market_refresh"
+        else 4 if stage == "universe"
+        else 4 if stage == "reconcile"
+        else 3 if stage == "research_chain"
+        else 2
+    )
     return f"{SCHEMA_VERSION}:{stage}:{revision}"
 
 
@@ -1221,6 +1230,12 @@ def _input_manifest_for(stage: str, root: Path, target: str) -> str:
         )
         inputs["refresh_latest"] = _file_hash(
             root / "results" / "data_refresh" / "data_refresh_latest.json"
+        )
+        # The reconciliation now also consumes the chain's published pointer,
+        # which carries this run's verified no-session evidence. Reusing a
+        # previous verdict is only valid while that evidence is unchanged.
+        inputs["chain_latest"] = _file_hash(
+            root / "results" / "data_chain" / "daily_data_chain_latest.json"
         )
     elif stage == "health_alert":
         inputs["refresh_latest"] = _file_hash(

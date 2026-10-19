@@ -276,18 +276,36 @@ def _quote_field_quality(rows: Sequence[Mapping[str, Any]], trade_date: str) -> 
 
     missing_date = sum(not str(row.get("quote_date") or "").strip() for row in rows)
     wrong_date = sum(bool(str(row.get("quote_date") or "").strip())
-                     and str(row.get("quote_date")) != trade_date for row in rows)
+                     and bool(trade_date) and str(row.get("quote_date")) != trade_date for row in rows)
     missing_time = sum(not str(row.get("quote_time") or "").strip() for row in rows)
+    invalid_date = invalid_time = 0
+    for row in rows:
+        quoted_date = str(row.get("quote_date") or "").strip()
+        quoted_time = str(row.get("quote_time") or "").strip()
+        if quoted_date:
+            try:
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", quoted_date):
+                    raise ValueError("invalid_quote_date")
+                date.fromisoformat(quoted_date)
+            except ValueError:
+                invalid_date += 1
+        if quoted_time:
+            # Keep the existing timestamp formats; validity is distinct from
+            # the not-after-receipt check done when the archive is filed.
+            time_row = dict(row, quote_date="2000-01-01")
+            invalid_time += int(_quote_time_state(time_row, "2000-01-01") == "unparseable")
     unknown_basis = sum(str(row.get("price_basis") or "").lower() != "raw" for row in rows)
     missing_price = sum(not _valid_price(row.get("price")) for row in rows)
     return {
         "quote_date_missing_count": missing_date,
         "quote_date_mismatch_count": wrong_date,
+        "quote_date_invalid_count": invalid_date,
         "quote_time_missing_count": missing_time,
+        "quote_time_invalid_count": invalid_time,
         "price_basis_unverified_count": unknown_basis,
         "price_missing_count": missing_price,
         "quality_status": "partial" if not rows or any((missing_date, wrong_date, missing_time,
-                                                        unknown_basis, missing_price)) else "complete",
+                                                        invalid_date, invalid_time, unknown_basis, missing_price)) else "complete",
         "quote_date_basis": "provider_date_or_empty",
         "price_basis_contract": "explicit_provider_declaration_or_empty",
     }
@@ -373,6 +391,51 @@ def normalize_snapshot_rows(
         rows.append(row)
     rows.sort(key=lambda row: row["symbol"])
     return rows
+
+
+def _provider_quote_quality(
+    payload: Any, *, source: str, expected: set[str], trade_date: str,
+) -> dict[str, Any]:
+    """Assess one capture using the same field aliases as its archive.
+
+    Only requested identities contribute to quality or the selection score.
+    Duplicate requested identities are ambiguous, even if the normalizer
+    would keep their first row. Receipt time never fills a provider date.
+    """
+    records = _records(payload)
+    identities = [normalize_symbol(row.get("symbol") or row.get("code") or row.get("代码")
+                                   or row.get("股票代码") or row.get("证券代码")) for row in records]
+    normalized = normalize_snapshot_rows(
+        records, source=source, fetched_at=_as_shanghai(None), trade_date=trade_date, slot_time="",
+    )
+    requested = expected or {row["symbol"] for row in normalized}
+    rows = [row for row in normalized if row["symbol"] in requested]
+    counts: dict[str, int] = {}
+    for code in identities:
+        if code in requested:
+            counts[code] = counts.get(code, 0) + 1
+    duplicate_symbols = {code for code, count in counts.items() if count > 1}
+    quality = _quote_field_quality(rows, trade_date)
+    usable = sum(row["symbol"] not in duplicate_symbols
+                 and _quote_field_quality([row], trade_date)["quality_status"] == "complete" for row in rows)
+    compatible_prices = sum(_valid_price(row.get("price"))
+                            and (not row["quote_date"] or row["quote_date"] == trade_date) for row in rows)
+    complete = bool(rows) and len(rows) == len(requested) and usable == len(requested)
+    return {
+        **quality,
+        "quality_status": "complete" if complete else "partial",
+        "row_count": len(records), "coverage_count": len(rows), "expected_symbol_count": len(expected),
+        "usable_quote_count": usable, "duplicate_symbol_count": len(duplicate_symbols),
+        "compatible_price_quote_count": compatible_prices,
+        "non_current_quote_date_count": quality["quote_date_mismatch_count"],
+        "quote_date_target": trade_date,
+        "quote_date_currentness": "requested_date_checked" if trade_date else "not_assessed_no_target_date",
+    }
+
+
+def _unneeded_provider_evidence(names: Iterable[str]) -> list[dict[str, Any]]:
+    return [{"source": name, "stage": "skipped", "outcome": "not_needed", "duration_ms": 0,
+             "error_type": "", "message": "verified_requested_quotes_complete"} for name in names]
 
 
 SINA_DIRECT_BUDGET_REFUSED_SOURCE = "sina.spot_direct:budget_below_minimum"
@@ -787,11 +850,12 @@ def resilient_network_fetch(
 
     allowance = min(150.0, max(0.0, float(budget_seconds)))
     deadline = clock() + allowance
+    trade_date = trade_date or _as_shanghai(None).date().isoformat()
     expected = {normalize_symbol(value) for value in symbols}
     evidence: list[dict[str, Any]] = []
     warnings: list[str] = []
     best: tuple[list[Mapping[str, Any]], str] = ([], "sina.hq_batch")
-    best_score = (-1, -1)
+    best_score = (-1, -1, -1)
 
     def hq(*, budget_seconds: float) -> Any:
         return _sina_hq_fetch(symbols, clock=clock, budget_seconds=budget_seconds, batch_size=500)
@@ -811,38 +875,27 @@ def resilient_network_fetch(
         stage["budget_seconds"] = window
         payload, source, notices, details = _fetch_result(result) if result is not None else ([], name, [], [])
         records = _records(payload)
-        observed = {normalize_symbol(row.get("symbol") or row.get("code") or row.get("代码"))
-                    for row in records}
-        coverage = len(expected & observed) if expected else len(observed)
-        usable = set()
-        stale_dates = 0
-        for row in records:
-            code = normalize_symbol(row.get("symbol") or row.get("code") or row.get("代码"))
-            quoted_date = str(row.get("quote_date") or row.get("date") or row.get("日期") or "")
-            stale = bool(trade_date and quoted_date and quoted_date != trade_date)
-            stale_dates += int(stale)
-            if not stale and _valid_price(row.get("price", row.get("trade", row.get("最新价")))):
-                usable.add(code)
-        usable_coverage = len(expected & usable) if expected else len(usable)
-        stage.update(row_count=len(records), coverage_count=coverage, expected_symbol_count=len(expected),
-                     usable_quote_count=usable_coverage, non_current_quote_date_count=stale_dates)
-        if records and not usable:
-            stage.update(outcome="unusable", error_type="NoUsableQuotes", message="no_positive_current_or_undated_quote")
-        elif records and (not expected or expected <= observed):
+        quality = _provider_quote_quality(records, source=source or name, expected=expected, trade_date=trade_date)
+        coverage, usable_coverage = quality["coverage_count"], quality["usable_quote_count"]
+        stage.update(quality)
+        if records and not usable_coverage:
+            stage.update(outcome="unusable", error_type="NoUsableQuotes", message="no_verified_requested_quote")
+        elif quality["quality_status"] == "complete":
             stage["outcome"] = "ok"
         elif records:
-            stage.update(outcome="partial", error_type="IncompleteCoverage",
-                         message=f"returned {coverage}/{len(expected)} requested identities")
+            stage.update(outcome="partial", error_type="IncompleteQuoteQuality",
+                         message=f"verified {usable_coverage}/{len(expected)} requested quotes; roster {coverage}")
         elif stage.get("outcome") == "ok":
             stage.update(outcome="empty", error_type="EmptyResponse", message="provider_returned_no_usable_rows")
         if stage.get("duration_ms", 0) / 1000.0 > window or clock() > deadline:
             stage.update(outcome="overrun", error_type="BudgetExhausted", message="shared_snapshot_deadline")
         evidence.extend([stage, *details])
         warnings.extend(notices)
-        score = (usable_coverage, coverage)
+        score = (usable_coverage, quality["compatible_price_quote_count"], coverage)
         if records and score > best_score:
             best, best_score = (records, source or name), score
         if stage["outcome"] == "ok":
+            evidence.extend(_unneeded_provider_evidence(name for name, _ in sources[index + 1:]))
             break
         warnings.append(f"{name}:{stage['outcome']}:{coverage}/{len(expected)}")
     rows, source = best
@@ -854,8 +907,9 @@ def default_network_fetch(
     *,
     clock: Callable[[], float] = time_module.monotonic,
     budget_seconds: float | None = PROVIDER_TOTAL_BUDGET_SECONDS,
+    trade_date: str = "",
 ) -> Any:
-    """Check coverage before accepting a provider's pagination as complete.
+    """Check requested quote fields before accepting pagination as complete.
 
     Keep the best real partial response if all providers remain incomplete;
     no data is invented or merged across capture times.  Every source, retry and
@@ -868,9 +922,10 @@ def default_network_fetch(
 
     failures: list[str] = []
     provider_errors: list[dict[str, Any]] = []
-    expected = set(symbols)
+    trade_date = trade_date or _as_shanghai(None).date().isoformat()
+    expected = {normalize_symbol(value) for value in symbols}
     best: tuple[Any, str] | None = None
-    best_coverage = -1
+    best_score = (-1, -1, -1)
     started = clock()
     deadline = None if budget_seconds is None else started + max(0.0, budget_seconds)
     # Even the process-bounded mode must not hand HQ a new full budget after
@@ -884,16 +939,21 @@ def default_network_fetch(
             budget_seconds=min(budget_seconds, max(0.0, hq_deadline - clock())),
         )
 
-    def consider(payload: Any, source: str) -> bool:
-        nonlocal best, best_coverage
+    def consider(payload: Any, source: str, evidence: dict[str, Any]) -> bool:
+        nonlocal best, best_score
         records = _records(payload)
-        observed = {normalize_symbol(row.get("symbol") or row.get("code") or row.get("代码")) for row in records}
-        coverage = len(expected & observed) if expected else len(observed)
-        if records and coverage > best_coverage:
-            best, best_coverage = (payload, source), coverage
-        if records and (not expected or expected <= observed):
+        quality = _provider_quote_quality(records, source=source, expected=expected, trade_date=trade_date)
+        evidence.update(quality)
+        score = (quality["usable_quote_count"], quality["compatible_price_quote_count"], quality["coverage_count"])
+        if records and score > best_score:
+            best, best_score = (payload, source), score
+        if quality["quality_status"] == "complete":
             return True
-        failures.append(f"{source}:incomplete:{coverage}/{len(expected)}")
+        if evidence["outcome"] == "ok":
+            evidence.update(outcome="partial" if quality["usable_quote_count"] else "unusable",
+                            error_type="IncompleteQuoteQuality", message="requested_quote_fields_unverified")
+        failures.append(f"{source}:incomplete:{quality['coverage_count']}/{len(expected)}")
+        failures.append(f"{source}:quote_fields_incomplete:{quality['usable_quote_count']}/{len(expected)}")
         return False
 
     chain: tuple[tuple[str, Callable[[], Any]], ...] = (
@@ -902,7 +962,7 @@ def default_network_fetch(
         ("eastmoney.spot_ak", lambda: _akshare_provider("fetch_spot_eastmoney")),
         ("sina.spot_ak", lambda: _akshare_provider("fetch_spot_sina")),
     )
-    for name, call in chain:
+    for index, (name, call) in enumerate(chain):
         minimum = PROVIDER_MINIMUM_BUDGET_SECONDS.get(name, 0.0)
         now = clock()
         if deadline is not None and now >= deadline:
@@ -974,12 +1034,13 @@ def default_network_fetch(
         if evidence["outcome"] == "budget_overrun":
             failures.append(f"{name}:budget_overrun")
             # Late data is kept only as diagnostic/partial material.
-            consider(payload, name)
+            consider(payload, name, evidence)
             continue
         if evidence["outcome"] != "ok":
             failures.append(f"{name}:{evidence['error_type']}")
             continue
-        if consider(payload, name):
+        if consider(payload, name, evidence):
+            provider_errors.extend(_unneeded_provider_evidence(name for name, _ in chain[index + 1:]))
             return ProviderRows(
                 _records(payload), source=name, warnings=failures,
                 provider_errors=provider_errors,
@@ -1139,10 +1200,11 @@ def _call_fetcher(fetcher: Callable[..., Any], now: datetime, symbols: Sequence[
     if signature is not None and len(signature.parameters) == 0:
         return fetcher()
     if signature is not None:
+        date_kwargs = {"trade_date": now.date().isoformat()} if "trade_date" in signature.parameters else {}
         if "symbols" in signature.parameters:
-            return fetcher(symbols=symbols)
+            return fetcher(symbols=symbols, **date_kwargs)
         if "universe" in signature.parameters:
-            return fetcher(universe=symbols)
+            return fetcher(universe=symbols, **date_kwargs)
         for name in ("now", "fetched_at", "at"):
             if name in signature.parameters:
                 return fetcher(**{name: now})

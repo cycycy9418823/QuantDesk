@@ -41,7 +41,7 @@ def test_opening_failure_keeps_budget_for_another_endpoint(failure):
         return [quote("600000", price=11), quote("000001", price=12)], "sina.spot_direct"
 
     rows, source = history.resilient_network_fetch(
-        ["600000", "000001"], clock=clock, budget_seconds=120,
+        ["600000", "000001"], clock=clock, budget_seconds=120, trade_date="2026-10-12",
         primary=primary, secondary=secondary,
     )
     assert calls == [("hq", 30), ("list", 90)]
@@ -53,7 +53,7 @@ def test_opening_failure_keeps_budget_for_another_endpoint(failure):
 def test_two_incomplete_sources_preserve_one_capture_and_all_failures():
     clock = Clock()
     rows, source = history.resilient_network_fetch(
-        ["600000", "000001", "600519"], clock=clock, budget_seconds=60,
+        ["600000", "000001", "600519"], clock=clock, budget_seconds=60, trade_date="2026-10-12",
         primary=lambda **kw: ([quote(), quote("000001")], "sina.hq_batch"),
         secondary=lambda **kw: ([quote("600519")], "sina.spot_direct"),
     )

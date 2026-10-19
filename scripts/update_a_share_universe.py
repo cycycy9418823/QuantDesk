@@ -35,6 +35,28 @@ UNIVERSE_SOURCE_PROVIDERS = (
 )
 DEFAULT_ROSTER_PROVIDERS = ("sina.spot_direct", "baostock.query_stock_basic", "stock_info_a_code_name")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+# Minimum window reserved for each source still queued behind the current one.
+# Without it the first two windows consume the whole shared budget and the last
+# fallback is never attempted (2026-10-14: stock_info_a_code_name got 0.0s).
+# The 35s total budget is unchanged; only the split is bounded.
+_MIN_SOURCE_SLICE = 4.0
+# The parent's own prepare/reap/accounting cost per source. It is charged to the
+# source's window so the reservation survives real orchestration overhead
+# instead of depending on an exact-fit split.
+_PARENT_OVERHEAD_SECONDS = 0.5
+
+# The failure classes a per-source receipt must be able to tell apart. Kept as
+# data so a new upstream shape is one line, not a rewrite.
+FAILURE_CLASSES = (
+    "connect_or_http_failure",
+    "protocol_or_schema_change",
+    "pagination_incomplete",
+    "time_budget_exhausted",
+    "empty_roster",
+    "date_or_symbol_validation_failed",
+    "not_attempted_budget",
+    "unknown_failure",
+)
 
 
 def read_csv_frame(path: str | Path, **kwargs: Any) -> Any:
@@ -103,6 +125,81 @@ def _provider_error_text(exc: BaseException) -> str:
     message = re.sub(r"((?:key|token|sendkey|password|secret|api_key)=)[^&\s]+",
                      r"\1<redacted>", message, flags=re.IGNORECASE)
     return f"{type(exc).__name__}:{message}"[:500]
+
+
+# Ordered token groups. Order matters: a network timeout is a connection
+# outcome even though the word "timeout" appears in it, and an explicit HTTP
+# failure is named before the generic page/pagination tokens can swallow it.
+_CONNECT_TOKENS = (
+    "connectionerror", "connecttimeout", "readtimeout", "connectionreset",
+    "connectionaborted", "proxyerror", "sslerror", "remotedisconnected",
+    "httperror", "http 4", "http 5", "status_code", "getaddrinfo",
+    "name or service", "max retries", "tunnel connection", "remote end closed",
+)
+_PROTOCOL_TOKENS = (
+    "not a list", "not an object", "invalid response", "unexpected response",
+    "schema", "keyerror", "attributeerror", "missing column", "protocol",
+    "jsondecode",
+)
+_EMPTY_TOKENS = ("empty_or_invalid_symbols", "empty_roster", "rows_empty", "no rows")
+_PAGINATION_TOKENS = (
+    "pagination", "terminal_page", "unconsumed_page", "truncat", "page ",
+    "incomplete_roster",
+)
+_SYMBOL_TOKENS = (
+    "invalid_symbols", "invalid_symbol", "symbol_mismatch", "attribution",
+    "invalid_rows", "not_object",
+)
+_DEADLINE_TOKENS = ("deadline", "total_budget_exhausted", "budget_exhausted")
+
+
+def _class_from_text(text: Any) -> str:
+    """Classify one piece of source-supplied text. "" means "no known cause"."""
+    lowered = str(text or "").lower()
+    if not lowered:
+        return ""
+    for tokens, name in (
+        (_CONNECT_TOKENS, "connect_or_http_failure"),
+        (_PROTOCOL_TOKENS, "protocol_or_schema_change"),
+        (_EMPTY_TOKENS, "empty_roster"),
+        (_PAGINATION_TOKENS, "pagination_incomplete"),
+        (_SYMBOL_TOKENS, "date_or_symbol_validation_failed"),
+        (_DEADLINE_TOKENS, "time_budget_exhausted"),
+    ):
+        if any(token in lowered for token in tokens):
+            return name
+    return ""
+
+
+def _classify_source_failure(attempt: dict[str, Any], error: str) -> str:
+    """Map one source attempt onto the failure class the receipt must name.
+
+    Evidence order, so a generic wrapper never overwrites a real cause:
+
+    1. ``provider_warning`` - the source's own stated reason (HTTP status, page
+       failure, non-list response). This is evidence, not a guess.
+    2. an explicit parent deadline (``timeout_kind`` / ``deadline_exhausted``) -
+       budget exhaustion and nothing else.
+    3. the recorded error text.
+
+    A bare ``"timeout"`` in a message is NOT budget exhaustion: ``ConnectTimeout``
+    and ``ReadTimeout`` are network outcomes and stay connection failures. An
+    unknown reason stays ``unknown_failure`` rather than being guessed.
+    """
+    if str(attempt.get("status") or "") == "not_attempted":
+        return "not_attempted_budget"
+    from_warning = _class_from_text(attempt.get("provider_warning"))
+    if from_warning:
+        return from_warning
+    if attempt.get("deadline_exhausted") or attempt.get("timeout_kind"):
+        return "time_budget_exhausted"
+    text = str(error or attempt.get("error") or "")
+    if "provider_deadline_exhausted" in text.lower():
+        return "time_budget_exhausted"
+    from_error = _class_from_text(text)
+    if from_error:
+        return from_error
+    return "unknown_failure"
 
 
 def _baostock_completion_evidence(
@@ -270,19 +367,49 @@ def _run_roster_source_process(
                 "deadline_monotonic": deadline, "fetch_deadline_monotonic": fetch_deadline,
                 "cleanup_budget_seconds": cleanup_budget, "duration_seconds": time.monotonic() - started,
                 "last_phase": phases[-1]["phase"] if phases else "startup", "phase_events": phases}
+    # A stopped child may already have reported the real upstream failure. That
+    # diagnosis must survive the timeout: replacing it with a generic deadline
+    # reason is exactly what left the 2026-10-14 roster receipt unable to say
+    # whether a source never connected or was merely slow. Same contract as the
+    # minute HTTP worker (test_minute_http_failure_budget_20261013).
+    recovered: dict[str, Any] | None = None
+    try:
+        parsed = json.loads(stdout)
+        if isinstance(parsed, dict):
+            recovered = parsed
+    except (ValueError, TypeError):
+        recovered = None
+
     if child.returncode is None:
-        payload = {"worker_error": "worker_not_reaped_within_phase"}
+        payload = {"worker_error": "worker_not_reaped_within_phase", "timeout_kind": "worker_not_reaped"}
     elif timed_out or child.returncode == 124 or time.monotonic() >= deadline:
-        payload = {"worker_error": "provider_deadline_exhausted"}
+        timeout_kind = (
+            "worker_watchdog_exit_124" if child.returncode == 124
+            else "parent_communicate_timeout" if timed_out
+            else "parent_deadline_passed"
+        )
+        child_error = str((recovered or {}).get("worker_error") or "").strip()
+        payload = dict(recovered or {})
+        if isinstance(payload.get("rows"), list):
+            payload["partial_row_count"] = len(payload["rows"])
+        # A timed-out child is never a roster source, whatever it managed to say.
+        payload.pop("rows", None)
+        payload.pop("response_complete", None)
+        payload.pop("pagination_complete", None)
+        payload["timeout_kind"] = timeout_kind
+        payload["deadline_exhausted"] = True
+        if child_error:
+            payload["worker_error"] = child_error
+            payload["child_error"] = child_error
+        else:
+            payload["worker_error"] = "provider_deadline_exhausted"
+    elif recovered is not None:
+        payload = recovered
+        if child.returncode and not payload.get("worker_error"):
+            payload["worker_error"] = f"worker_exit:{child.returncode}"
     else:
-        try:
-            payload = json.loads(stdout)
-            if not isinstance(payload, dict):
-                raise ValueError("provider_result_not_object")
-            if child.returncode and not payload.get("worker_error"):
-                payload["worker_error"] = f"worker_exit:{child.returncode}"
-        except (ValueError, TypeError) as exc:
-            payload = {"worker_error": _provider_error_text(exc)}
+        payload = {"worker_error": f"worker_unparsable_output:return_code_{child.returncode}"}
+    payload["stdout_recovered"] = recovered is not None
     payload["process_evidence"] = evidence
     return ProcessDeadlineResult({0: payload}, {}, [], timed_out, [child.pid])
 
@@ -343,15 +470,28 @@ def fetch_universe_from_akshare(
             # longer rotates four cold SDKs through quarter-sized windows.
             allowance = min(20.0 if provider == "sina.spot_direct" else 12.0, left / max(1, len(order) - index))
         elif index == 0:
+            # The primary source keeps its original window. Taking the
+            # reservation out of it crushed cold starts on small budgets (a 10s
+            # CLI budget left it 2.6s instead of the baseline 5.2s).
             allowance = min(20.0, left * 0.65)
-        elif provider == "baostock.query_stock_basic":
-            allowance = min(12.0, left)
         else:
-            allowance = min(15.0, left) if left >= 8.0 else 0.0
+            cap = 12.0 if provider == "baostock.query_stock_basic" else 15.0
+            queued = len(order) - index - 1
+            reserved = 0.0
+            if queued and left >= _MIN_SOURCE_SLICE * (queued + 1):
+                # Set a real window aside for every source still queued, but only
+                # when this source can still get a real window of its own.
+                reserved = min(_MIN_SOURCE_SLICE * queued, left - _MIN_SOURCE_SLICE)
+            # Charge the parent's own prepare/reap/accounting to this source, and
+            # hand any positive remainder to the last queued source rather than
+            # requiring another full slice (which is what starved it).
+            usable = max(0.0, left - reserved - _PARENT_OVERHEAD_SECONDS)
+            allowance = min(cap, usable) if usable > 0 else 0.0
         attempt: dict[str, Any] = {"provider": provider, "budget_seconds": allowance}
         result.attempts.append(attempt)
         if allowance <= 0:
             attempt.update(status="not_attempted", error="total_budget_exhausted")
+            attempt["failure_class"] = "not_attempted_budget"
             provider_errors[provider] = "total_budget_exhausted"
             continue
         started = clock()
@@ -368,6 +508,13 @@ def fetch_universe_from_akshare(
                 attempt["process_evidence"] = metadata["process_evidence"]
             if metadata.get("provider_warning"):
                 attempt["provider_warning"] = metadata["provider_warning"]
+            # Keep the child's own diagnosis and the timeout facts on the attempt
+            # so the receipt names the failure class instead of one generic
+            # string for every stalled source.
+            for key in ("timeout_kind", "deadline_exhausted", "child_error",
+                        "partial_row_count", "stdout_recovered"):
+                if key in metadata:
+                    attempt[key] = metadata[key]
             if metadata.get("worker_error"):
                 raise RuntimeError(str(metadata["worker_error"]))
             rows = metadata.get("rows") if metadata else payload
@@ -377,8 +524,13 @@ def fetch_universe_from_akshare(
                 raise TimeoutError("total_budget_exhausted")
             # The worker normalizes live source rows. No cache is admitted here.
             codes = sorted({str(row.get("symbol") or "") for row in rows})
-            if not codes or any(len(code) != 6 or not code.isdigit() for code in codes):
+            if not codes:
+                # An empty response and a non-empty but unusable one are
+                # different facts and must not share one diagnosis.
                 raise ValueError("provider_empty_or_invalid_symbols")
+            invalid = [code for code in codes if len(code) != 6 or not code.isdigit()]
+            if invalid:
+                raise ValueError("provider_invalid_symbols:" + ",".join(invalid[:3]))
             if any(row.get("source") != provider for row in rows):
                 raise ValueError("provider_attribution_mismatch")
             response_complete = (metadata.get("response_complete") is True if metadata else provider in UNIVERSE_SOURCE_PROVIDERS)
@@ -411,6 +563,8 @@ def fetch_universe_from_akshare(
             provider_errors[provider] = error
             attempt.update(status="failed", error=error)
         attempt["duration_seconds"] = max(0.0, clock() - started)
+        if attempt.get("status") != "complete":
+            attempt["failure_class"] = _classify_source_failure(attempt, provider_errors.get(provider, ""))
         if (attempt.get("process_evidence") or {}).get("process_reaped") is False:
             break
         if successes >= 2:
@@ -544,6 +698,13 @@ def run_update_universe(args: argparse.Namespace, *, started_monotonic: float | 
         "finished_at": now_text(),
         "provider_used": provider_used,
         "provider_errors": provider_errors,
+        # One class per failed source, so the receipt separates "never connected"
+        # from "answered too slowly" without re-deriving it from log text.
+        "provider_error_classes": {
+            str(item.get("provider") or ""): str(item.get("failure_class") or "unknown_failure")
+            for item in attempts
+            if item.get("failure_class")
+        },
         "row_count": len(rows) if fresh_roster and not limit_blocked else len(previous),
         "fetched_row_count": fetched_count,
         "minimum_complete_rows": minimum_rows,

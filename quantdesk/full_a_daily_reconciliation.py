@@ -22,7 +22,11 @@ from quantdesk.daily_price_update_engine import update_daily_prices
 from quantdesk.data_health_alert_delivery import dispatch_data_health_alerts
 from quantdesk.full_a_daily_coverage import build_full_a_daily_coverage
 from quantdesk.interprocess_lock import interprocess_file_lock
-from quantdesk.suspension_aware_completeness import classify_universe_completeness
+from quantdesk.suspension_aware_completeness import (
+    SuspensionEvidence,
+    classify_universe_completeness,
+    load_run_session_evidence,
+)
 from quantdesk.utils import atomic_write_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +36,13 @@ DAILY_RELATIVE = Path("data/daily")
 LOCK_RELATIVE = Path("state/daily_data_chain.lock")
 RUNS_RELATIVE = Path("results/data_chain/full_a_daily_reconciliation/runs")
 LATEST_RELATIVE = Path("results/data_chain/full_a_daily_reconciliation_latest.json")
+# The single published pointer the reconciliation binds its run evidence to. A
+# pointer, not a directory scan: it is written once per chain run and carries
+# the run id and target date that the evidence belongs to.
+CHAIN_LATEST_RELATIVE = Path("results/data_chain/daily_data_chain_latest.json")
+# The schema the chain writes for the bounded gap-recovery component. A pointer
+# that names another schema is not this contract's evidence.
+RUN_SESSION_SCHEMA = "target_day_gap_recovery.v1"
 
 
 def _truthy(value: Any) -> bool:
@@ -72,16 +83,171 @@ def _last_date(path: Path) -> str:
     return latest
 
 
+def _binding_contradictions(
+    binding: Mapping[str, Any],
+    *,
+    target: str,
+    run_id: str,
+    schema_version: str,
+) -> list[str]:
+    """Fields where an explicit ``evidence_source`` disagrees with the pointer.
+
+    Only *present* fields are compared: an older pointer that omits the binding
+    stays compatible, while one that states a different run, day, producer or
+    schema is a contradiction and must not be consumed as this run's evidence.
+    """
+    problems: list[str] = []
+    binding_target = _date_text(binding.get("target_date"))
+    if binding_target and binding_target != target:
+        problems.append("target_date")
+    binding_run = str(binding.get("run_id") or "").strip()
+    if run_id and binding_run and binding_run != run_id:
+        problems.append("run_id")
+    binding_source = str(binding.get("source") or "").strip()
+    if binding_source and binding_source != "target_day_gap_recovery":
+        problems.append("source")
+    binding_schema = str(binding.get("schema_version") or "").strip()
+    if schema_version and binding_schema and binding_schema != schema_version:
+        problems.append("schema_version")
+    return problems
+
+
+def resolve_run_session_evidence(
+    project_root: str | Path,
+    *,
+    target_date: str,
+    run_evidence_dir: str | Path | None = None,
+    universe_symbols: list[str] | None = None,
+) -> SuspensionEvidence:
+    """Bind this reconciliation to ONE run's validated no-session evidence.
+
+    Precedence:
+
+    1. an explicit ``run_evidence_dir`` (the caller already knows the run), or
+    2. the daily-data-chain *published pointer* for the SAME target date.
+
+    The pointer is a single published artifact, never a history scan, and its
+    ``target_date`` must match exactly: a stale pointer left over from another
+    day is refused rather than silently reused. Everything the pointer offers is
+    still re-validated by the strict session-evidence contract.
+    """
+    target = _date_text(target_date)
+    if run_evidence_dir is not None:
+        return load_run_session_evidence(
+            target,
+            run_evidence_dir=run_evidence_dir,
+            expected_symbols=universe_symbols,
+        )
+    if not target:
+        return SuspensionEvidence(target_date=target, present=False, warnings=("run_evidence_target_missing",))
+    pointer = Path(project_root).resolve() / CHAIN_LATEST_RELATIVE
+    if not pointer.is_file():
+        return SuspensionEvidence(
+            target_date=target,
+            present=False,
+            warnings=("run_session_evidence_pointer_missing",),
+        )
+    try:
+        payload = json.loads(pointer.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return SuspensionEvidence(
+            target_date=target,
+            present=False,
+            warnings=(f"run_session_evidence_pointer_unreadable:{type(exc).__name__}",),
+        )
+    if not isinstance(payload, Mapping):
+        return SuspensionEvidence(
+            target_date=target,
+            present=False,
+            warnings=("run_session_evidence_pointer_not_an_object",),
+        )
+    pointer_target = _date_text(payload.get("target_date"))
+    if pointer_target != target:
+        return SuspensionEvidence(
+            target_date=target,
+            present=False,
+            warnings=(f"run_session_evidence_pointer_date_mismatch:{pointer_target or '-'}",),
+        )
+    # A published pointer is only usable when its own binding is coherent. Absent
+    # fields stay compatible with older pointers, but an explicit contradiction
+    # is refused rather than re-labelled as this run's evidence.
+    if "authoritative" in payload and not _truthy(payload.get("authoritative")):
+        return SuspensionEvidence(
+            target_date=target,
+            present=False,
+            warnings=("run_session_evidence_pointer_not_authoritative",),
+        )
+    components = payload.get("components")
+    component = components.get("target_day_gap_recovery") if isinstance(components, Mapping) else None
+    if not isinstance(component, Mapping):
+        return SuspensionEvidence(
+            target_date=target,
+            present=False,
+            warnings=("run_session_evidence_component_missing",),
+        )
+    component_target = _date_text(component.get("target_date"))
+    if component_target and component_target != target:
+        return SuspensionEvidence(
+            target_date=target,
+            present=False,
+            warnings=(f"run_session_evidence_component_date_mismatch:{component_target}",),
+        )
+    component_schema = str(component.get("schema_version") or "").strip()
+    if component_schema and component_schema != RUN_SESSION_SCHEMA:
+        return SuspensionEvidence(
+            target_date=target,
+            present=False,
+            warnings=(f"run_session_evidence_component_schema_mismatch:{component_schema}",),
+        )
+    pointer_run_id = str(payload.get("run_id") or "").strip()
+    binding = component.get("evidence_source")
+    if isinstance(binding, Mapping):
+        contradictions = _binding_contradictions(
+            binding,
+            target=target,
+            run_id=pointer_run_id,
+            schema_version=component_schema,
+        )
+        if contradictions:
+            return SuspensionEvidence(
+                target_date=target,
+                present=False,
+                warnings=(
+                    "run_session_evidence_binding_contradiction:" + ",".join(contradictions),
+                ),
+            )
+    session_evidence = component.get("session_evidence")
+    if not isinstance(session_evidence, Mapping) or not session_evidence:
+        return SuspensionEvidence(
+            target_date=target,
+            present=False,
+            warnings=("run_session_evidence_empty",),
+        )
+    return load_run_session_evidence(
+        target,
+        run_evidence=session_evidence,
+        expected_symbols=universe_symbols,
+        run_id=pointer_run_id,
+    )
+
+
 def build_reconciliation_partition(
     project_root: str | Path,
     *,
     target_date: str,
+    run_evidence: SuspensionEvidence | None = None,
 ) -> dict[str, Any]:
     """Split the current universe into mutually exclusive update work classes."""
 
     root = Path(project_root).resolve()
     target = _date_text(target_date)
     universe = _read_symbols(root / UNIVERSE_RELATIVE)
+    if run_evidence is None:
+        # Same binding as the full reconciliation: this run's verified
+        # no-session evidence, never the legacy file alone.
+        run_evidence = resolve_run_session_evidence(
+            root, target_date=target, universe_symbols=universe
+        )
     research_set = set(_read_symbols(root / RESEARCH_POOL_RELATIVE, included_only=True))
     daily_dir = root / DAILY_RELATIVE
     research: list[str] = []
@@ -106,7 +272,7 @@ def build_reconciliation_partition(
         else:
             pending.append(symbol)
     completeness = classify_universe_completeness(
-        target, project_root=root, universe_symbols=universe
+        target, project_root=root, universe_symbols=universe, run_evidence=run_evidence
     )
     verified = [
         symbol
@@ -291,13 +457,24 @@ def run_full_a_daily_reconciliation(
     alert_network: bool = False,
     alert_push: bool = False,
     alert_dry_run: bool = True,
+    run_evidence_dir: str | Path | None = None,
+    run_evidence: SuspensionEvidence | None = None,
 ) -> dict[str, Any]:
     """Reconcile only current-universe daily gaps through existing safeguards."""
 
     root = Path(project_root).resolve()
     target = _date_text(target_date)
     current_run_id = _run_id(run_id)
-    partition = build_reconciliation_partition(root, target_date=target)
+    if run_evidence is None:
+        # Bind to ONE run's verified no-session evidence, so a symbol the chain
+        # already proved has no session is not reported here as a gap.
+        run_evidence = resolve_run_session_evidence(
+            root,
+            target_date=target,
+            run_evidence_dir=run_evidence_dir,
+            universe_symbols=_read_symbols(root / UNIVERSE_RELATIVE),
+        )
+    partition = build_reconciliation_partition(root, target_date=target, run_evidence=run_evidence)
     if not target or not partition["universe_symbols"]:
         payload = _manifest(run_id=current_run_id, target=target, partition=partition, status="blocked")
         payload["reason_codes"] = ["universe_or_target_missing"]
@@ -351,7 +528,9 @@ def run_full_a_daily_reconciliation(
         return payload
     try:
         with lock_factory(root / LOCK_RELATIVE, timeout_seconds=float(lock_timeout_seconds)):
-            partition = build_reconciliation_partition(root, target_date=target)
+            partition = build_reconciliation_partition(
+                root, target_date=target, run_evidence=run_evidence
+            )
             pending = list(partition["pending_symbols"])
             checkpoint = {
                 "schema_version": "full_a_daily_reconciliation_checkpoint_v1",
@@ -386,7 +565,9 @@ def run_full_a_daily_reconciliation(
                 universe_path=root / UNIVERSE_RELATIVE,
                 daily_dir=root / DAILY_RELATIVE,
             )
-            partition = build_reconciliation_partition(root, target_date=target)
+            partition = build_reconciliation_partition(
+                root, target_date=target, run_evidence=run_evidence
+            )
             retry_symbols = list(partition["pending_symbols"])
             status = "completed" if not retry_symbols else "partial"
             effective_coverage = _effective_coverage_from_partition(
@@ -439,4 +620,8 @@ def run_full_a_daily_reconciliation(
         return payload
 
 
-__all__ = ["build_reconciliation_partition", "run_full_a_daily_reconciliation"]
+__all__ = [
+    "build_reconciliation_partition",
+    "resolve_run_session_evidence",
+    "run_full_a_daily_reconciliation",
+]

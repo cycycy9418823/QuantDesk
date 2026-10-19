@@ -40,7 +40,7 @@ from zoneinfo import ZoneInfo
 
 from quantdesk.interprocess_lock import interprocess_file_lock
 from quantdesk.intraday.minute_storage import QUARANTINE_DIR, envelope_violation, minute_write_path
-from quantdesk.intraday_refresh.scope import build_dynamic_scope  # noqa: E402
+from quantdesk.intraday_refresh.scope import build_dynamic_scope, read_holding_inventory  # noqa: E402
 from quantdesk.intraday_refresh.snapshot import refresh_full_market_snapshot  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -1929,6 +1929,7 @@ def collect_intraday_refresh(
         "research_only": True,
         "no_broker": True,
         "snapshot": {},
+        "holding_minute_coverage": {"status": "not_assessed", "symbols": [], "full_day_verified_count": None},
     }
 
     if not is_trading_day:
@@ -2079,7 +2080,14 @@ def collect_intraday_refresh(
                 scope = scope_builder(root, extra_symbols=extra_symbols)
             except TypeError:
                 scope = scope_builder(root)
+        if "holding_inventory" not in scope:
+            scope["holding_inventory"] = [] if budget_exhausted else read_holding_inventory(root)
         scope_finished = monotonic()
+        manifest["scope"] = {
+            "selected_symbols": [entry["symbol"] for entry in scope.get("symbols", [])],
+            "excluded_symbols": list(scope.get("excluded_symbols") or []),
+            "holding_inventory": scope["holding_inventory"],
+        }
         manifest["stage_timings"].append(
             {"stage": "scope",
              "outcome": "skipped" if budget_exhausted else "ok",
@@ -2256,6 +2264,8 @@ def collect_intraday_refresh(
                         "legacy_price_basis_unknown": actual_path != path,
                         "requested_bar_limit": MINUTE_OFFSET,
                         "ignored_other_day_rows": ignored_other_day_rows,
+                        "minute_window": _response_minute_window(valid_rows),
+                        "validation_rejected_rows": len(rows) - len(valid_rows) - ignored_other_day_rows,
                         "error_stage": error_stage,
                         "error_type": error_type,
                         "stages": list(diagnostics.get("stages") or []),
@@ -2337,6 +2347,8 @@ def collect_intraday_refresh(
         )
         raise
     finally:
+        if "scope" in manifest:
+            manifest["holding_minute_coverage"] = _holding_minute_coverage(manifest)
         manifest["round_duration_ms"] = _elapsed_ms(round_started, monotonic)
         manifest["finished_at"] = _now_shanghai(None).strftime("%Y-%m-%dT%H:%M:%S")
         if manifest["run_state"] in {"running", "started"}:
@@ -2356,6 +2368,64 @@ def collect_intraday_refresh(
             if lock_guard is not None:
                 lock_guard.__exit__(None, None, None)
     return manifest
+
+
+def _response_minute_window(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Describe accepted response times without inventing a session standard."""
+    times = sorted({_minute_datetime_key(row.get("datetime")) for row in rows})
+    times = [stamp for stamp in times if stamp]
+    return {"valid_response_minutes": len(times), "first_valid_minute": times[0] if times else "",
+            "last_valid_minute": times[-1] if times else "", "evidence_scope": "this_provider_response",
+            "continuity_status": "not_assessed_provider_session_convention",
+            "expected_session_minutes": None, "missing_session_minutes": None,
+            "reason": "provider_session_start_end_and_minute_label_convention_unverified"}
+
+
+def _holding_minute_coverage(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep account holdings, authorized scope and response evidence separate."""
+    scope = manifest["scope"]
+    selected = set(scope["selected_symbols"])
+    excluded = {row["symbol"] for row in scope["excluded_symbols"]}
+    receipts = {row["symbol"]: row for row in manifest["provider_status"]}
+    rows: list[dict[str, Any]] = []
+    books: list[dict[str, Any]] = []
+    for book in scope["holding_inventory"]:
+        books.append({key: book[key] for key in ("account", "status", "reason", "path", "source_sha256",
+                                                "valuation_date", "unverified_quantity_symbols")})
+        for symbol in book["symbols"]:
+            receipt = receipts.get(symbol, {})
+            item = {"account": book["account"], "symbol": symbol, "in_scope": symbol in selected,
+                    "attempted": bool(receipt), "coverage_status": "not_in_scope",
+                    "reason": "not_in_authorized_minute_pool", "error_stage": receipt.get("error_stage", ""),
+                    "last_valid_response_minute": "", "last_archived_valid_minute": receipt.get("latest_bar_time", ""),
+                    "full_day_verified": False}
+            if symbol in excluded:
+                item.update(coverage_status="scope_capped", reason="minute_scope_capped")
+            elif symbol in selected and not receipt:
+                item.update(coverage_status="not_attempted", reason=manifest["not_attempted_reasons"].get(
+                    symbol, "network_not_authorized" if not manifest["network"] else "round_did_not_reach_symbol"))
+            elif receipt:
+                status = str(receipt.get("status") or "")
+                mapping = {"failed": "provider_failed", "validation_failed": "validation_failed",
+                           "empty": "provider_returned_empty", "storage_blocked": "storage_blocked"}
+                item.update(coverage_status=mapping.get(status, "response_unverified"), reason=receipt.get("reason", ""))
+                window = receipt.get("minute_window") or {}
+                if status == "ok" and window.get("valid_response_minutes", 0) > 0:
+                    item.update(coverage_status="observed_partial", reason=window["reason"],
+                                last_valid_response_minute=window["last_valid_minute"])
+            rows.append(item)
+    if not books:
+        return {"status": "not_assessed", "target_date": manifest["target_date"], "symbols": [],
+                "accounts": [], "known_holding_count": None, "full_day_verified_count": None,
+                "reason": "scope_stage_not_assessed", "pool_was_expanded": False}
+    return {"status": "partial" if rows or any(book["status"] != "ready" for book in books) else "no_known_holdings",
+            "target_date": manifest["target_date"], "symbols": rows, "accounts": books,
+            "known_holding_count": len(rows), "in_scope_count": sum(row["in_scope"] for row in rows),
+            "distinct_held_symbol_count": len({row["symbol"] for row in rows}),
+            "attempted_count": sum(row["attempted"] for row in rows),
+            "observed_partial_count": sum(row["coverage_status"] == "observed_partial" for row in rows),
+            "full_day_verified_count": 0, "pool_was_expanded": False,
+            "scope_note": "Existing collection pool retained; per-account holdings are read-only diagnostics"}
 
 
 def _evaluate_freshness(manifest: dict[str, Any], *, current: datetime, critical: set[str], session: str) -> None:

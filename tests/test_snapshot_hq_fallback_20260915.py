@@ -56,7 +56,8 @@ def test_known_list_failure_uses_hq_and_really_archives(tmp_path, monkeypatch, c
     now = datetime(2026, 9, 14, 10, 0, 2, tzinfo=ZoneInfo("Asia/Shanghai"))
     result = history.collect_market_snapshot(
         tmp_path, symbols=["600000", "000001"], network=True, now=now, clock=lambda: now,
-        fetcher=lambda symbols: history.default_network_fetch(symbols, budget_seconds=None),
+        fetcher=lambda symbols, trade_date='': history.default_network_fetch(
+            symbols, budget_seconds=None, trade_date=trade_date),
     )
     assert result["written"] is True
     assert result["source"] == "sina.hq_batch"
@@ -82,10 +83,10 @@ def test_known_list_failure_uses_hq_and_really_archives(tmp_path, monkeypatch, c
 
 
 def test_normal_primary_does_not_call_any_fallback(monkeypatch):
-    monkeypatch.setattr(history, "_sina_direct_fetch", lambda **kwargs: ([{"symbol": "600000", "price": 11}], "sina.spot_direct"))
+    monkeypatch.setattr(history, "_sina_direct_fetch", lambda **kwargs: ([quote("600000", price_basis="raw")], "sina.spot_direct"))
     monkeypatch.setattr(data_providers, "fetch_spot_sina_batch", lambda *a, **k: pytest.fail("HQ must not run"))
     monkeypatch.setattr(history, "_akshare_provider", lambda *a: pytest.fail("AkShare must not run"))
-    rows, source = history.default_network_fetch(["600000"])
+    rows, source = history.default_network_fetch(["600000"], trade_date="2026-09-14")
     assert source == "sina.spot_direct" and len(rows) == 1
     assert rows.warnings == []
 

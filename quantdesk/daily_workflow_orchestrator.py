@@ -8,6 +8,8 @@ investment advice, or promise returns.
 from __future__ import annotations
 
 import html
+import json
+import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -500,6 +502,19 @@ def _build_summary(payload: dict[str, Any]) -> dict[str, Any]:
         if "daily_pool_partial" in freshness
         else bool(_int(daily_pool_stale_count) or _int(daily_pool_missing_count))
     )
+    pnl_status = portfolio_summary.get("daily_pnl_status") or "unverified_legacy_pnl"
+    daily_pnl = portfolio_summary.get("daily_pnl")
+    valuation_date = str(portfolio_payload.get("valuation_date") or "")
+    target_date = str(payload.get("target_date") or freshness.get("target_complete_trade_date") or "")
+    if pnl_status == "verified":
+        if portfolio_payload.get("ok") is False or portfolio_payload.get("portfolio_review_valid") is False:
+            pnl_status = "current_valuation_unverified"
+        elif target_date and not valuation_date:
+            pnl_status = "valuation_date_unverified"
+        elif target_date and valuation_date != target_date:
+            pnl_status = "valuation_date_mismatch"
+        elif isinstance(daily_pnl, bool) or not isinstance(daily_pnl, (int, float)) or not math.isfinite(daily_pnl):
+            pnl_status = "daily_pnl_invalid"
     return {
         "report_generated_at": payload.get("generated_at") or dates.get("report_generated_at") or "",
         "data_freshness_status": freshness.get("data_freshness_status") or ("stale" if freshness.get("is_daily_stale") else ("feature_stale" if freshness.get("is_feature_stale") else "fresh")),
@@ -545,8 +560,9 @@ def _build_summary(payload: dict[str, Any]) -> dict[str, Any]:
         and _int(intraday_status_payload.get("missing_count")) == 0
         and _int(intraday_status_payload.get("invalid_count")) == 0,
         "portfolio_position_count": _int(portfolio_summary.get("position_count"), len(portfolio_payload.get("positions") or [])),
-        "today_pnl": portfolio_summary.get("daily_pnl") if portfolio_summary.get("daily_pnl_status") == "verified" else None,
-        "today_pnl_status": portfolio_summary.get("daily_pnl_status") or "unverified_legacy_pnl",
+        "today_pnl": daily_pnl if pnl_status == "verified" else None,
+        "today_pnl_status": pnl_status,
+        "portfolio_valuation_date": valuation_date,
         "previous_equity_date": portfolio_summary.get("previous_equity_date") or "",
         "previous_total_equity": portfolio_summary.get("previous_total_equity"),
         "cumulative_pnl": portfolio_summary.get("cumulative_pnl"),
@@ -986,7 +1002,9 @@ def _reference_confidence_report_lines(candidates: list[dict[str, Any]]) -> list
 
 
 def build_daily_workflow_report(payload: dict[str, Any]) -> str:
-    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else _build_summary(payload)
+    summary = dict(payload.get("summary") or {}) if isinstance(payload.get("summary"), dict) else {}
+    if not summary or any(key in payload for key in ("formal_candidate_intake", "auto_strategy", "auto_paper_portfolio")):
+        summary.update(_build_summary(payload))
     candidate_count_text = (
         f"长线 {summary.get('long_candidate_count')} 只，打板 {summary.get('board_candidate_count')} 只"
         if summary.get("long_candidate_count") is not None and summary.get("board_candidate_count") is not None
@@ -1003,6 +1021,9 @@ def build_daily_workflow_report(payload: dict[str, Any]) -> str:
         "current_valuation_unverified": "本日估值证据不足",
         "unverified_legacy_pnl": "旧报告未区分当日与累计口径",
         "valuation_date_invalid": "估值日期无效",
+        "valuation_date_unverified": "尚未提供本次权益的估值日期",
+        "valuation_date_mismatch": "权益属于其他交易日",
+        "daily_pnl_invalid": "当日金额无效",
     }.get(summary.get("today_pnl_status"), "缺少可核对的权益记录")
     today_pnl_text = (
         str(summary["today_pnl"]) if summary.get("today_pnl") is not None
@@ -1016,7 +1037,12 @@ def build_daily_workflow_report(payload: dict[str, Any]) -> str:
         DISCLAIMER,
         "",
         f"- 工作流状态：{payload.get('workflow_status', '-')}",
+        f"- 结果业务日期：{payload.get('result_target_date') or payload.get('target_date') or '-'}",
+        f"- 当前目标交易日：{payload.get('current_target_date') or payload.get('target_date') or '-'}",
+        f"- 运行编号：{payload.get('run_id') or '-'}",
+        f"- 读取状态：{payload.get('artifact_status') or '-'}",
         f"- 报告生成时间：{summary.get('report_generated_at') or '-'}",
+        f"- 策略账估值日期：{summary.get('portfolio_valuation_date') or '-'}",
         f"- 本地完整日线最新日期：{summary.get('local_daily_latest_date') or '-'}",
         f"- 日线特征日期：{summary.get('daily_feature_date') or '-'}",
         "",
@@ -1044,6 +1070,8 @@ def build_daily_workflow_report(payload: dict[str, Any]) -> str:
         f"- 待补：{summary.get('theme_pending_count', 0)} 只。",
         f"- 失败原因：{summary.get('theme_failed_reason') or '-'}。",
     ]
+    if payload.get("errors"):
+        lines[5:5] = ["- 本轮错误：" + "；".join(str(item) for item in payload["errors"])]
     daily_price_update = payload.get("daily_price_update") if isinstance(payload.get("daily_price_update"), dict) else {}
     daily_provider_results = daily_price_update.get("provider_results") if isinstance(daily_price_update.get("provider_results"), list) else []
     lines += [
@@ -1339,15 +1367,41 @@ def _load_formal_candidate_batch_for_review(
 
 
 def daily_workflow_latest() -> dict[str, Any]:
+    """Read the last run, keeping missing, failed and stale evidence distinct."""
+    try:
+        current_target, _ = infer_target_date()
+    except (OSError, ValueError):
+        current_target = ""
     if not DAILY_WORKFLOW_LATEST_JSON.exists():
         return {
             "ok": True,
             "exists": False,
             "path": str(DAILY_WORKFLOW_LATEST_JSON),
             "message": "尚未运行今日一键复盘。",
+            "artifact_status": "missing", "current_target_date": current_target,
+            "result_target_date": "", "degraded": True,
         }
-    payload = read_json_safe(DAILY_WORKFLOW_LATEST_JSON, {})
+    def reject_constant(token: str) -> None:
+        raise ValueError(f"nonfinite_json:{token}")
+
+    try:
+        payload = json.loads(DAILY_WORKFLOW_LATEST_JSON.read_text(encoding="utf-8-sig"), parse_constant=reject_constant)
+    except (OSError, ValueError):
+        return {"ok": False, "exists": True, "artifact_status": "unreadable", "degraded": True,
+                "path": str(DAILY_WORKFLOW_LATEST_JSON), "current_target_date": current_target,
+                "result_target_date": "", "message": "无法读取最新复盘记录；旧成功报告不代表本轮完成。"}
+    if not isinstance(payload, dict) or not payload:
+        return {"ok": False, "exists": True, "artifact_status": "invalid", "degraded": True,
+                "path": str(DAILY_WORKFLOW_LATEST_JSON), "current_target_date": current_target,
+                "result_target_date": "", "message": "最新复盘记录格式无效；旧成功报告不代表本轮完成。"}
+    target = str(payload.get("target_date") or "")
+    failed = payload.get("ok") is False or payload.get("workflow_status") == "failed" or payload.get("status") == "failed"
+    artifact_status = "failed" if failed else "current" if target and target == current_target else "stale" if target else "date_unverified"
+    payload.update(artifact_status=artifact_status, current_target_date=current_target,
+                   result_target_date=target, degraded=artifact_status != "current" or payload.get("degraded") is True)
     payload["exists"] = True
+    if any(key in payload for key in ("formal_candidate_intake", "auto_strategy", "auto_paper_portfolio")):
+        payload["summary"] = _build_summary(payload)
     return payload
 
 
@@ -2380,17 +2434,11 @@ def run_daily_workflow(
 
 def daily_workflow_report_html() -> str:
     latest = daily_workflow_latest()
-    report_path = None
-    if latest.get("report_path"):
-        candidate = PROJECT_ROOT / str(latest.get("report_path"))
-        if candidate.exists():
-            report_path = candidate
-    report_path = report_path or newest_daily_workflow_report()
-    if report_path and report_path.exists():
-        body = html.escape(report_path.read_text(encoding="utf-8"))
-        meta = html.escape(str(report_path))
+    if latest.get("exists") and latest.get("artifact_status") not in {"invalid", "unreadable"}:
+        body = html.escape(build_daily_workflow_report(latest))
+        meta = html.escape(str(DAILY_WORKFLOW_LATEST_JSON))
     else:
-        body = "尚未生成今日一键复盘报告。"
+        body = html.escape(latest.get("message") or "尚未生成今日一键复盘报告。")
         meta = ""
     return f"""<!doctype html>
 <html lang="zh-CN">

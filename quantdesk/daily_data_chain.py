@@ -62,7 +62,7 @@ from quantdesk.intraday.stage6_conflict_resolution import (
 )
 from quantdesk.session_expectation import build_session_expectation
 from quantdesk.shared import normalize_symbol, now_text, read_json
-from quantdesk.trading_calendar import trade_days_between
+from quantdesk.trading_calendar import load_a_share_trading_calendar, trade_days_between
 from quantdesk.universe_refresh import (
     build_default_fetchers,
     refresh_universe_snapshot,
@@ -3349,10 +3349,33 @@ def _run_daily_data_chain_impl(
             and symbols is None and not use_low_price_filter
             and upstream_reuse_normalized is not None
         ):
+            calendar_path = root / "data/calendar/a_share_trading_calendar.csv"
+            ledger_calendar = load_a_share_trading_calendar(calendar_path)
+            ledger_warning = str(ledger_calendar.get("coverage_warning") or "")
+            ledger_days: list[str] = []
+            if not ledger_calendar.get("weekend_only") and not ledger_warning:
+                lookup = ledger_calendar.get("is_open_by_date") or {}
+                if resolved_target in lookup:
+                    ledger_days = sorted(day for day, is_open in lookup.items()
+                                         if is_open and day <= resolved_target)[-250:]
+                else:
+                    ledger_warning = "historical_ledger_target_outside_calendar"
+            # Describe the bounded observed-calendar scope. Missing calendar
+            # evidence remains unavailable; never invent weekday sessions.
+            ledger_scope = {
+                "path": str(calendar_path), "target_date": resolved_target,
+                "max_trading_days": 250, "start_date": ledger_days[0] if ledger_days else "",
+                "end_date": ledger_days[-1] if ledger_days else "",
+                "status": "available" if ledger_days else "unavailable",
+                "warning": ledger_warning,
+                "listing_status": "not_assessed; pending dates require symbol/session evidence",
+            }
             target_gap_payload = recover_target_day_gaps(
                 project_root=root, target_date=resolved_target,
                 daily_payload=daily_payload, output_dir=run_dir / "target_day_gap_recovery",
                 network=True,
+                ledger_symbols=session_symbols, ledger_trading_days=ledger_days,
+                ledger_calendar_scope=ledger_scope,
             )
             touched = list(target_gap_payload.get("appended_symbols") or [])
             refreshed = _reused_daily_payload(
@@ -3363,6 +3386,24 @@ def _run_daily_data_chain_impl(
                 daily_payload, refreshed, touched, target_gap_payload,
             )
             atomic_write_json(run_dir / "daily_update.json", daily_payload)
+        # Bind the run-scoped no-session evidence to the run that produced it, so
+        # the total reconciliation consumes the SAME evidence instead of falling
+        # back to the legacy metadata directory and calling a verified
+        # no-session day a gap.
+        if (
+            isinstance(target_gap_payload, dict)
+            and target_gap_payload.get("schema_version") == "target_day_gap_recovery.v1"
+        ):
+            target_gap_payload.setdefault(
+                "evidence_source",
+                {
+                    "run_id": current_run_id,
+                    "target_date": resolved_target,
+                    "source": "target_day_gap_recovery",
+                    "evidence_dir": (run_dir / "target_day_gap_recovery").as_posix(),
+                    "schema_version": str(target_gap_payload.get("schema_version") or ""),
+                },
+            )
         base_manifest["components"]["target_day_gap_recovery"] = target_gap_payload
         session_output_path = (
             run_dir / "session_expectation.json" if not dry_run else None

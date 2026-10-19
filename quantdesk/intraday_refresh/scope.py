@@ -15,6 +15,8 @@ asserts the seven protected ledgers keep their hashes).
 from __future__ import annotations
 
 import json
+import hashlib
+import math
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
@@ -60,6 +62,55 @@ def _symbols_from_positions(ledger: dict[str, Any]) -> list[str]:
                 if sym:
                     out.append(sym)
     return [s for s in (x.strip() for x in out) if s.isdigit() and len(s.strip()) == 6]
+
+
+def read_holding_inventory(project_root: Path) -> list[dict[str, Any]]:
+    """Observe both paper books without changing the authorized minute pool."""
+    accounts = [
+        ("ai_default", Path("state/ai_trader/ledger.json")),
+        ("ai_glm", Path("state/ai_trader_glm/ledger.json")),
+        ("strategy", Path("state/auto_paper_portfolio.json")),
+    ]
+    inventory: list[dict[str, Any]] = []
+    for account, relative in accounts:
+        item: dict[str, Any] = {"account": account, "path": relative.as_posix(), "status": "missing",
+                                "symbols": [], "unverified_quantity_symbols": [], "reason": "ledger_missing",
+                                "source_sha256": "", "valuation_date": ""}
+        path = Path(project_root) / relative
+        if path.is_file():
+            try:
+                content = path.read_bytes()
+                item["source_sha256"] = hashlib.sha256(content).hexdigest()
+                payload = json.loads(content.decode("utf-8-sig"))
+                if not isinstance(payload, dict) or not isinstance(payload.get("positions"), (dict, list)):
+                    raise ValueError("positions_schema_unverified")
+                item.update(status="ready", reason="", valuation_date=str(payload.get("valuation_date") or
+                                                                           payload.get("last_trade_date") or ""))
+                positions = payload["positions"]
+                rows = positions.items() if isinstance(positions, dict) else (("", row) for row in positions)
+                for key, row in rows:
+                    if not isinstance(row, dict):
+                        item.update(status="partial", reason="position_record_unverified")
+                        continue
+                    symbol = str(row.get("symbol") or key).strip()
+                    if not re.fullmatch(r"[0-9]{6}", symbol) or (key and str(key).strip() != symbol):
+                        item.update(status="partial", reason="position_identity_unverified")
+                        continue
+                    quantity = row.get("quantity", row.get("qty", row.get("shares")))
+                    try:
+                        if isinstance(quantity, bool) or not math.isfinite(float(quantity)) or float(quantity) < 0:
+                            raise ValueError("quantity_unverified")
+                        if float(quantity) > 0:
+                            item["symbols"].append(symbol)
+                    except (TypeError, ValueError, OverflowError):
+                        item["unverified_quantity_symbols"].append(symbol)
+                        item.update(status="partial", reason="position_quantity_unverified")
+                for field in ("symbols", "unverified_quantity_symbols"):
+                    item[field] = sorted(set(item[field]))
+            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                item.update(status="unreadable", reason=f"ledger_unreadable:{type(exc).__name__}", symbols=[])
+        inventory.append(item)
+    return inventory
 
 
 def _symbols_from_plan(plan: dict[str, Any]) -> list[str]:
@@ -255,13 +306,17 @@ def build_dynamic_scope(
         entries.values(),
         key=lambda e: (PRIORITY_ORDER[e["priority"]], e["symbol"]),
     )
+    excluded_symbols: list[dict[str, Any]] = []
     if len(symbols) > max_symbols:
+        excluded_symbols = [dict(entry, exclusion_reason="minute_scope_capped") for entry in symbols[max_symbols:]]
         symbols = symbols[:max_symbols]
         warnings.append(f"minute_scope_capped:{max_symbols}")
     if not symbols:
         warnings.append("scope_empty")
     return {
         "symbols": symbols,
+        "excluded_symbols": excluded_symbols,
+        "holding_inventory": read_holding_inventory(root),
         "counts": {
             "total": len(symbols),
             "critical": sum(1 for s in symbols if s["priority"] == "critical"),

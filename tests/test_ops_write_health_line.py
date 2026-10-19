@@ -55,7 +55,8 @@ def run_cli(root: Path, extra: list[str]) -> dict:
 def strategy_fixture(root: Path, as_of: str, generated: str = "2026-09-18T20:03:44") -> None:
     write_json(
         root / "results" / "auto_paper_portfolio_latest.json",
-        {"generated_at": generated, "candidate_intake": {"as_of": as_of}},
+        {"generated_at": generated, "candidate_intake": {"as_of": as_of},
+         "ok": True, "valuation_date": as_of, "portfolio_review_valid": True},
     )
 
 

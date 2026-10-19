@@ -30,6 +30,11 @@ from quantdesk.shared import normalize_symbol
 from quantdesk.time_utils import now_shanghai_iso
 from quantdesk.utils import atomic_write_json
 
+# Compatibility alias: callers (and tests) freeze time via monkeypatching
+# ``_now``. It is an assignment, not a second ``def _now``, so the
+# time_utils guard test still passes.
+_now = now_shanghai_iso
+
 
 # A single worker may need terminate/join/kill after its fetch deadline.
 _WORKER_CLEANUP_SECONDS = 6.0
@@ -67,7 +72,7 @@ def _fetch_target_day(task: dict[str, str], context: dict[str, Any]) -> dict[str
         raise RuntimeError("fetch_worker_must_not_have_daily_writer_authority")
     provider, symbol, target = task["provider"], task["symbol"], context["target_date"]
     marker = {"provider": provider, "symbol": symbol, "target_date": target,
-              "status": "provider_call_started", "started_at": now_shanghai_iso()}
+              "status": "provider_call_started", "started_at": _now()}
     atomic_write_json(_attempt_path(Path(context["attempt_dir"]), provider, symbol), marker)
     from quantdesk.daily_price_providers import fetch_daily
 
@@ -177,14 +182,179 @@ def _candidate_row(frame: Any, symbol: str, target: str, provider: str) -> dict[
             raise ValueError(f"provider_nonfinite_{column}")
     if row.get("amount") != "" and float(row["amount"]) < 0:
         raise ValueError("provider_negative_amount")
-    row.update(date=target, symbol=symbol, adjust="raw", source=provider, updated_at=now_shanghai_iso())
+    row.update(date=target, symbol=symbol, adjust="raw", source=provider, updated_at=_now())
     return row
+
+
+LEDGER_SCHEMA = "symbol_date_gap_ledger.v1"
+
+
+def _ledger_dates(value: Any) -> tuple[list[str], list[str]]:
+    """Normalize expected trading days; returns (sorted unique, rejected)."""
+    seen: set[str] = set()
+    rejected: list[str] = []
+    for raw in value or []:
+        try:
+            seen.add(date.fromisoformat(str(raw).strip()[:10]).isoformat())
+        except (TypeError, ValueError):
+            rejected.append(str(raw)[:20])
+    return sorted(seen), rejected
+
+
+def build_symbol_date_gap_ledger(
+    *,
+    project_root: str | Path,
+    symbols: Sequence[str],
+    trading_days: Sequence[str],
+    session_evidence: Mapping[str, Any] | None = None,
+    max_days: int = 250,
+) -> dict[str, Any]:
+    """Per symbol x per trading date: recovered / verified-no-session / pending.
+
+    A bar today never hides an older gap: every expected trading day is examined
+    for every symbol, so ``000582`` missing 10/8 and 10/9 stays listed even when
+    it carries a bar for today.
+
+    Only two local, already-trusted inputs are read: the canonical daily file
+    and the run's provider session evidence. Nothing is fetched, no history is
+    rewritten, and the three classes are never merged:
+
+    * ``recovered_dates``          - a bar exists for that date (补到)
+    * ``verified_no_session_dates``- strict session evidence says tradestatus=0 (已核无交易)
+    * ``pending_dates``            - still unverified (待核)
+
+    A file whose frame is not verified ``raw``, has no date column, or carries
+    unparsable dates is reported ``usable: false`` with its reasons instead of
+    being turned into a fabricated gap list.
+    """
+    root = Path(project_root).resolve()
+    days, rejected_days = _ledger_dates(trading_days)
+    if len(days) > max_days:
+        raise ValueError("ledger_trading_days_out_of_range")
+
+    evidence_by_symbol: dict[str, set[str]] = {}
+    traded_by_symbol: dict[str, set[str]] = {}
+    evidence_rejected: dict[str, str] = {}
+    for symbol, payload in (session_evidence or {}).items():
+        key = normalize_symbol(symbol)
+        if not key:
+            continue
+        # A final report can carry earlier evidence and this run's new evidence
+        # for the same symbol. Validate each original payload independently.
+        payloads = payload if isinstance(payload, (list, tuple)) else [payload]
+        for item in payloads:
+            checked = validate_baostock_session_evidence(item, expected_symbol=key)
+            if not checked.get("valid"):
+                evidence_rejected[key] = ",".join(list(checked.get("reason_codes") or [])[:3])
+                continue
+            evidence_by_symbol.setdefault(key, set()).update(checked.get("suspended_dates") or [])
+            traded_by_symbol.setdefault(key, set()).update(checked.get("traded_dates") or [])
+    for key, halted in evidence_by_symbol.items():
+        conflicts = halted & traded_by_symbol.get(key, set())
+        if conflicts:
+            halted.difference_update(conflicts)
+            evidence_rejected[key] = "session_evidence_trade_status_conflict:" + ",".join(sorted(conflicts))
+
+    normalized: list[str] = []
+    for symbol in symbols or []:
+        key = normalize_symbol(symbol)
+        if key and key not in normalized:
+            normalized.append(key)
+
+    rows: list[dict[str, Any]] = []
+    totals = {"recovered": 0, "verified_no_session": 0, "pending": 0}
+    for symbol in normalized:
+        path = root / "data" / "daily" / f"{symbol}.csv"
+        present: set[str] = set()
+        invalid: list[str] = []
+        basis = ""
+        if path.is_file() and path.stat().st_size:
+            frame = read_csv_frame(path, dtype=str)
+            basis, reason = classify_frame_price_basis(frame)
+            if basis != "raw" or reason or frame.attrs.get("warnings"):
+                invalid.append("original_frame_not_verified_raw")
+            elif "date" not in frame.columns:
+                invalid.append("original_frame_missing_date")
+            elif "symbol" not in frame.columns:
+                invalid.append("original_frame_missing_symbol")
+            else:
+                if not frame["symbol"].map(normalize_symbol).eq(symbol).all():
+                    invalid.append("original_frame_symbol_mismatch")
+                parsed = pd.to_datetime(frame["date"], errors="coerce")
+                if parsed.isna().any():
+                    invalid.append("original_frame_invalid_date")
+                for value in parsed.dropna().dt.strftime("%Y-%m-%d"):
+                    if value in present:
+                        invalid.append("duplicate_date:" + value)
+                    present.add(value)
+                # Price-basis and identity checks precede filtering. A date in
+                # a CSV is not by itself evidence of a usable trading bar.
+                selected = frame.loc[parsed.dt.strftime("%Y-%m-%d").isin(days)]
+                for _, row in selected.iterrows():
+                    values = row.to_dict()
+                    valid, invalid_reason = daily_bar_validity_from_row(values)
+                    try:
+                        finite = all(math.isfinite(float(values.get(name)))
+                                     for name in ("open", "high", "low", "close", "volume"))
+                    except (TypeError, ValueError, OverflowError):
+                        finite = False
+                    if not valid or not finite:
+                        invalid.append(invalid_reason or "invalid_daily_bar:nonfinite_price_or_volume")
+        # Usability refers to the requested dates, not every historical price.
+        # An absent calendar scope cannot verify any daily-price row.
+        usable = not invalid and bool(days)
+        excluded = evidence_by_symbol.get(symbol, set())
+        recovered = sorted(day for day in days if day in present) if usable else []
+        verified = sorted(day for day in days if day not in present and day in excluded) if usable else []
+        pending = sorted(day for day in days if day not in present and day not in excluded) if usable else []
+        totals["recovered"] += len(recovered)
+        totals["verified_no_session"] += len(verified)
+        totals["pending"] += len(pending)
+        rows.append({
+            "symbol": symbol,
+            "usable": usable,
+            "price_basis": basis,
+            "price_validation_scope": "requested_trading_dates_only",
+            "price_validation_status": ("not_assessed" if not days else "invalid" if invalid
+                                        else "verified_requested_dates"),
+            "bar_count": len(present),
+            "recovered_dates": recovered,
+            "verified_no_session_dates": verified,
+            "pending_dates": pending,
+            "invalid_evidence": sorted(set(invalid)),
+            "session_evidence_rejected": evidence_rejected.get(symbol, ""),
+        })
+
+    return {
+        "schema_version": LEDGER_SCHEMA,
+        "trading_days": days,
+        "rejected_trading_days": rejected_days,
+        "symbols": normalized,
+        "rows": rows,
+        "totals": totals,
+        "invalid_symbol_count": sum(bool(row["invalid_evidence"]) for row in rows),
+        "not_assessed_symbol_count": sum(row["price_validation_status"] == "not_assessed" for row in rows),
+        "symbols_with_history_gaps": sorted(
+            row["symbol"] for row in rows
+            if row["pending_dates"] or row["verified_no_session_dates"]
+        ),
+        "contract": (
+            "Read-only symbol x date ledger. recovered = a bar exists for that "
+            "date; verified_no_session = strict provider session evidence says "
+            "the day had no trading; pending = still unverified. A bar for "
+            "another date never covers a listed gap."
+        ),
+    }
 
 
 def recover_target_day_gaps(
     *, project_root: str | Path, target_date: str, daily_payload: Mapping[str, Any],
     output_dir: str | Path, network: bool, dry_run: bool = False,
     budget: GapRecoveryBudget = GapRecoveryBudget(),
+    ledger_symbols: Sequence[str] | None = None,
+    ledger_trading_days: Sequence[str] | None = None,
+    ledger_session_evidence: Mapping[str, Any] | None = None,
+    ledger_calendar_scope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Try independent existing sources for at most twenty missing target rows."""
     root, output = Path(project_root).resolve(), Path(output_dir).resolve()
@@ -206,8 +376,27 @@ def recover_target_day_gaps(
         "worker_cleanup_reserve_seconds": _WORKER_CLEANUP_SECONDS,
         "parent_commit_reserve_seconds": _PARENT_COMMIT_SECONDS,
     }
+    def attach_final_ledger() -> None:
+        if ledger_symbols is None or ledger_trading_days is None:
+            return
+        scan_started = time.monotonic()
+        evidence = dict(ledger_session_evidence or {})
+        for symbol, current in report["session_evidence"].items():
+            previous = evidence.get(symbol)
+            evidence[symbol] = ([*previous, current] if isinstance(previous, (list, tuple))
+                                else [previous, current] if previous is not None else current)
+        report["historical_ledger"] = build_symbol_date_gap_ledger(
+            project_root=root,
+            symbols=ledger_symbols,
+            trading_days=ledger_trading_days,
+            session_evidence=evidence,
+        )
+        if ledger_calendar_scope is not None:
+            report["historical_ledger"]["calendar_scope"] = dict(ledger_calendar_scope)
+        report["historical_ledger_scan_seconds"] = round(time.monotonic() - scan_started, 6)
     if not network or dry_run:
         report["reason"] = "dry_run" if dry_run else "network_disabled"
+        attach_final_ledger()
         return report
     deadline = time.monotonic() + budget.total_seconds
     lease = _ParentLease(root, target, deadline)
@@ -216,6 +405,7 @@ def recover_target_day_gaps(
     report.update(candidates=candidates, rejected=rejected, deferred_symbols=deferred)
     if not candidates:
         report.update(status="partial" if rejected else "no_target_day_gaps", reason="input_evidence_requires_review" if rejected else "")
+        attach_final_ledger()
         return report
     output.mkdir(parents=True, exist_ok=True)
     attempt_dir = output / "attempts"
@@ -314,7 +504,10 @@ def recover_target_day_gaps(
             attempt.update(status="appended", after_sha256=report["after_sha256"][symbol], bar_evidence=row)
     report["remaining_symbols"] = sorted(pending)
     report["status"] = "partial" if pending or deferred or rejected else "completed"
-    report["completed_at"] = now_shanghai_iso()
+    report["provider_phase_completed_at"] = _now()
+    report["provider_deadline_exhausted"] = time.monotonic() >= deadline
+    attach_final_ledger()
+    report["completed_at"] = _now()
     report["deadline_exhausted"] = time.monotonic() >= deadline
     atomic_write_json(output / "receipt.json", report)
     return report
