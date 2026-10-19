@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -687,6 +688,48 @@ def rewrite_status(root: Path, header: str, section_line: str, explain: str) -> 
     path.write_text("\n".join(block).rstrip() + "\n", encoding="utf-8")
 
 
+HEALTH_HISTORY_RELATIVE = Path("results") / "health_line" / "history"
+
+
+def health_history_path(root: Path, target: str) -> Path:
+    """One append-only evidence file per business date (CHARTER §7)."""
+
+    return root / HEALTH_HISTORY_RELATIVE / f"{target}.md"
+
+
+def append_health_history(
+    root: Path, *, target: str, header: str, line: str,
+    explains: list[str], trading: bool,
+) -> Path:
+    """Write the day's health line; rerunning the same day replaces only that day.
+
+    This exists because STATUS.md is overwritten every run, so it cannot answer
+    "was the health line red for 10 consecutive days?". The history file is the
+    durable answer; a failed write must be surfaced by the caller, never hidden.
+    """
+
+    path = health_history_path(root, target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    detail = "\n".join(f"- {item}" for item in explains if str(item).strip()) or "- （无）"
+    body = (
+        f"# 健康行 {target}\n\n"
+        f"- 生成：{header}\n"
+        f"- 交易日：{'是' if trading else '否'}\n"
+        f"- 健康行：{line}\n\n"
+        f"## 解释\n\n{detail}\n"
+    )
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return path
+
+
 def build_line(root: Path, target: str) -> tuple[str, list[str], bool]:
     trading, cal_note = is_trading_day(root, target)
     explains: list[str] = [f"健康业务日期 {target}"]
@@ -727,15 +770,26 @@ def main(argv: list[str] | None = None) -> int:
         "header": header,
         "trading_day": trading,
         "dry_run": bool(args.dry_run),
+        "history_path": "",
+        "history_error": "",
     }
     if not args.dry_run:
         rewrite_status(root, header, line, " · ".join(explains))
+        try:
+            payload["history_path"] = str(append_health_history(
+                root, target=target, header=header, line=line,
+                explains=explains, trading=trading,
+            ))
+        except OSError as exc:
+            # The daily STATUS line is still written, but a missing history is
+            # evidence loss and must be visible in the payload/log.
+            payload["history_error"] = f"{type(exc).__name__}:{exc}"
         log = log_path(root)
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
     print(json.dumps(payload, ensure_ascii=False))
-    return 0
+    return 1 if payload["history_error"] else 0
 
 
 if __name__ == "__main__":
