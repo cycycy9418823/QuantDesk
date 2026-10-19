@@ -100,7 +100,14 @@ def test_repeated_partial_pages_try_fallback_and_choose_real_complete_batch(monk
     calls=[]
     def backup():
         calls.append(True)
-        return [{"代码":"600000"}, {"代码":"920000"}]
+        def row(code):
+            return {
+                "symbol": code, "name": code, "price": 10.0, "open": 10.0,
+                "high": 10.0, "low": 10.0, "pre_close": 10.0, "volume": 1000,
+                "amount": 10000.0, "quote_date": "2026-10-13",
+                "quote_time": "15:00:00", "price_basis": "raw",
+            }
+        return [row("600000"), row("920000")]
     monkeypatch.setattr(providers, "fetch_spot_eastmoney", backup)
     # Every chain source is simulated: the last one must never be reached once
     # the AkShare eastmoney batch is complete.
@@ -110,7 +117,9 @@ def test_repeated_partial_pages_try_fallback_and_choose_real_complete_batch(monk
     monkeypatch.setattr(providers, "fetch_spot_sina", last_source_must_not_run)
     # Unbounded mode is required so the finite-budget chain does not skip the
     # (deliberately unboundable) legacy provider.
-    rows, source=history.default_network_fetch(symbols=["600000", "920000"], budget_seconds=None)
+    rows, source=history.default_network_fetch(
+        symbols=["600000", "920000"], budget_seconds=None, trade_date="2026-10-13",
+    )
     assert calls==[True] and source=="eastmoney.spot_ak" and len(rows)==2
 
 
