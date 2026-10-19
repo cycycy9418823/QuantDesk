@@ -63,12 +63,16 @@ def test_maturity_uses_published_as_of_not_the_computer_clock(tmp_path, monkeypa
 
 def test_sources_history_and_missing_evidence_never_mix_in_the_model_denominator(tmp_path, monkeypatch):
     model = record("model", llm_used=True, decision_origin="model", llm_model="fixture-model",
+                   ledger_id="fixture-book", plan_id="fixture-plan", side="buy",
                    trade_date="2026-09-21", recorded_at_source="original", result_as_of="2026-09-22",
                    verification={"kind": "stand_above", "n_sessions": 2, "due_date": "2026-09-22",
                                  "source": "model_declared", "level": 21.73, "price_basis": "raw"},
                    result_evidence=[{"kind": "window_hit", "price_basis": "raw",
+                                     "due_date": "2026-09-22", "level": 21.73,
                                      "observed": [["2026-09-21", 21.74], ["2026-09-22", 21.80]]}],
-                   fill_evidence={"status": "confirmed", "trades": [{"plan_id": "fixture-plan"}]})
+                   fill_evidence={"status": "confirmed", "ledger_id": "fixture-book", "trades": [
+                       {"plan_id": "fixture-plan", "symbol": "603468", "side": "buy", "date": "2026-09-21",
+                        "quantity": 100, "price": 21.73, "price_basis": "raw", "evidence_id": "fixture-raw"}]})
     rows = [
         model, record("rule"),
         record("history", llm_used=True, backfill=True),

@@ -111,7 +111,11 @@ def test_workbench_opens_on_charts_with_judgment() -> None:
 
 
 def test_today_kpi_does_not_treat_zero_new_generation_as_empty_pool() -> None:
-    assert "今日未新生成" in JS
+    # 2026-10-19 TODAY evidence semantics: an unverified/zero batch must be
+    # labelled as unverified/zero, never silently rendered as an empty pool.
+    assert "homeCandidateBatch" in JS
+    assert "今日批次未核验" in JS
+    assert "当日批次已核验为 0 只" in JS
     assert "可读复核池" in JS
     assert "health-bad" in JS
     assert "成绩单仍在读" in JS
