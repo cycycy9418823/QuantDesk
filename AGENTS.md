@@ -361,10 +361,13 @@ available, use the active interpreter or set `QUANTDESK_PYTHON` in helper script
 ```powershell
 python -m compileall -q quantdesk scripts tests
 node --check app/static/js/daily_research.js
-python -m unittest discover -s tests -p "test_*.py"
+# Windows long paths: keep pytest basetemp/TEMP short, or IsolatedProject tests fail with FileNotFoundError.
+$env:TMP='E:\q\tmp'; $env:TEMP='E:\q\tmp'
+python -m pytest -q -p no:cacheprovider --basetemp='E:\q\bt' tests
+python scripts/run_tests_isolated.py --output-root <repo-parent>\test_runtime\isolated -- tests -q
 python scripts/self_check.py
 python scripts/quant_api_server.py --help
-python -m unittest tests.test_v3427_p3_engineering_cleanup_replay_performance_and_market_calendar -v
+python -m pytest -q -p no:cacheprovider tests/test_v3427_p3_engineering_cleanup_replay_performance_and_market_calendar.py
 python scripts/qd.py env-doctor --json true
 python scripts/qd.py status --json true
 python scripts/qd.py fix-plan --json true

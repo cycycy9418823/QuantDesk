@@ -2859,10 +2859,18 @@ def check_agents_ready() -> CheckResult:
         "Fail Fast",
         "Module Responsibilities",
         "Do not connect live trading",
-        "python -m unittest discover",
         "python scripts/self_check.py",
     ]
     missing = [token for token in required if token not in text]
+    # The test runner changed from unittest discovery (incomplete and fence-
+    # bypassing) to pytest / the isolated runner. Accept either documented form
+    # so an old checkout and the new AGENTS.md both pass this self-check.
+    if not any(token in text for token in (
+        "python -m unittest discover",
+        "python -m pytest -q",
+        "run_tests_isolated.py",
+    )):
+        missing.append("pytest or unittest test command")
     if missing:
         return result("FAIL", "agents_md", "missing: " + ", ".join(missing))
     return result("PASS", "agents_md", "rules and fail-fast guidance present")
