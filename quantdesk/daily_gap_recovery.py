@@ -13,10 +13,9 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -28,6 +27,7 @@ from quantdesk.pipeline_process_guard import assert_canonical_daily_write, daily
 from quantdesk.price_basis import classify_frame_price_basis
 from quantdesk.process_deadline import run_process_tasks_until_deadline
 from quantdesk.shared import normalize_symbol
+from quantdesk.time_utils import now_shanghai_iso
 from quantdesk.utils import atomic_write_json
 
 
@@ -46,10 +46,6 @@ class GapRecoveryBudget:
 
 def _hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
-
-
-def _now() -> str:
-    return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
 
 
 def _target(value: Any) -> str:
@@ -71,7 +67,7 @@ def _fetch_target_day(task: dict[str, str], context: dict[str, Any]) -> dict[str
         raise RuntimeError("fetch_worker_must_not_have_daily_writer_authority")
     provider, symbol, target = task["provider"], task["symbol"], context["target_date"]
     marker = {"provider": provider, "symbol": symbol, "target_date": target,
-              "status": "provider_call_started", "started_at": _now()}
+              "status": "provider_call_started", "started_at": now_shanghai_iso()}
     atomic_write_json(_attempt_path(Path(context["attempt_dir"]), provider, symbol), marker)
     from quantdesk.daily_price_providers import fetch_daily
 
@@ -181,7 +177,7 @@ def _candidate_row(frame: Any, symbol: str, target: str, provider: str) -> dict[
             raise ValueError(f"provider_nonfinite_{column}")
     if row.get("amount") != "" and float(row["amount"]) < 0:
         raise ValueError("provider_negative_amount")
-    row.update(date=target, symbol=symbol, adjust="raw", source=provider, updated_at=_now())
+    row.update(date=target, symbol=symbol, adjust="raw", source=provider, updated_at=now_shanghai_iso())
     return row
 
 
@@ -318,7 +314,7 @@ def recover_target_day_gaps(
             attempt.update(status="appended", after_sha256=report["after_sha256"][symbol], bar_evidence=row)
     report["remaining_symbols"] = sorted(pending)
     report["status"] = "partial" if pending or deferred or rejected else "completed"
-    report["completed_at"] = _now()
+    report["completed_at"] = now_shanghai_iso()
     report["deadline_exhausted"] = time.monotonic() >= deadline
     atomic_write_json(output / "receipt.json", report)
     return report

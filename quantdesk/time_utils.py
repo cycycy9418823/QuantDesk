@@ -26,6 +26,13 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def now_shanghai_iso() -> str:
+    """A-share local timestamp with explicit +08:00, for evidence/audit fields."""
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
+
+
 def today_text() -> str:
     return current_local_datetime().date().isoformat()
 

@@ -1068,7 +1068,13 @@ def _fetch_snapshot_worker(
             "error_type": "BudgetExhausted", "duration_ms": 0,
         }])
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(source_root), env.get("PYTHONPATH", "")]))
+    # Keep an inherited PYTHONPATH first: under the test safety fence that is
+    # the bootstrap directory which re-arms the write/network guard in the
+    # child. The source root is appended, so normal runs still import it.
+    path_entries = [entry for entry in env.get("PYTHONPATH", "").split(os.pathsep) if entry]
+    if str(source_root) not in path_entries:
+        path_entries.append(str(source_root))
+    env["PYTHONPATH"] = os.pathsep.join(path_entries)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     child = subprocess.Popen(
         [sys.executable, "-B", "-m", "quantdesk.snapshot_history"], cwd=str(source_root), env=env,
