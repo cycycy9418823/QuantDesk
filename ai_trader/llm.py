@@ -684,6 +684,10 @@ def _call_openai_compatible(
             "authorization": f"Bearer {cfg['token']}",
             "content-type": "application/json",
             "accept": "application/json",
+            # Some OpenAI-compatible relays sit behind Cloudflare, which rejects
+            # the default Python-urllib user agent with a 403 page before the
+            # request reaches the model.
+            "user-agent": "QuantDesk-AI-Trader/1.0",
         },
         diagnostics,
         timeout,
@@ -748,6 +752,7 @@ def _call_anthropic_compatible(
             "authorization": f"Bearer {cfg['token']}",
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
+            "user-agent": "QuantDesk-AI-Trader/1.0",
         },
         diagnostics,
         _cfg_int(cfg, "timeout", DEFAULT_TIMEOUT_S),
