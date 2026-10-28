@@ -2406,6 +2406,18 @@
         .split-chart { width: 100%; height: 260px; }
         .split-chart-price { height: 42vh; min-height: 360px; }
         .split-chart-volume { height: 220px; }
+        /* Minute view keeps a readable height before its first layout pass. */
+        #minuteChart { height: 300px; }
+        .sq-overlay-legend {
+            font-size: 12px;
+            line-height: 1.6;
+            color: #334155;
+            background: #F1F5F9;
+            border-left: 3px solid #2563EB;
+            border-radius: 4px;
+            padding: 8px 12px;
+            margin: 0 0 10px;
+        }
         .workbench-nav {
             display: flex;
             flex-wrap: wrap;
@@ -3643,6 +3655,7 @@
             resize: vertical;
         }
     </style>
+    <link rel="stylesheet" href="/static/css/stock_workbench.css?v={{ asset_versions.stock_workbench_css | default('dev') }}">
 </head>
 <body>
     <main class="app">
@@ -3676,6 +3689,9 @@
                     <span class="side-nav-icon" aria-hidden="true">复</span>
                     <span>复盘学习</span>
                 </button>
+                <details class="secondary-nav">
+                <summary>更多研究与系统工具</summary>
+                <div class="secondary-nav-items">
                 <div class="side-nav-label">研究工具</div>
                 <button class="side-nav-button" type="button" data-page="tools" data-side-module-target="performance-section" aria-pressed="false">
                     <span class="side-nav-icon" aria-hidden="true">策</span>
@@ -3710,6 +3726,8 @@
                     <span class="side-nav-icon" aria-hidden="true">AI</span>
                     <span>AI账</span>
                 </button>
+                </div>
+                </details>
             </nav>
             <div class="side-boundary" aria-label="系统边界">
                 <span class="badge">Research Only</span>
@@ -3726,7 +3744,7 @@
         <header class="topbar">
             <div>
                 <h1 id="topbarTitle">今天</h1>
-                <p class="subtitle">纸面研究 · 不接券商 · 不下真实订单。首页只看今天有没有正常工作、两本账各自怎样、哪些判断要看。</p>
+                <p class="subtitle">纸面未验证 · 不接券商、不下真实订单。</p>
             </div>
             <div class="topbar-right">
                 <div class="section-actions">
@@ -3735,7 +3753,7 @@
                 </div>
                 <details class="boundary-details" aria-label="边界说明">
                     <summary class="badge">边界声明 · 研究/纸面 7 项</summary>
-                    <div class="badge-row">
+                    <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row">
                         <span class="badge">Research Only</span>
                         <span class="badge">Paper Account Only</span>
                         <span class="badge">No Broker Route</span>
@@ -3743,45 +3761,46 @@
                         <span class="badge">QMT Order Route Locked</span>
                         <span class="badge">Not Investment Advice</span>
                         <span class="badge">Not Position Advice</span>
-                    </div>
+                    </div></details>
                 </details>
             </div>
         </header>
+        <p id="runtimeModeNote" class="runtime-mode-note" role="status">正在核实运行权限；写入操作暂不可用。</p>
 
         <div id="dutyStatusStrip" class="duty-strip" aria-label="值班状态灯排" role="group" data-home-page="system">
             <button class="duty-lamp" type="button" data-duty-lamp="t0" data-duty-target="forwardPitHomeSection" title="跳到 Forward PIT / T0 状态">
                 <span class="duty-lamp-label">T0</span>
                 <span class="duty-lamp-value">—</span>
-                <span class="duty-lamp-sub">读取中</span>
+                <span class="duty-lamp-sub">未读取</span>
             </button>
             <button class="duty-lamp" type="button" data-duty-lamp="data" data-duty-target="dataHealthHomeSection" title="跳到数据健康">
                 <span class="duty-lamp-label">数据健康</span>
                 <span class="duty-lamp-value">—</span>
-                <span class="duty-lamp-sub">读取中</span>
+                <span class="duty-lamp-sub">未读取</span>
             </button>
             <button class="duty-lamp" type="button" data-duty-lamp="batch" data-duty-target="startupUpdateStatus" title="跳到候选批次说明">
                 <span class="duty-lamp-label">候选批次</span>
                 <span class="duty-lamp-value">—</span>
-                <span class="duty-lamp-sub">读取中</span>
+                <span class="duty-lamp-sub">未读取</span>
             </button>
             <button class="duty-lamp" type="button" data-duty-lamp="brain" data-duty-target="homeDashboardSection" title="跳到今日速览">
                 <span class="duty-lamp-label">市场大脑</span>
                 <span class="duty-lamp-value">—</span>
-                <span class="duty-lamp-sub">读取中</span>
+                <span class="duty-lamp-sub">未读取</span>
             </button>
             <button class="duty-lamp" type="button" data-duty-lamp="paper" data-duty-target="homeDashboardSection" title="跳到今日速览">
                 <span class="duty-lamp-label">Paper 净值</span>
                 <span class="duty-lamp-value">—</span>
-                <span class="duty-lamp-sub">读取中</span>
+                <span class="duty-lamp-sub">未读取</span>
             </button>
         </div>
 
         <section id="startupUpdateStatus" class="startup-update startup-update-pending" aria-live="polite" data-home-page="today">
-            正在读取启动数据更新状态...
+            启动更新状态未读取；今天页可查看
         </section>
 
         <div id="newsStatusBanner" class="news-status-banner" aria-live="polite" hidden data-home-page="today">
-            <span id="newsStatus" class="badge">新闻状态加载中…</span>
+            <span id="newsStatus" class="badge">新闻状态未读取；今天页可查看</span>
         </div>
 
         <section id="projectStatusSection" class="section project-status" aria-labelledby="projectStatusTitle" data-home-section data-home-page="today system">
@@ -3825,6 +3844,11 @@
                     </details>
                 </div>
             </article>
+        </section>
+
+        <section id="productIntegritySection" class="section" aria-labelledby="productIntegrityTitle" data-home-section data-home-page="today">
+            <div class="section-head"><h2 id="productIntegrityTitle">今天哪些数字还需核对</h2></div>
+            <div id="productIntegrityPanel" aria-live="polite">正在读取账本和研究证据，不据此认定正常…</div>
         </section>
 
         <section id="homeDashboardSection" class="section home-dashboard" aria-labelledby="homeDashboardTitle" data-home-section data-home-page="today">
@@ -3875,7 +3899,7 @@
                 </article>
                 <article class="home-dash-panel">
                     <h3>板块涨跌 Top5</h3>
-                    <p class="section-note">来自本地板块缓存；深红为涨、深绿为跌（A 股约定）。</p>
+                    <p class="section-note" id="homeSectorNote">行业板块行情日与新鲜度未核实；深红为涨、深绿为跌（A股约定）。</p>
                     <div id="homeSectorChart" class="home-dash-chart tall" hidden></div>
                     <div id="homeSectorChartEmpty" class="empty-state">正在加载板块数据…</div>
                 </article>
@@ -3975,6 +3999,15 @@
                         <button id="stockSearchButton" class="action-button" type="button">查询</button>
                     </div>
                     <div id="stockSearchResults" class="stock-search-results"></div>
+                    <section class="personal-watchlist" aria-labelledby="personalWatchlistTitle">
+                        <h3 id="personalWatchlistTitle">我的本机自选</h3>
+                        <p id="personalWatchlistNote" class="section-note">仅保存在此浏览器，程序更新不覆盖；不加入每日候选、观察池或纸面持仓。</p>
+                        <div class="stock-search-controls">
+                            <input id="personalWatchlistInput" class="stock-search-input" aria-label="加入本机自选的六位股票代码" inputmode="numeric" maxlength="6" placeholder="六位股票代码">
+                            <button id="personalWatchlistAddButton" class="action-button" type="button">加入自选</button>
+                        </div>
+                        <div id="personalWatchlistItems" class="personal-watchlist-items"></div>
+                    </section>
                 </aside>
             </div>
         </section>
@@ -4030,7 +4063,7 @@
                 </div>
             </div>
             <div id="dailyStrategySummary" class="candidate-generation-panel">正在读取今日策略研究摘要…</div>
-            <div class="badge-row" aria-label="今日候选边界" style="justify-content:flex-start;margin-bottom:12px">
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="今日候选边界" style="justify-content:flex-start;margin-bottom:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
                 <span class="badge">No Broker Route</span>
@@ -4038,7 +4071,7 @@
                 <span class="badge">QMT Order Route Locked</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
+            </div></details>
             <div id="llmSelectionAnalysis" class="llm-analysis-card">
                 <div class="llm-analysis-header">
                     <h3>LLM 选股分析</h3>
@@ -4057,7 +4090,7 @@
             <div class="paper-entry-zone">
                 <h3>执行今日纸面策略</h3>
                 <p class="paper-desk-note">点击后把今日策略候选同步到本地纸面研究池，进入持仓跟踪与每日复盘；不会连接券商，不会生成真实订单，不构成投资建议或真实配置指令。</p>
-                <div class="badge-row" style="justify-content:flex-start;margin-bottom:10px">
+                <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" style="justify-content:flex-start;margin-bottom:10px">
                     <span class="badge">Research Only</span>
                     <span class="badge">Paper Account Only</span>
                     <span class="badge">No Broker Route</span>
@@ -4065,7 +4098,7 @@
                     <span class="badge">QMT Order Route Locked</span>
                     <span class="badge">Not Investment Advice</span>
                     <span class="badge">Not Position Advice</span>
-                </div>
+                </div></details>
                 <button id="executeStrategyButton" class="action-button" type="button">执行今日纸面策略（同步入池）</button>
                 <span id="strategyExecuteStatus" class="section-note"></span>
             </div>
@@ -4101,7 +4134,7 @@
                     <button class="action-button module-back-button" type="button" data-module-back>返回首页</button>
                 </div>
             </div>
-            <div class="badge-row" aria-label="候选池边界" style="justify-content:flex-start;margin-bottom:12px">
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="候选池边界" style="justify-content:flex-start;margin-bottom:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
                 <span class="badge">No Broker Route</span>
@@ -4109,7 +4142,7 @@
                 <span class="badge">QMT Order Route Locked</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
+            </div></details>
             <div class="candidate-grid" id="candidatesGrid">
                 <div class="empty-state">正在加载候选股票…</div>
             </div>
@@ -4127,13 +4160,13 @@
                     <button id="refreshAgentContextButton" class="action-button" type="button">刷新上下文</button>
                 </div>
             </div>
-            <div class="badge-row" aria-label="Agent 边界" style="justify-content:flex-start;margin-bottom:12px">
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="Agent 边界" style="justify-content:flex-start;margin-bottom:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
                 <span class="badge">No Broker Route</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
+            </div></details>
             <div class="agent-layout">
                 <div class="agent-chat-panel">
                     <div class="agent-toolbar">
@@ -4190,7 +4223,7 @@
                 <button type="button" class="action-button secondary-action" id="aiTraderProfileGlm" data-ai-trader-profile="glm" aria-pressed="false">GLM · glm-5.3</button>
             </div>
             <p class="section-note" style="margin:0 0 12px">两个大脑<strong>只共享同一份行情数据</strong>：账本、计划、日记、自选与决策各自隔离，互不可见；切换会同步 AI 账与复盘学习的档位，不触发任何跑批。</p>
-            <div class="badge-row" aria-label="AI 纸面交易员边界" style="justify-content:flex-start;margin-bottom:10px">
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="AI 纸面交易员边界" style="justify-content:flex-start;margin-bottom:10px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
                 <span class="badge">No Broker Route</span>
@@ -4198,7 +4231,7 @@
                 <span class="badge">QMT Order Route Locked</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
+            </div></details>
             <p class="section-note" style="margin:0 0 12px"><strong>聊天不能下单：</strong>聊天只能解释它的想法，仓位只在每晚纸面复盘流程中变化。</p>
             <div id="aiTraderWarningsPanel"></div>
             <div class="ai-trader-grid">
@@ -4305,7 +4338,7 @@
                     <button id="refreshAiFundDailyLogButton" class="action-button" type="button">刷新 AI 日志</button>
                 </div>
             </div>
-            <div class="badge-row" aria-label="AI 日志边界" style="justify-content:flex-start;margin-bottom:12px">
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="AI 日志边界" style="justify-content:flex-start;margin-bottom:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
                 <span class="badge">No Broker Route</span>
@@ -4313,7 +4346,7 @@
                 <span class="badge">QMT Order Route Locked</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
+            </div></details>
             <div id="aiFundDailyLogPanel" class="performance-panel">
                 <div class="empty-state">正在加载 AI 日志…</div>
             </div>
@@ -4337,7 +4370,11 @@
                 <button type="button" class="action-button secondary-action" id="reviewAiProfileGlm" data-ai-trader-profile="glm" aria-pressed="false">GLM</button>
             </div>
             <p class="section-note" style="margin:0 0 12px">与 AI 账使用同一档位；下方 AI 成交与判断均来自所选档位，策略账记录独立展示。</p>
-            <div class="badge-row" aria-label="决策历史边界" style="justify-content:flex-start;margin-bottom:12px">
+            <section class="product-weekly-learning" aria-labelledby="productWeeklyLearningTitle">
+                <h3 id="productWeeklyLearningTitle">策略账每周回顾</h3>
+                <div id="productWeeklyLearningPanel" aria-live="polite">正在按已有平仓记录回顾，不补写历史判断…</div>
+            </section>
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="决策历史边界" style="justify-content:flex-start;margin-bottom:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
                 <span class="badge">No Broker Route</span>
@@ -4345,7 +4382,7 @@
                 <span class="badge">QMT Order Route Locked</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
+            </div></details>
             <div id="decisionHistoryPanel" class="performance-panel">
                 <div class="empty-state">正在加载决策历史…</div>
             </div>
@@ -4369,7 +4406,7 @@
                 <button type="button" data-side-module-target="paper-watchlist-section" aria-current="page">策略账</button>
                 <button type="button" data-side-module-target="ai-trader-section">AI账</button>
             </div>
-            <div class="badge-row" aria-label="纸面模拟边界" style="justify-content:flex-start;margin-bottom:12px">
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="纸面模拟边界" style="justify-content:flex-start;margin-bottom:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
                 <span class="badge">No Broker Route</span>
@@ -4377,8 +4414,8 @@
                 <span class="badge">QMT Order Route Locked</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
-            <p class="panel-disclaimer">当前页面是纸面研究复核台：后端开放同步候选、刷新跟踪、继续验证、降级复盘、归档和恢复；不开放真实买入/卖出/重置账本，不生成成交、费用或订单。</p>
+            </div></details>
+            <p class="panel-disclaimer">当前页面是纸面研究复核台，研究未验证。同步、重新计算、归档和恢复只在明确开启研究编辑模式时可用；只读模式下按钮禁用。纸面研究复核不执行真实买入/卖出，账本重置不可用。</p>
             <div id="decisionBoardEnvelope" class="metric-row" aria-label="决策看板证据封套">
                 <article class="metric-box"><span>决策看板</span><strong>正在读取后端证据…</strong></article>
             </div>
@@ -4425,7 +4462,7 @@
                     <button id="refreshStrategyLabButton" class="action-button" type="button">刷新策略实验室</button>
                 </div>
             </div>
-            <div class="badge-row" aria-label="策略实验室边界" style="justify-content:flex-start;margin-bottom:12px">
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="策略实验室边界" style="justify-content:flex-start;margin-bottom:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
                 <span class="badge">No Broker Route</span>
@@ -4433,7 +4470,7 @@
                 <span class="badge">QMT Order Route Locked</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
+            </div></details>
             <div id="strategyLabPanel" class="performance-panel">
                 <div class="empty-state">正在加载策略实验室证据...</div>
             </div>
@@ -4474,7 +4511,7 @@
                     <button id="refreshPaperRiskButton" class="action-button" type="button">刷新纸面风险线</button>
                 </div>
             </div>
-            <div class="badge-row" aria-label="风险通知边界" style="justify-content:flex-start;margin-bottom:12px">
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="风险通知边界" style="justify-content:flex-start;margin-bottom:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
                 <span class="badge">No Broker Route</span>
@@ -4482,7 +4519,7 @@
                 <span class="badge">QMT Order Route Locked</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
+            </div></details>
             <div id="riskNotificationsPanel" class="performance-panel">
                 <div class="empty-state">正在加载风险/通知看板...</div>
             </div>
@@ -4500,7 +4537,7 @@
                     <button id="refreshSmartStopButton" class="action-button" type="button">刷新观察退出参考</button>
                 </div>
             </div>
-            <div class="badge-row" aria-label="观察退出参考边界" style="justify-content:flex-start;margin-bottom:12px">
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="观察退出参考边界" style="justify-content:flex-start;margin-bottom:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
                 <span class="badge">No Broker Route</span>
@@ -4508,7 +4545,7 @@
                 <span class="badge">QMT Order Route Locked</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
+            </div></details>
             <div id="smartStopPanel" class="performance-panel">
                 <div class="empty-state">正在加载观察退出参考状态...</div>
             </div>
@@ -4526,7 +4563,7 @@
                     <button id="refreshNotificationCenterButton" class="action-button" type="button">刷新通知中心</button>
                 </div>
             </div>
-            <div class="badge-row" aria-label="通知中心边界" style="justify-content:flex-start;margin-bottom:12px">
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="通知中心边界" style="justify-content:flex-start;margin-bottom:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Local Dry Run</span>
                 <span class="badge">No Broker Route</span>
@@ -4534,7 +4571,7 @@
                 <span class="badge">QMT Order Route Locked</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
+            </div></details>
             <div id="notificationCenterPanel" class="performance-panel">
                 <div class="empty-state">正在加载通知中心...</div>
             </div>
@@ -4567,7 +4604,7 @@
             <div id="backtestPanel" class="backtest-panel">
                 <div class="empty-state">选择策略后点击“运行回测”。</div>
             </div>
-            <div class="badge-row" aria-label="回测边界" style="justify-content:flex-start;margin-top:12px">
+            <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="回测边界" style="justify-content:flex-start;margin-top:12px">
                 <span class="badge">Research Only</span>
                 <span class="badge">Paper Account Only</span>
                 <span class="badge">No Broker Route</span>
@@ -4575,7 +4612,7 @@
                 <span class="badge">QMT Order Route Locked</span>
                 <span class="badge">Not Investment Advice</span>
                 <span class="badge">Not Position Advice</span>
-            </div>
+            </div></details>
             <div class="quant-summary-head" style="margin-top:14px">
                 <strong>策略筛选漏斗（后台）</strong>
                 <div class="section-note" id="strategyScreeningNote">默认限样本并启用特征缓存；用于研究候选与纸面模拟池的证据衔接，不默认全 A 扫描。</div>
@@ -4597,7 +4634,7 @@
                     <button id="refreshStrategyScreeningButton" class="action-button is-muted" type="button">刷新漏斗状态</button>
                     <button id="runStrategyScreeningButton" class="action-button" type="button">后台运行漏斗</button>
                 </div>
-                <div class="badge-row" aria-label="策略筛选边界" style="justify-content:flex-start">
+                <details class="boundary-compact"><summary>纸面研究 · 未验证 · 不接券商</summary><div class="badge-row" aria-label="策略筛选边界" style="justify-content:flex-start">
                     <span class="badge">Research Only</span>
                     <span class="badge">Paper Account Only</span>
                     <span class="badge">No Broker Route</span>
@@ -4605,7 +4642,7 @@
                     <span class="badge">QMT Order Route Locked</span>
                     <span class="badge">Not Investment Advice</span>
                     <span class="badge">Not Position Advice</span>
-                </div>
+                </div></details>
             </div>
             <div id="strategyScreeningPanel" class="backtest-panel" style="margin-top:12px">
                 <div class="empty-state">尚未读取策略筛选漏斗状态。</div>
@@ -4636,6 +4673,7 @@
         window.__QD_DAILY_RESEARCH_ASSET_VERSION__ = "{{ asset_versions.daily_research | default('dev') }}";
     </script>
     <script src="/static/echarts.min.js?v={{ asset_versions.echarts | default('dev') }}" defer></script>
+    <script src="/static/js/stock_workbench.js?v={{ asset_versions.stock_workbench | default('dev') }}" defer></script>
     <script src="/static/js/daily_research.js?v={{ asset_versions.daily_research | default('dev') }}" defer></script>
 </body>
 </html>

@@ -7,6 +7,7 @@ Research-only: local files only, no broker connection, no real orders, no networ
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -16,24 +17,30 @@ import subprocess
 import sys
 import time
 import webbrowser
+from io import BytesIO
 from threading import Thread
 
 logging.basicConfig(level=logging.WARNING, format="[%(levelname)s] %(name)s: %(message)s")
 LOG = logging.getLogger("quant_api")
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 import argparse
 
 import pandas as pd
 from flask import jsonify, request
+from flask import g, has_request_context
 
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+# Remapped to the viewer data root because the tail of this path is under data/.
+INTRADAY_ONE_MINUTE_DIR = project_root / "data" / "intraday" / "1m"
 
 from quantdesk import technical_indicators
 from quantdesk.csv_io import read_csv_frame
+from quantdesk.ui_read_cache import (UI_READ_CACHE, byte_identity, cached_file_value,
+    InputChangedDuringRead, detail_page, summary_projection, public_read_identity)
 from quantdesk.candidate_contract import (
     attach_theme_map_to_candidates,
     summarize_candidate_theme_coverage,
@@ -43,6 +50,7 @@ from quantdesk.data_confidence import build_reference_confidence
 from quantdesk.data_chain_consumer_gate import evaluate_data_chain_consumer_gate
 from quantdesk.explainers import stock_explainer
 from quantdesk.daily_candidate_generator import generate_daily_recommendations
+from quantdesk.daily_candidate_refresh import load_formal_candidate_intake
 from quantdesk.daily_price_update_engine import update_daily_prices
 from quantdesk.market_clock import expected_settlement_date, get_market_session, to_shanghai_datetime
 from quantdesk.market_intelligence_utils import intraday_file_exists
@@ -96,6 +104,8 @@ from scripts.server.routes.realtime import RealtimeRouteDeps, register_realtime_
 from scripts.server.routes.research import ResearchRouteDeps, register_research_routes
 from scripts.server.routes.sector import SectorRouteDeps, register_sector_routes
 from scripts.server.routes.stock import StockRouteDeps, register_stock_routes
+from scripts.server.routes.stock_workbench import StockWorkbenchDeps, register_stock_workbench_routes
+from quantdesk.market_clock import load_cn_trading_calendar
 from scripts.server.routes.strategy_screening import (
     StrategyScreeningRouteDeps,
     register_strategy_screening_routes,
@@ -179,6 +189,8 @@ def daily_research_asset_versions() -> dict[str, str]:
     return {
         "echarts": static_asset_version("echarts.min.js"),
         "daily_research": static_asset_version("js/daily_research.js"),
+        "stock_workbench": static_asset_version("js/stock_workbench.js"),
+        "stock_workbench_css": static_asset_version("css/stock_workbench.css"),
     }
 
 
@@ -190,7 +202,7 @@ def set_research_cache_headers(response: Response) -> Response:
     if (
         request.path == "/"
         or request.path.startswith("/api/")
-        or request.path.endswith("/daily_research.js")
+        or request.path.endswith(("/daily_research.js", "/stock_workbench.js", "/stock_workbench.css"))
     ):
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["Pragma"] = "no-cache"
@@ -205,6 +217,286 @@ def server_source_build_id() -> str:
 
 
 SERVER_BUILD_ID = server_source_build_id()
+
+
+def runtime_capabilities() -> dict[str, Any]:
+    read_only = bool(app.config.get("RESEARCH_READ_ONLY", False))
+    return {"ok": True, "read_only": read_only, "mutations_enabled": not read_only,
+            "selected_quote_refresh": bool(app.config.get("STOCK_QUOTE_REFRESH_ALLOWED", True)),
+            "mode": "read_only_research" if read_only else "local_research_edit",
+            "source_identity": {"server_build_id": SERVER_BUILD_ID,
+                "entry_sha256": app.config.get("RUNTIME_ENTRY_SHA256") or hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "data_root": str(app.config.get("QUANTDESK_PROJECT_ROOT") or project_root)},
+            "paper_only": True, "no_broker": True, "label": "纸面 · 未验证"}
+
+
+@app.before_request
+def guard_research_mode() -> Response | None:
+    if not app.config.get("RESEARCH_READ_ONLY") or request.method in {"GET", "HEAD", "OPTIONS"}:
+        return None
+    if (app.config.get("STOCK_QUOTE_REFRESH_ALLOWED", False) and request.method == "POST"
+            and re.fullmatch(r"/api/stock/[0-9]{6}/quote-refresh", request.path)):
+        return None
+    return jsonify(ok=False, status="research_read_only",
+                   message_for_ui="当前为只读研究模式，此操作未执行；查看行情和证据仍可继续。"), 423
+
+
+from scripts.server.routes.product_review_routes import register_product_review_routes
+register_product_review_routes(app, root=lambda: Path(app.config.get("QUANTDESK_PROJECT_ROOT") or project_root),
+                               capabilities=runtime_capabilities)
+
+
+def stock_reference_fee_assumptions() -> dict[str, Any]:
+    from quantdesk.config import load_config
+    config = load_config(project_root / "config/default.yaml")
+    return {**config.get("backtest", {}), "source": "config/default.yaml/backtest；研究费用假设"}
+
+
+def stock_reference_account_context() -> dict[str, Any]:
+    value = read_json_file(project_root / "state/auto_paper_portfolio.json")
+    return value if isinstance(value, dict) else {}
+
+
+def ui_calendar_days() -> list[str]:
+    paths = [project_root / "data/calendar/a_share_trading_calendar.csv",
+        project_root / "config/trading_calendar_cn.yaml"]
+    return cached_file_value(paths, lambda: [day for day, is_open in
+        (load_a_share_trading_calendar().get("is_open_by_date") or {}).items() if is_open],
+        scope="ui_calendar_days", code_id=str(id(load_a_share_trading_calendar)))
+
+
+_UI_CACHE_PATHS = frozenset({"/api/daily/overview", "/api/daily/candidates", "/api/strategy-scorecard",
+    "/api/decision-board", "/api/project-status", "/api/data-health/dashboard"})
+
+
+def _ui_input_object(path: Path, *, fields: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Read claims for dependency enumeration; admission stays in the consumer."""
+    try:
+        def read() -> dict[str, Any]:
+            value = json.loads(path.read_text(encoding="utf-8-sig"))
+            if not isinstance(value, dict):
+                return {}
+            return {key: value[key] for key in fields if key in value} if fields else value
+        value = cached_file_value([path], read, scope="ui_dependency_object:" + ",".join(fields))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, UnicodeError):
+        return {}
+
+
+def _ui_generation_dependency_paths(target_text: str) -> list[Path]:
+    from quantdesk.daily_candidate_refresh import _safe_run_id
+    chain_path = project_root / "results/data_chain/daily_data_chain_latest.json"
+    paths = [DAILY_CANDIDATE_GENERATION_JSON, DAILY_CANDIDATE_LATEST_CSV,
+        TRACKING_DIR / "candidate_ledger.csv", chain_path]
+    formal_dir = project_root / "results/candidate_refresh/daily"
+    paths.append(formal_dir)
+    if target_text:
+        target = formal_dir / f"{target_text}.json"
+        paths.append(target)
+        if not target.is_file():
+            previous = sorted(p for p in formal_dir.glob("????-??-??.json") if p.stem < target_text)
+            if previous:
+                paths.append(previous[-1])
+    run_id = _safe_run_id(_ui_input_object(chain_path, fields=("run_id",)).get("run_id"))
+    if run_id:
+        paths.extend([project_root / "results/data_chain/runs" / run_id / "manifest.json",
+            project_root / "results/candidate_refresh/runs" / run_id / "formal_candidate_batch.json"])
+    return paths
+
+
+def _ui_symbols_in_files(paths: list[Path]) -> set[str]:
+    """Cache only symbol projections while rehashing source bytes on each read."""
+    found: set[str] = set()
+    for path in paths:
+        if path.suffix not in {".csv", ".json"}:
+            continue
+        def extract(path: Path = path) -> frozenset[str]:
+            symbols: set[str] = set()
+            def visit(value: Any) -> None:
+                if isinstance(value, list):
+                    for item in value:
+                        visit(item)
+                elif isinstance(value, dict):
+                    if "symbol" in value:
+                        symbols.add(normalize_symbol(value["symbol"]))
+                    for item in value.values():
+                        visit(item)
+            text = path.read_text(encoding="utf-8-sig")
+            if path.suffix == ".csv":
+                symbols.update(normalize_symbol(row.get("ts_code") or row.get("symbol") or row.get("code") or "")
+                    for row in csv.DictReader(text.splitlines()))
+            else:
+                value = json.loads(text)
+                if isinstance(value, dict):
+                    visit(value)
+            return frozenset(symbol for symbol in symbols if re.fullmatch(r"\d{6}", symbol))
+        try:
+            found.update(cached_file_value([path], extract, scope="ui_dependency_symbols",
+                code_id=str(id(normalize_symbol))))
+        except (OSError, ValueError, UnicodeError):
+            pass
+    return found
+
+
+def _ui_dependency_paths() -> list[Path]:
+    """Hash the inputs of this read view; never read all-market bar contents."""
+    from quantdesk.daily_candidate_refresh import _safe_run_id
+    from quantdesk.plan_review_receipts import STORE_PATH
+    scope = request.path
+    market = [BENCHMARK_DIR / name for name in ("hs300.csv", "sh000001.csv", "sh_index.csv", "000001_index.csv")]
+    market.extend([SPOT_SNAPSHOT_CACHE, SPOT_SNAPSHOT_META, INDUSTRY_BOARD_CACHE,
+        project_root / "data/calendar/a_share_trading_calendar.csv", project_root / "config/trading_calendar_cn.yaml"])
+    if scope == "/api/daily/overview":
+        return market
+    target = expected_settlement_date(to_shanghai_datetime())
+    target_text = target.isoformat() if target else ""
+    if scope == "/api/project-status":
+        root = Path(app.config.get("QUANTDESK_PROJECT_ROOT") or project_root)
+        paths = [root / "STATUS.md", root / "data/calendar/a_share_trading_calendar.csv"]
+        observed_dates = []
+        for account in ("ai_trader", "ai_trader_glm"):
+            cycle_path = root / "results" / account / "cycle_latest.json"
+            paths.append(cycle_path)
+            cycle = _ui_input_object(cycle_path)
+            plan = cycle.get("plan") if isinstance(cycle.get("plan"), dict) else {}
+            day = cycle.get("as_of") or plan.get("decision_date")
+            if isinstance(day, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                observed_dates.append(day)
+        if observed_dates:
+            paths.append(root / "data/snapshots" / max(observed_dates) / "manifest.json")
+        else:
+            paths.append(root / "data/snapshots")
+            paths.extend(sorted((root / "data/snapshots").glob("????-??-??/manifest.json")))
+        return paths
+    chain = [project_root / "results/data_chain/daily_data_chain_latest.json",
+        project_root / "state/daily_data_chain.lock", project_root / "state/daily_data_chain.lock.json"]
+    active = _safe_run_id(_ui_input_object(chain[-1]).get("run_id"))
+    if active:
+        chain.append(project_root / "results/data_chain/runs" / active / "checkpoint.json")
+    portfolio = [project_root / "state/auto_paper_portfolio.json",
+        project_root / "results/auto_paper_portfolio_latest.json", project_root / "results/auto_paper_portfolio_history.json"]
+    if scope == "/api/decision-board":
+        return [PAPER_WATCHLIST_JSON, *portfolio, *chain, project_root / STORE_PATH / "latest.json",
+            BENCHMARK_DIR / "hs300.csv", *market[-2:]]
+    if scope == "/api/data-health/dashboard":
+        ai_inputs = [project_root / "state/ai_trader/ledger.json", project_root / "state/ai_trader/plan_latest.json"]
+        paths = [*chain, *portfolio, *ai_inputs, *market[-2:],
+            project_root / "results/data_health/data_health_dashboard_latest.json",
+            project_root / "results/data_close_pipeline/data_close_pipeline_latest.json",
+            project_root / "state/scheduler/daily_data_chain_status.json",
+            project_root / "results/candidate_tracking/latest.json", TRACKING_DIR / "candidate_ledger.csv",
+            TRACKING_DIR / "candidate_performance.csv", TRACKING_DIR / "tracking_summary.json"]
+        paths.extend(DAILY_DIR / f"{symbol}.csv" for symbol in sorted(_ui_symbols_in_files(ai_inputs)))
+        return paths
+    generation_paths = _ui_generation_dependency_paths(target_text)
+    paths = [*generation_paths, *market, TRACKING_DIR / "candidate_review_overrides.json",
+        project_root / "data/universe/historical_listings.csv", STOCK_THEME_MAP_CSV, LIMIT_UP_REVIEW_CACHE,
+        project_root / "results/strategy_effectiveness_weights.json"]
+    if scope == "/api/daily/candidates":
+        paths.extend([PAPER_WATCHLIST_JSON, portfolio[0]])
+    # Only these selected rows are consumed by the daily read view. Binding all
+    # historical ledger symbols hashed >100 MB of unrelated bars per request.
+    # The ledger/generation bytes still bind selection; selected bar bytes are
+    # rehashed, including same-stat rewrites, on every read.
+    symbols = set(_candidate_read_symbols(18))
+    # Empty/invalid ledgers use the consumer's first 18 local files. Directory
+    # names bind additions/removals; only these requested frames are hashed.
+    paths.append(DAILY_DIR)
+    fallback = sorted(DAILY_DIR.glob("*.csv"))[:18]
+    if not symbols:
+        symbols.update(normalize_symbol(p.stem) for p in fallback)
+    paths.extend(DAILY_DIR / f"{symbol}.csv" for symbol in sorted(symbols))
+    paths.append(project_root / "data/intraday")
+    for folder in ("data/intraday/1m", "data/intraday"):
+        paths.append(project_root / folder)
+        for symbol in sorted(symbols):
+            paths.append(project_root / folder / f"{symbol}.csv")
+        # The confidence consumer only checks presence for dated files.
+        for directory in sorted((project_root / folder).glob("????-??-??")):
+            if directory.is_dir():
+                paths.append(directory)
+    paths.extend(sorted((project_root / "data/intraday").glob("*_????-??-??.csv")))
+    if scope == "/api/strategy-scorecard":
+        paths.extend([PAPER_WATCHLIST_JSON, project_root / "data/news"])
+        paths.extend(project_root / "results" / name for name in (
+            "backtest/backtest_latest.json", "backtest/latest.json", "factor_health_latest.json",
+            "strategy_lab/v420_strategy_leaderboard_latest.json", "strategy_lab/v420_real_use_strategy_lab_handoff_latest.json",
+            "strategy_lab/v421_strategy_statistics_latest.json", "combined_score_backtest_latest.json", "walk_forward_latest.json"))
+    return sorted(set(paths), key=str)
+
+
+def _ui_request_identity() -> dict[str, Any]:
+    target = expected_settlement_date(to_shanghai_datetime())
+    callbacks = (candidate_rows, latest_generation_status, load_stock_data, build_strategy_scorecard,
+        load_paper_simulation_watchlist, auto_paper_portfolio_latest, load_a_share_trading_calendar)
+    return byte_identity(_ui_dependency_paths(), target_date=target.isoformat() if target else "",
+        account="strategy/ai_trader/ai_trader_glm", scope=request.path,
+        code_id=SERVER_BUILD_ID + ":" + ":".join(str(id(f)) for f in callbacks)
+            + ":" + str(id(app.view_functions.get(request.endpoint))),
+        config_id=json.dumps({"network": realtime_network_enabled(), "root": str(project_root),
+            "configured_root": str(app.config.get("QUANTDESK_PROJECT_ROOT") or project_root)}, sort_keys=True))
+
+
+@app.before_request
+def serve_identified_ui_read() -> Response | None:
+    """Cache only GET builds; each hit rehashes its explicit source bytes."""
+    if request.method != "GET" or request.path not in _UI_CACHE_PATHS:
+        return None
+    if app.testing and not app.config.get("UI_READ_CACHE_ENABLED"):
+        return None
+    if app.config.get("UI_READ_CACHE_ENABLED") is False:
+        return None
+    try:
+        identity = _ui_request_identity()
+        scope = request.path
+        # Presentation-only args share the exact full response and run identity.
+        ignored = {"summary", "details", "pointer", "offset", "limit", "identity"}
+        key = (scope, tuple(sorted((k,v) for k,v in request.args.items() if k not in ignored)), identity["sha256"])
+        wants_summary = request_truthy(request.args.get("summary"))
+        wants_details = request_truthy(request.args.get("details"))
+        if scope == "/api/data-health/dashboard" and (wants_summary or wants_details):
+            from quantdesk.data_health_dashboard import build_cached_data_health_dashboard
+            def build_health() -> dict[str, Any]:
+                value = build_cached_data_health_dashboard()
+                if _ui_request_identity() != identity:
+                    raise InputChangedDuringRead("ui_health_inputs_changed_during_response")
+                return value
+            payload = UI_READ_CACHE.get(("ui_health_payload", identity["sha256"]), build_health,
+                copy=False, admit=lambda value: value.get("ok") is not False)
+            status = 200
+        else:
+            def build() -> tuple[bytes, int]:
+                response = app.make_response(app.view_functions[request.endpoint](**(request.view_args or {})))
+                if _ui_request_identity() != identity:
+                    raise InputChangedDuringRead("ui_inputs_changed_during_response")
+                return response.get_data(), response.status_code
+            raw, status = UI_READ_CACHE.get(key, build, copy=False, admit=lambda value: value[1] < 400
+                and json.loads(value[0]).get("ok") is not False)
+            if not wants_summary and not wants_details:
+                return app.response_class(raw, status=status, mimetype="application/json")
+            payload = json.loads(raw)
+        claimed = request.args.get("identity")
+        if claimed and claimed != identity["sha256"]:
+            return jsonify(ok=False, status="read_identity_changed", read_identity=public_read_identity(identity)), 409
+        if wants_details:
+            value = detail_page(payload, pointer=request.args.get("pointer", ""),
+                offset=int(request.args.get("offset", "0")), limit=int(request.args.get("limit", "100")))
+        else:
+            value = summary_projection(payload)
+            value["details_url"] = scope + "?details=true&identity=" + identity["sha256"]
+        value["read_identity"] = public_read_identity(identity)
+        # JSON null is part of the paging/evidence contract (end of pages and
+        # unknown values). Legacy display sanitization turns it into text and
+        # cannot be used for these new machine-readable projections.
+        return app.response_class(json.dumps(value, ensure_ascii=False, allow_nan=False,
+            default=clean_payload), status=status, mimetype="application/json")
+    except TimeoutError as exc:
+        return jsonify(ok=False, status="ui_read_cache_wait_timeout", reason=type(exc).__name__,
+                       message_for_ui="同一资料的读取仍在进行，本次等待已结束；可稍后重试，原有结果保留。", read_only=True), 503
+    except (InputChangedDuringRead, OSError) as exc:
+        return jsonify(ok=False, status="read_input_unstable", reason=type(exc).__name__, read_only=True), 409
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        return jsonify(ok=False, status="invalid_read_projection", reason=type(exc).__name__, read_only=True), 400
 
 
 def _start_strategy_screening_worker(request_id: str, params: dict[str, Any]) -> None:
@@ -280,6 +572,21 @@ register_stock_routes(
         get_stock_detail=lambda symbol: get_stock_detail(symbol),
     ),
 )
+register_stock_workbench_routes(
+    app,
+    StockWorkbenchDeps(
+        load_original_daily=lambda symbol: load_stock_workbench_daily(symbol),
+        cached_quote=lambda symbol: spot_quote_for_symbol(symbol),
+        fetch_quote=lambda symbol: fetch_eastmoney_single_quote(symbol),
+        research_builder=lambda frame: build_research_reference(frame),
+        load_calendar=lambda: load_cn_trading_calendar(project_root / "data/calendar/a_share_trading_calendar.csv"),
+        network_enabled=lambda: bool(app.config.get("STOCK_QUOTE_NETWORK_ENABLED", realtime_network_enabled())),
+        refresh_allowed=lambda: bool(app.config.get("STOCK_QUOTE_REFRESH_ALLOWED", True)),
+        fee_assumptions=stock_reference_fee_assumptions,
+        account_context=stock_reference_account_context,
+        load_minute_bars=lambda symbol: stock_minute_view(symbol),
+    ),
+)
 register_sector_routes(
     app,
     SectorRouteDeps(
@@ -306,6 +613,7 @@ register_daily_routes(
         ),
         calculate_sector_stats=lambda: calculate_sector_stats(),
         market_overview_hint=MARKET_OVERVIEW_HINT,
+        pool_context=lambda rows, focus: candidate_pool_context(rows, focus),
     ),
 )
 register_daily_action_routes(
@@ -424,11 +732,7 @@ register_decision_board_routes(
         load_equity_history=lambda: auto_paper_portfolio_equity_history(limit=250),
         load_benchmark=lambda: load_benchmark_series("hs300", days=500),
         load_profile=lambda: default_research_paper_profile(),
-        load_calendar_days=lambda: [
-            day
-            for day, is_open in (load_a_share_trading_calendar().get("is_open_by_date") or {}).items()
-            if is_open
-        ],
+        load_calendar_days=lambda: ui_calendar_days(),
         strategy_version=lambda: APP_VERSION,
         source_paths=lambda: {
             "portfolio": project_relative_path(AUTO_PAPER_PORTFOLIO_LATEST_JSON),
@@ -557,8 +861,12 @@ _market_refresh_spot_snapshot_cache = market_helpers.refresh_spot_snapshot_cache
 
 def load_stock_data(symbol: str) -> pd.DataFrame:
     _sync_market_helper_contract()
-    market_helpers._load_stock_data_cached.cache_clear()
-    return _market_load_stock_data(symbol)
+    path = DAILY_DIR / f"{normalize_symbol(symbol)}.csv"
+    def load() -> pd.DataFrame:
+        market_helpers._load_stock_data_cached.cache_clear()
+        return _market_load_stock_data(symbol)
+    return cached_file_value([path], load, scope="ui_daily_frame",
+        code_id=str(id(_market_load_stock_data)))
 
 
 def load_benchmark_index(kind: str) -> dict[str, Any]:
@@ -592,13 +900,14 @@ def load_candidate_ledger() -> pd.DataFrame:
 
 def candidate_name(symbol: str, row: pd.Series | None = None) -> str:
     if row is not None:
-        name = str(row.get("stock_name") or "").strip()
+        name = str(row.get("stock_name") or row.get("name") or "").strip()
         if name and name.lower() != "nan":
             return name
     listings = UNIVERSE_DIR / "historical_listings.csv"
     if listings.exists():
         try:
-            df = read_csv_frame(listings, usecols=lambda col: col in {"symbol", "code", "ts_code", "name", "stock_name"})
+            df = cached_file_value([listings], lambda: read_csv_frame(listings,
+                usecols=lambda col: col in {"symbol", "code", "ts_code", "name", "stock_name"}), scope="ui_names")
             for col in ("symbol", "code", "ts_code"):
                 if col in df.columns:
                     hit = df[df[col].astype(str).map(normalize_symbol) == normalize_symbol(symbol)]
@@ -638,7 +947,8 @@ def row_strategy_type(row: pd.Series | None) -> str:
     if row is None:
         return ""
     text = str(row.get("strategy_type") or "").strip()
-    return text if text and text.lower() != "nan" else ""
+    return {"long": "long_term", "long_swing": "long_term", "board": "da_ban"}.get(
+        text, text if text and text.lower() != "nan" else "")
 
 
 def strategy_label(strategy_type: str) -> str:
@@ -685,6 +995,63 @@ def row_candidate_role(row: pd.Series | None) -> str:
 
 
 def latest_generation_status() -> dict[str, Any]:
+    target = expected_settlement_date(to_shanghai_datetime())
+    target_text = target.isoformat() if target is not None else ""
+    # A single response uses one admitted generation snapshot. The enclosing
+    # response cache still rehashes every source before and after construction,
+    # so a write during the request rejects the response rather than mixing it.
+    request_key = (target_text, str(project_root), id(load_formal_candidate_intake))
+    memo = getattr(g, "candidate_generation_snapshot", None) if has_request_context() else None
+    if memo is not None and memo[0] == request_key:
+        return memo[1]
+    paths = _ui_generation_dependency_paths(target_text)
+    value = cached_file_value(paths, _latest_generation_status_uncached, scope="ui_candidate_generation",
+        target_date=target_text, code_id=str(id(load_formal_candidate_intake)))
+    if has_request_context():
+        g.candidate_generation_snapshot = (request_key, value)
+    return value
+
+
+def _latest_generation_status_uncached() -> dict[str, Any]:
+    target = expected_settlement_date(to_shanghai_datetime())
+    target_text = target.isoformat() if target is not None else ""
+    formal_dir = project_root / "results/candidate_refresh/daily"
+    if target_text and formal_dir.is_dir():
+        source_date = target_text
+        path = formal_dir / f"{target_text}.json"
+        if not path.exists():
+            previous = sorted(p.stem for p in formal_dir.glob("????-??-??.json") if p.stem < target_text)
+            if previous:
+                source_date = previous[-1]
+                path = formal_dir / f"{source_date}.json"
+        before = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+        intake = load_formal_candidate_intake(project_root, target_date=source_date)
+        batch = intake.get("batch") if intake.get("status") == "passed" else None
+        reasons = list(intake.get("reason_codes") or [])
+        if batch and any(batch.get(k) is True for k in ("synthetic_test_data", "synthetic", "demo", "smoke_run")):
+            reasons.append("candidate_batch_nonformal_mode")
+        actual_path = Path(intake.get("path") or path)
+        after = hashlib.sha256(actual_path.read_bytes()).hexdigest() if actual_path.is_file() else ""
+        if actual_path == path and before != after:
+            reasons.append("candidate_batch_changed_during_read")
+        if reasons:
+            batch = None
+        candidates = list((batch or {}).get("candidates") or [])
+        counts: dict[str, int] = {}
+        for row in candidates:
+            kind = row_strategy_type(pd.Series(row))
+            counts[kind] = counts.get(kind, 0) + 1
+        identity = {"target_date": source_date, "source_run_id": intake.get("source_run_id"),
+            "batch_provenance_hash": intake.get("provenance_hash"), "source_path": str(actual_path),
+            "source_sha256": after, "source_mode": intake.get("source_mode", "dated_verified_formal_batch")}
+        return {"status": "passed" if batch else "blocked" if reasons else intake.get("status", "missing"),
+            "signal_date": source_date if batch else "", "target_date": target_text,
+            "candidate_count": len(candidates), "strategy_counts": counts, "source": "formal_candidate_daily_batch",
+            "formal_current": bool(batch and source_date == target_text), "formal_rows": candidates,
+            "batch_identity": identity, "reason_codes": reasons,
+            "generated_batch": (batch or {}).get("generated_batch", ""),
+            "message_for_ui": (f"已读取 {source_date} 正式研究候选 {len(candidates)} 只 · 纸面 · 未验证。"
+                               if batch else "目标日正式研究候选缺失或未核实，保留历史观察。")}
     payload = read_json_file(DAILY_CANDIDATE_GENERATION_JSON)
     if not payload:
         return {
@@ -736,9 +1103,13 @@ def latest_generation_ledger_symbols(signal_date: str) -> set[str]:
 
 def latest_generation_symbols(payload: dict[str, Any] | None = None) -> set[str]:
     raw = payload if isinstance(payload, dict) else latest_generation_status()
+    if raw.get("source") == "formal_candidate_daily_batch":
+        return {normalize_symbol(row.get("symbol")) for row in raw.get("formal_rows") or []} if raw.get("formal_current") else set()
     signal_date = str(raw.get("signal_date") or "")[:10]
-    ledger_mtime = _path_mtime(TRACKING_DIR / "candidate_ledger.csv")
-    csv_mtime = _path_mtime(DAILY_CANDIDATE_LATEST_CSV)
+    # Legacy in-memory symbol lookup must obey the same byte contract too.
+    # A same-size rewrite with a preserved mtime is still a new batch input.
+    ledger_mtime = byte_identity([TRACKING_DIR / "candidate_ledger.csv"])["sha256"]
+    csv_mtime = byte_identity([DAILY_CANDIDATE_LATEST_CSV])["sha256"]
     if (
         _LATEST_GENERATION_SYMBOL_CACHE.get("csv_mtime") == csv_mtime
         and _LATEST_GENERATION_SYMBOL_CACHE.get("ledger_mtime") == ledger_mtime
@@ -808,7 +1179,11 @@ def generation_status_for_ui(payload: dict[str, Any] | None = None) -> dict[str,
             f"最新研究候选批次停在 {signal_date}，目标完整交易日为 {target_text}；"
             "当前列表只能视为最近一批研究重点，需要联网更新或重新生成后才是目标交易日研究候选。"
         )
-    elif signal_date:
+    elif signal_date and target_text and signal_date > target_text:
+        freshness_status = "future"
+        freshness_label = "研究候选日期晚于目标日"
+        freshness_message = f"批次日期 {signal_date} 晚于目标完整交易日 {target_text}，不可当作今日候选。"
+    elif signal_date and target_text and signal_date == target_text:
         freshness_status = "current"
         freshness_label = "研究候选批次已覆盖目标交易日"
         needs_refresh = False
@@ -830,6 +1205,9 @@ def generation_status_for_ui(payload: dict[str, Any] | None = None) -> dict[str,
         "board_count": strategy_counts.get("da_ban", 0),
         "message_for_ui": raw.get("message_for_ui", "尚未生成今日研究候选。"),
         "warning": raw.get("warning", ""),
+        "source": raw.get("source", "legacy_generation"),
+        "batch_identity": raw.get("batch_identity", {}),
+        "reason_codes": raw.get("reason_codes", []),
         "boundary": "Research Only；不扫描全 A；不接券商；不下真实订单；Not Investment Advice；Not Position Advice。",
     }
 
@@ -1313,14 +1691,43 @@ def selection_reason_from_row(row: pd.Series | None, indicators: dict[str, Any])
     return "MACD金叉观察" if dif >= dea else "候选池复盘观察"
 
 
-def build_candidate(symbol: str, row: pd.Series | None = None) -> dict[str, Any]:
+def _row_matches_formal_generation(row: pd.Series | None, generation: dict[str, Any]) -> bool:
+    if generation.get("source") != "formal_candidate_daily_batch":
+        return True
+    identity = generation.get("batch_identity") or {}
+    return bool(row is not None and generation.get("formal_current") is True
+        and str(row.get("source_run_id") or "") == str(identity.get("source_run_id") or "")
+        and str(row.get("source_hash") or "") == str(identity.get("batch_provenance_hash") or ""))
+
+
+def candidate_exposure_evidence(row: pd.Series | None) -> dict[str, Any]:
+    """Keep recorded industry/theme facts without inferring missing mappings."""
+    unknown = {"", "nan", "<na>", "none", "null", "未知", "未知行业", "未知题材", "未知板块", "数据缺失"}
+    def recorded(key: str) -> str:
+        raw = row.get(key) if row is not None else None
+        value = str(raw).strip() if raw is not None else ""
+        return "" if value.lower() in unknown else value
+    values = {key: recorded(key) for key in ("industry", "sector", "theme", "primary_theme", "theme_tags")}
+    industry_known = bool(values["industry"] or values["sector"])
+    theme_known = any(values[key] for key in ("theme", "primary_theme", "theme_tags"))
+    return {**values, "exposure_evidence": {
+        "industry_status": "recorded" if industry_known else "unknown",
+        "industry_source": recorded("industry_source") or ("candidate_record" if industry_known else ""),
+        "industry_as_of": recorded("industry_as_of"),
+        "theme_status": "recorded" if theme_known else "unknown",
+        "theme_source": recorded("theme_source") or ("candidate_record" if theme_known else ""),
+        "unknown_does_not_prove_diversification": True,
+        "selection_note": "未知行业/题材不能视为独立分散；沿用原筛选分组，未调整排序和权重。"}}
+
+
+def build_candidate(symbol: str, row: pd.Series | None = None, *, generation: dict[str, Any] | None = None) -> dict[str, Any]:
     stock_df = load_stock_data(symbol)
     clean_symbol = normalize_symbol(symbol)
     name = candidate_name(symbol, row)
     entry_date = row_entry_date(row)
     signal_date = row_signal_date(row)
     candidate_role = row_candidate_role(row)
-    generation = latest_generation_status()
+    generation = generation if generation is not None else latest_generation_status()
     generation_signal_date = str(generation.get("signal_date") or "")[:10]
     generation_symbols = latest_generation_symbols(generation)
     is_today_recommendation = bool(
@@ -1329,6 +1736,7 @@ def build_candidate(symbol: str, row: pd.Series | None = None) -> dict[str, Any]
         and generation_signal_date
         and signal_date == generation_signal_date
         and (not generation_symbols or clean_symbol in generation_symbols)
+        and _row_matches_formal_generation(row, generation)
     )
     candidate_origin_label = "今日新候选" if is_today_recommendation else "历史观察"
     strategy_type = row_strategy_type(row)
@@ -1338,6 +1746,7 @@ def build_candidate(symbol: str, row: pd.Series | None = None) -> dict[str, Any]
         tracking = build_strategy_tracking(stock_df, row, {})
         strategy_bucket, strategy_lane, group_key = classify_candidate_lane(strategy_type, {}, tracking, quality)
         return {
+            **candidate_exposure_evidence(row),
             "symbol": clean_symbol,
             "name": name,
             "current_price": "数据缺失",
@@ -1363,6 +1772,7 @@ def build_candidate(symbol: str, row: pd.Series | None = None) -> dict[str, Any]
             "tracking": tracking,
             "focus_reason": f"{strategy_lane}；{tracking['status_label']}；{quality['status']}。",
             "data_hint": UPDATE_HINT,
+            "batch_identity": generation.get("batch_identity", {}) if is_today_recommendation else {},
         }
 
     latest = stock_df.iloc[-1]
@@ -1372,6 +1782,7 @@ def build_candidate(symbol: str, row: pd.Series | None = None) -> dict[str, Any]
     tracking = build_strategy_tracking(stock_df, row, indicators)
     strategy_bucket, strategy_lane, group_key = classify_candidate_lane(strategy_type, indicators, tracking, quality)
     return {
+        **candidate_exposure_evidence(row),
         "symbol": clean_symbol,
         "name": name,
         "current_price": chart_number(latest.get("close")),
@@ -1397,14 +1808,15 @@ def build_candidate(symbol: str, row: pd.Series | None = None) -> dict[str, Any]
         "tracking": tracking,
         "focus_reason": f"{strategy_lane}；{tracking['status_label']}；{quality['status']}。",
         "data_hint": quality["hint"],
+        "batch_identity": generation.get("batch_identity", {}) if is_today_recommendation else {},
     }
 
 
-def strategy_priority(row: pd.Series) -> tuple[int, str]:
+def strategy_priority(row: pd.Series, *, generation: dict[str, Any] | None = None) -> tuple[int, str]:
     strategy_type = row_strategy_type(row)
     entry_date = row_entry_date(row)
     signal_date = row_signal_date(row)
-    generation = latest_generation_status()
+    generation = generation if generation is not None else latest_generation_status()
     generation_symbols = latest_generation_symbols(generation)
     symbol = normalize_symbol(str(row.get("ts_code") or row.get("symbol") or ""))
     is_today = (
@@ -1412,6 +1824,7 @@ def strategy_priority(row: pd.Series) -> tuple[int, str]:
         and signal_date
         and signal_date == str(generation.get("signal_date") or "")[:10]
         and (not generation_symbols or symbol in generation_symbols)
+        and _row_matches_formal_generation(row, generation)
     )
     return (100 if is_today else 0, PRIMARY_STRATEGY_PRIORITY.get(strategy_type, 0), entry_date)
 
@@ -1558,8 +1971,16 @@ def candidate_rows(limit: int = 10) -> list[dict[str, Any]]:
     ledger = load_candidate_ledger()
     rows: list[dict[str, Any]] = []
     overrides = load_candidate_review_overrides()
+    generation = latest_generation_status()
+    if generation.get("formal_current"):
+        formal_rows = [{**row, "ts_code": row.get("symbol"), "stock_name": row.get("name"),
+            "signal_date": generation["signal_date"], "entry_date": generation["signal_date"],
+            "candidate_role": "daily_recommendation", "data_source": "formal_candidate_batch",
+            "source_hash": generation["batch_identity"]["batch_provenance_hash"],
+            "source_run_id": generation["batch_identity"]["source_run_id"]}
+            for row in generation.get("formal_rows") or []]
+        ledger = pd.concat([pd.DataFrame(formal_rows), ledger], ignore_index=True).fillna("")
     if not ledger.empty and "ts_code" in ledger.columns:
-        generation = latest_generation_status()
         generation_date = str(generation.get("signal_date") or "")[:10]
         generation_symbols = latest_generation_symbols(generation)
         grouped: dict[str, list[pd.Series]] = {}
@@ -1575,19 +1996,22 @@ def candidate_rows(limit: int = 10) -> list[dict[str, Any]]:
                 row_candidate_role(row) == "daily_recommendation"
                 and row_signal_date(row) == generation_date
                 and (not generation_symbols or symbol in generation_symbols)
+                and _row_matches_formal_generation(row, generation)
                 for row in related_rows
             )
             (today_symbols if has_today else observation_symbols).append(symbol)
 
         def symbol_priority(symbol: str) -> tuple[int, str]:
-            return max(strategy_priority(row) for row in grouped[symbol])
+            return max(strategy_priority(row, generation=generation) for row in grouped[symbol])
 
         ordered_symbols = sorted(today_symbols, key=symbol_priority, reverse=True)
         ordered_symbols.extend(sorted(observation_symbols, key=symbol_priority, reverse=True))
         for symbol in ordered_symbols:
             related = grouped[symbol]
-            primary = sorted(related, key=strategy_priority, reverse=True)[0]
-            candidate = attach_strategy_conflict(build_candidate(symbol, primary), related, primary)
+            primary = sorted(related, key=lambda row: strategy_priority(row, generation=generation), reverse=True)[0]
+            built = (build_candidate(symbol, primary, generation=generation)
+                     if generation.get("source") == "formal_candidate_daily_batch" else build_candidate(symbol, primary))
+            candidate = attach_strategy_conflict(built, related, primary)
             rows.append(attach_reference_confidence(apply_candidate_review_state(candidate, overrides)))
             if len(rows) >= limit:
                 break
@@ -1599,6 +2023,39 @@ def candidate_rows(limit: int = 10) -> list[dict[str, Any]]:
         candidate = attach_strategy_conflict(build_candidate(symbol, None), [], None)
         rows.append(attach_reference_confidence(apply_candidate_review_state(candidate, overrides)))
     return rows
+
+
+def _candidate_read_symbols(limit: int = 18) -> list[str]:
+    """Project the exact bounded candidate selection without building bars."""
+    ledger = load_candidate_ledger()
+    generation = latest_generation_status()
+    if generation.get("formal_current"):
+        formal_rows = [{**row, "ts_code": row.get("symbol"), "stock_name": row.get("name"),
+            "signal_date": generation["signal_date"], "entry_date": generation["signal_date"],
+            "candidate_role": "daily_recommendation", "data_source": "formal_candidate_batch",
+            "source_hash": generation["batch_identity"]["batch_provenance_hash"],
+            "source_run_id": generation["batch_identity"]["source_run_id"]}
+            for row in generation.get("formal_rows") or []]
+        ledger = pd.concat([pd.DataFrame(formal_rows), ledger], ignore_index=True).fillna("")
+    if ledger.empty or "ts_code" not in ledger.columns:
+        return [normalize_symbol(path.stem) for path in sorted(DAILY_DIR.glob("*.csv"))[:limit]]
+    generation_date = str(generation.get("signal_date") or "")[:10]
+    generation_symbols = latest_generation_symbols(generation)
+    grouped: dict[str, list[Any]] = {}
+    for _, row in ledger.iterrows():
+        symbol = normalize_symbol(str(row.get("ts_code") or ""))
+        if symbol.strip("0"):
+            grouped.setdefault(symbol, []).append(row)
+    def is_today(symbol: str) -> bool:
+        return any(row_candidate_role(row) == "daily_recommendation"
+            and row_signal_date(row) == generation_date
+            and (not generation_symbols or symbol in generation_symbols)
+            and _row_matches_formal_generation(row, generation) for row in grouped[symbol])
+    def priority(symbol: str) -> tuple[int, str]:
+        return max(strategy_priority(row, generation=generation) for row in grouped[symbol])
+    today = sorted((s for s in grouped if is_today(s)), key=priority, reverse=True)
+    historical = sorted((s for s in grouped if not is_today(s)), key=priority, reverse=True)
+    return (today + historical)[:limit]
 
 
 def search_stock_rows(query: str, limit: int = 8) -> list[dict[str, Any]]:
@@ -1670,6 +2127,77 @@ def search_stock_rows(query: str, limit: int = 8) -> list[dict[str, Any]]:
     if q_symbol and q_symbol not in seen:
         add({"symbol": q_symbol, "name": candidate_name(q_symbol), "price": "数据缺失", "pct_chg": "数据缺失", "source": "代码输入"})
     return rows[:limit]
+
+
+def stock_minute_view(symbol: str, *, max_rows: int = 300) -> dict[str, Any]:
+    """Read the local 1-minute cache for one stock; never fill or invent bars.
+
+    The cache lives in data/intraday/1m/<symbol>.csv and is written by the
+    minute pool, not by this reader. Only the most recent session is returned so
+    the page can show an honest intraday view together with its coverage.
+    """
+    clean_symbol = normalize_symbol(symbol)
+    path = INTRADAY_ONE_MINUTE_DIR / f"{clean_symbol}.csv"
+    payload: dict[str, Any] = {
+        "available": False, "rows": [], "date": "", "times": [],
+        "coverage": {}, "price_basis": [], "source": [], "message": "",
+    }
+    if not path.is_file():
+        payload["message"] = "本地没有该股的1分钟缓存；不补齐、不编造。"
+        return payload
+    try:
+        frame = read_csv_frame(path)
+    except Exception as exc:  # noqa: BLE001 - a read failure must degrade visibly
+        payload["message"] = "本地1分钟缓存读取失败：" + type(exc).__name__
+        return payload
+    if frame.empty:
+        payload["message"] = "本地1分钟缓存为空文件。"
+        return payload
+    if "datetime" in frame.columns:
+        stamps = pd.to_datetime(frame["datetime"], errors="coerce")
+    elif {"date", "time"} <= set(frame.columns):
+        stamps = pd.to_datetime(frame["date"].astype(str) + " " + frame["time"].astype(str), errors="coerce")
+    else:
+        payload["message"] = "本地1分钟缓存缺少日期或时间列；不推测。"
+        return payload
+    frame = frame.loc[stamps.notna()].copy()
+    if frame.empty:
+        payload["message"] = "本地1分钟缓存没有可解析的时间戳。"
+        return payload
+    frame["_stamp"] = stamps.loc[stamps.notna()].values
+    last_date = frame["_stamp"].max().date()
+    session = frame.loc[frame["_stamp"].dt.date == last_date].sort_values("_stamp")
+    first_date = frame["_stamp"].min().date()
+    rows = []
+    for _, item in session.tail(max_rows).iterrows():
+        rows.append({
+            "time": item["_stamp"].strftime("%H:%M"),
+            "open": chart_number(item.get("open")),
+            "high": chart_number(item.get("high")),
+            "low": chart_number(item.get("low")),
+            "close": chart_number(item.get("close")),
+            "volume": chart_number(item.get("volume")),
+            "amount": chart_number(item.get("amount")),
+        })
+    def distinct(column: str) -> list[str]:
+        if column not in frame.columns:
+            return []
+        values = sorted({str(value).strip() for value in frame[column].dropna().tolist() if str(value).strip()})
+        return [value for value in values if value.lower() not in {"nan", "none"}]
+    coverage = {
+        "first_date": first_date.isoformat(), "last_date": last_date.isoformat(),
+        "total_rows": int(len(frame)), "session_rows": int(len(session)),
+        "returned_rows": len(rows),
+    }
+    return {
+        **payload, "available": bool(rows), "rows": rows,
+        "date": last_date.isoformat(),
+        "times": [row["time"] for row in rows],
+        "coverage": coverage,
+        "price_basis": distinct("price_basis"), "source": distinct("source"),
+        "message": ("仅展示本地缓存最近一个交易日（" + last_date.isoformat() + "）的1分钟数据；"
+                    "缓存起止 " + first_date.isoformat() + " 至 " + last_date.isoformat() + "。"),
+    }
 
 
 def ensure_single_stock_daily(symbol: str, *, refresh_daily: bool) -> dict[str, Any]:
@@ -2059,6 +2587,13 @@ def load_paper_simulation_watchlist() -> dict[str, Any]:
         for item in data.get("items", [])
         if isinstance(item, dict)
     ]
+    for item in data["items"]:
+        if item.get("tracking_metric_version") != "peak-to-trough-v2":
+            item["legacy_max_drawdown_since_added"] = item.get("max_drawdown_since_added")
+            item["max_drawdown_since_added"] = None
+            item["max_drawdown_status"] = "legacy_metric_unverified"
+            item["tracking_message"] = (str(item.get("tracking_message") or "")
+                + " 历史缓存的最大回撤采用旧口径，已停止作为回撤展示；原始记录保留，等待按峰谷口径重新统计。")
     data.setdefault("research_only", True)
     data.setdefault("paper_only", True)
     data.setdefault("broker_boundary", "No Broker Route / No real orders.")
@@ -3168,7 +3703,9 @@ def refresh_paper_simulation_item_tracking(item: dict[str, Any]) -> dict[str, An
     returns = (closes / initial_price - 1.0) * 100.0
     latest_return = float((latest_price / initial_price - 1.0) * 100.0)
     max_gain = float(returns.max()) if not returns.empty else latest_return
-    max_drawdown = float(returns.min()) if not returns.empty else latest_return
+    min_return = float(returns.min()) if not returns.empty else latest_return
+    peaks = closes.cummax().clip(lower=initial_price)
+    max_drawdown = min(0.0, float(((closes / peaks - 1.0) * 100.0).min()))
     elapsed_days = max(0, int(len(window) - 1))
     review = _paper_simulation_review_state(tracked, latest_return, max_drawdown, elapsed_days)
     tracked.update(review)
@@ -3196,6 +3733,8 @@ def refresh_paper_simulation_item_tracking(item: dict[str, Any]) -> dict[str, An
             "return_since_added_pct": _round_float(latest_return),
             "max_gain_since_added": _round_float(max_gain),
             "max_drawdown_since_added": _round_float(max_drawdown),
+            "min_return_since_added_pct": _round_float(min_return),
+            "tracking_metric_version": "peak-to-trough-v2",
             "elapsed_trading_days": elapsed_days,
             "tracking_message": (
                 f"入池以来 {elapsed_days} 个完整交易日，纸面变化 {latest_return:+.2f}%，"
@@ -4368,6 +4907,55 @@ def priority_reason(candidate: dict[str, Any]) -> str:
     return "；".join(reasons[:4]) or "本地研究排序样本"
 
 
+def focus_score_explanation(candidate: dict[str, Any], weight: float) -> dict[str, Any]:
+    """Explain the unchanged UI ranking; these points are not probabilities."""
+    quality = candidate.get("data_quality", {}).get("tone")
+    tone = candidate.get("tracking", {}).get("status_tone")
+    pct = finite_float(candidate.get("pct_chg"))
+    components = [
+        {"name": "今日候选", "points": 8 if candidate.get("is_today_recommendation") else 0},
+        {"name": "字段完整性", "points": {"ok": 3, "warn": 1}.get(quality, 0)},
+        {"name": "观察假设状态", "points": {"ok": 4, "watch": 2, "warn": -3, "missing": -4}.get(tone, 0)},
+        {"name": "风险标签", "points": {"低": 2, "中": 1, "高": -2}.get(str(candidate.get("risk_level") or ""), 0)},
+        {"name": "观察分组", "points": {"long_swing": 1.5, "board": 1}.get(candidate.get("group_key"), 0)},
+        {"name": "当日涨跌", "points": max(-2.0, min(2.0, pct / 3)) if pct is not None else 0},
+    ]
+    return {"score_id": "ui-focus-score-v1", "components": components,
+        "base_total": focus_score(candidate), "strategy_tilt": (weight - 1) * 10,
+        "total": round(focus_score(candidate) + (weight - 1) * 10, 2), "ranking_only": True,
+        "tie_breaker": "API同分保留输入次序；前端依优先名次、基础分及代码排序。同分或微小分差不证明优劣。",
+        "not_comparable_to": "纸面研究·未验证；选股器原始分、其他策略分和历史统计使用不同口径，不能直接比较。"}
+
+
+def candidate_pool_context(rows: list[dict[str, Any]], focus: list[dict[str, Any]]) -> dict[str, Any]:
+    """Relate independent pools with their recorded dates, without syncing."""
+    watch = read_json_file(PAPER_WATCHLIST_JSON)
+    state = read_json_file(project_root / "state/auto_paper_portfolio.json")
+    watch_rows = watch.get("items") if isinstance(watch, dict) else None
+    positions = state.get("positions") if isinstance(state, dict) else None
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    def add(symbol: Any, pool: str, label: str, as_of: Any) -> None:
+        symbol = normalize_symbol(str(symbol or ""))
+        if symbol:
+            by_symbol.setdefault(symbol, []).append({"pool": pool, "label": label, "as_of": str(as_of or "")[:10]})
+    for row in rows:
+        today = row.get("is_today_recommendation") is True
+        add(row.get("symbol"), "today" if today else "historical", "今日候选" if today else "历史观察", row.get("signal_date"))
+    for row in focus:
+        add(row.get("symbol"), "focus", "本次重点观察", row.get("signal_date"))
+    for row in watch_rows if isinstance(watch_rows, list) else []:
+        if isinstance(row, dict):
+            add(row.get("symbol"), "paper_watchlist", "纸面观察池", row.get("latest_reference_date"))
+    for row in positions if isinstance(positions, list) else []:
+        if isinstance(row, dict):
+            add(row.get("symbol"), "paper_position", "策略纸面持仓", state.get("valuation_date"))
+    return {"by_symbol": by_symbol, "visible_candidate_count": len(rows), "focus_count": len(focus),
+        "paper_watchlist_count": len(watch_rows) if isinstance(watch_rows, list) else None,
+        "paper_position_count": len(positions) if isinstance(positions, list) else None,
+        "read_only": True, "synchronization_executed": False,
+        "note": "各池日期独立；重点观察是候选子集，观察池不是持仓。本次只读展示，没有同步或交易。"}
+
+
 def annotate_recommendation_priorities(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # Soft strategy-effectiveness re-rank: a bounded tilt on the focus order so
     # strategies that keep failing on paper (or fail the backtest) drift down,
@@ -4416,6 +5004,7 @@ def annotate_recommendation_priorities(rows: list[dict[str, Any]]) -> list[dict[
         copy["strategy_bucket_canonical"] = bucket
         copy["strategy_weight"] = round(weight, 3)
         copy["weighted_priority_score"] = round(_weighted_score(copy), 2)
+        copy["score_explanation"] = focus_score_explanation(copy, weight)
         if weight < 0.98:
             copy["strategy_weight_note"] = f"策略近期降权（{bucket}：{info.get('confidence_label') or '近期纸面偏离'}）"
         elif weight > 1.02:
@@ -4565,7 +5154,11 @@ def candidate_pool_review_policy(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def data_gap_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     missing_rows = [row for row in rows if row.get("data_quality", {}).get("tone") == "missing"]
     stale_rows = [row for row in rows if row.get("data_quality", {}).get("status") == "日线滞后"]
-    field_gap_rows = [row for row in rows if row.get("data_quality", {}).get("tone") == "field_gap"]
+    def has_field_gap(row: dict[str, Any]) -> bool:
+        evidence = row.get("missing_evidence") or []
+        return row.get("data_quality", {}).get("tone") == "field_gap" or any(
+            isinstance(item, dict) and item.get("kind") == "missing_liquidity_evidence" for item in evidence)
+    field_gap_rows = [row for row in rows if has_field_gap(row)]
     today_rows = [row for row in rows if bool(row.get("is_today_recommendation"))]
     observation_rows = [row for row in rows if not bool(row.get("is_today_recommendation"))]
     today_stale_rows = [row for row in stale_rows if bool(row.get("is_today_recommendation"))]
@@ -6016,22 +6609,36 @@ def _compact_strategy_lab_context(
 
 
 def latest_research_evidence_context() -> dict[str, Any]:
+    from quantdesk.research.evidence_identity import read_research_evidence
     evidence: dict[str, Any] = {}
+    target = expected_settlement_date(to_shanghai_datetime())
+    target_text = target.isoformat() if target else ""
     backtest_paths = [
         project_root / "results" / "backtest" / "backtest_latest.json",
         project_root / "results" / "backtest" / "latest.json",
     ]
     for path in backtest_paths:
-        payload = read_json_file(path)
+        admission = read_research_evidence(path, target_date=target_text)
+        payload = admission["payload"]
         if payload and payload.get("status") != "unreadable":
             evidence["backtest_summary"] = _compact_backtest_context(payload, path=path)
+            evidence["backtest_summary"].update(formal_eligible=admission["formal_eligible"],
+                evidence_admission={k: v for k, v in admission.items() if k != "payload"})
+            if not admission["formal_eligible"]:
+                evidence["backtest_summary"].update(available=False, status="unverified_research_evidence")
             break
     factor_path = project_root / "results" / "factor_health_latest.json"
-    factor_payload = read_json_file(factor_path)
+    factor_admission = read_research_evidence(factor_path, target_date=target_text)
+    factor_payload = factor_admission["payload"]
     if factor_payload and factor_payload.get("status") != "unreadable":
         evidence["factor_health"] = _compact_factor_health_context(factor_payload, path=factor_path)
+        evidence["factor_health"].update(formal_eligible=factor_admission["formal_eligible"],
+            evidence_admission={k: v for k, v in factor_admission.items() if k != "payload"})
+        if not factor_admission["formal_eligible"]:
+            evidence["factor_health"].update(available=False, status="unverified_research_evidence")
     strategy_lab_path = project_root / "results" / "strategy_lab" / "v420_strategy_leaderboard_latest.json"
-    strategy_lab_payload = read_json_file(strategy_lab_path)
+    strategy_admission = read_research_evidence(strategy_lab_path, target_date=target_text)
+    strategy_lab_payload = strategy_admission["payload"]
     if strategy_lab_payload and strategy_lab_payload.get("status") != "unreadable":
         handoff_path = project_root / "results" / "strategy_lab" / "v420_real_use_strategy_lab_handoff_latest.json"
         statistics_path = project_root / "results" / "strategy_lab" / "v421_strategy_statistics_latest.json"
@@ -6041,6 +6648,21 @@ def latest_research_evidence_context() -> dict[str, Any]:
             handoff_payload=read_json_file(handoff_path),
             statistics_payload=read_json_file(statistics_path),
         )
+        evidence["strategy_lab"].update(formal_eligible=strategy_admission["formal_eligible"],
+            evidence_admission={k: v for k, v in strategy_admission.items() if k != "payload"})
+        if not strategy_admission["formal_eligible"]:
+            evidence["strategy_lab"].update(available=False, status="unverified_research_evidence")
+    for kind, filename in (("combined_score_backtest", "combined_score_backtest_latest.json"),
+                           ("walk_forward", "walk_forward_latest.json")):
+        path = project_root / "results" / filename
+        admission = read_research_evidence(path, target_date=target_text)
+        payload = admission["payload"]
+        evidence[kind] = {"available": bool(payload) and admission["formal_eligible"],
+            "formal_eligible": admission["formal_eligible"], "status": admission["status"],
+            "path": project_relative_path(path), "research_only": True,
+            "diagnostic_metrics": payload.get("performance") or payload.get("walk_forward_summary") or {},
+            "warnings_top": list(payload.get("warnings") or [])[:8],
+            "evidence_admission": {k: v for k, v in admission.items() if k != "payload"}}
     evidence.setdefault(
         "backtest_summary",
         {
@@ -6325,6 +6947,16 @@ def _run_startup_refresh_worker(reason: str, request_id: str | None = None) -> N
         DATA_WRITE_LOCK.release()
 
 
+def load_stock_workbench_daily(symbol: str) -> dict[str, Any]:
+    """Read original bytes; the new consumer classifies before transforming."""
+    path = DAILY_DIR / f"{symbol}.csv"
+    if not path.is_file():
+        return {"frame": pd.DataFrame(), "sha256": ""}
+    data = path.read_bytes()
+    return {"frame": pd.read_csv(BytesIO(data), dtype={"adjust": str}),
+            "sha256": hashlib.sha256(data).hexdigest()}
+
+
 def get_stock_detail(symbol: str):
     clean_symbol = normalize_symbol(symbol)
     refresh_daily = request_truthy(request.args.get("refresh_daily"))
@@ -6419,6 +7051,9 @@ def get_stock_detail(symbol: str):
         "indicators_exp": stock_explainer.generate_indicator_explanation(indicators),
         "risk_warning": stock_explainer.generate_risk_warning(indicators, len(stock_df)),
         "chart_data": {
+            "price_basis": stock_df.attrs.get("price_basis", "mixed_or_unknown"),
+            "price_basis_verified": bool(stock_df.attrs.get("price_basis_eligible")),
+            "price_basis_source": "original_daily_frame_before_filtering",
             "kline_data": chart_rows(stock_df),
             "select_date": chart_select_date,
             "select_reason": select_reason,
@@ -6916,7 +7551,13 @@ def build_research_reference(stock_df: pd.DataFrame) -> dict[str, Any]:
             "win_rate_pct": win_rate,
             "avg_return_pct": avg_return,
             "label": trade_label,
-            "note": "MA5/MA20 交叉规则的历史模拟结果。不保证未来重复，不构成交易指令。",
+            "note": "样本内理想毛收益：收盘生成信号并按同一收盘成交，未扣费用与滑点，未模拟涨跌停、停牌、T+1或资金约束；不能证明当前参考价有效。",
+            "rule_id": "legacy-ma5-ma20-same-close-v1",
+            "validation_status": "in_sample_idealized_unvalidated",
+            "signal_timing": "same_close",
+            "fill_timing": "same_close",
+            "costs_included": False,
+            "capital_constrained": False,
         },
         "recent_trend": {
             "return_5d_pct": ret_5d,
