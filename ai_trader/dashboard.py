@@ -35,6 +35,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ai_trader.llm import llm_runtime_descriptor
+from ai_trader.llm_transport import describe_model_request
 from ai_trader.mandate import BOUNDARY
 from ai_trader.paths import CYCLE_LATEST_PATH, STATE_DIR
 
@@ -307,6 +308,9 @@ def build_dashboard_payload(
         "source": "plan_latest.json",
         "recovery_status": str(chosen.get("recovery_status") or ""),
         "raw_response_reused": bool(_as_dict(chosen.get("raw_response")).get("reused")),
+        **describe_model_request(chosen),
+        "decision_label": ("模型判断" if llm_used else "未取得新判断，维持持仓"
+            if plan.get("decision_mode") == "hold_only" else "未取得模型判断" if chosen else "判断来源未知"),
     }
     # Cross-check against the cycle snapshot when present: disagreement is a
     # warning, never silently rewritten to look consistent.
@@ -334,7 +338,7 @@ def build_dashboard_payload(
             "missing_data": _marker(degraded, "有文件缺失/损坏，按缺数展示"),
             "unknown_identity": _marker(bool(st_unknown_fills), "成交里存在 ST 身份未知的票"),
             "unverified_statements": _marker(bool(unverified_rows), "有未核验的当晚陈述（不算对错）"),
-            "model_fallback": _marker(llm.get("mode") == "rule_fallback", "当次走的是备用规则"),
+            "model_fallback": _marker(llm.get("mode") == "rule_fallback", llm["decision_label"]),
             "model_unknown": _marker(llm.get("mode") == "unknown", "当次模型来源未知"),
             "recheck_present": _marker(bool(rechecked_rows), "有补证后的关联评价（原判定不变）"),
             "plan_uncommitted": _marker(classified["plan_committed"] is False, "今晚计划未提交/未成交"),
@@ -475,6 +479,14 @@ def build_dashboard_payload(
         "recent_trades": trades[-10:],
         "review_summary": _as_dict(review.get("score_summary")),
         "llm": llm,
+        "operation_stages": {
+            "process_completed": cycle.get("status") in {"completed", "completed_with_skips"} if cycle else None,
+            "provider_response_received": llm.get("provider_response_received"),
+            "model_judgment_accepted": llm_used if chosen else None,
+            "plan_committed": classified["plan_committed"],
+            "paper_fill_count": len(filled),
+            "paper_fill_scope": "reported_review_actions; may settle a previous plan",
+        },
         # Secret-free runtime disclosure: which LLM provider is configured,
         # whether data leaves this device, and EXACTLY what context would be
         # sent. The token is never included.

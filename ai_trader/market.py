@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import math
+import errno
+import os
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import pandas as pd
 
@@ -13,8 +16,54 @@ from ai_trader.paths import DEFAULT_DAILY_DIR, DEFAULT_MINUTE_DIR
 from ai_trader.execution_evidence import fingerprint_file, source_reference
 from quantdesk.corporate_action_repair import repair_corporate_actions
 from quantdesk.csv_io import read_csv_frame
-from quantdesk.price_basis import PRICE_BASIS_UNKNOWN, classify_frame_price_basis
+from quantdesk.price_basis import PRICE_BASIS_UNKNOWN, classify_frame_price_basis, validate_price_frame_set
 from quantdesk.trading_calendar import resolve_target_complete_trade_date
+
+
+class DailyPriceWriterBusy(TimeoutError):
+    """The Pipeline or a surviving writer child still owns the daily files."""
+
+
+@contextmanager
+def locked_daily_price_reader(daily_dir: Path) -> Iterator[dict[str, Any]]:
+    """Use both existing writer bytes; never create or rewrite its lock file.
+
+    The Pipeline owns byte 0 and surviving writer children own byte 1. A reader
+    needs both for a coherent local session. Detached fixture directories may
+    have no writer lock. Contention is retryable; file/open errors stay visible.
+    """
+
+    daily = Path(daily_dir).resolve()
+    lock_path = daily.parent / ".locks/data_close_pipeline.lock.json"
+    if daily.name != "daily" or daily.parent.name != "data" or not lock_path.exists():
+        yield {"status": "absent", "lock_path": str(lock_path)}
+        return
+    acquired: list[int] = []
+    with lock_path.open("r+b") as handle:
+        try:
+            for offset in (0, 1):
+                handle.seek(offset)
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:  # pragma: no cover - Linux writer uses OFD locks
+                        from quantdesk.pipeline_process_guard import acquire_linux_ofd_lock
+                        acquire_linux_ofd_lock(handle.fileno(), offset)
+                except OSError as exc:
+                    if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise DailyPriceWriterBusy("daily_price_writer_active") from exc
+                    raise
+                acquired.append(offset)
+            yield {"status": "locked", "lock_path": str(lock_path), "writer_bytes": [0, 1]}
+        finally:
+            if os.name == "nt":
+                import msvcrt
+                for offset in reversed(acquired):
+                    handle.seek(offset)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            # Closing the fd releases Linux OFD locks, including a first byte
+            # acquired before the second byte was found to be held by a child.
 
 
 def list_symbols(daily_dir: Path | None = None) -> list[str]:
@@ -188,6 +237,8 @@ def load_symbol_frame(
     *,
     lookback: int = 180,
     adjust_corporate_actions: bool = False,
+    as_of: str | None = None,
+    _source_input: tuple[pd.DataFrame, dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """Read one symbol's daily bars.
 
@@ -204,21 +255,37 @@ def load_symbol_frame(
     """
 
     path = Path(daily_dir or DEFAULT_DAILY_DIR) / f"{symbol}.csv"
-    source_before = fingerprint_file(path)
-    frame = read_csv_frame(path)
+    source_before = fingerprint_file(path) if _source_input is None else _source_input[1]
+    frame = read_csv_frame(path) if _source_input is None else _source_input[0].copy()
+    source_rows = len(frame)
     original_basis, original_reason = classify_frame_price_basis(frame)
+    original_gate = validate_price_frame_set({symbol: frame}, consumer="feature")
     warnings = list(frame.attrs.get("warnings") or [])
     if frame.empty:
         frame.attrs["warnings"] = warnings
         frame.attrs["price_basis"] = PRICE_BASIS_UNKNOWN
+        frame.attrs["price_policy_validation"] = original_gate
+        frame.attrs["original_source_rows"] = 0
         return frame
+    if not original_gate["eligible"]:
+        empty = pd.DataFrame()
+        empty.attrs.update(warnings=[*warnings, *original_gate["reason_codes"]],
+            price_basis=original_basis, price_basis_reason=original_reason,
+            price_policy_validation=original_gate, original_price_basis=original_basis,
+            original_source_rows=source_rows)
+        return empty
     frame.columns = [str(col).strip().lower() for col in frame.columns]
     if "date" not in frame.columns or "close" not in frame.columns:
         empty = pd.DataFrame()
         empty.attrs["warnings"] = warnings + [f"missing_ohlc_columns:{symbol}"]
         empty.attrs["price_basis"] = PRICE_BASIS_UNKNOWN
+        empty.attrs.update(original_price_basis=original_basis, original_source_rows=source_rows,
+                           price_policy_validation=original_gate)
         return empty
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    if as_of is not None:
+        cutoff = pd.to_datetime(as_of, errors="coerce")
+        frame = frame.loc[frame["date"] <= cutoff].copy() if pd.notna(cutoff) else frame.iloc[:0].copy()
     frame = frame.dropna(subset=["date", "close"]).sort_values("date")
     frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
     if "open" in frame.columns:
@@ -229,7 +296,7 @@ def load_symbol_frame(
     frame = frame.dropna(subset=["close"])
     ca_info: dict[str, Any] = {"ca_bars": 0}
     if adjust_corporate_actions and not frame.empty:
-        # Repair on full history so the back-adjust factors are complete, then tail.
+        # Only corporate actions already observable at the cutoff may restate history.
         frame, ca_info = repair_corporate_actions(frame)
         if ca_info.get("unverifiable"):
             empty = pd.DataFrame()
@@ -237,6 +304,8 @@ def load_symbol_frame(
                 f"unverifiable_corporate_action:{symbol}:{ca_info.get('reason') or ''}"
             ]
             empty.attrs["price_basis"] = PRICE_BASIS_UNKNOWN
+            empty.attrs.update(original_price_basis=original_basis, original_source_rows=source_rows,
+                               price_policy_validation=original_gate)
             return empty
         if ca_info.get("ca_bars"):
             warnings.append(f"corporate_actions_repaired:{symbol}:{ca_info['ca_bars']}")
@@ -244,15 +313,31 @@ def load_symbol_frame(
         frame = frame.tail(int(lookback))
     basis, reason = original_basis, original_reason
     source = source_reference(source_before, fingerprint_file(path))
+    if source.get("status") != "stable":
+        empty = pd.DataFrame()
+        empty.attrs.update(warnings=[*warnings, f"daily_source_unverified:{symbol}"],
+            price_basis=original_basis, original_price_basis=original_basis,
+            original_source_rows=source_rows, price_policy_validation=original_gate,
+            source_evidence=source)
+        return empty
     transformed_dates: list[str] = []
     if "raw_close" in frame.columns:
         for _, item in frame.iterrows():
             actual, original = _safe_float(item.get("close")), _safe_float(item.get("raw_close"))
             if actual is not None and original is not None and not math.isclose(actual, original, rel_tol=1e-12, abs_tol=1e-12):
                 transformed_dates.append(item["date"].strftime("%Y-%m-%d"))
+    if transformed_dates:
+        frame["adjust"] = "qfq"
+        if "price_basis" in frame.columns:
+            frame["price_basis"] = "qfq"
+        basis, reason = classify_frame_price_basis(frame)
     frame.attrs["warnings"] = warnings
     frame.attrs["price_basis"] = basis
+    frame.attrs["original_price_basis"] = original_basis
+    frame.attrs["original_source_rows"] = source_rows
     frame.attrs["price_basis_reason"] = reason
+    frame.attrs["price_policy_validation"] = original_gate
+    frame.attrs["information_cutoff"] = as_of or "latest_input"
     frame.attrs["symbol"] = symbol
     frame.attrs["source_evidence"] = source
     frame.attrs["transformed_dates"] = transformed_dates
@@ -267,6 +352,7 @@ def load_close_panel(
     daily_dir: Path | None = None,
     *,
     lookback: int = 180,
+    as_of: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Close/pct panels used for ranking, momentum, volatility and moving averages.
 
@@ -280,13 +366,42 @@ def load_close_panel(
     warnings: list[str] = []
     bases: set[str] = set()
     series_evidence: dict[str, dict[str, Any]] = {}
-    for symbol in symbols:
+    selected_symbols = list(dict.fromkeys(str(symbol) for symbol in symbols))
+    original_frames: dict[str, pd.DataFrame] = {}
+    source_inputs: dict[str, tuple[pd.DataFrame, dict[str, Any]]] = {}
+    excluded: list[dict[str, str]] = []
+    for symbol in selected_symbols:
+        path = Path(daily_dir or DEFAULT_DAILY_DIR) / f"{symbol}.csv"
+        source_before = fingerprint_file(path)
+        original = read_csv_frame(path)
+        source_inputs[symbol] = (original, source_before)
+        if not original.empty:
+            classify_frame_price_basis(original)
+            original_frames[symbol] = original
+    original_policy = validate_price_frame_set(original_frames, consumer="feature")
+    if original_frames and not original_policy["eligible"]:
+        panel = pd.DataFrame()
+        panel.attrs.update(price_policy_validation=original_policy,
+            warnings=list(original_policy["reason_codes"]),
+            input_evidence={"requested_symbols": selected_symbols, "loaded_symbols": [],
+                "excluded_symbols": [{"symbol": symbol, "reason_code": row["reason_code"]}
+                    for symbol, row in original_policy["per_symbol"].items() if not row["eligible"]],
+                "as_of": as_of, "observed_end": None, "status": "blocked"})
+        return panel, pd.DataFrame(), list(original_policy["reason_codes"])
+    for symbol in selected_symbols:
         frame = load_symbol_frame(
-            symbol, daily_dir, lookback=lookback, adjust_corporate_actions=True
+            symbol, daily_dir, lookback=lookback, adjust_corporate_actions=True, as_of=as_of,
+            _source_input=source_inputs[symbol],
         )
         warnings.extend(str(item) for item in (frame.attrs.get("warnings") or []))
+        basis = str(frame.attrs.get("original_price_basis") or frame.attrs.get("price_basis") or PRICE_BASIS_UNKNOWN)
         if frame.empty:
             warnings.append(f"empty_daily:{symbol}")
+            policy = frame.attrs.get("price_policy_validation") or {}
+            # Empty/missing files are data gaps. A nonempty original file with
+            # bad basis must block the whole requested panel even after cutoff.
+            reasons = policy.get("reason_codes") or []
+            excluded.append({"symbol": symbol, "reason_code": ",".join(reasons) or "no_asof_data"})
             continue
         basis = str(frame.attrs.get("price_basis") or PRICE_BASIS_UNKNOWN)
         bases.add(basis)
@@ -294,7 +409,8 @@ def load_close_panel(
             warnings.append(f"unlabeled_or_unknown_price_basis:{symbol}")
         indexed = frame.set_index(frame["date"].dt.strftime("%Y-%m-%d"))
         series_evidence[str(symbol)] = {
-            "original_price_basis": basis,
+            "original_price_basis": frame.attrs.get("original_price_basis"),
+            "calculation_price_basis": basis,
             "price_basis_reason": frame.attrs.get("price_basis_reason") or "",
             "source_evidence": dict(frame.attrs.get("source_evidence") or {}),
             "transformed_dates": list(frame.attrs.get("transformed_dates") or []),
@@ -307,9 +423,23 @@ def load_close_panel(
     pct_panel = pd.DataFrame(pct).reindex(close_panel.index) if pct else pd.DataFrame(index=close_panel.index)
     if len(bases) > 1:
         warnings.append("cross_symbol_price_basis_mismatch")
+    if not original_policy["eligible"]:
+        warnings.extend(original_policy["reason_codes"])
+        close_panel, pct_panel = pd.DataFrame(), pd.DataFrame()
     close_panel.attrs["warnings"] = warnings
     close_panel.attrs["price_bases"] = sorted(bases)
     close_panel.attrs["series_evidence"] = series_evidence
+    close_panel.attrs["calculation_basis"] = (
+        "corporate_action_repaired_research_proxy"
+        if any(row.get("transformed_dates") for row in series_evidence.values()) else "source_prices"
+    )
+    close_panel.attrs["price_policy_validation"] = original_policy
+    close_panel.attrs["input_evidence"] = {"requested_symbols": selected_symbols,
+        "loaded_symbols": list(close_panel.columns), "excluded_symbols": excluded,
+        "as_of": as_of, "observed_end": str(close_panel.index[-1]) if len(close_panel) else None,
+        "status": "blocked" if not original_policy["eligible"] else "partial" if excluded else "ready",
+        "sources": {symbol: row.get("source_evidence") or {} for symbol, row in series_evidence.items()},
+        "price_policy_validation": original_policy}
     return close_panel, pct_panel, warnings
 
 

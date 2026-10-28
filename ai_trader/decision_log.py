@@ -36,10 +36,12 @@ from ai_trader.prompt_pack import load_prompt_pack
 from ai_trader.evaluation_contract import (
     EXCLUSION_LABELS, complete_outcome_evidence, declared_verification,
     decision_origin, eligibility, with_fill_evidence,
+    DECLARATION_SCHEMA, declaration_evidence, evidence_hash,
 )
 from quantdesk.price_basis import PRICE_BASIS_RAW, validate_price_frame_set
 from quantdesk.trading_calendar import is_trade_day, load_a_share_trading_calendar
 from quantdesk.utils import atomic_write_json
+from ai_trader.execution_evidence import fingerprint_file, source_reference
 
 SCHEMA = "ai_trader_decision_v1"
 DISCLAIMER = "纸面 · 未验证"
@@ -74,11 +76,12 @@ _OPEN_PRICE = re.compile(r"开盘价?\s*[为是:]?\s*(\d+(?:\.\d+)?)(?:\s*元)?"
 _UNTAGGED_PCT = re.compile(
     r"(?P<verb>涨(?:幅)?|跌(?:幅)?|回调|[+＋\-－])\s*约?\s*(?P<pct>[+-]?\d+(?:\.\d+)?)\s*%"
 )
-_N_SESSIONS = re.compile(r"近\s*(\d+)\s*个?交易日|近\s*(\d+)\s*日")
+_N_SESSIONS = re.compile(r"(?:(?:近|过去|最近)\s*)?(\d+)\s*(?:个?\s*交易日|日|天)")
 _CLAIM_TIME = re.compile(
-    r"\d{4}-\d{2}-\d{2}|近\s*\d+\s*个?交易日|近\s*\d+\s*日|"
+    r"\d{4}-\d{2}-\d{2}|" + _N_SESSIONS.pattern + r"|"
     r"今天|今日|当日|昨天|昨日|前天|近期|最近|明天|明日|后天|次日|往后|未来"
 )
+_DATED_LIST_CONTEXT = re.compile(r"\s*(?:的\s*)?(?:候选(?:表|名单|清单|榜单|池)?|推荐(?:表|名单|清单|榜单)|观察名单)")
 _CLAUSE_BOUNDARY = re.compile(r"[，,；;。！？!?\n]|但是|但|然而|不过")
 _FUTURE_TIME = {"明天", "明日", "后天", "次日", "往后", "未来"}
 _PREDICTION_CONTEXT = re.compile(r"预计|预判|预期|目标价?|将会?|有望|看涨|看跌")
@@ -182,6 +185,7 @@ class _ClaimScope:
     sessions: int | None = None
     forecast: bool = False
     ambiguous: bool = False
+    list_date_only: bool = False
 
 
 def _scope_period_unspecified(scope: _ClaimScope) -> bool:
@@ -209,26 +213,30 @@ def _claim_scope(text: str, start: int, decision_date: str) -> _ClaimScope:
         return _ClaimScope(decision_date, period=token, ambiguous=True)
     numbered = _N_SESSIONS.fullmatch(token)
     if numbered:
-        sessions = int(numbered.group(1) or numbered.group(2))
+        sessions = int(numbered.group(1))
         endpoint = _claim_scope(prefix, times[-1].start(), decision_date)
         return _ClaimScope(
             endpoint.evidence_date,
             period=token,
             sessions=sessions,
             forecast=endpoint.forecast,
-            ambiguous=sessions < 1 or endpoint.ambiguous,
+            ambiguous=sessions < 1 or (endpoint.ambiguous and not endpoint.list_date_only),
         )
+    # A list's date does not state the horizon of its attached returns. Keep
+    # those values unverified unless a later token states their own period.
+    dated_list = bool(_DATED_LIST_CONTEXT.match(prefix[times[-1].end():]))
     if token in {"今天", "今日", "当日"}:
-        return _ClaimScope(decision_date, period=token)
+        return _ClaimScope(decision_date, period=token, ambiguous=dated_list, list_date_only=dated_list)
     if token in {"昨天", "昨日", "前天"}:
         offset = 2 if token == "前天" else 1
         day = (date.fromisoformat(decision_date) - timedelta(days=offset)).isoformat()
-        return _ClaimScope(day, period=token)
+        return _ClaimScope(day, period=token, ambiguous=dated_list, list_date_only=dated_list)
     try:
         day = date.fromisoformat(token).isoformat()
     except ValueError:
         return _ClaimScope(token, period=token, ambiguous=True)
-    return _ClaimScope(day, period=token, forecast=day > decision_date)
+    return _ClaimScope(day, period=token, forecast=day > decision_date,
+                       ambiguous=dated_list, list_date_only=dated_list)
 
 
 def _intent_fact_texts(intent: dict[str, Any]) -> list[str]:
@@ -605,7 +613,7 @@ _CLAIM_WORDS = ("收盘", "开盘", "最高", "最低", "报收", "涨", "跌", 
 _SUBJECT_TIME_WORDS = (
     "今天", "今日", "当日", "当天", "昨天", "昨日", "前天", "近期", "最近", "目前", "现在",
     "明天", "明日", "后天", "次日", "往后", "未来", "本周", "上周", "本月", "上月", "今年",
-    "去年", "以来", "至今", "此前", "之后", "随后", "早前", "上午", "下午", "盘中", "当晚",
+    "去年", "以来", "至今", "此前", "之后", "随后", "早前", "上午", "下午", "盘中", "当晚", "过去",
 )
 _SUBJECT_PERIOD_WORDS = ("个交易日", "交易日", "季度", "小时", "分钟", "个月", "个", "只", "款", "家")
 _SUBJECT_GENERIC_WORDS = (
@@ -736,7 +744,9 @@ def _verify_fact_text(
             continue
         label = "收盘" if kind == "close" else "开盘"
         extra = {"claimed": claimed, "symbol": symbol, "evidence_date": scope.evidence_date}
-        if scope.ambiguous or _scope_period_unspecified(scope):
+        # A dated list still names the session of an explicit open/close price.
+        # Its unspecified return horizon applies only to percentage claims.
+        if (scope.ambiguous and not scope.list_date_only) or _scope_period_unspecified(scope):
             hits.append(_mismatch(f"claimed_{kind}_ambiguous_period", f"{label}价对应的时段不明确，不能核对。",
                                   claim_indeterminate=True,
                                   evidence_status="unverified", **extra))
@@ -1166,7 +1176,12 @@ def build_decision_record(
             "prompt_approval_status", "prompt_builder_version")},
         "prompt_provenance": "recorded" if recorded_prompt and recorded_menu else "current_default_unconfirmed" if not backfill else "unknown",
         "llm_used": llm.get("used") if isinstance(llm.get("used"), bool) else None,
-        "llm_model": str(llm.get("model") or ""),
+        "llm_model": str((llm.get("response_evidence") or {}).get("response_model") or llm.get("model") or ""),
+        # Old persisted plans retain their recorded contract. Every future
+        # evening plan marks v2, including failure plans with missing evidence.
+        **({"evaluation_schema": DECLARATION_SCHEMA,
+            "evaluation_evidence": declaration_evidence(plan, intent) if not backfill else {}}
+            if plan.get("evaluation_schema") == DECLARATION_SCHEMA or "input_evidence" in plan else {}),
         "decision_origin": str(intent.get("decision_origin") or ("rule" if llm.get("used") is False else "unknown")),
         "committed": bool(plan.get("committed", True)) and result not in {RESULT_MISMATCH, RESULT_UNVERIFIED},
     }
@@ -1405,6 +1420,21 @@ def score_decision(record: dict[str, Any], *, daily_dir: Path, as_of: str) -> di
             recheck_only=recheck_only,
         )
     closes = dict(_closes_from(symbol, start, daily_dir, n_days + 5))
+    outcome_proof: dict[str, Any] = {}
+    if updated.get("evaluation_schema") == DECLARATION_SCHEMA:
+        path = Path(daily_dir) / f"{symbol}.csv"
+        before = fingerprint_file(path)
+        try:
+            original_rows = list(csv.DictReader(path.read_text(encoding="utf-8-sig").splitlines()))
+            original_validation = validate_price_frame_set({symbol: pd.DataFrame(original_rows)}, consumer=_DAILY_PRICE_CONSUMER)
+            reference = source_reference(before, fingerprint_file(path))
+            originals = [r for r in original_rows if r.get("date") in window]
+            originals.sort(key=lambda r: r["date"])
+            outcome_proof = {"source_sha256": reference.get("sha256"),
+                "source_status": reference["status"] if original_validation.get("eligible") else "unverified",
+                "original_rows": originals, "original_rows_sha256": evidence_hash(originals)}
+        except (OSError, ValueError, TypeError):
+            outcome_proof = {"source_status": "unverified"}
     observed: list[tuple[str, float]] = []
     for day in window:
         if day > as_of:
@@ -1445,7 +1475,7 @@ def score_decision(record: dict[str, Any], *, daily_dir: Path, as_of: str) -> di
     return _apply_verdict(
         updated, RESULT_RIGHT if hit else RESULT_WRONG, as_of,
         [{"kind": "window_hit" if hit else "window_miss", "level": level, "observed": observed,
-          "due_date": due, "price_basis": "raw"}],
+          "due_date": due, "price_basis": "raw", **outcome_proof}],
         recheck_only=recheck_only,
     )
 
@@ -1506,11 +1536,34 @@ def decision_review_summary(records: list[dict[str, Any]], *, as_of: Any) -> dic
     contexts: dict[str, dict[str, Any]] = {}
     historical = 0
     exclusion_counts: dict[str, int] = {}
+    seen_judgments: set[tuple[str, ...]] = set()
+    model_styles: dict[str, dict[str, Any]] = {}
+    identities: dict[str, set[str]] = {}
+    for row in records:
+        if row.get("decision_id"):
+            try:
+                signature = evidence_hash({k: row.get(k) for k in (
+                    "ledger_id", "plan_id", "symbol", "side", "decision_date", "trade_date",
+                    "verification", "result", "evaluation_evidence", "llm_model", "style")})
+            except (ValueError, TypeError):
+                signature = "invalid"
+            identities.setdefault(str(row["decision_id"]), set()).add(signature)
     for row in records:
         origin = decision_origin(row)
         group = groups[origin]
         contract = eligibility(row)
         exclusion_reasons = list(contract["exclusion_reasons"])
+        if len(identities.get(str(row.get("decision_id") or ""), set())) > 1:
+            exclusion_reasons.append("duplicate_decision_conflict")
+        proof = row.get("evaluation_evidence") or {}
+        judgment_key = (str(row.get("ledger_id") or ""), str(proof.get("original_response_sha256") or ""),
+            str(row.get("symbol") or ""), str(row.get("side") or ""),
+            str(row.get("decision_date") or ""), str(proof.get("response_observed_at") or ""),
+            json.dumps(proof.get("declared_condition"), sort_keys=True))
+        if row.get("evaluation_schema") == DECLARATION_SCHEMA and judgment_key[1]:
+            if judgment_key in seen_judgments:
+                exclusion_reasons.append("duplicate_judgment")
+            seen_judgments.add(judgment_key)
         in_denominator = False
         verification = row.get("verification") if isinstance(row.get("verification"), dict) else {}
         due = _review_date(verification.get("due_date"))
@@ -1552,10 +1605,16 @@ def decision_review_summary(records: list[dict[str, Any]], *, as_of: Any) -> dic
                 if not complete_outcome_evidence(row):
                     exclusion_reasons.append("outcome_evidence_incomplete")
                 if not exclusion_reasons:
-                    phase, note = "mature_evaluable", "模型事前声明、实际纸面成交及到期完整证据已确认"
+                    phase, note = "mature_evaluable", "模型事前声明、所需成交或非成交观察及到期完整证据已确认"
                     in_denominator = True
                     group[phase] += 1
                     group["mature_correct" if result == RESULT_RIGHT else "mature_wrong"] += 1
+                    key = str(row.get("llm_model") or "") + "|" + str(row.get("style") or "unknown")
+                    style = model_styles.setdefault(key, {"model": row.get("llm_model"), "style": row.get("style"),
+                        "denominator": 0, "correct": 0, "accuracy": None})
+                    style["denominator"] += 1
+                    style["correct"] += int(result == RESULT_RIGHT)
+                    style["accuracy"] = style["correct"] / style["denominator"]
                 else:
                     phase, note = "diagnostic_only", "保留原判定；不计可信模型成绩"
             else:
@@ -1593,12 +1652,13 @@ def decision_review_summary(records: list[dict[str, Any]], *, as_of: Any) -> dic
             group["accuracy"] = group["mature_correct"] / group["mature_evaluable"]
     denominator_note = (
         "可信准确率分母仅含：模型逐项判断、实际模型名称、带时区的事前记录、模型明确声明的"
-        "原始价格验证条件、按计划编号核实的实际纸面成交，以及观察期结束后的完整日线证据。"
+        "原始价格验证条件、声明所需的实际纸面成交或非成交价格观察，以及观察期结束后的完整日线证据。"
         "规则判断、来源未知、程序推导条件、提前命中、缺证与历史补写保留展示，均不计入。"
     )
     return {
         "as_of": cutoff.isoformat() if cutoff else None, "maturity_known": cutoff is not None,
         "historical_records": historical, "groups": groups, "record_context": contexts,
+        "model_style_groups": model_styles,
         "exclusion_counts": exclusion_counts,
         "credible_model": {"denominator": groups["model"]["mature_evaluable"],
                            "correct": groups["model"]["mature_correct"], "accuracy": groups["model"]["accuracy"]},

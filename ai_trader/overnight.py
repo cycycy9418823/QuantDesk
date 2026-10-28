@@ -11,6 +11,7 @@ from ai_trader.llm_transport import capture_requests
 import json
 import math
 import os
+import time
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -35,13 +36,16 @@ from ai_trader.llm import persistable_response_evidence, persistable_transport_d
 from ai_trader.mandate import BOUNDARY, DEFAULT_MANDATE, max_open_gap_for_style
 from ai_trader.market import (
     focus_universe,
+    DailyPriceWriterBusy,
     latest_as_of,
+    locked_daily_price_reader,
     load_close_panel,
     load_minute_session,
     load_ohlc_row,
 )
 from ai_trader.paths import (
     PLAN_LATEST_PATH,
+    DEFAULT_DAILY_DIR,
     CyclePaths,
     assert_not_quantdesk_ledger,
 )
@@ -98,6 +102,79 @@ def save_plan(plan: dict[str, Any], path: Any = None) -> None:
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+class DailySessionNotReady(RuntimeError):
+    """Expose a deferred cycle to launchers without changing either account."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        super().__init__(
+            "ai_trader_daily_data_not_ready:"
+            f"target_date={payload.get('as_of')}:"
+            f"observed_date={payload.get('observed_as_of') or 'missing'}:"
+            f"reason={payload.get('reason_code')}"
+        )
+
+
+def _session_inputs(
+    runtime: CyclePaths, *, as_of: str, lookback: int, universe_limit: int,
+    prompt_candidate: str | None,
+) -> dict[str, Any]:
+    """Observe before any account writes or model calls; preserve partial data."""
+
+    ledger = load_ledger(runtime.ledger)
+    held_names = list(position_map(ledger).keys())
+    watch = load_watchlist(runtime.watchlist)
+    recommendations = (load_recommendations(require_fresh_for=as_of) if prompt_candidate is None
+                       else {"symbols": [], "rows": [], "warnings": []})
+    recommended_names = list(recommendations.get("symbols") or [])
+    symbols = focus_universe(
+        runtime.daily_dir, as_of, held=held_names, watch=watch_names(watch),
+        recommended=recommended_names, limit=min(max(int(universe_limit), 8), 80),
+    )
+    panel, pct, warnings = (
+        load_close_panel(symbols, runtime.daily_dir, lookback=lookback, as_of=as_of)
+        if symbols else (pd.DataFrame(), pd.DataFrame(), ["focus_universe_empty"])
+    )
+    if (panel.attrs.get("input_evidence") or {}).get("status") == "blocked":
+        reasons = (panel.attrs.get("price_policy_validation") or {}).get("reason_codes") or warnings
+        raise RuntimeError("ai_trader_daily_price_policy_invalid:" + ",".join(map(str, reasons)))
+    present = (list(map(str, panel.loc[as_of].dropna().index))
+               if as_of in panel.index else [])
+    missing = [symbol for symbol in symbols if symbol not in present]
+    readiness = {
+        "target_date": as_of,
+        "observed_as_of": str(panel.index[-1]) if len(panel.index) else None,
+        "status": "partial" if present and missing else "ready" if present else "missing",
+        "present_symbols": present, "missing_symbols": missing,
+        "reason_codes": [f"daily_session_missing:{symbol}" for symbol in missing],
+    }
+    return {"ledger": ledger, "watch": watch, "held_names": held_names,
+            "recommendations": recommendations, "recommended_names": recommended_names,
+            "symbols": symbols, "panel": panel, "pct": pct, "warnings": warnings,
+            "readiness": readiness}
+
+
+def _deferred_daily_session(
+    runtime: CyclePaths, target_date: str, inputs: dict[str, Any] | None,
+    reason: str, wait_seconds: float,
+) -> dict[str, Any]:
+    # Read-only diagnostics leave the prior ledger, plan, judgment and outputs
+    # intact. In particular, no append_journal or init_ledger is allowed here.
+    ledger = (inputs or {}).get("ledger") or load_ledger(runtime.ledger)
+    readiness = dict((inputs or {}).get("readiness") or {})
+    return {
+        "ok": False, "status": "deferred", "mode": "overnight_open",
+        "as_of": target_date, "observed_as_of": readiness.get("observed_as_of"),
+        "reason_code": reason, "wait_seconds": wait_seconds,
+        "daily_readiness": readiness, "ledger": {
+            key: ledger.get(key) for key in ("ledger_id", "as_of", "cash", "equity", "positions")
+        },
+        "actions": [], "model_called": False, "ledger_written": False,
+        "plan_written": False, "warnings": [reason, *readiness.get("reason_codes", [])],
+        "boundary": dict(BOUNDARY), "disclaimer": "纸面 · 未验证",
+    }
 
 
 def _append_llm_response_evidence(evidence: dict[str, Any], ledger_path: Path) -> None:
@@ -594,6 +671,7 @@ def build_plan(
                     "side": "sell",
                     "decision_origin": "model" if asked_to_sell and llm_directed else "rule",
                     "verification": deepcopy((llm_sell_map.get(symbol) or {}).get("verification")) if asked_to_sell else None,
+                    "style": ((llm_sell_map.get(symbol) or {}).get("style") or None) if asked_to_sell else None,
                     "quantity": int(pos.get("quantity") or 0),
                     "ref_close": close,
                     "predicted_direction": "down",
@@ -1070,38 +1148,109 @@ def run_evening(
     universe_limit: int = 240,
     network_news: bool | None = None,
     prompt_candidate: str | None = None,
+    target_date: str | None = None,
+    require_current_data: bool | None = None,
+    data_wait_seconds: float = 7200.0,
+    data_poll_seconds: float = 5.0,
+) -> dict[str, Any]:
+    """Freeze automatic business dates and wait without holding writer locks.
+
+    Existing detached research callers keep their historical behavior. Managed
+    daily paths and an explicit target use this date-preserving contract;
+    partial universes stay labelled and do not require full-A coverage.
+    """
+
+    managed = Path(paths.daily_dir).resolve() == Path(DEFAULT_DAILY_DIR).resolve()
+    if managed and require_current_data is False:
+        raise ValueError("managed_daily_requires_current_session")
+    strict = managed or bool(require_current_data) or target_date is not None
+    if not strict:
+        return _run_evening_ready(paths=paths, lookback=lookback, universe_limit=universe_limit,
+                                  network_news=network_news, prompt_candidate=prompt_candidate)
+    wait, poll = float(data_wait_seconds), float(data_poll_seconds)
+    if not math.isfinite(wait) or wait < 0 or not math.isfinite(poll) or poll <= 0:
+        raise ValueError("ai_trader_data_wait_parameters_invalid")
+    calendar = latest_as_of(paths.daily_dir)
+    as_of = str(target_date or calendar.get("as_of") or "").strip()
+    if not as_of or date.fromisoformat(as_of).isoformat() != as_of:
+        raise ValueError("ai_trader_target_date_invalid")
+    deadline = time.monotonic() + wait
+    inputs: dict[str, Any] | None = None
+    reason = "ai_trader_target_daily_bars_missing"
+    while True:
+        selected = False
+        try:
+            with locked_daily_price_reader(paths.daily_dir) as reader:
+                inputs = _session_inputs(paths, as_of=as_of, lookback=lookback,
+                                         universe_limit=universe_limit, prompt_candidate=prompt_candidate)
+                if inputs["readiness"]["present_symbols"]:
+                    selected = True
+                    inputs["readiness"]["reader_lock"] = reader
+                    return _run_evening_ready(
+                        paths=paths, lookback=lookback, universe_limit=universe_limit,
+                        network_news=network_news, prompt_candidate=prompt_candidate,
+                        session_inputs=inputs, session_calendar=calendar, session_target=as_of,
+                    )
+                reason = "ai_trader_target_daily_bars_missing"
+        except DailyPriceWriterBusy:
+            if selected:
+                raise
+            reason = "daily_price_writer_active"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _deferred_daily_session(paths, as_of, inputs, reason, wait)
+        time.sleep(min(poll, remaining))
+
+
+def _run_evening_ready(
+    *,
+    paths: CyclePaths,
+    lookback: int = 180,
+    universe_limit: int = 240,
+    network_news: bool | None = None,
+    prompt_candidate: str | None = None,
+    session_inputs: dict[str, Any] | None = None,
+    session_calendar: dict[str, Any] | None = None,
+    session_target: str | None = None,
 ) -> dict[str, Any]:
     pack = load_prompt_pack(candidate=prompt_candidate)
     runtime = paths
     runtime.ledger.parent.mkdir(parents=True, exist_ok=True)
     init_ledger(path=runtime.ledger)
     ledger = load_ledger(runtime.ledger)
-    calendar = latest_as_of(runtime.daily_dir)
-    as_of = str(calendar.get("as_of") or "")[:10]
-    watch = load_watchlist(runtime.watchlist)
-    held_names = list(position_map(ledger).keys())
-    recommendations = (load_recommendations(require_fresh_for=as_of) if prompt_candidate is None
-                       else {"symbols": [], "rows": [], "warnings": []})
-    recommended_names = list(recommendations.get("symbols") or [])
+    calendar = session_calendar or latest_as_of(runtime.daily_dir)
+    as_of = session_target or str(calendar.get("as_of") or "")[:10]
+    if session_inputs is None:
+        watch = load_watchlist(runtime.watchlist)
+        held_names = list(position_map(ledger).keys())
+        recommendations = (load_recommendations(require_fresh_for=as_of) if prompt_candidate is None
+                           else {"symbols": [], "rows": [], "warnings": []})
+        recommended_names = list(recommendations.get("symbols") or [])
+        symbols = focus_universe(
+            runtime.daily_dir, as_of, held=held_names, watch=watch_names(watch),
+            recommended=recommended_names, limit=min(max(int(universe_limit), 8), 80),
+        )
+    else:
+        watch, held_names = session_inputs["watch"], session_inputs["held_names"]
+        recommendations, recommended_names = session_inputs["recommendations"], session_inputs["recommended_names"]
+        symbols = session_inputs["symbols"]
     focus_limit = min(max(int(universe_limit), 8), 80)
-    symbols = focus_universe(
-        runtime.daily_dir,
-        as_of,
-        held=held_names,
-        watch=watch_names(watch),
-        recommended=recommended_names,
-        limit=focus_limit,
-    )
     warnings: list[str] = []
     panel, _pct, market_warnings = (
-        load_close_panel(symbols, runtime.daily_dir, lookback=lookback)
+        load_close_panel(symbols, runtime.daily_dir, lookback=lookback, as_of=as_of)
         if symbols
         else (pd.DataFrame(), pd.DataFrame(), ["focus_universe_empty"])
-    )
+    ) if session_inputs is None else (session_inputs["panel"], session_inputs["pct"], session_inputs["warnings"])
     warnings.extend(market_warnings)
-    if as_of not in getattr(panel, "index", []) and len(getattr(panel, "index", [])):
+    if session_inputs is not None:
+        warnings.extend(session_inputs["readiness"]["reason_codes"])
+    if session_inputs is None and as_of not in getattr(panel, "index", []) and len(getattr(panel, "index", [])):
         earlier = panel.index[panel.index <= as_of]
-        as_of = str((earlier[-1] if len(earlier) else panel.index[-1]))
+        if not len(earlier):
+            panel = panel.iloc[:0].copy()
+            warnings.append("no_daily_data_at_or_before_as_of")
+        else:
+            as_of = str(earlier[-1])
         warnings.append(f"as_of_rolled_to_last_bar:{as_of}")
         symbols = focus_universe(
             runtime.daily_dir,
@@ -1111,7 +1260,7 @@ def run_evening(
             recommended=recommended_names,
             limit=focus_limit,
         )
-        panel, _pct, market_warnings = load_close_panel(symbols, runtime.daily_dir, lookback=lookback)
+        panel, _pct, market_warnings = load_close_panel(symbols, runtime.daily_dir, lookback=lookback, as_of=as_of)
         warnings.extend(market_warnings)
 
     prices = {}
@@ -1188,6 +1337,9 @@ def run_evening(
 
     book = load_hypotheses(runtime.hypotheses)
     research = research_ideas(panel, book, as_of=as_of) if not panel.empty else {"book": book, "evaluated": [], "live": None}
+    research["input_evidence"] = research.get("input_evidence") or dict(panel.attrs.get("input_evidence") or {})
+    research["price_policy_validation"] = dict(panel.attrs.get("price_policy_validation") or {})
+    warnings.extend(research["input_evidence"].get("reason_codes") or [])
     save_hypotheses(research["book"], runtime.hypotheses)
     use_network = DEFAULT_MANDATE.network_enabled if network_news is None else bool(network_news)
     method, conviction = pick_operating_method(research)
@@ -1379,6 +1531,9 @@ def run_evening(
         ),
     }
     plan["ledger_id"] = str(ledger.get("ledger_id") or "")
+    plan["recorded_at"] = datetime.now().astimezone().isoformat()
+    plan["evaluation_schema"] = "ai_prior_declaration.v2"
+    plan["input_evidence"] = deepcopy(research.get("input_evidence") or panel.attrs.get("input_evidence") or {})
     response_evidence = persistable_response_evidence(llm_diag)
     if response_evidence:
         response_evidence["cycle"] = {
@@ -1442,6 +1597,11 @@ def run_evening(
         # 保留当晚的裁定与意图：把既有计划的原字段搬进今晚的计划对象（不重新核对、不改内容），
         # 并连原模型异常一起留下——重启后的记录不得变成另一份、也不得丢掉原来的错误原因。
         plan["intents"] = deepcopy(list(existing.get("intents") or []))
+        for key in ("evaluation_schema", "input_evidence", "ledger_id"):
+            if key in existing:
+                plan[key] = deepcopy(existing[key])
+            else:
+                plan.pop(key, None)
         plan["decision_mode"] = existing.get("decision_mode") or "preserved_existing_decision"
         plan["statement_rejections"] = deepcopy(existing.get("statement_rejections"))
         plan["statement_review"] = deepcopy(existing.get("statement_review"))
@@ -1750,6 +1910,8 @@ def run_evening(
         "disclaimer": note.get("disclaimer"),
         "prediction_note": PREDICTION_NOTE,
     }
+    if session_inputs is not None:
+        snapshot["daily_readiness"] = session_inputs["readiness"]
     runtime.cycle_latest.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(assert_not_quantdesk_ledger(runtime.cycle_latest), snapshot)
     atomic_write_json(assert_not_quantdesk_ledger(runtime.snapshot), snapshot)

@@ -10,6 +10,9 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import date, datetime, time, timezone, timedelta
 from math import isfinite
+from hashlib import sha256
+import json
+import re
 from typing import Any
 
 from quantdesk.trading_calendar import is_trade_day
@@ -31,7 +34,80 @@ EXCLUSION_LABELS = {
     "outcome_evidence_incomplete": "到期日线证据不完整",
     "decision_identity_missing": "缺原始判断或账户计划身份",
     "duplicate_decision_conflict": "同一判断编号有冲突记录",
+    "declaration_evidence_incomplete": "原始模型声明与当时数据版本证据不完整",
+    "duplicate_judgment": "同一原始判断重复记录",
 }
+
+DECLARATION_SCHEMA = "ai_prior_declaration.v2"
+
+
+def evidence_hash(value: Any) -> str:
+    return sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def declaration_evidence(plan: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
+    """Capture only existing input/response facts; missing facts stay missing."""
+    llm = plan.get("llm") or {}
+    response = llm.get("response_evidence") or {}
+    original = response.get("raw_text")
+    if not isinstance(original, str):
+        original = (llm.get("raw_response") or {}).get("text")
+    inputs = deepcopy(plan.get("input_evidence"))
+    return {"schema": DECLARATION_SCHEMA, "ledger_id": plan.get("ledger_id"),
+        "plan_id": plan.get("plan_id"), "decision_date": plan.get("decision_date"),
+        "trade_date": plan.get("trade_date"), "actual_model": response.get("response_model"),
+        "response_observed_at": response.get("observed_at"), "original_response": original,
+        "original_response_sha256": sha256(original.encode("utf-8")).hexdigest() if isinstance(original, str) else None,
+        "declared_condition": deepcopy(intent.get("verification")),
+        "declared_style": intent.get("style"),
+        "input_evidence": inputs, "input_evidence_sha256": evidence_hash(inputs) if isinstance(inputs, dict) else None}
+
+
+def verified_declaration(row: dict[str, Any]) -> bool:
+    proof = row.get("evaluation_evidence")
+    if not isinstance(proof, dict) or proof.get("schema") != DECLARATION_SCHEMA:
+        return False
+    try:
+        if any(proof.get(k) != row.get(k) for k in ("ledger_id", "plan_id", "decision_date", "trade_date")):
+            return False
+        original = proof["original_response"]
+        if (not isinstance(original, str) or not original.strip() or len(original) > 2_000_000
+                or proof.get("original_response_sha256") != sha256(original.encode("utf-8")).hexdigest()
+                or not proof.get("actual_model") or proof["actual_model"] != row.get("llm_model")):
+            return False
+        inputs = proof["input_evidence"]
+        if (not isinstance(inputs, dict) or proof.get("input_evidence_sha256") != evidence_hash(inputs)
+                or inputs.get("as_of") != row.get("decision_date")
+                or not inputs.get("observed_end") or inputs["observed_end"] > row["decision_date"]
+                or (inputs.get("price_policy_validation") or {}).get("eligible") is not True):
+            return False
+        sources = inputs.get("sources")
+        if not isinstance(sources, dict) or not sources or not all(
+            isinstance(s, dict) and s.get("status") == "stable"
+            and re.fullmatch(r"[0-9a-f]{64}", str(s.get("sha256") or ""))
+            for s in sources.values()):
+            return False
+        observed = datetime.fromisoformat(str(proof.get("response_observed_at") or ""))
+        recorded = datetime.fromisoformat(row["recorded_at"])
+        if observed.tzinfo is None or recorded.tzinfo is None or observed > recorded:
+            return False
+        declared = declared_verification(proof.get("declared_condition"))
+        if declared is None or declared != declared_verification(row.get("verification")):
+            return False
+        if proof.get("declared_style") != row.get("style"):
+            return False
+        # Raw responses can contain a fenced JSON object. The original bytes
+        # stay intact; parse the first object solely to bind its declared rule.
+        start = original.find("{")
+        answer, _end = json.JSONDecoder().raw_decode(original[start:])
+        bucket = "buys" if row.get("side") == "buy" else "sells"
+        return any(isinstance(item, dict) and item.get("symbol") == row.get("symbol")
+            and (item.get("style") or None) == row.get("style")
+            and declared_verification(item.get("verification")) == declared
+            for item in answer.get(bucket, []))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
 
 
 def declared_verification(value: Any) -> dict[str, Any] | None:
@@ -49,7 +125,13 @@ def declared_verification(value: Any) -> dict[str, Any] | None:
         return None
     if not isfinite(level) or level <= 0:
         return None
-    return {"kind": kind, "n_sessions": sessions, "level": float(level), "price_basis": "raw"}
+    mode = value.get("evaluation_mode", "filled_trade")
+    if mode not in {"filled_trade", "price_observation"}:
+        return None
+    result = {"kind": kind, "n_sessions": sessions, "level": float(level), "price_basis": "raw"}
+    if "evaluation_mode" in value:
+        result["evaluation_mode"] = mode
+    return result
 
 
 def decision_origin(row: dict[str, Any]) -> str:
@@ -184,7 +266,12 @@ def eligibility(row: dict[str, Any]) -> dict[str, Any]:
             reasons.append("declaration_not_before_window")
     except (ValueError, TypeError):
         reasons.append("original_timestamp_missing")
-    if not _confirmed_fill(row):
+    is_new = row.get("evaluation_schema") == DECLARATION_SCHEMA
+    verified = verified_declaration(row) if is_new else True
+    if is_new and not verified:
+        reasons.append("declaration_evidence_incomplete")
+    observation = is_new and verified and verification.get("evaluation_mode") == "price_observation"
+    if not observation and not _confirmed_fill(row):
         reasons.append("filled_trade_unconfirmed")
     return {"schema": SCHEMA, "eligible": not reasons, "exclusion_reasons": reasons,
             "exclusion_labels": [EXCLUSION_LABELS[reason] for reason in reasons]}
@@ -216,6 +303,17 @@ def complete_outcome_evidence(row: dict[str, Any]) -> bool:
         if not isinstance(evidence, dict) or evidence.get("kind") not in {"window_hit", "window_miss"}:
             continue
         observed = evidence.get("observed")
+        if row.get("evaluation_schema") == DECLARATION_SCHEMA:
+            original = evidence.get("original_rows")
+            try:
+                if (not evidence.get("source_sha256") or len(evidence["source_sha256"]) != 64
+                        or evidence.get("source_status") != "stable" or not isinstance(original, list)
+                        or evidence.get("original_rows_sha256") != evidence_hash(original)
+                        or [r.get("date") for r in original] != expected
+                        or [(r.get("date"), float(r["close"])) for r in original] != [tuple(r) for r in observed]):
+                    continue
+            except (TypeError, ValueError, KeyError):
+                continue
         if (evidence.get("price_basis") != "raw" or evidence.get("due_date") != due.isoformat()
                 or evidence.get("level") != spec["level"] or not _positive_number(evidence.get("level"))
                 or not isinstance(observed, (list, tuple)) or len(observed) != len(expected)):

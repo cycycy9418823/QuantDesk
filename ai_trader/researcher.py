@@ -8,7 +8,9 @@ LLM is off. Ideas that fail holdout-after-cost never reach the ledger.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any, Callable
+from quantdesk.research.validation_identity import identity_hash
 
 import pandas as pd
 
@@ -130,14 +132,22 @@ def _evaluate_template(template: IdeaTemplate, panel: pd.DataFrame) -> dict[str,
         "claim": template.claim,
         "status": LIVE if passed else REJECTED,
         "reason": (
-            f"扣大约{ROUND_TRIP_COST:.2%}来回成本后，样本外{HOLD_DAYS}日篮子均收益为{mean_net:.2%}。"
-            + ("通过，允许上场。" if passed else "未通过，不准下场交易。")
+            f"扣约{ROUND_TRIP_COST:.2%}来回成本后，后段{HOLD_DAYS}日篮子均收益为{mean_net:.2%}，实际后段{len(holdout)}次。"
+            + ("仅是既有研究筛选结果，未证明有效优势。" if passed else "既有筛选未通过。")
         ),
         "holdout_mean_net": round(mean_net, 6),
         "holdout_n": len(holdout),
         "train_n": split,
         "lookback": template.lookback,
         "quantile": template.quantile,
+        "validation_status": "unverified" if len(holdout) >= MIN_HOLDOUT_OBS else "insufficient_holdout",
+        "validation_label": "研究假设 · 未验证",
+        "meets_holdout_minimum": len(holdout) >= MIN_HOLDOUT_OBS,
+        "minimum_holdout_observations": MIN_HOLDOUT_OBS,
+        "proven_edge": False,
+        "validation_limits": ["5-session returns overlap", "same holdout reused for selection among 3 templates",
+            "no independent future interval", "fixed approximate round-trip cost", "no multiplicity-adjusted confidence interval"],
+        "operational_status_note": "live is a compatibility research-selection status, not validation success",
     }
 
 
@@ -163,11 +173,34 @@ def template_by_id(hypothesis_id: str) -> IdeaTemplate | None:
 
 
 def research_ideas(panel: pd.DataFrame, book: dict[str, Any], *, as_of: str) -> dict[str, Any]:
+    original_attrs = dict(panel.attrs)
+    source_policy = original_attrs.get("price_policy_validation") or {}
+    blocked = source_policy.get("eligible") is not True
+    cutoff = pd.to_datetime(as_of, errors="coerce")
+    dates = pd.to_datetime(panel.index, errors="coerce")
+    panel = panel.loc[dates <= cutoff].copy() if pd.notna(cutoff) else panel.iloc[:0].copy()
+    panel.index = pd.to_datetime(panel.index).strftime("%Y-%m-%d")
+    panel = panel.sort_index()
+    input_evidence = {**(original_attrs.get("input_evidence") or {}), "as_of": as_of,
+        "observed_end": str(panel.index[-1]) if len(panel) else None,
+        "observed_rows": len(panel), "price_policy_validation": source_policy,
+        "reason_codes": list(source_policy.get("reason_codes") or (["research_price_evidence_missing"] if blocked else []))}
     evaluated: list[dict[str, Any]] = []
     next_book = dict(book)
     for template in TEMPLATES:
-        result = _evaluate_template(template, panel)
+        result = _evaluate_template(template, panel if not blocked else panel.iloc[:0])
+        if blocked:
+            result["reason"] = "研究输入价格口径未核验，本轮不计算正式指标。"
+            result["price_contract_status"] = "blocked"
         result["as_of"] = as_of
+        result.setdefault("validation_label", "研究假设 · 未验证")
+        result.setdefault("validation_status", "insufficient_evidence")
+        result["proven_edge"] = False
+        result["selection_identity"] = {"as_of": as_of,
+            "config_sha256": identity_hash({"hypothesis_id": template.hypothesis_id,
+                "lookback": template.lookback, "quantile": template.quantile, "pick_high": template.pick_high,
+                "holding_days": HOLD_DAYS, "round_trip_cost": ROUND_TRIP_COST}),
+            "data_sha256": sha256(panel.to_csv().encode()).hexdigest()}
         result["born_on"] = result.get("born_on") or as_of
         existing = next(
             (
@@ -192,7 +225,7 @@ def research_ideas(panel: pd.DataFrame, book: dict[str, Any], *, as_of: str) -> 
         for item in evaluated:
             if item["hypothesis_id"] != chosen["hypothesis_id"] and item.get("status") == LIVE:
                 item["status"] = "standby"
-                item["reason"] = item.get("reason", "") + " 同类中不是最好，本轮只让一条方法上场。"
+                item["reason"] = item.get("reason", "") + " 本轮按既有方法只保留一条研究候选，独立验证待完成。"
                 next_book = upsert_hypothesis(next_book, item)
         chosen["status"] = LIVE
         next_book = upsert_hypothesis(next_book, chosen)
@@ -202,6 +235,8 @@ def research_ideas(panel: pd.DataFrame, book: dict[str, Any], *, as_of: str) -> 
         "live": chosen,
         "live_count": 1 if chosen else 0,
         "all_rejected": chosen is None,
+        "status": "blocked" if blocked else "missing" if panel.empty else "ready",
+        "input_evidence": input_evidence,
     }
 
 

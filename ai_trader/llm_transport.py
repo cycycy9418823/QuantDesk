@@ -31,6 +31,34 @@ _PRIVATE_FIELDS = {"reasoning_content", "reasoning", "reasoning_details", "think
                    "api_key", "access_token", "auth_token", "cookie", "set-cookie"}
 
 
+def describe_model_request(record: dict[str, Any]) -> dict[str, Any]:
+    """Summarize existing request evidence without calling a provider or exposing a body."""
+    response = record.get("response_evidence") if isinstance(record.get("response_evidence"), dict) else {}
+    detail = record.get("transport_detail") if isinstance(record.get("transport_detail"), dict) else response.get("transport_detail") or {}
+    transport = record.get("transport") if isinstance(record.get("transport"), dict) else response.get("transport") or record.get("diagnostics") or {}
+    detail = detail if isinstance(detail, dict) else {}
+    transport = transport if isinstance(transport, dict) else {}
+    status = detail.get("http_status", transport.get("http_status"))
+    phase = str(detail.get("failure_phase") or detail.get("active_phase") or "")
+    reason = str(record.get("unavailable_reason") or record.get("reason") or "")
+    timeout = transport.get("error_category") == "timeout" or "timeout" in reason.lower()
+    category = "provider_gone" if status == 410 else (
+        "response_headers_timeout" if timeout and phase == "response_headers" else
+        "connect_timeout" if timeout and phase in {"dns", "tcp", "proxy_connect", "tls"} else
+        "response_body_timeout" if timeout and phase == "response_body" else
+        "timeout_unknown_phase" if timeout else "http_error" if isinstance(status, int) and status >= 400 else
+        "answer_rejected" if reason else "none" if record.get("used") is True else "unknown")
+    actual = response.get("response_model")
+    received = response.get("text_status") in {"received", "empty"} or bool(actual)
+    accepted = record.get("used") is True
+    return {"requested_model": detail.get("requested_model") or response.get("requested_model") or record.get("model") or None,
+        "actual_response_model": actual or None, "failure_category": category,
+        "failure_phase": phase or None, "http_status": status,
+        "request_started_at": detail.get("started_at"), "request_finished_at": detail.get("finished_at"),
+        "provider_response_received": detail.get("response_headers_received"),
+        "judgment_status": "accepted" if accepted else "rejected" if received else "not_received"}
+
+
 def _unescape_view(text: str) -> str:
     """Detection view only; never presented as the original response bytes."""
     for _ in range(4):
