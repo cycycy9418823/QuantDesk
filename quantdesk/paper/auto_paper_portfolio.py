@@ -74,6 +74,13 @@ from quantdesk.paper.position_management_engine import (
     simulate_conditional_plan_file,
 )
 from quantdesk.paper.state_store import PaperStateStore
+from quantdesk.paper.ledger_read_contract import (
+    IDENTITY_FIELDS,
+    inspect_strategy_ledger,
+    strategy_initialization_evidence,
+    strategy_pnl_identity,
+    strategy_state_errors,
+)
 from quantdesk.price_basis import classify_frame_price_basis, validate_price_frame_set
 from quantdesk.plan_review_receipts import (
     bind_plan_replay_receipt,
@@ -189,7 +196,8 @@ def _auto_paper_lock_path() -> Path:
 
 
 def _auto_paper_state_store() -> PaperStateStore:
-    return PaperStateStore(AUTO_PAPER_PORTFOLIO_STATE_JSON, schema_version=API_SCHEMA_VERSION, max_backups=7)
+    return PaperStateStore(AUTO_PAPER_PORTFOLIO_STATE_JSON, schema_version=API_SCHEMA_VERSION,
+                           max_backups=7, validator=strategy_state_errors, identity_fields=IDENTITY_FIELDS)
 
 
 def _normalized_management_state(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -236,6 +244,9 @@ def _paper_state_shape_errors(state: Any) -> list[str]:
         return ["paper_state_not_object"]
 
     errors: list[str] = []
+    if state.get("ledger_read_status") in {"missing", "invalid", "recovery_available"}:
+        errors.append("paper_ledger_requires_initialization_or_recovery")
+        errors.extend(str(item) for item in state.get("ledger_read_reason_codes") or [])
     for key, numeric_fields in (
         ("positions", _PAPER_POSITION_NUMERIC_FIELDS),
         ("closed_positions", _PAPER_CLOSED_NUMERIC_FIELDS),
@@ -319,6 +330,7 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
         "realized_pnl": round(detail_realized_pnl + explicit_adjustment, 2),
         "total_equity": round(cash + market_value, 2),
     }
+    pnl_identity = strategy_pnl_identity({**reconciled, **totals})
     drift_fields = [
         key
         for key, value in totals.items()
@@ -341,6 +353,8 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
         )
     if abs(explicit_adjustment) > 0.005:
         warnings.append("paper_account_legacy_realized_adjustment_preserved")
+    if pnl_identity["status"] != "consistent":
+        warnings.append("paper_account_pnl_identity_" + pnl_identity["status"])
     if invalid_reason_codes:
         warnings.append("paper_account_invalid")
         warnings.extend(f"paper_account_invalid:{reason}" for reason in invalid_reason_codes)
@@ -357,6 +371,8 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
         "status": (
             "invalid"
             if invalid_reason_codes
+            else "unverified"
+            if pnl_identity["status"] != "consistent"
             else "reconciled"
             if drift_fields or status_mismatches
             else "consistent"
@@ -368,6 +384,7 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
         "closed_realized_pnl": round(closed_realized_pnl, 2),
         "partial_realized_pnl": round(partial_realized_pnl, 2),
         "legacy_realized_adjustment": round(explicit_adjustment, 2),
+        "pnl_identity": pnl_identity,
         "drift_fields": drift_fields,
         "status_mismatch_symbols": sorted(set(status_mismatches)),
     }
@@ -376,7 +393,10 @@ def reconcile_paper_account(state: dict[str, Any]) -> dict[str, Any]:
 
 def _write_auto_paper_state(state: dict[str, Any]) -> dict[str, Any]:
     ensure_declared_fill_policy(state, policy_id=_declared_strategy_policy(state))
-    return _auto_paper_state_store().write(reconcile_paper_account(state))
+    normalized = reconcile_paper_account(state)
+    if normalized["accounting_reconciliation"]["status"] == "invalid":
+        raise ValueError("paper_account_invalid")
+    return _auto_paper_state_store().write(normalized)
 
 
 def _declared_strategy_policy(state: dict[str, Any]) -> str:
@@ -406,6 +426,21 @@ def _write_auto_paper_latest(snapshot: dict[str, Any]) -> dict[str, Any]:
         prepared["shadow_warnings"] = list(dict.fromkeys([*(prepared.get("shadow_warnings") or []), *unrecorded]))
         prepared["warnings"] = list(dict.fromkeys([*(prepared.get("warnings") or []), *unrecorded]))
     normalized = reconcile_paper_account(prepared)
+    if isinstance(summary, dict):
+        # The persisted summary declares this run's PnL. Its earlier check may
+        # have used the ledger's prior totals while today's rows were assembled.
+        # Recheck these declared values without filling missing fields or
+        # replacing a conflict with detail-derived financial values.
+        summary_identity_input = dict(summary)
+        for key in ("credit_used", "simulated_interest"):
+            if key not in summary_identity_input and key in prepared:
+                summary_identity_input[key] = prepared[key]
+        summary_identity = strategy_pnl_identity(summary_identity_input)
+        normalized["summary"] = {
+            **summary,
+            "pnl_identity": summary_identity,
+            "accounting_status": "consistent" if summary_identity["status"] == "consistent" else "unverified",
+        }
     atomic_write_json(AUTO_PAPER_PORTFOLIO_LATEST_JSON, normalized)
     return normalized
 
@@ -644,7 +679,13 @@ def _read_daily_bars(symbol: str) -> pd.DataFrame:
     path = DAILY_DIR / f"{normalize_symbol(symbol)}.csv"
     if not path.exists():
         return pd.DataFrame()
+    source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     df = read_csv_frame(path, dtype={"symbol": str})
+    df.attrs["source_sha256"] = source_hash
+    df.attrs["source_file"] = str(path)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != source_hash:
+        df.attrs["price_basis_reason"] = "unknown_price_basis"
+        df.attrs["warnings"] = [*(df.attrs.get("warnings") or []), "daily_source_changed_during_read"]
     rename = {
         "日期": "date",
         "收盘": "close",
@@ -707,6 +748,10 @@ def _quote_limit_base(quote: dict[str, Any]) -> tuple[float | None, str]:
 def _latest_daily_quote(symbol: str, *, decision_date: str | None = None) -> dict[str, Any]:
     df = _read_daily_bars(symbol)
     warnings = [str(item) for item in df.attrs.get("warnings", [])]
+    if decision_date and "date" in df.columns:
+        # Basis was classified on the full input by _read_daily_bars. A later
+        # legitimate raw session is not price evidence for an earlier review.
+        df = df.loc[df["date"] <= pd.Timestamp(str(decision_date)[:10])].copy()
     code = normalize_symbol(symbol)
     if df.empty or "close" not in df.columns:
         warnings.append(f"missing_daily_quote:{code}")
@@ -741,6 +786,8 @@ def _latest_daily_quote(symbol: str, *, decision_date: str | None = None) -> dic
         "price": price,
         "date": date_text,
         "source": "daily_cache",
+        "source_file": str(df.attrs.get("source_file") or ""),
+        "source_sha256": str(df.attrs.get("source_sha256") or ""),
         "warnings": warnings,
         "price_basis": str(df.attrs.get("price_basis") or ""),
         "price_basis_reason": str(df.attrs.get("price_basis_reason") or ""),
@@ -772,11 +819,17 @@ def _latest_daily_quote(symbol: str, *, decision_date: str | None = None) -> dic
     # policy freezes at the last genuinely tradable price instead of treating a
     # non-trading row as a fresh mark.
     ok, reason = daily_bar_validity_from_row(row.to_dict())
+    quote["bar_valid"] = ok
+    quote["bar_validation_reason"] = reason
     if not ok and "volume_not_positive" in reason:
         last_tradable = _last_tradable_close(df)
         if last_tradable is not None:
             quote["price"] = last_tradable
             quote["last_tradable_price"] = last_tradable
+            for _, prior in df.iloc[::-1].iterrows():
+                if daily_bar_validity_from_row(prior.to_dict())[0]:
+                    quote["last_tradable_date"] = pd.Timestamp(prior["date"]).strftime("%Y-%m-%d")
+                    break
         quote.update(
             {
                 "suspended": True,
@@ -815,9 +868,12 @@ def _daily_price_basis(symbol: Any) -> tuple[str, str]:
 def _basis_fill_rejection(symbol: Any) -> str:
     """Human reason when the symbol's price basis must block a paper fill."""
 
+    frame = _read_daily_bars(str(symbol or ""))
+    gate = validate_price_frame_set({str(symbol): frame}, consumer="paper_execution")
     basis, reason = _daily_price_basis(symbol)
-    if not reason:
+    if gate["eligible"]:
         return ""
+    reason = ",".join(gate["reason_codes"]) or reason
     return (
         f"价格口径不可用于成交（{reason or 'unknown_price_basis'}"
         f"{'; basis=' + basis if basis else ''}），拒绝模拟买入。"
@@ -846,12 +902,18 @@ def _fill_tradability_rejection(
     price = safe_float(quote.get("price"), None)
     if require_quote and (quote.get("missing") or price is None or price <= 0):
         return f"缺少当日成交证据（{quote.get('source') or 'missing'}），拒绝模拟{label}。"
+    if require_quote and quote.get("stale"):
+        return f"成交价格日期 {quote.get('date') or '未知'} 已滞后，缺少目标日证据，拒绝模拟{label}。"
     volume = safe_float(quote.get("volume"), None)
     if quote.get("suspended") or quote.get("is_suspended") or (volume is not None and volume <= 0):
         return f"当日零成交量（停牌或无成交），无法确认成交，拒绝模拟{label}。"
     basis_reason = str(quote.get("price_basis_reason") or "")
-    if basis_reason in {"mixed_price_basis", "unknown_price_basis"} or quote.get("price_basis_untrusted"):
+    if (basis_reason in {"mixed_price_basis", "unknown_price_basis"} or quote.get("price_basis_untrusted")
+            or (quote.get("price_basis") and quote.get("price_basis") != "raw")):
+        basis_reason = basis_reason or "consumer_price_basis_not_allowed"
         return f"价格口径不可用于成交（{basis_reason or 'unknown_price_basis'}），拒绝模拟{label}。"
+    if require_quote and quote.get("bar_valid") is False:
+        return f"当日价格字段未通过核对（{quote.get('bar_validation_reason') or 'invalid_daily_bar'}），拒绝模拟{label}。"
     # The booked price is compared with the cent-rounded limit price of the
     # quote's own session (shared rule in quantdesk.board_rules). The old check
     # only caught a one-word board with pct >= 9.8, so a close sealed at the
@@ -1029,19 +1091,36 @@ def _empty_state(initial_cash: float) -> dict[str, Any]:
     return ensure_declared_fill_policy(payload, policy_id=POLICY_DAILY_APPROX)
 
 
+def _strategy_book_existed() -> bool:
+    return strategy_initialization_evidence(AUTO_PAPER_PORTFOLIO_STATE_JSON,
+        latest_path=AUTO_PAPER_PORTFOLIO_LATEST_JSON, history_path=AUTO_PAPER_PORTFOLIO_HISTORY_JSON)
+
+
 def _load_state(initial_cash: float) -> dict[str, Any]:
-    if not AUTO_PAPER_PORTFOLIO_STATE_JSON.exists():
-        return reconcile_paper_account(_empty_state(initial_cash))
-    data = _auto_paper_state_store().read(default={})
-    if not isinstance(data, dict) or not data:
-        return reconcile_paper_account(_empty_state(initial_cash))
-    data.setdefault("initial_cash", float(initial_cash))
-    if "cash" not in data:
-        data["cash"] = 0.0
-        data["warnings"] = list(dict.fromkeys([
-            *(data.get("warnings") or []),
-            "funded_ledger_cash_missing: existing paper state was not replenished from initial capital",
-        ]))
+    """Read the funded account without initialization, quarantine or auto-restore."""
+
+    expected = read_json_safe(AUTO_PAPER_PORTFOLIO_LATEST_JSON, {})
+    expected = expected if isinstance(expected, dict) else {}
+    identity = {key: expected[key] for key in IDENTITY_FIELDS if expected.get(key) is not None}
+    result = _auto_paper_state_store().read_snapshot(expected_identity=identity or None)
+    if result.status != "ready" or result.data is None:
+        reason = "paper_ledger_missing_after_initialization" if _strategy_book_existed() else "paper_ledger_not_initialized"
+        structural_errors: list[str] = []
+        try:
+            original = json.loads(AUTO_PAPER_PORTFOLIO_STATE_JSON.read_text(encoding="utf-8-sig"))
+            structural_errors = _paper_state_shape_errors(original)
+        except (OSError, ValueError, UnicodeError):
+            pass
+        return reconcile_paper_account({
+            "cash": 0.0, "positions": [], "closed_positions": [], "actions": [],
+            "ledger_read_status": result.status, "state_recovered_from_backup": False,
+            "ledger_read_reason_codes": [*result.reason_codes, *structural_errors],
+            "state_recovery_source": result.recovery_source,
+            "state_recovery_sha256": result.recovery_sha256,
+            "state_recovery_warning": "账本不可用；有备份也须显式核验恢复，读取未修改原件或补本金。",
+            "warnings": [reason, *result.reason_codes],
+        })
+    data = result.data
     data.setdefault("positions", [])
     data.setdefault("closed_positions", [])
     data.setdefault("realized_reductions", [])
@@ -1199,6 +1278,21 @@ def _mark_position(
     adjustment_factors: AdjustmentFactorTable | None = None,
     quote: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    original_price = safe_float(position.get("latest_price"), None)
+    original_date = str(position.get("latest_date") or "")[:10]
+    quote = quote if isinstance(quote, dict) else _latest_daily_quote(position.get("symbol"), decision_date=decision_date)
+    quote_date = str(quote.get("date") or "")[:10]
+    raw_price = safe_float(quote.get("price"), None)
+    # A refusal to sell is independent of whether a valid raw mark is available.
+    # A candidate price, missing basis or stale quote cannot establish today's value.
+    raw_valid = (quote.get("price_basis") == "raw" and not quote.get("price_basis_reason")
+                 and not quote.get("missing") and raw_price is not None and raw_price > 0
+                 and quote.get("bar_valid") is not False
+                 and not quote.get("suspended") and not quote.get("is_suspended"))
+    if raw_valid:
+        latest_price = raw_price
+    elif original_price is not None and original_price > 0:
+        latest_price = original_price
     quantity = safe_int(position.get("quantity"), 0) or 0
     entry_price = safe_float(position.get("entry_price"), latest_price) or latest_price
     position["latest_price"] = round(latest_price, 4)
@@ -1211,13 +1305,23 @@ def _mark_position(
     position["hold_reason"] = hold_reason
     position["sector"] = position.get("sector") or "未知板块"
     position["primary_theme"] = position.get("primary_theme") or "未知题材"
-    quote = quote if isinstance(quote, dict) else _latest_daily_quote(position.get("symbol"), decision_date=decision_date)
-    position["latest_date"] = quote.get("date") or position.get("latest_date") or decision_date
+    position["latest_date"] = quote_date if raw_valid else original_date
+    position["valuation_date"] = decision_date
+    position["valuation_price_date"] = position["latest_date"]
+    position["valuation_price_basis"] = "raw" if raw_valid else position.get("valuation_price_basis", "unknown")
+    position["valuation_price_source"] = quote.get("source") if raw_valid else "carried_legacy_mark"
+    position["valuation_status"] = "normal" if raw_valid and quote_date == decision_date else "stale" if raw_valid else "missing_or_untrusted"
     quote_warnings = [str(item) for item in (quote.get("warnings") or [])]
     if quote_warnings:
         seen = list(position.get("valuation_warnings") or [])
         position["valuation_warnings"] = seen + [w for w in quote_warnings if w not in seen]
-    position = apply_suspension_valuation_policy(position, quote)
+    suspension_quote = quote
+    if quote.get("price_basis") != "raw" or quote.get("price_basis_reason"):
+        suspension_quote = {**quote, "price": latest_price, "close": latest_price}
+    position = apply_suspension_valuation_policy(position, suspension_quote)
+    if position.get("valuation_status") == "suspended_frozen":
+        position["latest_date"] = str(quote.get("last_tradable_date") or original_date)
+        position["valuation_price_date"] = position["latest_date"]
     adjusted_price = safe_float(position.get("latest_price"), latest_price) or latest_price
     position = apply_paper_adjustment_policy(
         position,
@@ -1529,6 +1633,9 @@ def _summary(state: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, 
     realized_pnl = closed_realized_pnl + partial_realized_pnl + legacy_realized_adjustment
     unrealized_pnl = sum(safe_float(row.get("unrealized_pnl"), 0.0) or 0.0 for row in positions)
     total_equity = cash + market_value
+    # Compare the declared accounting fields, not the display fallbacks above.
+    # Missing evidence and differences must survive summary generation.
+    pnl_identity = strategy_pnl_identity({**state, "total_equity": total_equity})
     counts = Counter(str(action.get("action") or "") for action in actions)
     return {
         "initial_cash": round(initial_cash, 2),
@@ -1539,6 +1646,8 @@ def _summary(state: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, 
         "total_equity": round(total_equity, 2),
         "total_return_pct": round((total_equity / initial_cash - 1.0) * 100.0, 2) if initial_cash else 0.0,
         "cumulative_pnl": round(total_equity - initial_cash, 2),
+        "accounting_status": "consistent" if pnl_identity["status"] == "consistent" else "unverified",
+        "pnl_identity": pnl_identity,
         "daily_pnl": None,
         "daily_return_pct": None,
         "daily_pnl_status": "missing_previous_equity",
@@ -1716,6 +1825,9 @@ def _write_report(
         f"- 总权益：{summary.get('total_equity', 0)}",
         f"- 总收益率：{summary.get('total_return_pct', 0)}%",
         f"- 当前持仓数：{summary.get('position_count', 0)}",
+        *([f"- 对账尚未完成：权益与已实现/未实现盈亏存在未解释差额 "
+           f"{summary['pnl_identity']['difference']:+.2f} 元；原始金额保留。"]
+          if (summary.get("pnl_identity") or {}).get("status") == "mismatch" else []),
         "",
         "## 昨日持仓复盘",
         "",
@@ -2908,6 +3020,8 @@ def _run_auto_paper_portfolio_unlocked(
             "disclaimer": DISCLAIMER,
             "broker_boundary": BROKER_BOUNDARY,
         }
+    if mode == "init" and _strategy_book_existed() and not AUTO_PAPER_PORTFOLIO_STATE_JSON.exists() and not force_reset:
+        return _invalid_paper_account_payload(_load_state(initial_cash))
     loaded_update_state: dict[str, Any] | None = None
     if fill_mode == open_fill.FILL_MODE_NEXT_OPEN_SNAPSHOT:
         return _run_next_open_snapshot_update(
@@ -3095,7 +3209,7 @@ def _run_auto_paper_portfolio_unlocked(
                 position["primary_theme"] = position.get("primary_theme") or candidate.get("primary_theme") or "未知题材"
             entry_date_for_t1 = str(position.get("entry_date") or position.get("buy_date") or position.get("first_buy_date") or "")[:10]
             if entry_date_for_t1 and entry_date_for_t1 >= decision_date:
-                quote = _latest_daily_quote(position.get("symbol"))
+                quote = _latest_daily_quote(position.get("symbol"), decision_date=decision_date)
                 warnings.extend(_quote_warnings(position.get("symbol"), quote))
                 latest_price = (
                     safe_float(quote.get("price"), None)
@@ -3152,7 +3266,7 @@ def _run_auto_paper_portfolio_unlocked(
                     cash += safe_float(closed.get("net_amount"), latest_price * (safe_int(position.get("quantity"), 0) or 0)) or 0.0
                     continue
                 actions.append(swing_action)
-            quote = _latest_daily_quote(position.get("symbol"))
+            quote = _latest_daily_quote(position.get("symbol"), decision_date=decision_date)
             warnings.extend(_quote_warnings(position.get("symbol"), quote))
             latest_price = (
                 safe_float(quote.get("price"), None)
@@ -3165,7 +3279,8 @@ def _run_auto_paper_portfolio_unlocked(
             if latest_price <= 0:
                 reason = "本地日线缺失或最新价无效，保留旧持仓并阻断今日估值更新。"
                 actions.append(_block_action(position, reason, decision_date))
-                updated_positions.append(dict(position))
+                updated_positions.append(_mark_position(dict(position), latest_price, decision_date, reason,
+                    adjustment_factors=adjustment_factors, quote=quote))
                 continue
             entry_date = str(position.get("entry_date") or "")[:10]
             if entry_date and entry_date >= decision_date and latest_price > 0 and entry_price > 0 and latest_price <= entry_price * 0.92:
@@ -3193,7 +3308,8 @@ def _run_auto_paper_portfolio_unlocked(
                 )
                 if rejection:
                     actions.append(_block_action(position, rejection, decision_date))
-                    updated_positions.append(dict(position))
+                    updated_positions.append(_mark_position(dict(position), latest_price, decision_date, rejection,
+                        adjustment_factors=adjustment_factors, quote=quote))
                     continue
                 reason = "触发自动虚拟组合风险复核：最新价较模拟买入价回撤超过 8%，执行纸面退出。"
                 actions.append(_sell_action(position, latest_price, decision_date, reason))
@@ -3210,7 +3326,6 @@ def _run_auto_paper_portfolio_unlocked(
                 adjustment_factors=adjustment_factors,
                 quote=quote,
             )
-            updated["latest_date"] = quote.get("date") or updated.get("latest_date") or decision_date
             if candidate:
                 action = _hold_action(updated, latest_price, decision_date, reason)
                 action["already_held"] = True
@@ -3235,8 +3350,8 @@ def _run_auto_paper_portfolio_unlocked(
             actions.append(_block_action(candidate, reason, decision_date))
             record_legacy_shadow_block(candidate, reason, "auto_paper_daily_buy")
             continue
-        # Evidence requirement shared with the AI book: never book a fill off a
-        # mixed/unknown price basis. A known basis (raw/qfq/hfq) proceeds.
+        # The strategy book requires raw execution evidence, including when a
+        # research signal was produced with a known adjusted basis.
         basis_rejection = _basis_fill_rejection(candidate.get("symbol"))
         if basis_rejection:
             actions.append(_block_action(candidate, basis_rejection, decision_date))
@@ -3244,10 +3359,10 @@ def _run_auto_paper_portfolio_unlocked(
             continue
         # A new book entry is a real fill too: a zero-volume suspension or a
         # one-word limit-up board cannot be bought at the open.
-        buy_quote = _latest_daily_quote(candidate.get("symbol"))
+        buy_quote = _latest_daily_quote(candidate.get("symbol"), decision_date=decision_date)
         warnings.extend(_quote_warnings(candidate.get("symbol"), buy_quote))
         buy_rejection = _fill_tradability_rejection(
-            buy_quote, "buy", fill_price=_candidate_price(candidate),
+            buy_quote, "buy", require_quote=True, fill_price=buy_quote.get("price"),
             symbol=normalize_symbol(candidate.get("symbol")), name=candidate.get("name"),
         )
         if buy_rejection:
@@ -3360,7 +3475,7 @@ def _run_auto_paper_portfolio_unlocked(
             })
             actions.append(action)
             continue
-        price = _candidate_price(candidate)
+        price = safe_float(buy_quote.get("price"), None)
         if price is None or price <= 0:
             reason = "缺少可用模拟价格，未进入自动虚拟组合。"
             actions.append(_block_action(candidate, reason, decision_date))
@@ -3417,9 +3532,16 @@ def _run_auto_paper_portfolio_unlocked(
                 )
         cash -= cash_out
         position = _make_position(candidate, quantity, price, decision_date, cost_info)
+        price_evidence = {"execution_price_basis": "raw", "execution_price_date": buy_quote.get("date"),
+            "execution_price_source": buy_quote.get("source_file") or buy_quote.get("source"),
+            "execution_price_source_sha256": buy_quote.get("source_sha256"),
+            "valuation_price_basis": "raw", "valuation_price_date": buy_quote.get("date"),
+            "valuation_price_source": buy_quote.get("source_file") or buy_quote.get("source")}
+        position.update(price_evidence)
         positions.append(position)
         existing_keys.add(key)
         action = _buy_action(candidate, quantity, price, decision_date, cash)
+        action.update(price_evidence)
         action.update({
             "gross_amount": round(safe_float(cost_info.get("gross"), price * quantity) or price * quantity, 2),
             "total_fee": round(safe_float(cost_info.get("total_fee"), 0.0) or 0.0, 2),
@@ -3437,11 +3559,16 @@ def _run_auto_paper_portfolio_unlocked(
     yesterday_review = build_yesterday_holding_review(previous_positions, positions, actions, decision_review, freshness_gate)
     warnings = list(dict.fromkeys(str(item) for item in warnings))
     summary_for_state = _summary({**state, "cash": round(cash, 2), "positions": positions, "closed_positions": closed_positions}, actions)
+    valuation_valid = bool(freshness_gate.get("can_review_yesterday_positions", True)) and all(
+        str(row.get("latest_date") or "")[:10] == decision_date
+        and str(row.get("valuation_status") or "normal") == "normal"
+        for row in positions
+    )
     if mode == "update":
         summary_for_state = _with_daily_pnl(
             summary_for_state, valuation_date=decision_date,
             previous_state=previous_valuation_state,
-            valuation_valid=bool(freshness_gate.get("can_review_yesterday_positions", True)),
+            valuation_valid=valuation_valid,
         )
     trade_actions = {"buy", "add", "breakout_add", "reduce_half", "take_profit", "sell", "sell_all", "stop_loss"}
     state.update({
@@ -3462,7 +3589,7 @@ def _run_auto_paper_portfolio_unlocked(
         "yesterday_holding_review": yesterday_review,
         "delist_liquidation": delist_liquidation,
         "data_freshness_gate": freshness_gate,
-        "portfolio_review_valid": bool(freshness_gate.get("can_review_yesterday_positions", True)),
+        "portfolio_review_valid": valuation_valid,
         "warnings": warnings,
         "disclaimer": DISCLAIMER,
         "broker_boundary": BROKER_BOUNDARY,
@@ -3489,7 +3616,7 @@ def _run_auto_paper_portfolio_unlocked(
         "yesterday_holding_review": yesterday_review,
         "delist_liquidation": delist_liquidation,
         "data_freshness_gate": freshness_gate,
-        "portfolio_review_valid": bool(freshness_gate.get("can_review_yesterday_positions", True)),
+        "portfolio_review_valid": valuation_valid,
         "decision_audit": build_decision_audit(actions),
         "auto_strategy_generated_at": auto_payload.get("generated_at"),
         "auto_candidate_count": len(candidates),
@@ -3610,7 +3737,7 @@ def run_auto_paper_portfolio(
             except (OSError, ValueError):
                 return _snapshot_failure("snapshot_ledger_unreadable")
         else:
-            existing_profile_state = _auto_paper_state_store().read(default={})
+            existing_profile_state = _auto_paper_state_store().read_snapshot().data or {}
     if isinstance(existing_profile_state, dict) and existing_profile_state.get("initial_cash"):
         capital_profile = resolve_paper_capital_profile(
             existing_state=existing_profile_state,
@@ -3710,6 +3837,12 @@ def auto_paper_portfolio_latest() -> dict[str, Any]:
     data.setdefault("disclaimer", DISCLAIMER)
     data.setdefault("broker_boundary", BROKER_BOUNDARY)
     data.update(load_plan_review_snapshot(_archive_project_root()))
+    ledger_health = inspect_strategy_ledger(AUTO_PAPER_PORTFOLIO_STATE_JSON,
+        target_date=str(data.get("valuation_date") or "")[:10], latest=data)
+    data["ledger_health"] = ledger_health
+    if not ledger_health["ok"]:
+        data["portfolio_review_valid"] = False
+        data["warnings"] = list(dict.fromkeys([*(data.get("warnings") or []), *ledger_health["reason_codes"]]))
     return data
 
 

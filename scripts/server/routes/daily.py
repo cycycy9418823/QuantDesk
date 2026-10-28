@@ -27,6 +27,7 @@ class DailyRouteDeps:
     generate_market_sentiment: Callable[[float | None, float | None, int, int], Any]
     calculate_sector_stats: Callable[[], dict[str, Any]]
     market_overview_hint: str
+    pool_context: Callable[[list[dict[str, Any]], list[dict[str, Any]]], dict[str, Any]] | None = None
 
 
 def create_daily_blueprint(deps: DailyRouteDeps) -> Blueprint:
@@ -48,6 +49,8 @@ def create_daily_blueprint(deps: DailyRouteDeps) -> Blueprint:
             int(breadth.get("declining_count", 0)),
         )
         sector_stats = deps.calculate_sector_stats()
+        dates = {"hs300": hs300.get("date") or "", "sh_index": sh_index.get("date") or "",
+                 "breadth": breadth.get("quote_date") or "", "sectors": sector_stats.get("as_of") or ""}
         payload = {
             "hs300": hs300,
             "sh_index": sh_index,
@@ -55,6 +58,10 @@ def create_daily_blueprint(deps: DailyRouteDeps) -> Blueprint:
             "sector_top_gainers": sector_stats.get("gainers") or [],
             "sector_top_losers": sector_stats.get("losers") or [],
             "market_sentiment": sentiment,
+            "market_dates": dates,
+            "as_of": next(iter(set(dates.values()))) if all(dates.values()) and len(set(dates.values())) == 1 else "",
+            "sector_snapshot": {key: sector_stats.get(key) or "" for key in
+                                ("as_of", "freshness_status", "cache_modified_at", "source")},
             "update_hint": deps.market_overview_hint,
             "research_only": "仅用于股票研究学习；不接券商、不下真实订单。",
         }
@@ -64,6 +71,9 @@ def create_daily_blueprint(deps: DailyRouteDeps) -> Blueprint:
     def get_daily_candidates() -> Any:
         rows = deps.annotate_recommendation_priorities(deps.candidate_rows(18))
         focus = deps.daily_focus_rows(rows)
+        pool_context = deps.pool_context(rows, focus) if deps.pool_context else {}
+        for row in rows:
+            row["pool_memberships"] = (pool_context.get("by_symbol") or {}).get(str(row.get("symbol") or ""), [])
         groups = deps.candidate_groups(rows)
         quant_summary = deps.quant_daily_summary(rows)
         generation = deps.generation_status_for_ui()
@@ -93,6 +103,7 @@ def create_daily_blueprint(deps: DailyRouteDeps) -> Blueprint:
                     "candidates": rows[:10],
                     "all_candidates": rows,
                     "candidate_groups": groups,
+                    "pool_context": pool_context,
                     "candidate_pool_policy": deps.candidate_pool_review_policy(rows),
                     "data_gap_summary": deps.data_gap_summary(rows),
                     "candidate_confidence_summary": deps.candidate_confidence_summary(rows),

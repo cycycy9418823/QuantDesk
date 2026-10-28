@@ -8,6 +8,7 @@ from quantdesk.research.backtest_return_evidence import closed_trade_return_evid
 from quantdesk.backtest_loaders import read_backtest_daily, validate_backtest_history_sources, align_backtest_research_basis
 
 import json
+import hashlib
 import os
 import re
 from datetime import datetime
@@ -34,6 +35,15 @@ CandidateRowsFunc = Callable[[int], list[dict[str, Any]]]
 
 class BacktestSymbolInputError(ValueError):
     """The requested local-history universe violates symbol/path boundaries."""
+
+
+class BacktestHistories(dict[str, pd.DataFrame]):
+    """Prepared frames together with the complete bounded-request evidence."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_evidence: dict[str, Any] = {}
+        self.price_policy_validation: dict[str, Any] = {}
 
 
 def _validated_backtest_symbols(values: Any) -> list[str]:
@@ -153,25 +163,57 @@ def _load_backtest_histories(
                 selected_symbols.append(sym)
             if len(selected_symbols) >= max_symbols:
                 break
-    histories: dict[str, pd.DataFrame] = {}
+    histories = BacktestHistories()
+    originals: dict[str, pd.DataFrame] = {}
+    excluded = [{"symbol": symbol, "reason_code": "sample_limit"} for symbol in selected_symbols[max_symbols:]]
+    source_files: dict[str, dict[str, Any]] = {}
     paths = _validated_history_paths(daily_dir, selected_symbols[:max_symbols])
     for sym, path in paths:
         if not path.exists():
+            excluded.append({"symbol": sym, "reason_code": "daily_file_missing"})
             continue
         try:
-            df = read_csv_frame(path)
-            _basis, basis_reason = classify_frame_price_basis(df)
-            if basis_reason:
-                # Preserve the untrusted frame long enough for the run-level
-                # validator to block the complete requested universe.  Silently
-                # dropping it here would change that universe and hide the defect.
-                histories[sym] = df
+            source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            df = read_csv_frame(path, on_bad_lines="error")
+            read_warnings = list(df.attrs.get("warnings") or [])
+            if any(item.startswith(("csv_parse_failed:", "csv_read_failed:")) for item in read_warnings):
+                excluded.append({"symbol": sym, "reason_code": "csv_parse_failed", "detail": ";".join(read_warnings)[:300]})
                 continue
-            df, _reason = read_backtest_daily(sym, daily_dir, start_date=start_date, end_date=end_date)
-            if len(df) >= 130:
-                histories[sym] = df
-        except Exception:  # noqa: BLE001
+            if df.empty:
+                excluded.append({"symbol": sym, "reason_code": "daily_file_empty"})
+                continue
+            basis, basis_reason = classify_frame_price_basis(df)
+            source_files[sym] = {"sha256": source_hash, "rows": len(df), "original_price_basis": basis,
+                                 "basis_reason": basis_reason, "path": str(path)}
+            originals[sym] = df
+        except (OSError, ValueError) as exc:
+            excluded.append({"symbol": sym, "reason_code": "daily_read_failed", "detail": str(exc)[:300]})
             continue
+    # Even a short or future-only frame participates in the original-source
+    # basis gate; dropping it first would hide a mismatch in the request.
+    histories.price_policy_validation = validate_price_frame_set(originals, consumer="backtest")
+    if originals and not histories.price_policy_validation["eligible"]:
+        histories.update(originals)
+    else:
+        for sym in originals:
+            df, reason = read_backtest_daily(sym, daily_dir, start_date=start_date, end_date=end_date)
+            path = daily_dir / f"{sym}.csv"
+            if hashlib.sha256(path.read_bytes()).hexdigest() != source_files[sym]["sha256"]:
+                excluded.append({"symbol": sym, "reason_code": "source_changed_during_read"})
+            elif df.empty:
+                code = "no_asof_data" if "date" in originals[sym] and end_date and not bool(
+                    (pd.to_datetime(originals[sym]["date"], errors="coerce") <= pd.Timestamp(end_date)).any()
+                ) else "empty_window_or_unverifiable"
+                excluded.append({"symbol": sym, "reason_code": code, "detail": reason})
+            elif len(df) < 130:
+                excluded.append({"symbol": sym, "reason_code": "short_history", "rows": len(df), "required_rows": 130})
+            else:
+                histories[sym] = df
+    histories.input_evidence = {"requested_symbols": selected_symbols, "loaded_symbols": list(histories),
+        "excluded_symbols": excluded, "requested_count": len(selected_symbols), "loaded_count": len(histories),
+        "excluded_count": len(excluded), "source_files": source_files, "start_date": start_date,
+        "end_date": end_date, "sample_limit": max_symbols,
+        "status": "blocked" if originals and not histories.price_policy_validation["eligible"] else "partial" if excluded else "complete"}
     return histories
 
 
@@ -275,11 +317,19 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                     start_date=start_date,
                     end_date=end_date,
                 )
+                input_evidence = getattr(histories, "input_evidence", {
+                    "requested_symbols": requested_symbols or list(histories), "loaded_symbols": list(histories),
+                    "excluded_symbols": [], "requested_count": len(requested_symbols or histories),
+                    "loaded_count": len(histories), "excluded_count": 0, "start_date": start_date, "end_date": end_date,
+                })
+                original_price_policy = getattr(histories, "price_policy_validation", {})
                 if not histories:
                     return jsonify(
                         clean_payload(
                             {
                                 "ok": False,
+                                "status": "missing",
+                                "input_evidence": input_evidence,
                                 "source": source or "current_analysis_pool",
                                 "backtest_handoff": handoff,
                                 "message_for_ui": "本地日线不足，无法回测（每只至少约需 130 个交易日）。",
@@ -287,7 +337,8 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                         )
                     )
                 histories = align_backtest_research_basis(histories)
-                price_policy_validation = validate_backtest_history_sources(histories)
+                price_policy_validation = (original_price_policy if original_price_policy.get("eligible") is False
+                                           else validate_backtest_history_sources(histories))
                 if not price_policy_validation.get("eligible"):
                     reason_codes = [
                         str(item)
@@ -298,6 +349,7 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                         "status": "blocked",
                         "source": source or "current_analysis_pool",
                         "backtest_handoff": handoff,
+                        "input_evidence": input_evidence,
                         "symbol_count": len(histories),
                         "symbols": list(histories),
                         "price_policy_validation": price_policy_validation,
@@ -336,8 +388,12 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                     or PRICE_BASIS_UNKNOWN
                 )
                 return_data = closed_trade_return_evidence(result.trades or [])
+                partial = bool(input_evidence.get("excluded_count"))
                 payload = {
-                    "ok": True,
+                    "ok": not partial,
+                    "status": "partial" if partial else "completed",
+                    "input_evidence": input_evidence,
+                    "metrics_scope": "loaded_subset_only" if partial else "bounded_requested_universe",
                     "exists": True,
                     "strategy": strategy,
                     "source": source or ("current_analysis_pool_sample" if candidate_rows_func else "full_a_local_archive_sample"),
@@ -377,7 +433,9 @@ def create_backtest_blueprint(candidate_rows_func: CandidateRowsFunc | None = No
                     "assumptions": clean_payload(result.assumptions),
                     "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                     "message_for_ui": (
-                        f"回测完成：策略 {strategy}，{len(histories)} 只样本，{int(m.number_of_trades or 0)} 笔交易。"
+                        (f"回测部分完成：请求 {input_evidence['requested_count']} 只，"
+                         f"排除 {input_evidence['excluded_count']} 只，指标仅适用于已加载子集。" if partial else "回测完成：")
+                        + f"策略 {strategy}，{len(histories)} 只样本，{int(m.number_of_trades or 0)} 笔交易。"
                     ),
                     **_research_paper_boundary_fields(),
                     "price_policy_validation": price_policy_validation,

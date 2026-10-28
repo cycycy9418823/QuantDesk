@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 import json
 import sys
 from pathlib import Path
@@ -139,7 +140,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     profile_config = get_low_price_strategy_viability_config() if args.profile == "low_price" else default_strategy_repair_config()
     smoke_run = truthy(args.smoke_run)
     synthetic_test_data = truthy(args.synthetic_test_data)
-    write_latest = truthy(args.write_latest) if str(args.write_latest).strip() else (not smoke_run)
+    write_latest = (truthy(args.write_latest) if str(args.write_latest).strip() else True) and not (smoke_run or synthetic_test_data)
     if int(args.top_n or 0) <= 0:
         args.top_n = int(profile_config.get("top_n") or 10)
     if args.profile == "low_price":
@@ -279,8 +280,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         payload["status"] = "warning"
     if payload["warnings"]:
         payload["status"] = "warning"
-    output_dir = "results/smoke" if smoke_run and not write_latest else args.output_dir
-    report_dir = "reports/smoke" if smoke_run and not write_latest else args.report_dir
+    from quantdesk.research.evidence_identity import stamp_research_evidence
+    from quantdesk.reproducibility_manifest import capture_git_or_source_state
+    observed_end = str(price_panel["date"].max()) if not price_panel.empty and "date" in price_panel else ""
+    payload = stamp_research_evidence(payload, target_date=str(args.end_date or observed_end),
+        code_identity=capture_git_or_source_state(), data_identity={"prices": sha256(price_panel.to_csv(index=False).encode()).hexdigest(),
+            "scores": sha256(score_panel.to_csv(index=False).encode()).hexdigest()},
+        config_identity=payload.get("config") or {}, run_type="synthetic" if synthetic_test_data else "smoke" if smoke_run else "formal")
+    output_dir = "results/smoke" if smoke_run else args.output_dir
+    report_dir = "reports/smoke" if smoke_run else args.report_dir
     payload = write_combined_score_backtest_outputs(payload, output_dir=output_dir, report_dir=report_dir)
     payload["output_paths"] = {key: _rel(value) for key, value in (payload.get("output_paths") or {}).items()}
     return payload

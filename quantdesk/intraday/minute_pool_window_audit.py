@@ -45,6 +45,9 @@ WINDOW_AUDIT_LATEST_JSON = (
 )
 
 USABLE_STANDARD = "existing_intraday_quality_audit_v1"
+from quantdesk.intraday.minute_bar_lifecycle import FORMAL_EVIDENCE_STANDARD
+
+ELIGIBILITY_STANDARD = FORMAL_EVIDENCE_STANDARD
 
 __all__ = [
     "audit_minute_pool_window",
@@ -90,6 +93,8 @@ def _window_snapshot_is_semantically_valid(payload: Mapping[str, Any]) -> bool:
     if not isinstance(rows, list):
         return False
     criteria = payload.get("criteria")
+    if criteria is not None and not isinstance(criteria, Mapping):
+        return False
     if isinstance(criteria, Mapping) and criteria.get("usable_standard") not in {
         None,
         USABLE_STANDARD,
@@ -152,6 +157,7 @@ def _audit_symbol_days(
     intraday_dir: Path,
     encoding: str = "auto",
     price_basis: str = "",
+    evidence: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, str]:
     """Grade one symbol for every window day, reading its CSV exactly once.
 
@@ -160,7 +166,8 @@ def _audit_symbol_days(
     """
 
     path = intraday_dir / f"{symbol}.csv"
-    if not path.exists():
+    from quantdesk.intraday.minute_storage import resolve_minute_read_path
+    if not resolve_minute_read_path(path).exists():
         return {day: "missing" for day in days}
     payload = read_intraday_csv(path, default_symbol=symbol, target_date="", encoding=encoding)
     frame = payload.get("frame")
@@ -185,6 +192,12 @@ def _audit_symbol_days(
             price_basis=price_basis,
         )
         statuses[day] = str(audit.get("status") or "invalid")
+        if evidence is not None:
+            evidence[day] = {
+                key: audit.get(key, False if key.endswith("eligible") else "")
+                for key in ("formal_execution_eligible", "reliable_no_fill_eligible", "session_status",
+                            "session_reason_codes", "signal_eligible", "validation_scope")
+            }
     return statuses
 
 
@@ -236,19 +249,24 @@ def audit_minute_pool_window(
 
     symbol_rows: list[dict[str, Any]] = []
     per_day_usable: dict[str, int] = {day: 0 for day in days}
+    per_day_formal: dict[str, int] = {day: 0 for day in days}
     fully_usable = 0
     for symbol in pool_symbols:
+        day_evidence: dict[str, dict[str, Any]] = {}
         day_status = _audit_symbol_days(
             symbol,
             days,
             intraday_dir=directory,
             encoding=encoding,
             price_basis=price_basis,
+            evidence=day_evidence,
         )
         usable_days = [day for day, status in day_status.items() if status == "usable"]
         not_usable = [day for day in days if day_status.get(day) != "usable"]
         for day in usable_days:
             per_day_usable[day] += 1
+            if day_evidence.get(day, {}).get("formal_execution_eligible") is True:
+                per_day_formal[day] += 1
         all_usable = len(usable_days) == len(days) and bool(days)
         if all_usable:
             fully_usable += 1
@@ -256,6 +274,7 @@ def audit_minute_pool_window(
             {
                 "symbol": symbol,
                 "day_status": day_status,
+                "day_evidence": day_evidence,
                 "usable_day_count": len(usable_days),
                 "all_days_usable": all_usable,
                 "not_usable_date_count": len(not_usable),
@@ -277,9 +296,11 @@ def audit_minute_pool_window(
         "total_symbols": len(pool_symbols),
         "fully_usable_symbol_count": fully_usable,
         "per_day_usable_counts": per_day_usable,
+        "per_day_formal_eligible_counts": per_day_formal,
         "symbols": symbol_rows,
         "criteria": {
             "usable_standard": USABLE_STANDARD,
+            "eligibility_standard": ELIGIBILITY_STANDARD,
             "grader": "quantdesk.intraday.intraday_quality_audit._audit_frame",
             "note": "window grade per day is identical to audit_intraday_file for that date",
         },
@@ -332,6 +353,7 @@ def load_window_verified_minute_pool(
             warning="window_audit_snapshot_semantically_invalid",
         )
     usable_by_symbol: dict[str, set[str]] = {}
+    current_contract = (payload.get("criteria") or {}).get("eligibility_standard") == ELIGIBILITY_STANDARD
     for row in payload.get("symbols") or []:
         if not isinstance(row, Mapping):
             # The semantic validator above makes this unreachable, but keep
@@ -349,7 +371,16 @@ def load_window_verified_minute_pool(
                 warning="window_audit_snapshot_semantically_invalid",
             )
         day_status = row.get("day_status") if isinstance(row.get("day_status"), Mapping) else {}
-        usable_days = {str(day)[:10] for day, status in day_status.items() if status == "usable"}
+        evidence = row.get("day_evidence")
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+        usable_days = {
+            str(day)[:10] for day, status in day_status.items()
+            if current_contract and status == "usable"
+            and isinstance(evidence.get(day), Mapping)
+            and evidence[day].get("formal_execution_eligible") is True
+            and evidence[day].get("reliable_no_fill_eligible") is True
+            and evidence[day].get("session_status") == "complete_session"
+        }
         if usable_days:
             usable_by_symbol[symbol] = usable_days
     return {
@@ -364,7 +395,8 @@ def load_window_verified_minute_pool(
         "usable_by_symbol": usable_by_symbol,
         "total_symbols": int(payload.get("total_symbols") or 0),
         "fully_usable_symbol_count": int(payload.get("fully_usable_symbol_count") or 0),
-        "warnings": [str(item) for item in (payload.get("warnings") or []) if item],
+        "warnings": [str(item) for item in (payload.get("warnings") or []) if item]
+        + ([] if current_contract else ["legacy_window_eligibility_unverified_reaudit_required"]),
     }
 
 

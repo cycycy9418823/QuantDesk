@@ -12,6 +12,7 @@ import json
 import platform
 import re
 import sys
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -101,13 +102,48 @@ def compute_json_hash(obj: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def capture_source_bytes(project_root: Path | None = None) -> dict[str, Any]:
+    """Hash maintained executing files only; safe for source copies without Git."""
+    root = project_root or PROJECT_ROOT
+    paths = []
+    for folder in ("quantdesk", "ai_trader", "scripts", "app"):
+        paths.extend(p for p in (root / folder).rglob("*") if p.is_file()
+            and not p.is_symlink() and p.suffix.lower() in {".py", ".js", ".html"}
+            and not any(part.startswith(".") or part == "__pycache__" for part in p.relative_to(root).parts))
+    source_hashes = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(paths)}
+    return {"source_hashes": source_hashes, "source_file_count": len(source_hashes), "source_sha256": hashlib.sha256(
+        json.dumps(source_hashes, sort_keys=True, separators=(",", ":")).encode()).hexdigest() if source_hashes else ""}
+
+
 def capture_git_or_source_state() -> dict[str, Any]:
+    """Fingerprint executing source; runtime data and secret configs stay excluded."""
     git_dir = PROJECT_ROOT / ".git"
-    return {
+    result: dict[str, Any] = {
         "git_available": git_dir.exists(),
         "project_root_name": PROJECT_ROOT.name,
         "source_state_note": "git metadata present" if git_dir.exists() else "git metadata not available in this workspace",
+        "git_head": "unknown", "dirty_count": "unknown", "identity_status": "source_only",
+        **capture_source_bytes(),
     }
+    source_hashes = result["source_hashes"]
+    if git_dir.exists():
+        options = {"cwd": PROJECT_ROOT, "capture_output": True, "check": True, "timeout": 5}
+        try:
+            head_out = subprocess.run(["git", "--no-optional-locks", "rev-parse", "HEAD"], **options).stdout
+            head = (head_out.decode() if isinstance(head_out, bytes) else head_out).strip()
+            status_out = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain=v1", "-z"], **options).stdout
+            entries = (status_out.decode("utf-8") if isinstance(status_out, bytes) else status_out).split("\0")
+            dirty_sources = {}
+            for entry in entries:
+                if len(entry) > 3 and entry[2] == " ":
+                    name = entry[3:].replace("\\", "/")
+                    if name in source_hashes:
+                        dirty_sources[name] = source_hashes[name]
+            result.update(git_head=head, dirty_count=sum(bool(e) and len(e) > 3 and e[2] == " " for e in entries),
+                dirty_source_hashes=dirty_sources, identity_status="commit_and_source_bytes")
+        except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+            result["source_state_note"] = "git identity unavailable:" + type(exc).__name__
+    return result
 
 
 def capture_runtime_environment() -> dict[str, Any]:

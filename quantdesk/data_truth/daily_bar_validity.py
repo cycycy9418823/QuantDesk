@@ -17,6 +17,7 @@ and record evidence - never fabricate a bar.
 from __future__ import annotations
 
 from typing import Any, Mapping
+import math
 
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
 
@@ -29,7 +30,7 @@ def is_valid_daily_bar(open_: Any, high: Any, low: Any, close: Any, volume: Any)
             out = float(value)
         except (TypeError, ValueError):
             return None
-        if out != out:  # NaN
+        if not math.isfinite(out) or isinstance(value, bool):
             return None
         return out
 
@@ -53,6 +54,15 @@ def is_valid_daily_bar(open_: Any, high: Any, low: Any, close: Any, volume: Any)
     if values["low"] > min(values["open"], values["close"], values["high"]):
         return False, "invalid_daily_bar:low_above_body"
     return True, ""
+
+
+def classify_daily_row(row: Mapping[str, Any], *, confirmed_nontrade: bool = False) -> dict[str, Any]:
+    """Separate admissible bars from confirmed nontrading and unknown gaps."""
+    valid, reason = daily_bar_validity_from_row(row)
+    return {"classification": "valid_trading_bar" if valid else "confirmed_nontrade" if confirmed_nontrade else "unknown_gap",
+        "valid_trading_bar": valid, "execution_eligible": valid,
+        "valuation_status": "current_close" if valid else "previous_verified_raw_close_only",
+        "reason_code": reason, "original_row_preserved": True}
 
 
 def daily_bar_validity_from_row(row: Mapping[str, Any]) -> tuple[bool, str]:

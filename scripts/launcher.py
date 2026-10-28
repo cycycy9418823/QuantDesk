@@ -17,9 +17,12 @@ Usage (packaged EXE):
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import ntpath
 import os
 import signal
+import shlex
 import socket
 import subprocess
 import sys
@@ -125,14 +128,49 @@ def running_server_build_id(port: int) -> str | None:
     return None
 
 
-def server_is_current(port: int, project_root: Path) -> bool:
-    """True only when the running server reports the same build id as the
-    source on disk. An old server without the build-id endpoint reports None,
-    so it is correctly treated as outdated."""
+def running_server_capabilities(port: int) -> dict | None:
+    """Read the advertised runtime mode without enabling any capability."""
+    import urllib.request
+
+    try:
+        url = f"http://127.0.0.1:{port}/api/runtime-capabilities"
+        with urllib.request.urlopen(url, timeout=1.5) as response:
+            if response.status == 200:
+                value = json.loads(response.read().decode("utf-8"))
+                return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def server_is_current(port: int, project_root: Path, *, expected_read_only: bool | None = None) -> bool:
+    """Match source identity and, when requested, the declared runtime mode."""
     running = running_server_build_id(port)
-    if not running:
+    if not running or running != server_source_build_id(project_root):
         return False
-    return running == server_source_build_id(project_root)
+    if expected_read_only is None:
+        return True  # Backward-compatible source-only helper contract.
+    if not isinstance(expected_read_only, bool):
+        return False
+    capabilities = running_server_capabilities(port)
+    if not capabilities:
+        return False
+    identity = capabilities.get("source_identity")
+    if not isinstance(identity, dict):
+        return False
+    expected_mode = "read_only_research" if expected_read_only else "local_research_edit"
+    entry_hash = str(identity.get("entry_sha256") or "")
+    try:
+        same_root = bool(identity.get("data_root")) and Path(identity["data_root"]).resolve() == Path(project_root).resolve()
+    except (OSError, TypeError, ValueError):
+        return False
+    return bool(capabilities.get("ok") is True
+        and capabilities.get("read_only") is expected_read_only
+        and capabilities.get("mutations_enabled") is (not expected_read_only)
+        and isinstance(capabilities.get("selected_quote_refresh"), bool)
+        and capabilities.get("mode") == expected_mode
+        and identity.get("server_build_id") == running and same_root
+        and len(entry_hash) == 64 and all(char in "0123456789abcdef" for char in entry_hash.lower()))
 
 
 def _listener_pids(port: int) -> list[int]:
@@ -169,9 +207,8 @@ def _pid_is_python(pid: int) -> bool:
     """Check whether *pid* belongs to a Python process (not some unrelated service).
 
     Uses ``tasklist`` on Windows to read the image name.  Returns True when the
-    image name contains 'python' (case-insensitive).  When the check itself
-    fails (e.g. access denied, tasklist unavailable) we return None to signal
-    'unknown' so the caller can decide whether to proceed with caution.
+    image name is a Python interpreter. A failed query is never permission
+    to terminate an unknown process.
     """
     if os.name != "nt":
         # POSIX: read /proc/<pid>/cmdline or exe link
@@ -179,7 +216,7 @@ def _pid_is_python(pid: int) -> bool:
             cmdline = Path(f"/proc/{pid}/cmdline").read_text()
             return "python" in cmdline.lower()
         except Exception:
-            return True  # can't verify — assume OK
+            return False
     try:
         result = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
@@ -190,27 +227,91 @@ def _pid_is_python(pid: int) -> bool:
             timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        output = (result.stdout or "").strip().lower()
-        # CSV format: "python.exe","1234","Console","1","12,345 K"
-        return "python" in output
+        if result.returncode != 0:
+            return False
+        rows = csv.reader((result.stdout or "").splitlines())
+        return any(len(row) >= 2 and row[0].casefold() in {"python.exe", "pythonw.exe"}
+                   and row[1] == str(pid) for row in rows)
     except Exception:
-        return True  # can't verify — assume OK
+        return False
 
 
-def kill_server_on_port(port: int) -> bool:
-    """Force-kill Python processes listening on *port* and wait for it to free up.
+def _process_identity(pid: int) -> dict | None:
+    """Read executable, command and creation identity; no process mutation."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        if os.name == "nt":
+            command = (
+                f"$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}' -ErrorAction Stop;"
+                "if($null -eq $p){exit 1};"
+                "[ordered]@{pid=[int]$p.ProcessId;executable=[string]$p.ExecutablePath;"
+                "command_line=[string]$p.CommandLine;created=[string]$p.CreationDate.ToString('o')}|ConvertTo-Json -Compress"
+            )
+            result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if result.returncode != 0:
+                return None
+            value = json.loads(result.stdout)
+        else:
+            proc = Path(f"/proc/{pid}")
+            args = proc.joinpath("cmdline").read_bytes().split(b"\0")
+            value = {"pid": pid, "executable": str(proc.joinpath("exe").resolve(strict=True)),
+                     "argv": [arg.decode() for arg in args if arg],
+                     "created": proc.joinpath("stat").read_text().rsplit(")", 1)[1].split()[19]}
+        if (not isinstance(value, dict) or value.get("pid") != pid or not value.get("created")
+                or not value.get("executable") or not (value.get("command_line") or value.get("argv"))):
+            return None
+        return value
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
 
-    Only kills processes whose image name contains 'python' to avoid killing
-    unrelated services that happen to share the port.  Returns True once the
-    port is no longer answering.
-    """
+
+def _identity_is_project_server(identity: dict | None, project_root: Path) -> bool:
+    """Require this project's absolute server script and an expected interpreter."""
+    if not identity:
+        return False
+    root = Path(project_root).resolve()
+    path_key = lambda value: ntpath.normcase(ntpath.normpath(str(value)))
+    executable = path_key(identity.get("executable") or "")
+    if executable not in {path_key(resolve_python(root)), path_key(root / ".venv/Scripts/python.exe"),
+                          path_key(root / ".venv/Scripts/pythonw.exe")}:
+        return False
+    try:
+        tokens = identity.get("argv") or [token[1:-1] if token.startswith('"') and token.endswith('"') else token
+            for token in shlex.split(str(identity.get("command_line") or ""), posix=False)]
+    except ValueError:
+        return False
+    if not tokens or path_key(tokens[0]) != executable:
+        return False
+    offset = 1
+    while offset < len(tokens):
+        if tokens[offset] in {"-B", "-u", "-Xutf8"}:
+            offset += 1
+        elif tokens[offset:offset+2] == ["-X", "utf8"]:
+            offset += 2
+        else:
+            break
+    server_scripts = {path_key(root / "scripts/quant_api_server.py"),
+                      path_key(root / "scripts/run_research_viewer.py")}
+    return offset < len(tokens) and path_key(tokens[offset]) in server_scripts
+
+
+def kill_server_on_port(port: int, *, project_root: Path | None = None) -> bool:
+    """An explicit restart may stop only a verified, unchanged project server."""
+    if project_root is None:
+        return False
     pids = set(_listener_pids(port))
     for pid in pids:
-        if not _pid_is_python(pid):
+        identity = _process_identity(pid)
+        if not _identity_is_project_server(identity, project_root):
             print(
-                f"[QuantDesk] WARNING: PID {pid} on port {port} does not look "
-                "like a Python process — skipping kill to avoid collateral damage."
+                f"[QuantDesk] PID {pid} on port {port} could not be verified as this project's server; left running."
             )
+            continue
+        if _process_identity(pid) != identity:
+            print(f"[QuantDesk] PID {pid} changed during verification; left running.")
             continue
         try:
             subprocess.run(
@@ -567,14 +668,16 @@ def open_app_window(url: str) -> None:
 
 
 def start_server(project_root: Path, port: int, *, realtime_network: bool = False) -> subprocess.Popen | None:
-    """Start the QuantDesk API server as a subprocess.
+    """Start the maintained read-only viewer unless realtime mode is explicit.
 
     Returns the process handle so the launcher can terminate it on exit.
     """
     python = resolve_python(project_root)
-    server_script = project_root / "scripts" / "quant_api_server.py"
-    if not server_script.exists():
-        print(f"[QuantDesk] Server script not found: {server_script}")
+    server_name = "quant_api_server.py" if realtime_network else "run_research_viewer.py"
+    server_script = project_root / "scripts" / server_name
+    if not server_script.is_file():
+        mode = "explicit realtime" if realtime_network else "read-only research"
+        print(f"[QuantDesk] Required {mode} entry not found: {server_script}; server was not started.")
         return None
 
     env = os.environ.copy()
@@ -629,6 +732,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="QuantDesk Desktop Launcher")
     parser.add_argument("--port", type=int, default=8000, help="Preferred HTTP port (default: 8000)")
     parser.add_argument("--allow-fallback-port", action="store_true", help="If the preferred port is busy and cannot be freed, use the next free port instead of failing. Default off, so http://127.0.0.1:8000/ stays predictable.")
+    parser.add_argument("--restart-own-server", action="store_true", help="Explicitly restart an outdated server only when its interpreter, absolute project script and creation identity are verified")
     parser.add_argument("--no-browser", action="store_true", help="Do not open browser automatically")
     parser.add_argument("--update-on-start", action="store_true", help="Request the full-A Data Close Pipeline when a completed session is available")
     parser.add_argument("--no-update", action="store_true", help="Skip startup data update even when configured")
@@ -662,7 +766,7 @@ def main() -> int:
     # be mistaken for "our server". Anything else: free the port or fail loudly,
     # instead of silently drifting to another port (the old "8000 vs 800x" trap).
     if port_is_alive(args.port):
-        if server_is_current(args.port, project_root):
+        if server_is_current(args.port, project_root, expected_read_only=not update_enabled):
             url = f"http://127.0.0.1:{args.port}/"
             print(f"[QuantDesk] Server already running (current build) at {url}")
             if not args.no_browser:
@@ -693,16 +797,14 @@ def main() -> int:
                     f"new_ledger_rows={candidate_generation.get('new_ledger_rows', 0)}"
                 )
             return 0
-        # Occupied by an outdated build or a foreign process — try to free the
-        # canonical port so the latest UI is served on it.
         print(
-            f"[QuantDesk] Port {args.port} is occupied by an outdated or foreign "
-            "server; trying to free it so the latest UI is served on the canonical port."
+            f"[QuantDesk] Port {args.port} is occupied by a server with a different or unknown build."
         )
-        if not kill_server_on_port(args.port) and not args.allow_fallback_port:
+        freed = bool(args.restart_own_server and kill_server_on_port(args.port, project_root=project_root))
+        if not freed and not args.allow_fallback_port:
             print(
                 f"[QuantDesk] ERROR: port {args.port} is in use and could not be freed. "
-                f"Close whatever is using port {args.port}, or relaunch with "
+                f"Close its known owner, use --restart-own-server for a verified project server, or relaunch with "
                 "--allow-fallback-port to use another port. Refusing to silently "
                 "change the URL so http://127.0.0.1:8000/ stays predictable."
             )

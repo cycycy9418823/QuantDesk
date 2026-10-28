@@ -838,6 +838,7 @@ def run_evening_review(
     project_root: Path,
     target_date: str,
     authoritative_chain_run_id: str,
+    expected_target_date: str | None = None,
     daily_runner: CommandRunner,
     candidate_tracking_runner: CandidateTrackingRunner | None = None,
     stage4_runner: CommandRunner | None = None,
@@ -855,6 +856,10 @@ def run_evening_review(
     if normalized_trigger not in REVIEW_TRIGGERS:
         raise ValueError("trigger must be manual or scheduled_daily_review")
     root = Path(project_root).resolve()
+    if expected_target_date is not None:
+        build_review_event_key(expected_target_date, authoritative_chain_run_id)
+        if target_date != expected_target_date:
+            raise ValueError("review_target_date_mismatch")
     event_key = build_review_event_key(target_date, authoritative_chain_run_id)
     path = review_receipt_path(root, target_date, authoritative_chain_run_id)
     date_lock_path = root / "state" / "daily_review_runs" / f"{target_date}.lock"

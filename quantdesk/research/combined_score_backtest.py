@@ -897,8 +897,16 @@ def write_combined_score_backtest_outputs(
     output_dir: str | Path = "results",
     report_dir: str | Path = "reports",
 ) -> dict[str, Any]:
-    output_path = Path(output_dir)
-    report_path = Path(report_dir)
+    from quantdesk.research.evidence_identity import nonformal_mode, isolated_output_path, stamp_research_evidence
+    from quantdesk.reproducibility_manifest import capture_git_or_source_state
+    mode = nonformal_mode(payload)
+    output_path = isolated_output_path(Path(output_dir) / "combined_score_backtest_latest.json", mode).parent
+    report_path = isolated_output_path(Path(report_dir) / "combined_score_backtest_report_latest.md", mode).parent
+    if "evidence_identity" not in payload:
+        payload = stamp_research_evidence(payload,
+            target_date=str(payload.get("target_date") or (payload.get("universe") or {}).get("end_date") or ""),
+            code_identity=capture_git_or_source_state(), data_identity=payload.get("input_identity") or {},
+            config_identity=payload.get("config") or {}, run_type=mode)
     output_path.mkdir(parents=True, exist_ok=True)
     report_path.mkdir(parents=True, exist_ok=True)
     stamp = now_text().replace("-", "").replace(":", "").replace("T", "_").replace(" ", "_")

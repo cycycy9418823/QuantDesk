@@ -21,6 +21,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "results" / "data_health" / "tushare_minute_quality_latest.json"
 DEFAULT_REPORT_PATH = PROJECT_ROOT / "reports" / "tushare_minute_quality_latest.md"
 LAST_PASSED_SNAPSHOT_NAME = "tushare_minute_quality_last_passed.json"
+from quantdesk.intraday.minute_bar_lifecycle import FORMAL_EVIDENCE_STANDARD
+
+ELIGIBILITY_STANDARD = FORMAL_EVIDENCE_STANDARD
 DEFAULT_LAST_PASSED_OUTPUT_PATH = DEFAULT_OUTPUT_PATH.with_name(LAST_PASSED_SNAPSHOT_NAME)
 
 MINUTE_JOB_GLOB = "data/vendor_staging/tushare_proxy_minutes_250d*"
@@ -110,6 +113,8 @@ def _overall_status(summary: dict[str, int]) -> str:
         return "warning"
     if int(summary.get("insufficient") or 0) or int(summary.get("partial") or 0):
         return "partial"
+    if int(summary.get("formal_execution_eligible") or 0) != int(summary.get("usable") or 0):
+        return "partial"
     return "passed"
 
 
@@ -120,11 +125,15 @@ def _is_clean_pass_quality_payload(payload: Any) -> bool:
         return False
     if str(payload.get("status") or "") != "passed":
         return False
+    if payload.get("eligibility_standard") != ELIGIBILITY_STANDARD:
+        return False
     quality = payload.get("quality_summary") if isinstance(payload.get("quality_summary"), dict) else {}
     total = int(payload.get("total_symbols") or 0)
     usable = int(quality.get("usable") or 0)
     not_usable = sum(int(quality.get(key) or 0) for key in ("partial", "insufficient", "invalid", "missing"))
-    return total > 0 and usable == total and not_usable == 0
+    formal = quality.get("formal_execution_eligible")
+    return (total > 0 and usable == total and not_usable == 0
+            and isinstance(formal, int) and not isinstance(formal, bool) and formal == total)
 
 
 def load_latest_tushare_minute_quality_snapshot(
@@ -198,6 +207,7 @@ def summarize_completed_minute_quality_snapshot(
         "target_date": payload.get("target_date") or job.get("target_end") or "",
         "total_symbols": total,
         "usable_count": usable,
+        "formal_execution_eligible_count": int(quality.get("formal_execution_eligible") or 0),
         "partial_count": partial,
         "insufficient_count": insufficient,
         "invalid_count": invalid,
@@ -224,9 +234,12 @@ def _pool_payload_from_snapshot(
         job_summary = {}
     symbols = _summary_symbols(job_summary)
     is_clean_pass = (
+        _is_clean_pass_quality_payload(snapshot)
+        and
         summary.get("status") == "passed"
         and int(summary.get("total_symbols") or 0) > 0
         and int(summary.get("usable_count") or 0) == int(summary.get("total_symbols") or 0)
+        and int(summary.get("formal_execution_eligible_count") or 0) == int(summary.get("total_symbols") or 0)
         and int(summary.get("partial_count") or 0) == 0
         and int(summary.get("insufficient_count") or 0) == 0
         and int(summary.get("invalid_count") or 0) == 0
@@ -237,6 +250,7 @@ def _pool_payload_from_snapshot(
     expected_total = int(summary.get("total_symbols") or 0)
     if is_clean_pass and expected_total and symbols and len(symbols) != expected_total:
         warnings.append(f"verified_minute_pool_symbol_count_mismatch:{len(symbols)}/{expected_total}")
+        is_clean_pass = False
     status = "passed" if is_clean_pass and symbols else ("missing" if summary.get("status") == "missing" else "warning")
     return {
         "task_type": "verified_minute_pool_snapshot",
@@ -352,6 +366,7 @@ def build_tushare_minute_quality_audit(
     quality_summary = audit.get("summary") if isinstance(audit.get("summary"), dict) else {}
     payload: dict[str, Any] = {
         "task_type": "tushare_minute_quality_audit",
+        "eligibility_standard": ELIGIBILITY_STANDARD,
         "status": _overall_status({str(key): int(value or 0) for key, value in quality_summary.items()}),
         "job": {
             "path": _relative(job, root),

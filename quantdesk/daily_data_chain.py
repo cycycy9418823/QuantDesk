@@ -603,7 +603,7 @@ def _csv_symbol_rows(path: Path, *, included_only: bool = False) -> list[str]:
     return sorted(symbols)
 
 
-def _full_a_research_universe(root: Path) -> dict[str, Any]:
+def _full_a_research_universe(root: Path, *, target_date: str | None = None) -> dict[str, Any]:
     """Return the default full-A research input and its source evidence.
 
     ``a_share_symbols.csv`` is the authoritative current-universe source.  A
@@ -613,7 +613,9 @@ def _full_a_research_universe(root: Path) -> dict[str, Any]:
 
     baseline = root / "data" / "universe" / "a_share_symbols.csv"
     fingerprint = _file_fingerprint(baseline)
-    symbols = _csv_symbol_rows(baseline)
+    from quantdesk.full_a_daily_coverage import load_roster_evidence
+    roster = load_roster_evidence(root, target_date=target_date or infer_target_date(None)[0])
+    symbols = roster["symbols"]
     source = "a_share_symbols.csv"
     source_path = baseline
     reason_codes: list[str] = []
@@ -638,7 +640,8 @@ def _full_a_research_universe(root: Path) -> dict[str, Any]:
     return {
         "source": source,
         "path": _display_path(source_path, root),
-        "source_sha256": str(fingerprint.get("sha256") or ""),
+        "source_sha256": str(roster.get("sha256") or fingerprint.get("sha256") or ""),
+        "roster_evidence": {k: v for k, v in roster.items() if k != "symbols"},
         "source_size": int(fingerprint.get("size") or 0),
         "symbols": symbols,
         "symbol_count": len(symbols),
@@ -2961,7 +2964,7 @@ def _run_daily_data_chain_impl(
     low_price_filter["used"] = bool(use_low_price_filter and symbols is None)
     if low_price_filter["used"]:
         low_price_filter["reason"] = "explicit_filter_selected"
-    full_a_universe = _full_a_research_universe(root)
+    full_a_universe = _full_a_research_universe(root, target_date=resolved_target)
     analysis_rows = (
         [{"symbol": item} for item in _normalized_symbols(list(symbols))]
         if symbols is not None

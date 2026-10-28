@@ -28,6 +28,9 @@ from zoneinfo import ZoneInfo
 from quantdesk.interprocess_lock import interprocess_file_lock
 from quantdesk.market_clock import is_cn_a_share_trading_day, load_cn_trading_calendar
 from quantdesk.shared import normalize_symbol
+from quantdesk.data_truth.daily_bar_validity import daily_bar_validity_from_row
+from quantdesk.full_a_daily_coverage import load_roster_evidence
+from quantdesk.reproducibility_manifest import capture_source_bytes
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SNAPSHOT_RELATIVE_DIR = Path("data/snapshots")
@@ -311,19 +314,40 @@ def _quote_field_quality(rows: Sequence[Mapping[str, Any]], trade_date: str) -> 
     }
 
 
-def _load_symbols(root: Path, symbols: Iterable[Any] | None) -> list[str]:
+def _quote_ohlcv_quality(rows: Sequence[Mapping[str, Any]], trade_date: str,
+                         fetched_at: datetime) -> dict[str, Any]:
+    """Quality of individual quotes, without altering archival completeness."""
+    classes: dict[str, str] = {}
+    price_ok = full_ok = nontrade = 0
+    reasons: dict[str, str] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "")
+        fields_ok = (_quote_time_state(row, trade_date, fetched_at=fetched_at) == "usable"
+            and str(row.get("quote_date") or "") == trade_date
+            and row.get("price_basis") == "raw" and bool(row.get("source")))
+        price_ok += int(fields_ok and _valid_price(row.get("price")))
+        bar = dict(row, close=row.get("price"))
+        valid, reason = daily_bar_validity_from_row(bar)
+        valid = valid and _valid_price(row.get("amount"))
+        confirmed = fields_ok and row.get("tradestatus") in {0, "0"} and row.get("nontrade_evidence_verified") is True
+        state = "full_ohlcv_valid" if fields_ok and valid else "confirmed_nontrade" if confirmed else "unknown_gap"
+        full_ok += int(state == "full_ohlcv_valid")
+        nontrade += int(state == "confirmed_nontrade")
+        classes[symbol] = state
+        if state == "unknown_gap":
+            reasons[symbol] = reason or ("quote_fields_unverified" if not fields_ok else "amount_missing_or_not_positive")
+    return {"explicit_raw_price_valid_count": price_ok, "full_ohlcv_valid_count": full_ok,
+        "confirmed_nontrade_count": nontrade, "unknown_gap_count": len(rows) - full_ok - nontrade,
+        "quote_row_classifications": classes, "quote_row_reason_codes": reasons,
+        "full_ohlcv_quality_status": "complete" if rows and full_ok == len(rows) else "partial"}
+
+
+def _load_symbols(root: Path, symbols: Iterable[Any] | None, *, target_date: str | None = None) -> list[str]:
     source: Iterable[Any]
     if symbols is not None:
         source = symbols
     else:
-        path = root / UNIVERSE_RELATIVE_PATH
-        if not path.is_file():
-            return []
-        try:
-            with path.open(encoding="utf-8-sig", newline="") as handle:
-                source = [row.get("symbol") or row.get("代码") or row.get("code") for row in csv.DictReader(handle)]
-        except (OSError, csv.Error):
-            return []
+        source = load_roster_evidence(root, target_date=target_date or _as_shanghai(None).date().isoformat())["symbols"]
     normalized = {normalize_symbol(item) for item in source}
     return sorted(item for item in normalized if len(item) == 6 and item.isdigit())
 
@@ -1281,6 +1305,9 @@ def _capture_code_version(captured_at: datetime) -> dict[str, Any]:
 
     version = _unknown_code_version()
     version["captured_at"] = captured_at.isoformat(timespec="seconds")
+    source = capture_source_bytes(Path(__file__).resolve().parents[1])
+    version.update(source_sha256=source["source_sha256"], source_file_count=source["source_file_count"],
+                   source_identity_status="verified_source_bytes" if source["source_sha256"] else "unknown")
     options = {
         "cwd": Path(__file__).resolve().parents[1],
         "capture_output": True, "text": True, "encoding": "utf-8",
@@ -1298,6 +1325,7 @@ def _capture_code_version(captured_at: datetime) -> dict[str, Any]:
             **options,
         ).stdout.split("\0")
         dirty_count = 0
+        dirty_source_hashes: dict[str, str] = {}
         index = 0
         while index < len(entries):
             entry = entries[index]
@@ -1305,11 +1333,15 @@ def _capture_code_version(captured_at: datetime) -> dict[str, Any]:
                 if len(entry) < 3 or entry[2] != " ":
                     raise ValueError("git_status_invalid")
                 dirty_count += 1
+                name = entry[3:].replace("\\", "/")
+                if name in source["source_hashes"]:
+                    dirty_source_hashes[name] = source["source_hashes"][name]
                 # Porcelain -z gives renamed/copied entries one extra path.
                 if "R" in entry[:2] or "C" in entry[:2]:
                     index += 1
             index += 1
-        version.update(status="recorded", dirty_count=dirty_count, reason_code="")
+        version.update(status="recorded", dirty_count=dirty_count, reason_code="",
+            dirty_source_hashes=dirty_source_hashes)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         version["reason_code"] = f"git_unavailable:{type(exc).__name__}"
     return version
@@ -1610,8 +1642,10 @@ def _slot_evidence(root: Path, trade_date: str, slot: str) -> dict[str, Any]:
             "fetch_outside_slot": fetch_outside_slot,
             "source": metadata["source"],
             **_quote_field_quality(rows, trade_date),
+            **_quote_ohlcv_quality(rows, trade_date, fetched),
         }
-        return {"status": "complete" if complete else "partial", "metadata": metadata, "quality": quality}
+        return {"status": "complete" if complete else "partial", "metadata": metadata, "quality": quality,
+            "archive_hash_verified": True}
     except (OSError, UnicodeError, ValueError, TypeError, KeyError, csv.Error) as exc:
         return {"status": "invalid", "reason": f"{type(exc).__name__}:{exc}"[:200]}
 
@@ -1720,6 +1754,10 @@ def _manifest(
     quote_num = sum(item["valid_quote_count"] for item in archived_quality)
     quote_den = sum(item["row_count"] for item in archived_quality)
     field_verified = [slot for slot in completed if slot_quality[slot]["quality_status"] == "complete"]
+    full_symbols = set().union(*(set(symbol for symbol, state in q["quote_row_classifications"].items()
+        if state == "full_ohlcv_valid") for q in archived_quality)) if archived_quality else set()
+    expected_set = set().union(*(set(u["symbols"]) for u in archived_universes.values())) if archived_universes else set(expected_symbols)
+    opening = slot_quality.get("0930") or {}
     return {
         "schema_version": "a0_snapshot_history_v1",
         "trade_date": trade_date,
@@ -1771,7 +1809,19 @@ def _manifest(
         "quoted_row_count": quote_den,
         "valid_quote_ratio": (quote_num / quote_den) if quote_den else None,
         "archived_slot_count": len(archived_quality),
-        "slot_quality": slot_quality,
+        "archive_hash_verified_slot_count": sum(item.get("archive_hash_verified") is True for item in evidence.values()),
+        "explicit_raw_price_valid_count": sum(q["explicit_raw_price_valid_count"] for q in archived_quality),
+        "full_ohlcv_valid_count": sum(q["full_ohlcv_valid_count"] for q in archived_quality),
+        "confirmed_nontrade_count": sum(q["confirmed_nontrade_count"] for q in archived_quality),
+        "unknown_quote_gap_count": sum(q["unknown_gap_count"] for q in archived_quality),
+        "all_archived_slots_no_valid_trading_quote_symbols": sorted(expected_set - full_symbols) if archived_quality else [],
+        "opening_quote_gap_symbols": sorted(expected_set - {s for s, state in opening.get("quote_row_classifications", {}).items()
+            if state == "full_ohlcv_valid"}) if opening else [],
+        "opening_transient_quote_gap_symbols": sorted(full_symbols - {s for s, state in opening.get("quote_row_classifications", {}).items()
+            if state == "full_ohlcv_valid"}) if opening else [],
+        "opening_quote_evidence_status": "observed" if opening else "missing",
+        "slot_quality": {slot: {k: v for k, v in q.items()
+            if k not in {"quote_row_classifications", "quote_row_reason_codes"}} for slot, q in slot_quality.items()},
         "field_verified_complete_slots": field_verified,
         "field_verified_complete_slot_count": len(field_verified),
         "field_partial_slot_count": len(archived_quality) - len(field_verified),
@@ -1803,7 +1853,10 @@ def collect_market_snapshot(
     root = Path(project_root).expanduser().resolve()
     current = _as_shanghai(now)
     trade_date = current.date().isoformat()
-    expected_symbols = _load_symbols(root, symbols)
+    roster = load_roster_evidence(root, target_date=trade_date) if symbols is None else {
+        "identity_status": "explicit_request", "symbols": _load_symbols(root, symbols), "as_of": trade_date,
+        "source": "injected_request", "accepted": None, "reason_codes": []}
+    expected_symbols = roster["symbols"]
     base: dict[str, Any] = {
         "schema_version": "a0_snapshot_history_v1",
         "trade_date": trade_date,
@@ -1831,6 +1884,7 @@ def collect_market_snapshot(
         "ai_input": False,
         "latest_overwrite": False,
         "producer_provenance": dict(provenance or {}),
+        "roster_evidence": {k: v for k, v in roster.items() if k != "symbols"},
     }
     if dry_run:
         base.update(status="dry_run", reason_codes=["dry_run_no_provider_or_write"])
@@ -1921,6 +1975,9 @@ def _collect_locked(
         attempt_started_at=started_at.isoformat(timespec="seconds"),
         code_version=_capture_code_version(started_at),
     )
+    base["producer_provenance"].update(writer="a0_history_only_snapshot_collector",
+        code_version=base["code_version"], roster_evidence=base["roster_evidence"],
+        universe_sha256=_universe_hash(expected_symbols))
     fetch_started = time_module.monotonic()
     try:
         result = _call_fetcher(fetcher or default_network_fetch, current, expected_symbols)
@@ -2114,7 +2171,7 @@ def snapshot_day_summary(
     """
 
     root = Path(project_root).expanduser().resolve()
-    expected_symbols = _load_symbols(root, symbols)
+    expected_symbols = _load_symbols(root, symbols, target_date=str(trade_date)[:10])
     payload = _manifest(
         root, str(trade_date)[:10], include_close=include_close,
         expected_symbols=expected_symbols, as_of=as_of,

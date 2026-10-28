@@ -555,7 +555,12 @@ def read_runtime_observations(project_root: str | Path, *, report_date: str | No
     declared_date = manifest.get("trade_date")
     if declared_date != target_date:
         manifest = {}
-    collected = count(manifest.get("collected_slot_count"))
+    strict_collected = count(manifest.get("collected_slot_count"))
+    archived = count(manifest.get("archived_slot_count"))
+    # Legacy manifests have only the old counter. Never infer received files
+    # from strict quality failures when a separately recorded archive exists.
+    collected = archived if archived is not None else strict_collected
+    fields_complete = count(manifest.get("field_verified_complete_slot_count"))
     expected = count(manifest.get("expected_slot_count"))
     quoted = count(manifest.get("quoted_row_count"))
     valid = count(manifest.get("valid_quote_count"))
@@ -565,7 +570,11 @@ def read_runtime_observations(project_root: str | Path, *, report_date: str | No
         collected = expected = None
         message = "采集次数尚无可靠记录；数量未知"
     else:
-        message = f"已采集 {collected}/{expected} 次"
+        message = f"已收到 {collected}/{expected} 份"
+        if strict_collected is not None:
+            message += f"；严格时段合格 {strict_collected}/{expected}"
+        if fields_complete is not None:
+            message += f"；字段完整 {fields_complete}/{expected}"
     if ratio is not None:
         message += f"；{ratio:.2%} 的报价通过检查，缺失或无效 {invalid} 条"
     else:
@@ -576,6 +585,8 @@ def read_runtime_observations(project_root: str | Path, *, report_date: str | No
         "snapshot": {
             "as_of": target_date, "document_report_date": day(report_date),
             "source": source, "collected_slots": collected, "expected_slots": expected,
+            "received_slots": collected, "archived_slots": archived,
+            "strict_qualified_slots": strict_collected, "field_complete_slots": fields_complete,
             "quoted_rows": quoted, "valid_quotes": valid, "invalid_quotes": invalid,
             "valid_quote_ratio": ratio, "blocks_workflow": False, "message": message,
         },

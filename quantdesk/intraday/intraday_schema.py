@@ -14,6 +14,7 @@ import pandas as pd
 
 from quantdesk.csv_io import read_csv_frame
 from quantdesk.intraday.minute_storage import resolve_minute_read_path
+from quantdesk.intraday.minute_bar_lifecycle import LIFECYCLE_COLUMNS, select_bar_observations
 from quantdesk.shared import normalize_symbol, now_text, safe_float
 
 STANDARD_COLUMNS = [
@@ -268,6 +269,14 @@ def normalize_intraday_frame(
         return {"ok": True, "frame": pd.DataFrame(columns=STANDARD_COLUMNS), "warnings": ["输入文件没有分钟线记录。"], "errors": []}
 
     df = frame.rename(columns=normalize_intraday_columns(list(frame.columns))).copy()
+    try:
+        if not df.attrs.get("lifecycle_materialized"):
+            df = select_bar_observations(df)
+    except ValueError as exc:
+        return {"ok": False, "frame": pd.DataFrame(columns=STANDARD_COLUMNS),
+                "warnings": warnings, "errors": [str(exc)]}
+    if df.empty:
+        return {"ok": True, "frame": pd.DataFrame(columns=STANDARD_COLUMNS), "warnings": warnings, "errors": []}
     if "symbol" not in df.columns:
         df["symbol"] = default_symbol
     df["symbol"] = df["symbol"].map(normalize_symbol)
@@ -360,7 +369,17 @@ def normalize_intraday_frame(
 
     for col in REQUIRED_PRICE_COLUMNS + ["volume", "amount"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            if "evidence_hash" in df.columns:
+                # Python's float conversion matches observation_hash; pandas'
+                # string parser can round the same decimal differently.
+                def evidence_number(value: Any) -> float:
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        return float("nan")
+                df[col] = df[col].map(evidence_number)
+            else:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=REQUIRED_PRICE_COLUMNS).copy()
     if df.empty:
         return {"ok": False, "frame": pd.DataFrame(columns=STANDARD_COLUMNS), "warnings": warnings, "errors": errors or ["没有可用的分钟线价格记录。"], "price_only_intraday": price_only}
@@ -378,7 +397,7 @@ def normalize_intraday_frame(
     for col in STANDARD_COLUMNS:
         if col not in df.columns:
             df[col] = pd.NA
-    df = df[STANDARD_COLUMNS].reset_index(drop=True)
+    df = df[STANDARD_COLUMNS + [col for col in LIFECYCLE_COLUMNS if col in df.columns]].reset_index(drop=True)
     basis_values = sorted(
         {
             _normalize_price_basis_text(item)
@@ -413,6 +432,7 @@ def read_intraday_csv(
     default_symbol: str = "",
     target_date: str = "",
     encoding: str = "auto",
+    as_of: str = "",
 ) -> dict[str, Any]:
     requested_path = Path(path)
     path = resolve_minute_read_path(requested_path)
@@ -424,7 +444,9 @@ def read_intraday_csv(
     read_errors: list[str] = []
     read_warnings: list[str] = []
     for enc in encodings:
-        frame = read_csv_frame(path, encoding=enc)
+        # Validate the recorded evidence before numeric inference can round a
+        # price or strip leading zeroes from a symbol. Normalization follows.
+        frame = read_csv_frame(path, encoding=enc, dtype=str, keep_default_na=False)
         warnings = list(frame.attrs.get("warnings") or [])
         if any(item.startswith("csv_read_failed:") for item in warnings):
             read_errors.extend(warnings)
@@ -435,6 +457,47 @@ def read_intraday_csv(
         break
     if raw is None:
         return {"ok": False, "exists": True, "frame": pd.DataFrame(columns=STANDARD_COLUMNS), "warnings": [], "errors": [f"CSV 不可读：{'; '.join(read_errors)}"], "path": str(path)}
+    input_paths = [path]
+    if "evidence_hash" in raw.columns:
+        try:
+            raw = select_bar_observations(raw, as_of=as_of)
+        except ValueError as exc:
+            return {"ok": False, "exists": True, "frame": pd.DataFrame(columns=STANDARD_COLUMNS),
+                    "warnings": [], "errors": [str(exc)], "path": str(path)}
+        # Preserve known raw historical observations. Unknown-basis legacy
+        # evidence stays separate; it cannot acquire raw from the new segment.
+        from quantdesk.intraday.minute_bar_lifecycle import LIFECYCLE_DIR
+        if path.parent.name == LIFECYCLE_DIR and not as_of:
+            candidates = list(dict.fromkeys([requested_path, path.parent.parent / path.name]))
+            older = []
+            for candidate in candidates:
+                if candidate == path or not candidate.is_file():
+                    continue
+                old_raw = read_csv_frame(candidate, encoding=used_encoding)
+                if ("price_basis" not in old_raw.columns or
+                        set(old_raw["price_basis"].astype(str).str.strip().str.lower()) != {"raw"}):
+                    read_warnings.append(f"historical_segment_basis_unverified:{candidate.name}")
+                    continue
+                normalized_old = normalize_intraday_frame(old_raw, default_symbol=default_symbol)
+                if not normalized_old.get("ok"):
+                    read_warnings.append(f"historical_segment_invalid:{candidate.name}")
+                    continue
+                older.append(normalized_old["frame"])
+                input_paths.append(candidate)
+            if older:
+                raw = pd.concat([*older, raw], ignore_index=True).drop_duplicates(["symbol", "datetime"], keep="last")
+                raw.attrs["lifecycle_materialized"] = True
+                read_warnings.append("historical_raw_observations_retained_with_unverified_finality")
+    if as_of:
+        try:
+            if not raw.attrs.get("lifecycle_materialized"):
+                raw = select_bar_observations(raw, as_of=as_of)
+            # It is now a materialized as-of view, not a full revision log.
+            # Keep metadata but avoid validating a partial chain a second time.
+            raw.attrs["lifecycle_materialized"] = True
+        except ValueError as exc:
+            return {"ok": False, "exists": True, "frame": pd.DataFrame(columns=STANDARD_COLUMNS),
+                    "warnings": [], "errors": [str(exc)], "path": str(path)}
     normalized_input_columns = set(
         normalize_intraday_columns(list(raw.columns)).values()
     )
@@ -445,10 +508,16 @@ def read_intraday_csv(
     payload["warnings"] = read_warnings + list(payload.get("warnings") or [])
     if path != requested_path:
         payload["requested_path"] = str(requested_path)
-        payload["warnings"].append(f"legacy_price_basis_unknown:{requested_path.name}; legacy rows not merged")
+        if path.parent.name == "lifecycle_v1":
+            payload["warnings"].append(f"minute_lifecycle_segment_selected:{requested_path.name}")
+        else:
+            payload["warnings"].append(f"legacy_price_basis_unknown:{requested_path.name}; legacy rows not merged")
     payload["exists"] = True
     payload["path"] = str(path)
     payload["encoding"] = used_encoding
+    payload["input_paths"] = [str(item) for item in input_paths]
+    import hashlib
+    payload["input_hashes"] = {str(item): hashlib.sha256(item.read_bytes()).hexdigest() for item in input_paths}
     return payload
 
 
@@ -754,7 +823,15 @@ def build_intraday_quality_gate(
         and sufficient_rows
         and not price_only
     )
-    eligible = ohlcv_complete
+    from quantdesk.intraday.minute_bar_lifecycle import frame_bar_evidence
+    bar_evidence = frame_bar_evidence(df)
+    gate["bar_evidence"] = bar_evidence
+    gate["finalized_signal_eligible"] = ohlcv_complete and bar_evidence["signal_eligible"]
+    gate["validation_scope"] = "minute_lifecycle_v1" if bar_evidence["lifecycle_present"] else "legacy_fields_only"
+    # Field completeness is observable even for legacy rows. It cannot supply
+    # missing finality, units or provenance to any signal consumer.
+    eligible = ohlcv_complete and bar_evidence["signal_eligible"]
+    warnings.extend(bar_evidence["reason_codes"])
 
     if price_only:
         gate.update({
@@ -784,8 +861,8 @@ def build_intraday_quality_gate(
         "status": "ok",
         "data_quality": "full_ohlcv",
         "ohlcv_complete": True,
-        "volume_semantics": "per_minute",
-        "signal_capability": "full_minute_ohlcv",
+        "volume_semantics": "per_minute" if eligible else "unknown",
+        "signal_capability": "full_minute_ohlcv" if eligible else "none",
         "signal_eligible": bool(eligible),
         "ohlcv_signal_eligible": bool(eligible),
     })

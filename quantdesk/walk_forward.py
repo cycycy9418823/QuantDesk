@@ -10,6 +10,7 @@ They do not constitute investment advice.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -22,13 +23,15 @@ from quantdesk.backtest_metrics import (
     compute_trade_metrics,
     summarize_windows,
 )
-from quantdesk.board_rules import classify_board, is_limit_down, is_limit_up
+from quantdesk.board_rules import classify_board, limit_fill_check
 from quantdesk.corporate_action_repair import repair_corporate_actions
 from quantdesk.csv_io import read_csv_frame
 from quantdesk.data_quality import DataGrade, assess_daily_frame_grade
+from quantdesk.data_truth.daily_bar_validity import daily_bar_validity_from_row
 from quantdesk.indicators import add_indicators
 from quantdesk.paper.market_rules import round_notional_down_to_lot_quantity
 from quantdesk.paper.trade_costs import TradeCostConfig, compute_trade_costs
+from quantdesk.price_basis import classify_frame_price_basis, validate_price_frame_set
 from quantdesk.strategy_conditions import evaluate_conditions
 from quantdesk.strategy_registry import StrategyDefinition, get_strategy
 
@@ -60,25 +63,23 @@ def generate_windows(
     return windows
 
 
-def load_daily_csv(path: Path) -> pd.DataFrame:
-    """Read a single daily CSV and return a normalised DataFrame.
+def _prepare_daily_frame(frame: pd.DataFrame, path: Path, *, as_of: str = "") -> pd.DataFrame:
+    """Validate the original frame, then restate only information known by as_of."""
 
-    ``data/daily`` is ``adjust=raw``, so the price columns carry split/dividend
-    cliffs that are not real moves (300259 prints -58% on 2018-05-23 where its own
-    ``pct_chg`` says -7.31%; 84% of files contain at least one). Every indicator
-    downstream is backward-looking, so an unrepaired cliff deforms MA/RSI/Bollinger
-    for ~20 bars and fabricates signals. Repairing here covers every caller of this
-    loader at once.
-    """
-
-    if not path.exists():
-        return pd.DataFrame()
-    df = read_csv_frame(path)
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        # The back-adjustment anchors on the latest bar, so order matters.
-        df = df.sort_values("date").reset_index(drop=True)
-    repaired, info = repair_corporate_actions(df)
+    basis, reason = classify_frame_price_basis(frame)
+    gate = validate_price_frame_set({path.stem: frame}, consumer="backtest")
+    if not gate["eligible"]:
+        raise ValueError("walk_forward_price_contract:" + ",".join(gate["reason_codes"]))
+    df = frame.copy()
+    if "date" not in df or "close" not in df:
+        empty = pd.DataFrame()
+        empty.attrs["warnings"] = [f"daily_required_columns_missing:{path.stem}"]
+        return empty
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if as_of:
+        df = df.loc[df["date"] <= pd.Timestamp(as_of)].copy()
+    df = df.dropna(subset=["date"]).sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    repaired, info = repair_corporate_actions(df) if basis == "raw" else (df, {"ca_bars": 0})
     if info.get("unverifiable"):
         # A large move that pct_chg cannot corroborate cannot be repaired, and
         # measuring it anyway would quietly poison the result.
@@ -86,10 +87,28 @@ def load_daily_csv(path: Path) -> pd.DataFrame:
         empty.attrs["warnings"] = [f"corporate_action_unverifiable:{path.stem}"]
         return empty
     if info.get("ca_bars"):
+        repaired["adjust"] = "qfq"
+        if "price_basis" in repaired:
+            repaired["price_basis"] = "qfq"
+        repaired["research_restatement"] = "reported_return_proxy"
         repaired.attrs["warnings"] = list(repaired.attrs.get("warnings") or []) + [
-            f"corporate_action_repaired:{path.stem}:{info['ca_bars']}"
+            f"corporate_action_repaired:{path.stem}:{info['ca_bars']}:research_proxy"
         ]
+    effective_basis, _ = classify_frame_price_basis(repaired)
+    repaired.attrs.update(original_price_basis=basis, price_basis=effective_basis,
+        price_basis_reason=reason, information_cutoff=as_of or "latest_input",
+        real_execution_price=False,
+        execution_price_role="raw_market_bar_research_proxy" if effective_basis == "raw" else "same_basis_research_proxy")
     return repaired
+
+
+def load_daily_csv(path: Path, *, as_of: str = "") -> pd.DataFrame:
+    """Read complete original prices before applying the research cutoff."""
+
+    frame = read_csv_frame(path)
+    if frame.empty:
+        return frame
+    return _prepare_daily_frame(frame, path, as_of=as_of)
 
 
 def _check_data_grade(
@@ -197,9 +216,8 @@ def _simulate_trades(
 ) -> tuple[list[TradeRecord], list[float]]:
     """Run a simple long-only single-position simulation.
 
-    Returns (trades, equity_curve). Signals are produced on day T and execute
-    on the next row's open when available. Close is only a compatibility
-    fallback for legacy data that lacks an open column.
+    Returns (trades, equity_curve). Signals execute on the next dated, valid
+    OHLCV row's open. Missing execution evidence cannot supply a fill.
 
     ``force_close_at_end`` (default off, so existing callers are unchanged)
     liquidates a still-open position on the final bar and records it as a trade.
@@ -209,6 +227,9 @@ def _simulate_trades(
     """
     trades: list[TradeRecord] = []
     equity: list[float] = [initial_cash]
+    gate = validate_price_frame_set({symbol or "requested_symbol": df}, consumer="backtest")
+    if not gate["eligible"]:
+        raise ValueError("walk_forward_price_contract:" + ",".join(gate["reason_codes"]))
     cash = initial_cash
     position = 0
     entry_price = 0.0
@@ -240,16 +261,28 @@ def _simulate_trades(
     close_col = "close" if "close" in merged.columns else None
     if close_col is None:
         return trades, equity
+    if "date" not in merged:
+        return trades, equity
     execution_col = "open" if "open" in merged.columns else close_col
 
     dates = merged["date"].tolist()
     closes = merged[close_col].tolist()
     execution_prices = merged[execution_col].tolist()
-    has_ohlc = all(col in merged.columns for col in ("open", "high", "low"))
-    opens = merged["open"].tolist() if "open" in merged.columns else closes
-    highs = merged["high"].tolist() if "high" in merged.columns else closes
-    lows = merged["low"].tolist() if "low" in merged.columns else closes
     board_lot = max(1, int(classify_board(str(symbol or "")).lot_size or 100))
+    last_mark = next((float(value) for value in closes if pd.notna(value) and math.isfinite(float(value)) and value > 0), 0.)
+
+    def can_fill(index: int, side: str, price: float, previous: float | None) -> bool:
+        row = merged.iloc[index].to_dict()
+        valid, _reason = daily_bar_validity_from_row(row)
+        if not valid or any(not math.isfinite(float(row[key])) for key in ("open", "high", "low", "close", "volume")):
+            return False
+        if str(row.get("suspended") or row.get("is_suspended") or "").lower() in {"true", "1"}:
+            return False
+        base = row.get("pre_close", row.get("prev_close"))
+        if base is None or pd.isna(base):
+            base = previous
+        return bool(limit_fill_check(symbol, side, price=price, trade_date=dates[index],
+            pre_close=base, pct_chg=row.get("pct_chg"), name=row.get("name"))["ok"])
 
     for i in range(len(dates) - 1):
         today = pd.Timestamp(dates[i]).normalize() if pd.notna(dates[i]) else None
@@ -259,25 +292,25 @@ def _simulate_trades(
         sig = signal_map.get(today)
         next_close = closes[i + 1]
         next_exec_price = execution_prices[i + 1]
-        if pd.isna(next_close) or next_close <= 0 or pd.isna(next_exec_price) or next_exec_price <= 0:
-            equity.append(equity[-1])
+        if pd.notna(next_close) and math.isfinite(float(next_close)) and next_close > 0:
+            last_mark = float(next_close)
+        if (pd.isna(next_exec_price) or not math.isfinite(float(next_exec_price)) or next_exec_price <= 0
+                or pd.isna(dates[i + 1]) or pd.Timestamp(dates[i + 1]).normalize() <= today):
+            equity.append(cash + position * last_mark)
             continue
 
         if sig == "entry" and position == 0:
-            # A next-day one-word limit-up bar cannot be bought into; assuming a
-            # fill there would fabricate an unreachable entry.
-            change_pct = _next_bar_change_pct(closes[i], closes[i + 1])
-            if (
-                has_ohlc
-                and change_pct is not None
-                and _is_one_word_bar(opens[i + 1], highs[i + 1], lows[i + 1], closes[i + 1])
-                and is_limit_up(change_pct=change_pct / 100.0, symbol=str(symbol or ""),
-                                trade_date=dates[i + 1])
-            ):
-                equity.append(cash + position * (closes[i + 1] if not pd.isna(closes[i + 1]) else closes[i]))
-                continue
             exec_price = next_exec_price * (1.0 + slip_rate)
+            if not can_fill(i + 1, "buy", exec_price, closes[i]):
+                equity.append(cash + position * last_mark)
+                continue
             shares = round_notional_down_to_lot_quantity(cash * max_position_pct, exec_price, lot_size=board_lot)
+            while shares > 0:
+                gross = shares * exec_price
+                cost = float(compute_trade_costs(side="buy", gross=gross, config=cost_config)["total_fee"])
+                if gross + cost <= cash:
+                    break
+                shares -= board_lot
             if shares > 0:
                 gross = shares * exec_price
                 buy_costs = compute_trade_costs(side="buy", gross=gross, config=cost_config)
@@ -288,19 +321,11 @@ def _simulate_trades(
                 entry_cost = cost
                 entry_date = pd.Timestamp(dates[i + 1]).strftime("%Y-%m-%d") if pd.notna(dates[i + 1]) else ""
         elif sig == "exit" and position > 0:
-            # A next-day one-word limit-down bar cannot be sold into; keep the
-            # position instead of fabricating an unreachable exit fill.
-            change_pct = _next_bar_change_pct(closes[i], closes[i + 1])
-            if (
-                has_ohlc
-                and change_pct is not None
-                and _is_one_word_bar(opens[i + 1], highs[i + 1], lows[i + 1], closes[i + 1])
-                and is_limit_down(change_pct=change_pct / 100.0, symbol=str(symbol or ""),
-                                  trade_date=dates[i + 1])
-            ):
-                equity.append(cash + position * (closes[i + 1] if not pd.isna(closes[i + 1]) else closes[i]))
-                continue
             exec_price = next_exec_price * (1.0 - slip_rate)
+            if (pd.Timestamp(dates[i + 1]).normalize() <= pd.Timestamp(entry_date)
+                    or not can_fill(i + 1, "sell", exec_price, closes[i])):
+                equity.append(cash + position * last_mark)
+                continue
             revenue = position * exec_price
             sell_costs = compute_trade_costs(side="sell", gross=revenue, config=cost_config)
             exit_fee = float(sell_costs["total_fee"])
@@ -336,19 +361,17 @@ def _simulate_trades(
             entry_price = 0.0
             entry_cost = 0.0
 
-        mark_price = closes[i + 1] if not pd.isna(closes[i + 1]) else closes[i]
-        equity.append(cash + position * mark_price)
+        equity.append(cash + position * last_mark)
 
     if force_close_at_end and position > 0:
         # Liquidate on the last available bar so an unexited position still lands
         # in the sample. Priced at the final close (the last mark we can observe)
         # with the same slippage and sell costs a real exit would pay.
-        final_price = None
-        for candidate in reversed(closes):
-            if not pd.isna(candidate) and candidate > 0:
-                final_price = float(candidate)
-                break
-        if final_price is not None:
+        final_price = float(closes[-1]) if closes and pd.notna(closes[-1]) else None
+        final_date = pd.Timestamp(dates[-1]).normalize() if dates and pd.notna(dates[-1]) else None
+        if (final_price is not None and math.isfinite(final_price) and final_price > 0
+                and final_date is not None and final_date > pd.Timestamp(entry_date)
+                and can_fill(len(dates) - 1, "sell", final_price * (1.0 - slip_rate), closes[-2])):
             exec_price = final_price * (1.0 - slip_rate)
             revenue = position * exec_price
             sell_costs = compute_trade_costs(side="sell", gross=revenue, config=cost_config)
@@ -387,6 +410,7 @@ def _simulate_trades(
                 forced_close=True,
             ))
             position = 0
+            equity[-1] = cash
 
     return trades, equity
 
@@ -519,12 +543,29 @@ def run_single_window(
     valid_count = 0
     skipped_count = 0
     invalid_count = 0
+    input_warnings: list[str] = []
+    original_frames = {symbol: read_csv_frame(daily_dir / f"{symbol}.csv") for symbol in dict.fromkeys(symbols)}
+    present_frames = {symbol: frame for symbol, frame in original_frames.items() if not frame.empty}
+    if present_frames:
+        price_gate = validate_price_frame_set(present_frames, consumer="backtest")
+        if not price_gate["eligible"]:
+            raise ValueError("walk_forward_price_contract:" + ",".join(price_gate["reason_codes"]))
+        input_warnings.append(f"original_price_basis:{price_gate['accepted_price_basis']}")
 
-    for symbol in symbols:
+    for symbol in dict.fromkeys(symbols):
         csv_path = daily_dir / f"{symbol}.csv"
-        df = load_daily_csv(csv_path)
+        original = original_frames[symbol]
+        read_warnings = list(original.attrs.get("warnings") or [])
+        input_warnings.extend(read_warnings)
+        if original.empty or any(item.startswith(("csv_parse_failed:", "csv_read_failed:")) for item in read_warnings):
+            skipped_count += 1
+            input_warnings.append(f"excluded_daily_unreadable_or_missing:{symbol}")
+            continue
+        df = _prepare_daily_frame(original, csv_path, as_of=str(test_end.date()))
+        input_warnings.extend(df.attrs.get("warnings") or [])
         if df.empty:
             skipped_count += 1
+            input_warnings.append(f"excluded_no_asof_data_or_unverifiable:{symbol}")
             continue
         # Safe to run now: measured on a 120-file sample post-repair, deep validation
         # downgrades zero symbols, because the return spikes it was built to catch
@@ -533,6 +574,7 @@ def run_single_window(
         allowed, reason = _check_data_grade(df, min_data_grade, deep_validate=deep_validate)
         if not allowed:
             invalid_count += 1
+            input_warnings.append(f"excluded_data_grade:{symbol}:{reason}")
             continue
         if "date" not in df.columns:
             skipped_count += 1
@@ -540,6 +582,7 @@ def run_single_window(
         test_df = df[(df["date"] >= test_start) & (df["date"] <= test_end)].copy()
         if len(test_df) < min_test_days:  # v3.7.0.1 提升最低测试天数
             skipped_count += 1
+            input_warnings.append(f"excluded_short_window:{symbol}:{len(test_df)}")
             continue
         valid_count += 1
         signals = _simple_strategy_signals(test_df, strategy)
@@ -566,7 +609,9 @@ def run_single_window(
     else:
         all_equity = []
     equity_metrics = compute_equity_metrics(all_equity) if all_equity else {}
-    warnings: list[str] = []
+    warnings: list[str] = list(dict.fromkeys(input_warnings))
+    if skipped_count or invalid_count:
+        warnings.append(f"partial_requested_universe:{len(set(symbols))}:loaded={valid_count}:skipped={skipped_count}:invalid={invalid_count}")
     if trade_metrics["trades_count"] < min_trades_for_valid:
         warnings.append(
             f"交易次数 {trade_metrics['trades_count']} 不足 {min_trades_for_valid} 笔，"
@@ -658,6 +703,7 @@ def run_walk_forward(
         window_results.append(result)
 
     summary = summarize_windows(window_results)
+    summary.warnings.extend(dict.fromkeys(warning for result in window_results for warning in result.warnings))
     summary.strategy = strategy.strategy_id
     summary.start_date = start_date
     summary.end_date = end_date

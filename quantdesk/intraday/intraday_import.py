@@ -28,6 +28,7 @@ from quantdesk.intraday.intraday_schema import (
     normalize_intraday_frame,
     read_intraday_csv,
 )
+from quantdesk.intraday.minute_bar_lifecycle import LIFECYCLE_COLUMNS
 from quantdesk.paper.position_management_engine import simulate_conditional_plan_file
 from quantdesk.shared import normalize_symbol, now_text, write_json
 
@@ -100,7 +101,7 @@ def _read_input_csv(path: Path, *, encoding: str = "auto") -> tuple[pd.DataFrame
     encodings = SUPPORTED_ENCODINGS if not encoding or encoding == "auto" else (encoding,)
     errors: list[str] = []
     for enc in encodings:
-        frame = read_csv_frame(path, encoding=enc)
+        frame = read_csv_frame(path, encoding=enc, dtype=str, keep_default_na=False)
         warnings = list(frame.attrs.get("warnings") or [])
         if any(item.startswith("csv_read_failed:") for item in warnings):
             errors.extend(warnings)
@@ -244,6 +245,22 @@ def import_intraday_1m_file(
         write_json(output_path, result)
         return result
 
+    write_frame = frame
+    if "evidence_hash" in raw.columns:
+        # Normalization returns one current row per minute. Keep the original
+        # validated chain for writes, including every superseded observation.
+        write_frame = raw.copy()
+        stamps = pd.to_datetime(write_frame["datetime"], errors="coerce")
+        if target_date:
+            write_frame = write_frame.loc[stamps.dt.strftime("%Y-%m-%d") == target_date[:10]].copy()
+        write_frame["date"] = stamps.loc[write_frame.index].dt.strftime("%Y-%m-%d")
+        write_frame["time"] = stamps.loc[write_frame.index].dt.strftime("%H:%M:%S")
+        for column in STANDARD_COLUMNS:
+            if column not in write_frame.columns:
+                # Only compatibility labels may be supplied at import. Missing
+                # signed values stay empty so their evidence hash is unchanged.
+                write_frame[column] = source if column == "source" else now_text() if column == "updated_at" else ""
+
     if canonical_apply:
         observed_dates = sorted(
             {
@@ -279,10 +296,11 @@ def import_intraday_1m_file(
             for item in frame["symbol"].dropna().astype(str).unique().tolist()
             if normalize_symbol(item)
         ]
-        for sym, group in frame.groupby("symbol", sort=True):
+        for sym, group in write_frame.groupby("symbol", sort=True):
             normalized = normalize_symbol(sym)
             if normalized:
-                staged_group = group[STANDARD_COLUMNS].copy()
+                columns = STANDARD_COLUMNS + [column for column in LIFECYCLE_COLUMNS if column in group.columns]
+                staged_group = group[columns].copy()
                 staged_group["price_only_intraday"] = False
                 staged_group.to_csv(
                     staging_dir / f"{normalized}.csv",
@@ -335,13 +353,18 @@ def import_intraday_1m_file(
     target_dir.mkdir(parents=True, exist_ok=True)
     updated_files: list[str] = []
     imported_rows = 0
-    for sym, group in frame.groupby("symbol", sort=True):
+    for sym, group in write_frame.groupby("symbol", sort=True):
         norm = normalize_symbol(sym)
         if not norm:
             continue
         target_path = target_dir / f"{norm}.csv"
-        merged = _merge_intraday(target_path, group.copy(), overwrite=overwrite, append=append)
-        merged.to_csv(target_path, index=False, encoding="utf-8-sig")
+        if "evidence_hash" in group.columns:
+            from quantdesk.intraday.intraday_update_engine import _merge_and_write
+            target_path = _merge_and_write(norm, group.copy(), overwrite=overwrite,
+                                           append=append, base_dir=target_dir)
+        else:
+            merged = _merge_intraday(target_path, group.copy(), overwrite=overwrite, append=append)
+            merged.to_csv(target_path, index=False, encoding="utf-8-sig")
         updated_files.append(str(target_path.relative_to(PROJECT_ROOT)) if target_path.is_absolute() and PROJECT_ROOT in target_path.parents else str(target_path))
         imported_rows += int(len(group))
     result.update({

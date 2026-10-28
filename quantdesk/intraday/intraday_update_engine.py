@@ -8,6 +8,8 @@ orders.
 from __future__ import annotations
 
 # Compatibility markers: update_intraday_1m_for_symbols provider_results full_scan tencent_intraday.
+import csv
+import io
 import os
 import tempfile
 import uuid
@@ -115,12 +117,41 @@ def _merge_and_write_unlocked(
     replace_target_date: str = "",
 ) -> Path:
     target = base_dir / f"{normalize_symbol(symbol)}.csv"
+    from quantdesk.intraday.minute_bar_lifecycle import (
+        LIFECYCLE_COLUMNS, lifecycle_write_path, merge_bar_observation_logs,
+        read_bar_observation_log,
+    )
+    lifecycle = "evidence_hash" in frame.columns
+    if lifecycle:
+        target = lifecycle_write_path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     write_columns = list(STANDARD_COLUMNS)
+    if lifecycle:
+        write_columns.extend(key for key in LIFECYCLE_COLUMNS if key in frame.columns)
     if STAGING_PRICE_ONLY_PROVENANCE_COLUMN in frame.columns:
         write_columns.append(STAGING_PRICE_ONLY_PROVENANCE_COLUMN)
     incoming = frame[write_columns].copy()
-    if target.exists() and append and not overwrite:
+    lifecycle_suffix: bytes | None = None
+    if lifecycle:
+        existing = pd.DataFrame()
+        if target.exists():
+            existing = read_bar_observation_log(target)
+        # A staging refresh cannot erase a final observation or its parent.
+        incoming = merge_bar_observation_logs(existing, incoming)
+        if not existing.empty:
+            known = set(existing["evidence_hash"])
+            new_events = incoming.loc[~incoming["evidence_hash"].isin(known)]
+            if new_events.empty:
+                return target
+            if list(existing.columns) != write_columns:
+                raise ValueError("minute_header_mismatch")
+            buffer = io.StringIO(newline="")
+            writer = csv.DictWriter(buffer, fieldnames=write_columns, lineterminator="\n")
+            writer.writerows(new_events[write_columns].to_dict("records"))
+            original = target.read_bytes()
+            separator = b"" if original.endswith((b"\n", b"\r")) else b"\n"
+            lifecycle_suffix = original + separator + buffer.getvalue().encode("utf-8")
+    elif target.exists() and append and not overwrite:
         existing_payload = read_intraday_csv(target, default_symbol=symbol)
         existing = existing_payload.get("frame")
         if isinstance(existing, pd.DataFrame) and not existing.empty:
@@ -137,7 +168,8 @@ def _merge_and_write_unlocked(
         incoming[STAGING_PRICE_ONLY_PROVENANCE_COLUMN] = incoming[
             STAGING_PRICE_ONLY_PROVENANCE_COLUMN
         ].fillna(False)
-    incoming = incoming.sort_values("datetime").drop_duplicates(subset=["symbol", "datetime"], keep="last")
+    if not lifecycle:
+        incoming = incoming.sort_values("datetime").drop_duplicates(subset=["symbol", "datetime"], keep="last")
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -150,7 +182,12 @@ def _merge_and_write_unlocked(
             delete=False,
         ) as handle:
             temp_path = Path(handle.name)
-            incoming[write_columns].to_csv(handle, index=False)
+            if lifecycle_suffix is None:
+                incoming[write_columns].to_csv(handle, index=False)
+            else:
+                # The BOM is managed by this text stream, so decode the one
+                # existing BOM instead of appending a second one.
+                handle.write(lifecycle_suffix.decode("utf-8-sig"))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, target)
@@ -158,6 +195,31 @@ def _merge_and_write_unlocked(
         if temp_path is not None and temp_path.exists():
             temp_path.unlink(missing_ok=True)
     return target
+
+
+def _lifecycle_write_frame(
+    source: pd.DataFrame, selected: pd.DataFrame, result: dict[str, Any], *,
+    symbol: str, target_date: str,
+) -> pd.DataFrame:
+    """Keep parent events when a provider exposes a materialized local view."""
+    from quantdesk.intraday.minute_bar_lifecycle import select_bar_observations, read_bar_observation_log
+
+    if "evidence_hash" not in selected.columns:
+        return selected.copy()
+    events = source.copy()
+    if source.attrs.get("lifecycle_materialized"):
+        path = result.get("path")
+        if path:
+            events = read_bar_observation_log(Path(path))
+    latest = select_bar_observations(events)
+    event_dates = events["datetime"].astype(str).str[:10]
+    events = events.loc[(event_dates == target_date[:10]) &
+                        (events["symbol"].map(normalize_symbol) == symbol)].copy()
+    latest = latest.loc[(latest["datetime"].astype(str).str[:10] == target_date[:10]) &
+                        (latest["symbol"].map(normalize_symbol) == symbol)]
+    if set(latest["evidence_hash"]) != set(selected["evidence_hash"]):
+        raise ValueError("minute_source_evidence_changed")
+    return events
 
 
 def _merge_and_write(
@@ -287,6 +349,7 @@ def update_intraday_1m_for_symbols(
                 pstat["suggested_next_action"] = result.get("suggested_next_action")
             frame = result.get("data")
             if result.get("status") == "ok" and isinstance(frame, pd.DataFrame) and not frame.empty:
+                source_frame = frame.copy()
                 normalized = normalize_intraday_frame(
                     frame,
                     default_symbol=symbol,
@@ -414,7 +477,14 @@ def update_intraday_1m_for_symbols(
                     symbol_failed.append(f"{provider}: {reason}")
                     continue
                 # Passed the gate (ohlcv_complete AND signal_eligible).
-                frame = frame.copy()
+                try:
+                    frame = _lifecycle_write_frame(
+                        source_frame, frame, result, symbol=symbol, target_date=trade_date)
+                except (OSError, ValueError, KeyError) as exc:
+                    pstat["failed"] += 1
+                    _append_failure(pstat, str(exc))
+                    symbol_failed.append(f"{provider}: {exc}")
+                    continue
                 frame[STAGING_PRICE_ONLY_PROVENANCE_COLUMN] = (
                     effective_price_only
                 )

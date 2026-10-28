@@ -8,13 +8,342 @@ read-only plan; applying it is an owner action outside this module.
 from __future__ import annotations
 
 import hashlib
+import base64
+import io
 import json
 import os
+import re
 import shutil
+import tarfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
+
+MAX_EVIDENCE_FILE_BYTES = 16 * 1024 * 1024
+MAX_EVIDENCE_TOTAL_BYTES = 128 * 1024 * 1024
+_EVIDENCE_NAMES = frozenset({"ledger.json", "plan_latest.json", "review_latest.json", "journal.jsonl",
+    "journal_latest.json", "decision_log.jsonl", "decision_latest.json", "hypotheses.json", "watchlist.json",
+    "philosophy.json", "daytime_notes.jsonl", "daytime_session.json", "daytime_intents.jsonl",
+    "llm_response_evidence.jsonl", "cycle_latest.json", "snapshot_latest.json", "decision_run_manifest.json",
+    "decision_page.html", "decision_page.md", "chat.jsonl"})
+
+
+def backup_transport_config(path: Path | str) -> dict[str, Any]:
+    """Read explicit transport locations without reading keys or permitting a call."""
+    config_path = Path(path).resolve()
+    if config_path.stat().st_size > 64 * 1024:
+        raise ValueError("backup_config_size_limit")
+    config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    allowed = {"project_root", "activation_plan", "ssh_key_path", "known_hosts_path", "remote",
+        "remote_backup_root", "remote_snapshot_root", "temp_root", "push_log", "pull_log", "keep",
+        "protected_snapshot", "network", "snapshot_cutoff"}
+    if not isinstance(config, dict) or set(config) - allowed:
+        raise ValueError("backup_config_unknown_or_secret_fields")
+    for key in ("project_root", "activation_plan", "ssh_key_path", "known_hosts_path", "temp_root", "push_log", "pull_log"):
+        if key in config:
+            target = Path(config[key])
+            config[key] = str(target if target.is_absolute() else (config_path.parent / target).resolve())
+    for key in ("remote_backup_root", "remote_snapshot_root"):
+        if key in config and not re.fullmatch(r"/[A-Za-z0-9_./-]+", config[key]):
+            raise ValueError("backup_remote_path_invalid")
+        if key in config and (".." in Path(config[key]).parts or config[key] == "/"):
+            raise ValueError("backup_remote_path_invalid")
+    if "remote" in config and not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+", config["remote"]):
+        raise ValueError("backup_remote_invalid")
+    if "keep" in config and (isinstance(config["keep"], bool) or not 1 <= int(config["keep"]) <= 1000):
+        raise ValueError("backup_retention_invalid")
+    if "network" in config and not isinstance(config["network"], bool):
+        raise ValueError("backup_network_flag_invalid")
+    return config
+
+
+def _allow_evidence_path(relative: Path) -> bool:
+    parts = relative.parts
+    if relative.is_absolute() or ".." in parts or not parts or any(":" in p for p in parts):
+        return False
+    if relative.as_posix() in {"state/auto_paper_portfolio.json", "docs/learning_log.md", "docs/owner_learning_log.md",
+        "results/strategy_decision_log_latest.json", "results/strategy_decision_review_latest.json",
+        "results/auto_paper_portfolio_latest.json", "results/auto_paper_portfolio_history.json"}:
+        return True
+    if len(parts) >= 3 and parts[0] in {"state", "results"} and parts[1] in {"ai_trader", "ai_trader_glm"}:
+        return ((len(parts) == 3 and parts[-1] in _EVIDENCE_NAMES)
+            or (len(parts) == 4 and parts[2] == "llm_requests" and parts[-1].endswith(".json"))
+            or (len(parts) == 4 and parts[0] == "state" and parts[2] == "execution_evidence"
+                and re.fullmatch(r"[0-9a-f]{64}\.json", parts[-1]) is not None))
+    return False
+
+
+def _read_evidence_bytes(root: Path, relative: Path) -> bytes:
+    if not _allow_evidence_path(relative):
+        raise ValueError("backup_path_not_allowlisted:" + relative.as_posix())
+    path = root / relative
+    if any(p.is_symlink() or getattr(p, "is_junction", lambda: False)() for p in (path, *path.parents) if p != root.parent):
+        raise ValueError("backup_symlink_or_junction:" + relative.as_posix())
+    if not path.resolve().is_relative_to(root) or path.stat().st_size > MAX_EVIDENCE_FILE_BYTES:
+        raise ValueError("backup_path_or_size_invalid:" + relative.as_posix())
+    return path.read_bytes()
+
+
+def _evidence_objects(relative: Path, raw: bytes) -> list[Any]:
+    if relative.suffix == ".jsonl":
+        return [json.loads(line) for line in raw.decode("utf-8-sig").splitlines() if line.strip()]
+    return [json.loads(raw.decode("utf-8-sig"))] if relative.suffix == ".json" else []
+
+
+def _check_evidence_object(obj: Any, relative: Path, *, expected_account: str | None) -> list[dict[str, str]]:
+    """Validate semantic references; absence is reported, never reconstructed."""
+    refs = []
+    def visit(value: Any, location: tuple[str, ...] = ()) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item, location)
+        elif isinstance(value, dict):
+            # The old cycle's top-level mandate is a shared configuration
+            # template. Its default ledger_id is not the recorded account.
+            # Keep its original bytes; all booked ledger/plan/receipt IDs still
+            # require the exact account identity.
+            template = location == ("mandate",) and relative.name in {"cycle_latest.json", "snapshot_latest.json"}
+            if (expected_account and not template and value.get("ledger_id") and value["ledger_id"] != expected_account):
+                raise ValueError("backup_account_identity_mismatch:" + relative.as_posix())
+            for key, item in value.items():
+                if re.fullmatch(r"(?:api[_-]?key|authorization|password|private[_-]?key|access[_-]?token)", str(key), re.I) and item:
+                    raise ValueError("backup_secret_content_excluded:" + relative.as_posix())
+                reference_key = key in {"capture_path", "evidence_path", "body_path", "manifest_path", "archive_path"}
+                reference_key |= relative.name == "decision_run_manifest.json" and key in {"page_html", "page_md", "log"}
+                if reference_key and isinstance(item, str) and item:
+                    expected_sha = value.get("capture_sha256") or value.get("file_sha256") or value.get("sha256")
+                    reference = {"path": item, "sha256": str(expected_sha or "")}
+                    if key == "archive_path":
+                        from ai_trader.execution_evidence import verify_execution_receipt
+
+                        receipt = value.get("receipt")
+                        evidence_id = value.get("evidence_id")
+                        if (not verify_execution_receipt(receipt) or evidence_id != receipt.get("evidence_id")
+                                or not re.fullmatch(r"[0-9a-f]{64}", str(evidence_id))):
+                            raise ValueError("backup_execution_receipt_invalid:" + relative.as_posix())
+                        reference["execution_evidence_id"] = str(evidence_id)
+                        reference["sha256"] = str(value.get("archive_sha256") or "")
+                        reference["receipt_sha256"] = hashlib.sha256(json.dumps(receipt, ensure_ascii=False,
+                            sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+                    refs.append(reference)
+                visit(item, (*location, str(key)))
+            if relative.name == "ledger.json" and expected_account and value is obj and value.get("ledger_id") != expected_account:
+                raise ValueError("backup_ledger_identity_missing:" + relative.as_posix())
+            body = value.get("http_body")
+            if isinstance(body, dict) and body.get("body_base64") is not None:
+                retained = base64.b64decode(body["body_base64"], validate=True)
+                if len(retained) != body.get("retained_bytes"):
+                    raise ValueError("backup_response_body_length_mismatch")
+                if body.get("byte_exact") is True and hashlib.sha256(retained).hexdigest() != body.get("received_sha256"):
+                    raise ValueError("backup_response_body_hash_mismatch")
+                if body.get("byte_exact") is True:
+                    try:
+                        body_object = json.loads(retained)
+                    except (ValueError, UnicodeError):
+                        if b"-----BEGIN PRIVATE KEY" in retained or re.search(rb'(?i)(authorization|api[_-]?key|access[_-]?token)\s*[=:]', retained):
+                            raise ValueError("backup_response_secret_content_excluded")
+                    else:
+                        visit(body_object, (*location, "http_body_decoded"))
+    visit(obj)
+    return refs
+
+
+def _verify_execution_reference(relative: Path, raw: bytes, reference: Mapping[str, str]) -> None:
+    """Bind an independent archive to the unchanged receipt embedded in a trade."""
+    if not reference.get("execution_evidence_id"):
+        return
+    from ai_trader.execution_evidence import verify_execution_receipt
+
+    receipt = json.loads(raw.decode("utf-8-sig"))
+    digest = hashlib.sha256(json.dumps(receipt, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+    if (relative.name != reference["execution_evidence_id"] + ".json"
+            or not verify_execution_receipt(receipt)
+            or receipt.get("evidence_id") != reference["execution_evidence_id"]
+            or digest != reference["receipt_sha256"]):
+        raise ValueError("backup_execution_archive_binding_mismatch:" + relative.as_posix())
+
+
+def build_backup_evidence_closure(source_root: Path | str, *, seed_paths: list[str] | None = None,
+                                 reference_origin_root: Path | str | None = None) -> dict[str, Any]:
+    """Bounded allowlisted dependency closure for three formal paper ledgers."""
+    root = Path(source_root).resolve()
+    origin = Path(reference_origin_root).resolve() if reference_origin_root is not None else root
+    required = ["state/auto_paper_portfolio.json", "state/ai_trader/ledger.json", "state/ai_trader_glm/ledger.json"]
+    pending = list(seed_paths if seed_paths is not None else required)
+    if seed_paths is None:
+        for bucket in ("state", "results"):
+            for account in ("ai_trader", "ai_trader_glm"):
+                pending.extend((Path(bucket) / account / name).as_posix() for name in _EVIDENCE_NAMES
+                    if (root / bucket / account / name).is_file())
+        pending.extend(p.as_posix() for p in (Path("docs/learning_log.md"),
+            Path("results/auto_paper_portfolio_latest.json"), Path("results/auto_paper_portfolio_history.json"),
+            Path("results/strategy_decision_log_latest.json"), Path("results/strategy_decision_review_latest.json")) if (root / p).is_file())
+    content: dict[str, bytes] = {}
+    references = []
+    errors: list[str] = []
+    total = 0
+    while pending and len(content) < 1000:
+        rel = Path(pending.pop(0))
+        if rel.as_posix() in content:
+            continue
+        try:
+            raw = _read_evidence_bytes(root, rel)
+            total += len(raw)
+            if total > MAX_EVIDENCE_TOTAL_BYTES:
+                raise ValueError("backup_total_size_limit")
+            account = "ai_trader_100k_glm" if "ai_trader_glm" in rel.parts else "ai_trader_100k" if "ai_trader" in rel.parts else None
+            for obj in _evidence_objects(rel, raw):
+                for ref in _check_evidence_object(obj, rel, expected_account=account):
+                    target = Path(ref["path"])
+                    target = target.relative_to(origin) if target.is_absolute() and target.is_relative_to(origin) else target
+                    target = target.relative_to(root) if target.is_absolute() and target.is_relative_to(root) else target
+                    if not _allow_evidence_path(target):
+                        raise ValueError("backup_reference_path_not_allowlisted:" + ref["path"])
+                    if account and "ai_trader" in target.parts and account != "ai_trader_100k":
+                        raise ValueError("backup_cross_account_reference")
+                    if account and "ai_trader_glm" in target.parts and account != "ai_trader_100k_glm":
+                        raise ValueError("backup_cross_account_reference")
+                    target_raw = _read_evidence_bytes(root, target)
+                    _verify_execution_reference(target, target_raw, ref)
+                    digest = hashlib.sha256(target_raw).hexdigest()
+                    if ref["sha256"] and ref["sha256"] != digest:
+                        raise ValueError("backup_reference_hash_mismatch:" + target.as_posix())
+                    references.append({"from": rel.as_posix(), "path": target.as_posix(), "sha256": digest,
+                        "reference_declared_hash": ref["sha256"],
+                        "binding_status": "embedded_execution_receipt_match" if ref.get("execution_evidence_id") else
+                            "declared_hash_match" if ref["sha256"] else "frozen_backup_bytes_only"})
+                    pending.append(target.as_posix())
+            content[rel.as_posix()] = raw
+        except (OSError, ValueError, TypeError, UnicodeError) as exc:
+            errors.append(type(exc).__name__ + ":" + str(exc))
+    if pending:
+        errors.append("backup_file_count_limit")
+    files = [{"path": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        for name, raw in sorted(content.items())]
+    return {"ok": not errors, "status": "ready" if not errors else "blocked", "files": files,
+        "contents": content, "references": references, "errors": errors, "bytes": total,
+        "network_used": False, "runtime_written": False, "source_root": str(root), "reference_origin_root": str(origin)}
+
+
+def pack_backup_evidence(source_root: Path | str, archive_path: Path | str, *, seed_paths: list[str] | None = None,
+                         reference_origin_root: Path | str | None = None) -> dict[str, Any]:
+    source, target = Path(source_root).resolve(), Path(archive_path).resolve()
+    _assert_external_destination(source, target)
+    closure = build_backup_evidence_closure(source, seed_paths=seed_paths, reference_origin_root=reference_origin_root)
+    if not closure["ok"]:
+        return {k: v for k, v in closure.items() if k != "contents"}
+    if target.exists():
+        raise FileExistsError("backup_archive_already_exists")
+    manifest = {"schema": "paper_evidence_closure.v1", "source_root": str(source), "files": closure["files"],
+        "reference_origin_root": closure["reference_origin_root"],
+        "references": closure["references"], "network_used": False, "restore_apply": False}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("xb") as handle, tarfile.open(fileobj=handle, mode="w:gz") as archive:
+        for name, raw in closure["contents"].items():
+            item = tarfile.TarInfo(name); item.size = len(raw)
+            archive.addfile(item, io.BytesIO(raw))
+        raw = json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        item = tarfile.TarInfo("manifest.json"); item.size = len(raw)
+        archive.addfile(item, io.BytesIO(raw))
+    verification = verify_backup_archive(target)
+    return {**verification, "archive": str(target), "archive_sha256": _sha256(target)[1], "runtime_written": False}
+
+
+def verify_backup_archive(archive_path: Path | str, *, isolated_restore_root: Path | str | None = None) -> dict[str, Any]:
+    """Verify bytes and closure before optionally restoring into a NEW empty folder."""
+    path = Path(archive_path).resolve()
+    errors: list[str] = []
+    blobs: dict[str, bytes] = {}
+    manifest: dict[str, Any] = {}
+    derived_refs: list[tuple[str, str, str]] = []
+    try:
+        if path.stat().st_size > MAX_EVIDENCE_TOTAL_BYTES:
+            raise ValueError("backup_archive_size_limit")
+        with tarfile.open(path, "r:gz") as archive:
+            total = 0
+            for item in archive:
+                relative = Path(item.name)
+                if (not item.isfile() or item.name in blobs or relative.as_posix() != item.name
+                        or (item.name != "manifest.json" and not _allow_evidence_path(relative))
+                        or item.size < 0 or item.size > MAX_EVIDENCE_FILE_BYTES):
+                    raise ValueError("backup_archive_member_invalid")
+                total += item.size
+                if total > MAX_EVIDENCE_TOTAL_BYTES or len(blobs) >= 1000:
+                    raise ValueError("backup_archive_total_limit")
+                handle = archive.extractfile(item)
+                if handle is None:
+                    raise ValueError("backup_archive_member_unreadable")
+                blobs[item.name] = handle.read(item.size + 1)
+        decoded_manifest = json.loads(blobs.pop("manifest.json").decode("utf-8"))
+        if not isinstance(decoded_manifest, dict) or decoded_manifest.get("schema") != "paper_evidence_closure.v1":
+            raise ValueError("backup_archive_schema_invalid")
+        manifest = decoded_manifest
+        rows = manifest["files"]
+        if not isinstance(rows, list) or len(rows) != len(blobs) or {r["path"] for r in rows} != set(blobs):
+            raise ValueError("backup_archive_file_set_mismatch")
+        for row in rows:
+            raw = blobs[row["path"]]
+            if len(raw) != row["bytes"] or hashlib.sha256(raw).hexdigest() != row["sha256"]:
+                raise ValueError("backup_archive_hash_mismatch:" + row["path"])
+            rel = Path(row["path"])
+            account = "ai_trader_100k_glm" if "ai_trader_glm" in rel.parts else "ai_trader_100k" if "ai_trader" in rel.parts else None
+            for obj in _evidence_objects(rel, raw):
+                for reference in _check_evidence_object(obj, rel, expected_account=account):
+                    destination = Path(reference["path"])
+                    original_root = Path(manifest.get("reference_origin_root") or manifest["source_root"]).resolve()
+                    if destination.is_absolute() and destination.is_relative_to(original_root):
+                        destination = destination.relative_to(original_root)
+                    frozen_root = Path(manifest["source_root"]).resolve()
+                    if destination.is_absolute() and destination.is_relative_to(frozen_root):
+                        destination = destination.relative_to(frozen_root)
+                    if not _allow_evidence_path(destination) or destination.as_posix() not in blobs:
+                        raise ValueError("backup_archive_reference_missing")
+                    if account and (("ai_trader" in destination.parts and account != "ai_trader_100k")
+                            or ("ai_trader_glm" in destination.parts and account != "ai_trader_100k_glm")):
+                        raise ValueError("backup_archive_cross_account_reference")
+                    target_sha = hashlib.sha256(blobs[destination.as_posix()]).hexdigest()
+                    _verify_execution_reference(destination, blobs[destination.as_posix()], reference)
+                    if reference["sha256"] and reference["sha256"] != target_sha:
+                        raise ValueError("backup_archive_reference_hash_mismatch")
+                    derived_refs.append((rel.as_posix(), destination.as_posix(), target_sha))
+        if not isinstance(manifest.get("references"), list):
+            raise ValueError("backup_archive_references_invalid")
+        for ref in manifest["references"]:
+            if not isinstance(ref, dict):
+                raise ValueError("backup_archive_reference_invalid")
+            if ref["path"] not in blobs or hashlib.sha256(blobs[ref["path"]]).hexdigest() != ref["sha256"]:
+                raise ValueError("backup_archive_reference_incomplete")
+        if sorted(derived_refs) != sorted((r["from"], r["path"], r["sha256"]) for r in manifest["references"]):
+            raise ValueError("backup_archive_dependency_closure_mismatch")
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, tarfile.TarError) as exc:
+        errors.append(type(exc).__name__ + ":" + str(exc))
+    restored = False
+    if not errors and isolated_restore_root is not None:
+        root = Path(isolated_restore_root).resolve()
+        source = Path(str(manifest["source_root"])).resolve()
+        if root.exists() or root == source or root.is_relative_to(source) or path.is_relative_to(root):
+            errors.append("isolated_restore_requires_new_external_directory")
+        else:
+            root.mkdir(parents=True, exist_ok=False)
+            for name, raw in blobs.items():
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(raw)
+            restored = all(_sha256(root / name)[1] == hashlib.sha256(raw).hexdigest() for name, raw in blobs.items())
+            if not restored:
+                errors.append("isolated_restore_hash_mismatch")
+    archive_references = manifest.get("references")
+    archive_references = archive_references if isinstance(archive_references, list) else []
+    execution_refs = [row for row in archive_references if isinstance(row, dict)
+                      and "/execution_evidence/" in str(row.get("path") or "")]
+    return {"ok": not errors, "status": "passed" if not errors else "blocked", "errors": errors,
+        "file_count": len(blobs), "references": archive_references,
+        "execution_archive_reference_count": len(execution_refs),
+        "historical_trade_evidence_complete": None,
+        "verification_scope": "archived bytes and declared dependencies; no reconstruction of missing historical evidence",
+        "isolated_restore_verified": restored, "network_used": False, "canonical_restore": False}
 
 BACKUP_SCHEMA = "paper_state_backup_v1"
 DISCLAIMER = "Paper-only research state backup; not a live trading account."

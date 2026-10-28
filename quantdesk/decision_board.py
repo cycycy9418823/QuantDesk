@@ -104,6 +104,7 @@ def _account(portfolio: Mapping[str, Any]) -> dict[str, Any]:
         return _finite(value if value is not None else portfolio.get(name))
 
     account = {
+        "valuation_date": _date_text(portfolio.get("valuation_date") or summary.get("valuation_date")),
         "initial_cash": pick("initial_cash"),
         "cash": pick("cash"),
         "market_value": pick("market_value"),
@@ -154,7 +155,9 @@ def _position_rows(
                 "latest_date": _date_text(raw.get("latest_date") or as_of),
                 "holding_days": holding_days,
                 "holding_days_source": holding_source,
-                "entry_price": _finite(raw.get("avg_cost") if raw.get("avg_cost") is not None else raw.get("entry_price")),
+                "entry_price": _finite(raw.get("entry_price")),
+                "historical_avg_cost": _finite(raw.get("avg_cost")),
+                "cost_basis_label": "当前盈亏采用的账本成本；历史均价另列",
                 "latest_price": _finite(raw.get("latest_price")),
                 "quantity": _finite(raw.get("quantity")),
                 "market_value": _finite(raw.get("market_value")),

@@ -14,9 +14,97 @@ GET route reads the persisted result rather than rescanning thousands of CSVs.
 from __future__ import annotations
 
 import csv
+import hashlib
+import io
+import json
+import re
 from collections import Counter
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+
+
+def prepare_roster_version(rows: list[dict[str, Any]], *, source: str, as_of: str,
+                           run_id: str, accepted_at: str) -> dict[str, Any]:
+    """Prepare immutable roster bytes and a pointer; never publishes by itself."""
+    day = date.fromisoformat(as_of).isoformat()
+    stamp = datetime.fromisoformat(accepted_at)
+    if not source or stamp.tzinfo is None or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
+        raise ValueError("roster_identity_missing")
+    codes = [str(r.get("symbol") or "") for r in rows]
+    if not codes or len(set(codes)) != len(codes) or any(not re.fullmatch(r"[0-9]{6}", c) for c in codes):
+        raise ValueError("roster_symbols_invalid")
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=["symbol", "name", "source", "as_of", "updated_at"])
+    writer.writeheader()
+    writer.writerows({"symbol": r["symbol"], "name": r.get("name") or "", "source": source,
+        "as_of": day, "updated_at": accepted_at} for r in sorted(rows, key=lambda r: r["symbol"]))
+    raw = stream.getvalue().encode("utf-8")
+    manifest = {"schema": "a_share_roster.v1", "status": "accepted", "accepted": True,
+        "source": source, "as_of": day, "accepted_at": accepted_at, "run_id": run_id,
+        "path": f"data/universe/versions/{day}_{run_id}.csv", "row_count": len(codes),
+        "sha256": hashlib.sha256(raw).hexdigest(), "symbols_sha256": hashlib.sha256(
+            json.dumps(sorted(codes), separators=(",", ":")).encode()).hexdigest()}
+    return {"csv_bytes": raw, "manifest": manifest, "publication_status": "proposal_only"}
+
+
+def load_roster_evidence(project_root: Path, *, target_date: str) -> dict[str, Any]:
+    """Use a verified version, then an explicit last-accepted or legacy fallback."""
+    root = Path(project_root).resolve()
+    reasons: list[str] = []
+    for pointer_name in ("a_share_roster_latest.json", "a_share_roster_last_accepted.json"):
+        pointer = root / "data/universe" / pointer_name
+        if not pointer.is_file():
+            continue
+        try:
+            if pointer.is_symlink() or pointer.stat().st_size > 256 * 1024:
+                raise ValueError("pointer_size_or_link")
+            meta = json.loads(pointer.read_text(encoding="utf-8-sig"))
+            path = root / meta["path"]
+            resolved = path.resolve()
+            if (path.is_symlink() or not resolved.is_relative_to(root / "data/universe/versions")
+                    or meta.get("schema") != "a_share_roster.v1" or meta.get("accepted") is not True
+                    or meta.get("status") != "accepted" or not meta.get("source")
+                    or date.fromisoformat(meta["as_of"]) > date.fromisoformat(target_date)
+                    or datetime.fromisoformat(meta["accepted_at"]).tzinfo is None
+                    or path.stat().st_size > 8 * 1024 * 1024):
+                raise ValueError("roster_identity_or_path_invalid")
+            raw = path.read_bytes()
+            codes = _read_universe(path)
+            symbols_sha = hashlib.sha256(json.dumps(sorted(codes), separators=(",", ":")).encode()).hexdigest()
+            if (hashlib.sha256(raw).hexdigest() != meta["sha256"] or len(codes) != meta["row_count"]
+                    or symbols_sha != meta["symbols_sha256"]):
+                raise ValueError("roster_hash_or_count_mismatch")
+            return {**meta, "symbols": sorted(codes), "identity_status": "verified_version",
+                "fallback": pointer_name != "a_share_roster_latest.json",
+                "age_days": (date.fromisoformat(target_date) - date.fromisoformat(meta["as_of"])).days,
+                "pointer_path": str(pointer), "pointer_sha256": hashlib.sha256(pointer.read_bytes()).hexdigest(),
+                "reason_codes": reasons, "read_only": True}
+        except (OSError, ValueError, TypeError, KeyError, UnicodeError) as exc:
+            reasons.append("roster_pointer_invalid:" + pointer_name + ":" + type(exc).__name__)
+    legacy = root / "data/universe/a_share_symbols.csv"
+    try:
+        raw = legacy.read_bytes()
+        records = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
+        codes = _read_universe(legacy)
+        days = {_date_text(r.get("as_of") or r.get("updated_at")) for r in records} - {""}
+        day = next(iter(days)) if len(days) == 1 else ""
+        sources = {str(r.get("source") or "") for r in records} - {""}
+        if day and date.fromisoformat(day) > date.fromisoformat(target_date):
+            return {"symbols": [], "source": "legacy_csv", "as_of": day,
+                "sha256": hashlib.sha256(raw).hexdigest(), "row_count": len(codes),
+                "path": "data/universe/a_share_symbols.csv", "identity_status": "future_roster",
+                "accepted": None, "fallback": True,
+                "reason_codes": [*reasons, "legacy_roster_after_target_date"], "read_only": True}
+        return {"symbols": sorted(codes), "source": next(iter(sources)) if len(sources) == 1 else "legacy_csv",
+            "as_of": day, "sha256": hashlib.sha256(raw).hexdigest(), "row_count": len(codes),
+            "path": "data/universe/a_share_symbols.csv", "identity_status": "legacy_unverified_acceptance",
+            "age_days": (date.fromisoformat(target_date) - date.fromisoformat(day)).days if day else None,
+            "accepted": None, "accepted_at": None, "fallback": True,
+            "reason_codes": [*reasons, "versioned_roster_unavailable"], "read_only": True}
+    except (OSError, ValueError, UnicodeError, csv.Error) as exc:
+        return {"symbols": [], "identity_status": "missing", "as_of": "", "sha256": "",
+            "reason_codes": [*reasons, "roster_missing_or_unreadable:" + type(exc).__name__], "read_only": True}
 
 
 def _date_text(value: Any) -> str:
@@ -69,6 +157,30 @@ def _last_date_and_rows(path: Path) -> tuple[str, int, bool]:
     return max(dates), len(dates), len(set(dates)) != len(dates)
 
 
+def inspect_target_daily_row(path: Path, *, target_date: str) -> dict[str, Any]:
+    """Read original rows before selecting a day; date coverage is not price proof."""
+    from quantdesk.data_truth.daily_bar_validity import classify_daily_row
+    from quantdesk.price_basis import validate_price_frame_set
+    import pandas as pd
+    try:
+        raw = path.read_bytes()
+        rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
+        gate = validate_price_frame_set({path.stem: pd.DataFrame(rows)}, consumer="paper_execution")
+        selected = [r for r in rows if _date_text(r.get("date") or r.get("trade_date")) == target_date]
+        classification = classify_daily_row(selected[0]) if len(selected) == 1 else {
+            "classification": "unknown_gap", "valid_trading_bar": False, "execution_eligible": False,
+            "reason_code": "target_row_missing" if not selected else "duplicate_target_rows"}
+        if not gate.get("eligible"):
+            classification.update(classification="unknown_gap", valid_trading_bar=False, execution_eligible=False,
+                reason_code="price_basis_untrusted")
+        return {**classification, "target_date": target_date, "target_row_count": len(selected),
+            "target_row_present": bool(selected), "price_policy_validation": gate,
+            "source_sha256": hashlib.sha256(raw).hexdigest(), "source_path": str(path)}
+    except (OSError, ValueError, UnicodeError, csv.Error) as exc:
+        return {"classification": "unknown_gap", "valid_trading_bar": False, "execution_eligible": False,
+            "target_row_present": False, "target_row_count": 0, "reason_code": "daily_read_failed:" + type(exc).__name__}
+
+
 def build_full_a_daily_coverage(
     *,
     target_date: str,
@@ -92,6 +204,7 @@ def build_full_a_daily_coverage(
     invalid: list[str] = []
     duplicate: list[str] = []
     latest_by_symbol: dict[str, str] = {}
+    target_rows: dict[str, dict[str, Any]] = {}
 
     for symbol in universe:
         path = Path(daily_dir) / f"{symbol}.csv"
@@ -108,6 +221,7 @@ def build_full_a_daily_coverage(
             continue
         present.append(symbol)
         latest_by_symbol[symbol] = latest
+        target_rows[symbol] = inspect_target_daily_row(path, target_date=target) if target else {}
         if has_duplicate:
             duplicate.append(symbol)
         if target and latest < target:
@@ -121,7 +235,7 @@ def build_full_a_daily_coverage(
         if len(path.stem) == 6 and path.stem.isdigit()
     }
     at_target = (
-        sorted(symbol for symbol, latest in latest_by_symbol.items() if latest >= target)
+        sorted(symbol for symbol, proof in target_rows.items() if proof.get("target_row_present"))
         if target
         else []
     )
@@ -140,6 +254,10 @@ def build_full_a_daily_coverage(
         "coverage_text": f"{len(present)}/{len(universe)}",
         "at_target_date_count": len(at_target),
         "at_target_date_text": f"{len(at_target)}/{len(universe)}",
+        "target_date_coverage_contract": "date_rows_only_not_execution_evidence",
+        "valid_raw_target_trading_bar_count": sum(p.get("valid_trading_bar") is True for p in target_rows.values()),
+        "future_latest_count": sum(day > target for day in latest_by_symbol.values()) if target else 0,
+        "target_row_quality": target_rows,
         "coverage_floor_date": present_dates[0] if present_dates else "",
         "latest_date_max": present_dates[-1] if present_dates else "",
         "dominant_latest_date": dominant_date,

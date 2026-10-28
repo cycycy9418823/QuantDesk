@@ -573,13 +573,24 @@ def minute_cell(root: Path, target: str) -> tuple[str, str]:
 
 
 def strategy_cell(root: Path, target: str) -> tuple[str, str]:
+    from quantdesk.paper.ledger_read_contract import inspect_strategy_ledger
+
     path = root / "results" / "auto_paper_portfolio_latest.json"
     data = load_json(path) or {}
     generated = str(data.get("generated_at") or "")
     intake = data.get("candidate_intake") if isinstance(data.get("candidate_intake"), dict) else {}
     as_of = _plain_day(data.get("valuation_date"))
-    mark = "✓" if as_of == target and data.get("ok") is True and data.get("portfolio_review_valid") is not False else "✗"
-    extra = "" if mark == "✓" else f"策略账估值日 {as_of or '缺失'}，候选资料日 {intake.get('as_of') or '缺失'}，生成 {generated or '缺失'}；估值/复盘未核验"
+    health = inspect_strategy_ledger(root / "state/auto_paper_portfolio.json", target_date=target, latest=data)
+    mark = "✓" if health["ok"] else "✗"
+    stale = ",".join(health.get("stale_symbols") or [])
+    extra = "" if mark == "✓" else (
+        f"策略账估值日 {as_of or '缺失'}，候选资料日 {intake.get('as_of') or '缺失'}，生成 {generated or '缺失'}；"
+        f"估值/复盘未核验：{','.join(health['reason_codes'])}"
+        + (f"；持仓旧估值/缺口 {stale}" if stale else "")
+    )
+    identity = health.get("pnl_identity") or {}
+    if identity.get("status") == "mismatch":
+        extra += f"；权益与盈亏相差 {identity['difference']:+.2f} 元，尚未核对完成"
     return f"策略账 {mark}", extra
 
 

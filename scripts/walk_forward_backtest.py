@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 import json
 import sys
 from pathlib import Path
@@ -49,6 +50,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-data-grade", default="BACKTEST_READY")
     parser.add_argument("--max-symbols", type=int, default=0)
     parser.add_argument("--output-dir", default="")
+    parser.add_argument("--run-type", choices=["formal", "smoke", "demo"], default="formal")
     parser.add_argument("--config", default="")
     parser.add_argument("--network", default="false", help="Accepted for qd.py consistency; walk-forward remains local-only.")
     parser.add_argument("--enable-network", action="store_true")
@@ -59,7 +61,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from quantdesk.research.evidence_identity import isolated_output_path, stamp_research_evidence
+    from quantdesk.reproducibility_manifest import capture_git_or_source_state
     args = parse_args(argv)
+    latest_path = isolated_output_path(PROJECT_ROOT / "results/walk_forward_latest.json", args.run_type)
     target_info = resolve_target_complete_trade_date(args.end_date or None)
     if not args.end_date:
         args.end_date = str(target_info.get("target_complete_trade_date") or target_info.get("target_date") or "").replace("-", "")
@@ -111,11 +116,13 @@ def main(argv: list[str] | None = None) -> int:
             "network": False,
             "warnings": cli_warnings + ["No symbols found."],
             "suggested_next_action": "python scripts/qd.py data-bootstrap --preset low_price_demo --network false",
-            "output_paths": {"json": "results/walk_forward_latest.json"},
+            "output_paths": {"json": str(latest_path)},
             "generated_at": now_text(),
             "disclaimer": DISCLAIMER,
         }
-        write_json(PROJECT_ROOT / "results" / "walk_forward_latest.json", payload)
+        payload["run_type"] = args.run_type
+        payload["formal_eligible"] = False
+        write_json(latest_path, payload)
         if truthy(args.summary):
             summary_payload = build_cli_summary(payload, task_type="walk_forward")
             print(json.dumps(summary_payload, ensure_ascii=True, indent=2, default=str) if truthy(args.json) else format_human_summary(summary_payload))
@@ -149,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT / "results" / "walk_forward"
     if not output_dir.is_absolute():
         output_dir = PROJECT_ROOT / output_dir
+    output_dir = isolated_output_path(output_dir / "report.json", args.run_type).parent
 
     json_path, md_path = save_audit_report(output_dir, summary, quality)
     latest_payload = {
@@ -166,11 +174,16 @@ def main(argv: list[str] | None = None) -> int:
         "warnings": list(summary.warnings),
         "walk_forward_summary": summary.to_dict(),
         "backtest_quality": quality.to_dict(),
-        "output_paths": {"json": str(json_path.relative_to(PROJECT_ROOT)).replace("\\", "/"), "report": str(md_path.relative_to(PROJECT_ROOT)).replace("\\", "/")},
+        "output_paths": {"json": str(json_path.relative_to(PROJECT_ROOT) if json_path.is_relative_to(PROJECT_ROOT) else json_path).replace("\\", "/"),
+                         "report": str(md_path.relative_to(PROJECT_ROOT) if md_path.is_relative_to(PROJECT_ROOT) else md_path).replace("\\", "/")},
         "suggested_next_action": "python scripts/qd.py daily --network false --with-guardrails true",
         "disclaimer": DISCLAIMER,
     }
-    write_json(PROJECT_ROOT / "results" / "walk_forward_latest.json", latest_payload)
+    latest_payload = stamp_research_evidence(latest_payload, target_date=str(args.end_date),
+        code_identity=capture_git_or_source_state(),
+        data_identity={s: sha256((daily_dir / f"{s}.csv").read_bytes()).hexdigest()
+            for s in symbols if (daily_dir / f"{s}.csv").is_file()}, config_identity=vars(args), run_type=args.run_type)
+    write_json(latest_path, latest_payload)
 
     if truthy(args.summary):
         summary_payload = build_cli_summary(latest_payload, task_type="walk_forward")

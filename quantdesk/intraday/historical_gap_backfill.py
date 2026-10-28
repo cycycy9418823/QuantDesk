@@ -5,10 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import re
 import shutil
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -18,9 +18,18 @@ from uuid import uuid4
 import pandas as pd
 
 from quantdesk.interprocess_lock import interprocess_file_lock
+from quantdesk.intraday.canonical_write_guard import atomic_restore_from_backup
 from quantdesk.intraday.intraday_providers import DEFAULT_INTRADAY_PROVIDER_ORDER
 from quantdesk.intraday.intraday_update_engine import update_intraday_1m_for_symbols
-from quantdesk.intraday.stage6_append_only_import import apply_audited_intraday_batch
+from quantdesk.intraday.minute_bar_lifecycle import (
+    LIFECYCLE_DIR,
+    read_bar_observation_log,
+    select_bar_observations,
+)
+from quantdesk.intraday.stage6_append_only_import import (
+    apply_audited_intraday_batch,
+    canonical_intraday_write_transaction,
+)
 from quantdesk.price_basis import (
     PRICE_BASIS_RAW,
     classify_frame_price_basis,
@@ -706,14 +715,46 @@ def _run_id(value: str | None) -> str:
     return f"round13-minute-gap-backfill-{stamp}-{uuid4().hex[:10]}"
 
 
-def _canonical_snapshot(paths: Mapping[tuple[str, str], Path]) -> dict[str, dict[str, Any]]:
+def _canonical_import_paths(
+    payload: Mapping[str, Any],
+    canonical_dir: Path,
+    symbols: Sequence[str],
+    target_date: str,
+) -> dict[tuple[str, str], Path]:
+    """Bind a Stage6 receipt to the requested symbols and known schema locations."""
+
+    paths: dict[tuple[str, str], Path] = {}
+    for item in payload.get("items") or []:
+        if not isinstance(item, Mapping):
+            raise ValueError("canonical_import_item_invalid")
+        symbol = _strict_symbol(item.get("symbol"))
+        if symbol not in symbols or str(item.get("target_date") or "") != target_date:
+            raise ValueError("canonical_import_scope_mismatch")
+        pair = (symbol, target_date)
+        if pair in paths:
+            raise ValueError("canonical_import_duplicate_item")
+        value = str(item.get("canonical_path") or "")
+        if not value:
+            raise ValueError("canonical_import_path_missing")
+        target = _descendant(canonical_dir, Path(value), role="canonical_import_target")
+        allowed = {
+            (canonical_dir / f"{symbol}.csv").resolve(),
+            (canonical_dir / LIFECYCLE_DIR / f"{symbol}.csv").resolve(),
+        }
+        if target not in allowed:
+            raise ValueError("canonical_import_path_mismatch")
+        paths[pair] = target
+    if set(paths) != {(symbol, target_date) for symbol in symbols}:
+        raise ValueError("canonical_import_items_incomplete")
+    return paths
+
+
+def _canonical_snapshot(paths: Sequence[Path]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
-    for symbol, _target in sorted(paths):
-        path = paths[(symbol, _target)]
-        if symbol in result:
-            continue
-        result[symbol] = {
+    for index, path in enumerate(sorted(set(paths))):
+        result[str(path)] = {
             "path": str(path),
+            "backup_name": f"{index}.csv",
             "exists": path.is_file(),
             "sha256": _sha256_file(path) if path.is_file() else "",
             "row_count": int(len(pd.read_csv(path, encoding="utf-8-sig"))) if path.is_file() else 0,
@@ -726,20 +767,24 @@ def _restore_snapshot(
     backups_dir: Path,
 ) -> tuple[bool, list[str]]:
     errors: list[str] = []
-    for symbol, item in snapshot.items():
+    for item in snapshot.values():
         target = Path(str(item.get("path") or ""))
         try:
             if item.get("exists") is True:
-                backup = backups_dir / f"{symbol}.csv"
-                restore = backups_dir / f"{symbol}.restore"
-                shutil.copy2(backup, restore)
-                os.replace(restore, target)
+                if _sha256_file(target) == str(item.get("sha256") or ""):
+                    continue
+                backup = backups_dir / str(item["backup_name"])
+                atomic_restore_from_backup(
+                    target, backup, expected_sha256=str(item.get("sha256") or "")
+                )
                 if _sha256_file(target) != str(item.get("sha256") or ""):
                     raise ValueError("rollback_hash_mismatch")
             else:
                 target.unlink(missing_ok=True)
+                if target.exists() or target.is_symlink():
+                    raise ValueError("rollback_new_target_still_exists")
         except Exception as exc:  # noqa: BLE001
-            errors.append(f"{symbol}:{type(exc).__name__}:{exc}")
+            errors.append(f"{target}:{type(exc).__name__}:{exc}")
     return not errors, errors
 
 
@@ -783,8 +828,9 @@ def run_round13_minute_gap_backfill(
     )
     canonical_daily = _descendant(root, root / "data" / "daily", role="canonical_daily")
     lock_path = _descendant(root, root / "state" / "daily_data_chain.lock", role="daily_chain_lock")
+    canonical_lock_requested = False
     try:
-        with interprocess_file_lock(lock_path, timeout_seconds=0):
+        with interprocess_file_lock(lock_path, timeout_seconds=0), ExitStack() as transaction:
             run_dir.mkdir(parents=True, exist_ok=False)
             provider_results: list[dict[str, Any]] = []
             staging_paths: dict[tuple[str, str], Path] = {}
@@ -852,6 +898,9 @@ def run_round13_minute_gap_backfill(
                 atomic_write_json(run_dir / "manifest.json", payload)
                 return payload
 
+            if apply:
+                canonical_lock_requested = True
+                transaction.enter_context(canonical_intraday_write_transaction(canonical_intraday))
             preflights: list[dict[str, Any]] = []
             for target in sorted({item[1] for item in pairs}):
                 symbols = [symbol for symbol, item_target in pairs if item_target == target]
@@ -897,18 +946,47 @@ def run_round13_minute_gap_backfill(
                 atomic_write_json(run_dir / "manifest.json", payload)
                 return payload
 
-            before = _canonical_snapshot(
-                {(symbol, target): canonical_intraday / f"{symbol}.csv" for symbol, target in pairs}
-            )
+            planned_paths: dict[tuple[str, str], Path] = {}
+            try:
+                for preflight, target in zip(preflights, sorted({item[1] for item in pairs})):
+                    symbols = [symbol for symbol, item_target in pairs if item_target == target]
+                    planned_paths.update(_canonical_import_paths(preflight, canonical_intraday, symbols, target))
+                legacy_paths = {
+                    symbol: _descendant(
+                        canonical_intraday, canonical_intraday / f"{symbol}.csv",
+                        role="canonical_transaction_legacy_target",
+                    )
+                    for symbol, _target in pairs
+                }
+                protected_paths = [
+                    _descendant(canonical_intraday, path, role="canonical_transaction_target")
+                    for symbol, _target in pairs
+                    for path in (
+                        canonical_intraday / f"{symbol}.csv",
+                        canonical_intraday / LIFECYCLE_DIR / f"{symbol}.csv",
+                    )
+                ]
+            except ValueError as exc:
+                payload.update(
+                    status="blocked", reason_codes=["canonical_import_preflight_failed"],
+                    canonical_import={"status": "blocked", "applied": False,
+                                      "error": str(exc), "preflights": preflights},
+                )
+                atomic_write_json(run_dir / "manifest.json", payload)
+                return payload
+            before = _canonical_snapshot(protected_paths)
             backups_dir = run_dir / "outer_transaction_backups"
             backups_dir.mkdir(parents=True, exist_ok=True)
-            for symbol, item in before.items():
-                if item["exists"]:
-                    shutil.copy2(Path(str(item["path"])), backups_dir / f"{symbol}.csv")
             imports: list[dict[str, Any]] = []
             post_import_row_hashes: dict[tuple[str, str], dict[str, str]] = {}
             error = ""
             try:
+                for item in before.values():
+                    if item["exists"]:
+                        backup = backups_dir / str(item["backup_name"])
+                        shutil.copy2(Path(str(item["path"])), backup)
+                        if _sha256_file(backup) != item["sha256"]:
+                            raise ValueError("canonical_transaction_backup_hash_mismatch")
                 for target in sorted({item[1] for item in pairs}):
                     symbols = [symbol for symbol, item_target in pairs if item_target == target]
                     current = dict(
@@ -926,9 +1004,20 @@ def run_round13_minute_gap_backfill(
                     imports.append(current)
                     if current.get("status") != "completed" or current.get("applied") is not True:
                         raise RuntimeError(f"canonical_import_not_completed:{target}")
+                    actual_paths = _canonical_import_paths(current, canonical_intraday, symbols, target)
+                    if any(path != planned_paths[pair] for pair, path in actual_paths.items()):
+                        raise ValueError("canonical_import_target_changed_after_preflight")
                 for symbol, target in pairs:
-                    staged = pd.read_csv(staging_paths[(symbol, target)], encoding="utf-8-sig", dtype={"symbol": str})
-                    canonical = pd.read_csv(canonical_intraday / f"{symbol}.csv", encoding="utf-8-sig", dtype={"symbol": str})
+                    staged = pd.read_csv(staging_paths[(symbol, target)], encoding="utf-8-sig", dtype={"symbol": str}, float_precision="round_trip")
+                    canonical_path = planned_paths[(symbol, target)]
+                    canonical = pd.read_csv(canonical_path, encoding="utf-8-sig", dtype={"symbol": str}, float_precision="round_trip")
+                    if "evidence_hash" in staged.columns:
+                        staged_events = read_bar_observation_log(staging_paths[(symbol, target)])
+                        canonical_events = read_bar_observation_log(canonical_path)
+                        if not set(staged_events["evidence_hash"]) <= set(canonical_events["evidence_hash"]):
+                            raise ValueError(f"post_import_evidence_mismatch:{symbol}:{target}")
+                        staged = select_bar_observations(staged_events)
+                        canonical = select_bar_observations(canonical_events)
                     canonical_timestamps = pd.to_datetime(
                         canonical.get("datetime"), errors="coerce"
                     )
@@ -968,18 +1057,19 @@ def run_round13_minute_gap_backfill(
                 )
                 atomic_write_json(run_dir / "manifest.json", payload)
                 return payload
-            after = _canonical_snapshot(
-                {(symbol, target): canonical_intraday / f"{symbol}.csv" for symbol, target in pairs}
-            )
+            after = _canonical_snapshot(protected_paths)
             provenance = [
                 {
                     "symbol": symbol,
                     "target_date": target,
-                    "canonical_path": before[symbol]["path"],
-                    "canonical_sha256_before": before[symbol]["sha256"],
-                    "canonical_sha256_after": after[symbol]["sha256"],
-                    "canonical_row_count_before": before[symbol]["row_count"],
-                    "canonical_row_count_after": after[symbol]["row_count"],
+                    "canonical_path": str(planned_paths[(symbol, target)]),
+                    "canonical_sha256_before": before[str(planned_paths[(symbol, target)])]["sha256"],
+                    "canonical_sha256_after": after[str(planned_paths[(symbol, target)])]["sha256"],
+                    "canonical_row_count_before": before[str(planned_paths[(symbol, target)])]["row_count"],
+                    "canonical_row_count_after": after[str(planned_paths[(symbol, target)])]["row_count"],
+                    "legacy_canonical_path": str(legacy_paths[symbol]),
+                    "legacy_canonical_sha256_before": before[str(legacy_paths[symbol])]["sha256"],
+                    "legacy_canonical_sha256_after": after[str(legacy_paths[symbol])]["sha256"],
                     "staging_path": str(staging_paths[(symbol, target)]),
                     "staging_sha256": _sha256_file(staging_paths[(symbol, target)]),
                     **post_import_row_hashes[(symbol, target)],
@@ -1005,7 +1095,8 @@ def run_round13_minute_gap_backfill(
             atomic_write_json(run_dir / "manifest.json", payload)
             return payload
     except TimeoutError:
-        return {**base, "status": "busy", "reason_codes": ["daily_data_chain_lock_busy"]}
+        reason = "canonical_intraday_write_lock_busy" if canonical_lock_requested else "daily_data_chain_lock_busy"
+        return {**base, "status": "busy", "reason_codes": [reason]}
 
 
 __all__ = [

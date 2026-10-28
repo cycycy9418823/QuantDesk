@@ -39,6 +39,7 @@ from typing import Any, Callable, Iterator
 from zoneinfo import ZoneInfo
 
 from quantdesk.interprocess_lock import interprocess_file_lock
+from quantdesk.shared import normalize_symbol
 from quantdesk.intraday.minute_storage import QUARANTINE_DIR, envelope_violation, minute_write_path
 from quantdesk.intraday_refresh.scope import build_dynamic_scope, read_holding_inventory  # noqa: E402
 from quantdesk.intraday_refresh.snapshot import refresh_full_market_snapshot  # noqa: E402
@@ -324,8 +325,28 @@ def _append_rows_with_latest(
 ) -> tuple[int, list[str], str]:
     """Share one archive scan between deduplication and freshness reporting."""
 
+    from quantdesk.intraday.minute_bar_lifecycle import (
+        append_bar_observations, LIFECYCLE_COLUMNS,
+    )
+    from quantdesk.intraday.minute_storage import resolve_minute_read_path
+
+    try:
+        observation_time = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return 0, [f"minute_lifecycle_rejected:{path.stem}:observation_time_invalid"], ""
+    existing = resolve_minute_read_path(path, history_now=observation_time)
+    lifecycle = any(any(key in row for key in LIFECYCLE_COLUMNS) for row in rows)
+    if existing.is_file():
+        with existing.open(encoding="utf-8-sig", newline="") as stream:
+            lifecycle = lifecycle or "evidence_hash" in next(csv.reader(stream), [])
+    if lifecycle:
+        return append_bar_observations(
+            path, rows, now_iso=now_iso, base_columns=MINUTE_COLUMNS,
+            atomic_append=_atomic_append_bytes,
+        )
+
     requested_path = path
-    path = minute_write_path(path, history_now=datetime.fromisoformat(now_iso.replace("Z", "+00:00")))
+    path = minute_write_path(path, history_now=observation_time)
     scanned = path.stat() if path.is_file() else None
     exists_with_data = scanned is not None and scanned.st_size > 0
     needs_newline = False
@@ -1305,6 +1326,7 @@ def _sina_http_frames(output: bytes) -> tuple[dict[str, Any], dict[str, Any] | N
 def _sina_http_get_text(
     url: str, *, timeout: float, monotonic: Callable[[], float] = time.monotonic,
     popen_factory: Callable[..., Any] | None = None,
+    user_agent: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """One HTTP request; launch, request, cancellation and reap share a budget."""
     global _SINA_HTTP_UNREAPED
@@ -1335,7 +1357,7 @@ def _sina_http_get_text(
         factory = popen_factory or subprocess.Popen
         process = factory(
             [sys.executable, "-I", "-S", "-B", "-c", _SINA_HTTP_PROGRAM,
-             url, f"QuantDesk/{PACKAGE_VERSION}", str(cutoff), str(_SINA_HTTP_MAX_BODY_BYTES)],
+             url, user_agent or f"QuantDesk/{PACKAGE_VERSION}", str(cutoff), str(_SINA_HTTP_MAX_BODY_BYTES)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             close_fds=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -1518,6 +1540,7 @@ def _live_minute_rows(
     monotonic: Callable[[], float] = time.monotonic,
     timeout_seconds: float = PROVIDER_TIMEOUT_SECONDS,
     preferred_provider: str = "mootdx",
+    fallback_fetchers: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
     """Bound both sources together and reuse proven source health this round."""
     deadline = monotonic() + max(0.0, float(timeout_seconds))
@@ -1534,6 +1557,47 @@ def _live_minute_rows(
             "message": "minute_provider_deadline_exhausted_after_http_cleanup",
         }
     supported = bool(_sina_minute_prefix(symbol))
+    from quantdesk.intraday.intraday_provider_capability import minute_exchange_capability
+    capability = minute_exchange_capability("mootdx", symbol)
+    if capability["exchange"] == "BJ":
+        bse_fallbacks = fallback_fetchers
+        if (not bse_fallbacks and symbol.startswith("920")
+                and _mootdx_minute_rows is _BUILTIN_MINUTE_FETCHERS[0]):
+            from quantdesk.intraday.bse_minute_provider import fetch_bse_minute_rows
+
+            def eastmoney_bse_fetch(code: str, **kwargs: Any) -> Any:
+                return fetch_bse_minute_rows(code, network=True, **kwargs)
+
+            bse_fallbacks = ({"provider": "eastmoney_bse_intraday", "exchanges": ("BJ",),
+                              "fetcher": eastmoney_bse_fetch},)
+        # Keep the native BJ=2 mapping and its full native-only allowance. Reserve
+        # time only when this route actually has a supported fallback to try.
+        has_fallback = any("BJ" in entry.get("exchanges", ()) and callable(entry.get("fetcher"))
+                           for entry in bse_fallbacks)
+        native_allowance = min(2.0, timeout_seconds / 3) if has_fallback else timeout_seconds
+        rows, error, diagnostics = _mootdx_minute_rows(symbol, offset=offset, now=now,
+            monotonic=monotonic, timeout_seconds=native_allowance, max_attempts=1)
+        attempts = [{"provider": "mootdx", "error": error, **diagnostics}]
+        if not error:
+            return rows, error, {**diagnostics, "exchange_capability": capability}
+        for entry in bse_fallbacks:
+            if ("BJ" not in entry.get("exchanges", ()) or not callable(entry.get("fetcher"))
+                    or monotonic() >= deadline):
+                continue
+            rows, fallback_error, detail = _unpack_fetch_result(entry["fetcher"](
+                symbol, offset=offset, now=now, timeout_seconds=max(0.0, deadline - monotonic())))
+            attempts.append({"provider": entry.get("provider"), "error": fallback_error, **detail})
+            if detail.get("stop_collection"):
+                return [], fallback_error, {**detail, "attempts": attempts, "fallback_from": "mootdx"}
+            if monotonic() >= deadline:
+                return [], "provider_failed:deadline_exhausted", {"attempts": attempts, "error_stage": "timeout"}
+            if not fallback_error and rows:
+                return rows, "", {**detail, "attempts": attempts, "fallback_from": "mootdx",
+                    "exchange_capability": capability,
+                    "live_availability": detail.get("live_availability", "mock_or_injected_only")}
+        return [], error, {**diagnostics, "exchange_capability": capability, "attempts": attempts,
+            "fallback_status": "unsupported_or_missing", "coverage_status": "missing",
+            "reason_code": "bse_minute_source_unavailable", "global_paper_account_block": False}
     if preferred_provider == "sina_intraday" and supported:
         # A prior symbol proved the native source failed and Sina worked. Avoid
         # spending that same connection timeout for every remaining symbol.
@@ -1843,6 +1907,7 @@ def collect_intraday_refresh(
 
     root = Path(project_root or PROJECT_ROOT)
     current = _now_shanghai(now)
+    observation_anchor = monotonic()
     rid = run_id or current.strftime("intraday-%Y%m%dT%H%M%S")
     session = market_session_for(current)
     is_trading_day = trading_day_today(root, now=current) if trading_day is None else trading_day
@@ -1868,7 +1933,7 @@ def collect_intraday_refresh(
         rows, error, diagnostics = _live_minute_rows(
             symbol,
             offset=offset,
-            now=current,
+            now=current + timedelta(seconds=max(0.0, monotonic() - observation_anchor)),
             monotonic=monotonic,
             timeout_seconds=timeout_seconds if timeout_seconds is not None else _provider_timeout_seconds(
                 symbol_budget_ms=int(budget_clock["symbol_ms"]),
@@ -2206,11 +2271,15 @@ def collect_intraday_refresh(
                             f"symbol_budget_exceeded:{symbol}:{duration_ms}ms"
                         )
                 else:
+                    observed_at = current + timedelta(seconds=max(0.0, monotonic() - observation_anchor))
+                    observation_iso = observed_at.isoformat(timespec="microseconds")
                     valid_rows = []
                     validation_reason = ""
                     ignored_other_day_rows = 0
                     for row in rows:
-                        ok, reason = validate_minute_bar(row, now=current, symbol=symbol)
+                        ok, reason = validate_minute_bar(row, now=observed_at, symbol=symbol)
+                        if ok and normalize_symbol(row.get("symbol")) != symbol:
+                            ok, reason = False, f"minute_symbol_mismatch:{symbol}"
                         if ok and str(row.get("price_basis") or "").strip().lower() != "raw":
                             ok, reason = False, f"minute_price_basis_not_raw:{symbol}"
                         if ok and "adjust" in row and str(row["adjust"]).strip().lower() != "raw":
@@ -2223,8 +2292,25 @@ def collect_intraday_refresh(
                         else:
                             manifest["reason_codes"].append(reason)
                             validation_reason = validation_reason or reason
-                    accepted, rejects, newest = _append_rows_with_latest(path, valid_rows, now_iso=now_iso)
-                    actual_path = minute_write_path(path, history_now=current)
+                    # The built-in collection path records mutable observations,
+                    # even if this provider has no verified finality profile yet.
+                    # Injected legacy fetchers retain the old fixture contract.
+                    if fetcher is None or any("finality" in row for row in valid_rows):
+                        from quantdesk.intraday.minute_bar_lifecycle import normalize_bar_observation
+                        try:
+                            valid_rows = [normalize_bar_observation(
+                                row, fetched_at=observation_iso,
+                                provider=str(diagnostics.get("provider") or row.get("source") or ""),
+                                convention=str(diagnostics.get("minute_label_convention") or ""),
+                            ) for row in valid_rows]
+                        except ValueError as exc:
+                            validation_reason = f"minute_lifecycle_rejected:{symbol}:{exc}"
+                            manifest["reason_codes"].append(validation_reason)
+                            valid_rows = []
+                    storage_iso = observation_iso if valid_rows and "finality" in valid_rows[0] else now_iso
+                    accepted, rejects, newest = _append_rows_with_latest(path, valid_rows, now_iso=storage_iso)
+                    from quantdesk.intraday.minute_storage import resolve_minute_read_path
+                    actual_path = resolve_minute_read_path(path, history_now=observed_at)
                     manifest["appended_rows"] += accepted
                     manifest["reason_codes"].extend(rejects[:3])
                     quarantine_reason = next(
@@ -2235,6 +2321,7 @@ def collect_intraday_refresh(
                     storage_reason = next(
                         (reason for reason in rejects if reason.startswith((
                             "minute_header_mismatch:", "minute_stored_row_invalid:", "minute_append_failed:",
+                            "minute_lifecycle_rejected:",
                         ))), ""
                     )
                     receipt_status = "ok"
@@ -2264,7 +2351,8 @@ def collect_intraday_refresh(
                         "legacy_price_basis_unknown": actual_path != path,
                         "requested_bar_limit": MINUTE_OFFSET,
                         "ignored_other_day_rows": ignored_other_day_rows,
-                        "minute_window": _response_minute_window(valid_rows),
+                        "minute_window": _response_minute_window(valid_rows, as_of=observed_at,
+                            convention=str(diagnostics.get("minute_label_convention") or "")),
                         "validation_rejected_rows": len(rows) - len(valid_rows) - ignored_other_day_rows,
                         "error_stage": error_stage,
                         "error_type": error_type,
@@ -2370,15 +2458,38 @@ def collect_intraday_refresh(
     return manifest
 
 
-def _response_minute_window(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _response_minute_window(rows: Sequence[Mapping[str, Any]], *, as_of: datetime | None = None,
+                            convention: str = "") -> dict[str, Any]:
     """Describe accepted response times without inventing a session standard."""
     times = sorted({_minute_datetime_key(row.get("datetime")) for row in rows})
     times = [stamp for stamp in times if stamp]
-    return {"valid_response_minutes": len(times), "first_valid_minute": times[0] if times else "",
+    result = {"valid_response_minutes": len(times), "first_valid_minute": times[0] if times else "",
             "last_valid_minute": times[-1] if times else "", "evidence_scope": "this_provider_response",
             "continuity_status": "not_assessed_provider_session_convention",
             "expected_session_minutes": None, "missing_session_minutes": None,
             "reason": "provider_session_start_end_and_minute_label_convention_unverified"}
+    if as_of is None or convention not in {"minute_start", "minute_end"}:
+        return result
+    current = as_of.astimezone(SHANGHAI) if as_of.tzinfo is not None else as_of.replace(tzinfo=SHANGHAI)
+    expected = []
+    for hour, minute in ((9, 30), (13, 0)):
+        start = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        for offset in range(120):
+            label = start + timedelta(minutes=offset + (1 if convention == "minute_end" else 0))
+            bar_end = start + timedelta(minutes=offset + 1)
+            if bar_end <= current:
+                expected.append(label.strftime("%Y-%m-%d %H:%M"))
+    observed = {stamp[:16] for stamp in times}
+    missing = [stamp for stamp in expected if stamp not in observed]
+    result.update(expected_session_minutes=len(expected), missing_session_minutes=len(missing),
+        session_coverage_ratio=(len(expected)-len(missing))/len(expected) if expected else None,
+        session_cutoff=current.isoformat(), minute_label_convention=convention,
+        continuity_status="complete_to_cutoff" if expected and not missing else "partial_to_cutoff",
+        full_day_grid_complete=bool(current.hour >= 15 and len(expected) == 240 and not missing),
+        full_day_verified=False,
+        validation_scope="coverage_grid_only",
+        reason="declared_provider_convention_and_current_session_cutoff")
+    return result
 
 
 def _holding_minute_coverage(manifest: Mapping[str, Any]) -> dict[str, Any]:

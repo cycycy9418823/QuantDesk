@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 import json
 import sys
 from dataclasses import asdict
@@ -273,7 +274,7 @@ def _equity_summary(frame: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-def _write_report(payload: dict[str, Any]) -> None:
+def _write_report(payload: dict[str, Any], report_path: Path | None = None) -> None:
     metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
     data_gate = payload.get("data_gate") if isinstance(payload.get("data_gate"), dict) else {}
     warnings = payload.get("warnings") if isinstance(payload.get("warnings"), list) else []
@@ -326,8 +327,11 @@ def _write_report(payload: dict[str, Any]) -> None:
         "",
         "This local backtest reads existing daily CSV files only. It does not fetch data, connect to brokers, place orders, or provide investment advice.",
     ])
-    REPORT_MD.parent.mkdir(parents=True, exist_ok=True)
-    REPORT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    output_paths = payload.get("output_paths")
+    payload_report = output_paths.get("report") if isinstance(output_paths, dict) else None
+    report_path = report_path or (_project_path(payload_report) if payload_report else REPORT_MD)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _attach_experiment_log(payload: dict[str, Any]) -> dict[str, Any]:
@@ -362,7 +366,13 @@ def _warning_payload(
     price_policy_validation: dict[str, Any] | None = None,
     pit_filter_audit: dict[str, Any] | None = None,
     blocked: bool = False,
+    result_path: Path | None = None,
+    report_path: Path | None = None,
 ) -> dict[str, Any]:
+    from quantdesk.research.evidence_identity import isolated_output_path
+    mode = "synthetic" if truthy(getattr(args, "synthetic_test_data", False)) else "smoke" if truthy(getattr(args, "smoke_run", False)) else "formal"
+    result_path = result_path or isolated_output_path(RESULT_JSON, mode)
+    report_path = report_path or isolated_output_path(REPORT_MD, mode)
     price_policy_validation = dict(price_policy_validation or {})
     observed_basis = str(
         price_policy_validation.get("accepted_price_basis") or PRICE_BASIS_UNKNOWN
@@ -422,12 +432,14 @@ def _warning_payload(
         **price_fields,
         "warnings": warnings,
         "suggested_next_action": "python scripts/qd.py data-update --enable-network --scope current_analysis_pool or manually import data/daily/{symbol}.csv, then rerun backtest",
-        "output_paths": {"json": _rel(RESULT_JSON), "report": _rel(REPORT_MD)},
+        "output_paths": {"json": _rel(result_path), "report": _rel(report_path)},
+        "run_type": mode,
+        "formal_eligible": False,
         "generated_at": now_text(),
         "disclaimer": DISCLAIMER,
     }
     payload = _attach_experiment_log(payload)
-    write_json(RESULT_JSON, payload)
+    write_json(result_path, payload)
     _write_report(payload)
     return payload
 
@@ -456,11 +468,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit-up-fill-model", nargs="?", const="true", default="false")
     parser.add_argument("--dynamic-slippage", nargs="?", const="true", default="false")
     parser.add_argument("--synthetic-test-data", nargs="?", const="true", default="false")
+    parser.add_argument("--smoke-run", nargs="?", const="true", default="false")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    from quantdesk.research.evidence_identity import isolated_output_path, stamp_research_evidence
+    from quantdesk.reproducibility_manifest import capture_git_or_source_state
     args = build_parser().parse_args(argv)
+    run_type = "synthetic" if truthy(args.synthetic_test_data) else "smoke" if truthy(args.smoke_run) else "formal"
+    result_path = isolated_output_path(RESULT_JSON, run_type)
+    report_path = isolated_output_path(REPORT_MD, run_type)
+    artifact_dir = isolated_output_path(ARTIFACT_DIR / "artifact", run_type).parent
     network_requested = bool(args.enable_network or truthy(args.network)) and not bool(args.no_network)
     target_info = resolve_target_complete_trade_date(args.end_date or None)
     if not args.end_date:
@@ -688,7 +707,7 @@ def main(argv: list[str] | None = None) -> int:
     adjustment_info = _resolve_price_adjustment(histories)
     if adjustment_info["price_adjustment_warnings"]:
         warnings.extend(adjustment_info["price_adjustment_warnings"])
-    artifact_paths = export_backtest_result(result, "portfolio" if args.mode == "portfolio" else "local", ARTIFACT_DIR)
+    artifact_paths = export_backtest_result(result, "portfolio" if args.mode == "portfolio" else "local", artifact_dir)
     assumptions = json_safe(dict(result.assumptions))
     assumptions.update({
         "network": False,
@@ -703,8 +722,8 @@ def main(argv: list[str] | None = None) -> int:
     charts: dict[str, str] = {}
     chart_warnings: list[str] = []
     try:
-        equity_chart = render_equity_curve(result.equity_curve, "reports/backtest_charts/equity_curve_latest.png")
-        monthly_chart = render_monthly_returns(result.equity_curve, "reports/backtest_charts/monthly_returns_latest.png")
+        equity_chart = render_equity_curve(result.equity_curve, isolated_output_path(Path("reports/backtest_charts/equity_curve_latest.png"), run_type))
+        monthly_chart = render_monthly_returns(result.equity_curve, isolated_output_path(Path("reports/backtest_charts/monthly_returns_latest.png"), run_type))
         if equity_chart.get("path"):
             charts["equity_curve"] = str(equity_chart.get("path"))
         if monthly_chart.get("path"):
@@ -779,12 +798,17 @@ def main(argv: list[str] | None = None) -> int:
         "charts": charts,
         "warnings": [SAMPLE_LIMITATION, *warnings, *load_warnings[:20], *chart_warnings],
         "suggested_next_action": "python scripts/qd.py walk-forward --network false" if status == "passed" else "Fill local data/daily CSV files, then rerun backtest",
-        "output_paths": {"json": _rel(RESULT_JSON), "report": _rel(REPORT_MD)},
+        "output_paths": {"json": _rel(result_path), "report": _rel(report_path)},
         "generated_at": now_text(),
         "disclaimer": DISCLAIMER,
     }
     payload = _attach_experiment_log(payload)
-    write_json(RESULT_JSON, json_safe(payload))
+    payload = stamp_research_evidence(payload, target_date=args.end_date,
+        code_identity=capture_git_or_source_state(),
+        data_identity={symbol: {"sha256": sha256((daily_dir / f"{symbol}.csv").read_bytes()).hexdigest()}
+            for symbol in histories if (daily_dir / f"{symbol}.csv").is_file()} if run_type == "formal" else {"synthetic": True},
+        config_identity={k: v for k, v in vars(args).items()}, run_type=run_type)
+    write_json(result_path, json_safe(payload))
     _write_report(payload)
     if truthy(args.summary):
         summary = build_cli_summary(payload, task_type="backtest")
@@ -792,7 +816,7 @@ def main(argv: list[str] | None = None) -> int:
     elif _json_arg(args.json):
         print(json.dumps(json_safe(payload), ensure_ascii=False, indent=2, default=str))
     else:
-        print(f"backtest status={status} symbols={len(histories)}/{len(selected_symbols)} json={_rel(RESULT_JSON)}")
+        print(f"backtest status={status} symbols={len(histories)}/{len(selected_symbols)} json={_rel(result_path)}")
         for warning in payload.get("warnings") or []:
             print(f"warning: {warning}")
         print(DISCLAIMER)

@@ -31,6 +31,20 @@ INTRADAY_PROVIDER_CAPABILITY_LATEST_JSON = RESULTS_DIR / "intraday_provider_capa
 DISCLAIMER = "仅用于本地数据源能力诊断，不接券商、不真实下单、不构成投资建议。"
 
 
+def minute_exchange_capability(provider: str, symbol: str) -> dict[str, Any]:
+    """Distinguish a coded route from real provider availability."""
+    code = normalize_symbol(symbol)
+    exchange = "BJ" if code.startswith(("92", "4", "8")) else "SH" if code.startswith("6") else "SZ" if code.startswith(("0", "3")) else "unknown"
+    known = {"mootdx": {"SH", "SZ", "BJ"}, "mootdx_intraday": {"SH", "SZ", "BJ"},
+        "sina_intraday": {"SH", "SZ"}, "local_existing": {"SH", "SZ", "BJ"}}
+    supported = exchange in known.get(provider, set())
+    return {"provider": provider, "symbol": code, "exchange": exchange,
+        "route_supported": supported, "live_availability": "unverified",
+        "market_id": {"SH": 1, "SZ": 0, "BJ": 2}.get(exchange),
+        "reason_code": "availability_requires_authorized_probe" if supported else "exchange_route_unsupported",
+        "bounded_probe_attempts": 1 if exchange == "BJ" else None}
+
+
 def _display_path(path: Path) -> str:
     try:
         return str(path.relative_to(PROJECT_ROOT))
@@ -107,6 +121,7 @@ def _sanitize_result(result: dict[str, Any], provider: str, symbol: str, target_
             suggested = "请查看 provider 状态后决定是否导入 CSV。"
     return {
         "provider": provider,
+        "exchange_capability": minute_exchange_capability(provider, symbol),
         "symbol": normalize_symbol(symbol),
         "target_date": target_date[:10],
         "status": status,

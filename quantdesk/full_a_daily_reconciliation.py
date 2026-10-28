@@ -20,7 +20,7 @@ from uuid import uuid4
 
 from quantdesk.daily_price_update_engine import update_daily_prices
 from quantdesk.data_health_alert_delivery import dispatch_data_health_alerts
-from quantdesk.full_a_daily_coverage import build_full_a_daily_coverage
+from quantdesk.full_a_daily_coverage import build_full_a_daily_coverage, load_roster_evidence, inspect_target_daily_row
 from quantdesk.interprocess_lock import interprocess_file_lock
 from quantdesk.suspension_aware_completeness import (
     SuspensionEvidence,
@@ -241,7 +241,8 @@ def build_reconciliation_partition(
 
     root = Path(project_root).resolve()
     target = _date_text(target_date)
-    universe = _read_symbols(root / UNIVERSE_RELATIVE)
+    roster = load_roster_evidence(root, target_date=target)
+    universe = roster["symbols"]
     if run_evidence is None:
         # Same binding as the full reconciliation: this run's verified
         # no-session evidence, never the legacy file alone.
@@ -256,18 +257,20 @@ def build_reconciliation_partition(
     accepted: list[str] = []
     pending: list[str] = []
     latest_by_symbol: dict[str, str] = {}
+    row_evidence: dict[str, dict[str, Any]] = {}
     for symbol in universe:
         path = daily_dir / f"{symbol}.csv"
         exists = path.is_file()
         latest = _last_date(path) if exists else ""
         latest_by_symbol[symbol] = latest
+        row_evidence[symbol] = inspect_target_daily_row(path, target_date=target)
         if not exists:
             missing.append(symbol)
         elif symbol in research_set:
             research.append(symbol)
         else:
             residual.append(symbol)
-        if latest and latest >= target:
+        if row_evidence[symbol].get("target_row_present"):
             accepted.append(symbol)
         else:
             pending.append(symbol)
@@ -285,6 +288,9 @@ def build_reconciliation_partition(
         if symbol in universe
     ]
     verified_set = set(verified)
+    conflicts = sorted(set(completeness.get("contradiction_symbols") or []))
+    raw_conflicts = [symbol for symbol in conflicts if row_evidence[symbol].get("valid_trading_bar")]
+    flagged = sorted(set(flagged) | set(conflicts))
     accepted_set = set(accepted) | verified_set
     accepted = [symbol for symbol in universe if symbol in accepted_set]
     pending = [symbol for symbol in universe if symbol not in accepted_set]
@@ -295,6 +301,13 @@ def build_reconciliation_partition(
         "target_date": target,
         "universe_symbols": universe,
         "universe_count": len(universe),
+        "roster_evidence": {k: v for k, v in roster.items() if k != "symbols"},
+        "target_row_evidence": row_evidence,
+        "provider_status_conflict_symbols": conflicts,
+        "raw_trading_overrides_stale_nontrade_symbols": raw_conflicts,
+        "gap_classification": {s: "raw_trading_provider_conflict" if s in raw_conflicts else
+            "confirmed_nontrade" if s in verified_set else "valid_raw_trading_bar" if row_evidence[s].get("valid_trading_bar") else
+            "unobtained_or_unverified" for s in universe},
         "research_pool_symbols": research,
         "residual_existing_symbols": residual,
         "missing_canonical_symbols": missing,

@@ -135,8 +135,14 @@ def minute_write_path(path: Path, *, history_now: datetime | None = None) -> Pat
     return path
 
 
-def resolve_minute_read_path(path: Path) -> Path:
+def resolve_minute_read_path(path: Path, *, history_now: datetime | None = None) -> Path:
     """Select the physical file, leaving missing/unknown legacy evidence visible."""
     original = Path(path)
-    alternate = minute_write_path(original)
-    return alternate if alternate.is_file() else original
+    alternate = minute_write_path(original, history_now=history_now)
+    from quantdesk.intraday.minute_bar_lifecycle import LIFECYCLE_DIR
+    lifecycle = alternate.parent / LIFECYCLE_DIR / alternate.name
+    if lifecycle.is_file():
+        return lifecycle
+    selected = alternate if alternate.is_file() else original
+    lifecycle = selected.parent / LIFECYCLE_DIR / selected.name
+    return lifecycle if lifecycle.is_file() else selected

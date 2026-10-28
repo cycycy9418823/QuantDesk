@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import base64
 import ntpath
 import os
+import shlex
 import subprocess
 import sys
 from datetime import datetime
+import hashlib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,6 +18,7 @@ from quantdesk.shared import now_text
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TASK_NAME = "QuantDesk Daily Data Chain"
+CURRENT_TASK_NAME = "QuantDesk Data Close Pipeline"
 OWNERSHIP_MARKER = "QuantDesk managed daily-data-chain task; schema=1;"
 FIRST_RUN_PENDING_RESULT = 0x41303
 LINUX_STATUS_SCHEMA = "quantdesk.daily_data_chain_scheduler_status.v1"
@@ -30,6 +34,7 @@ def _probe_command(task_name: str) -> list[str]:
     escaped_name = task_name.replace("'", "''")
     escaped_marker = OWNERSHIP_MARKER.replace("'", "''")
     script = rf"""
+# QuantDesk Daily Data Chain is the legacy scheduler, inspected separately.
 $ErrorActionPreference = 'Stop'
 $task = Get-ScheduledTask -TaskName '{escaped_name}' -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($null -eq $task) {{
@@ -44,7 +49,7 @@ $lastTaskResultPresent = ($null -ne $info.LastTaskResult)
 [ordered]@{{
   exists = $true
   task_name = '{escaped_name}'
-  managed = ([string]$task.Description).StartsWith('{escaped_marker}')
+  managed = (([string]$task.Description).StartsWith('{escaped_marker}') -or ('{escaped_name}' -eq '{CURRENT_TASK_NAME}'))
   enabled = ([string]$task.State -ne 'Disabled')
   state = [string]$task.State
   last_run_time = if ($info.LastRunTime) {{ $info.LastRunTime.ToString('o') }} else {{ '' }}
@@ -151,6 +156,17 @@ def _action_contract_kind(raw: dict[str, Any], project_root: Path) -> str:
     if not working_directory_matches:
         return ""
 
+    if raw.get("task_name") == CURRENT_TASK_NAME:
+        wrapped = _wrapped_pipeline_action(raw, root)
+        if wrapped is not None:
+            return "data_close_pipeline_wrapper" if _action_contract_kind(wrapped, root) == "data_close_pipeline" else ""
+        runner = root / "scripts" / "run_data_close_pipeline.py"
+        expected = f'-B "{runner}" --enable-network --trigger scheduled --enable-alert-network --alert-push'
+        if (_windows_path_key(execute) == _windows_path_key(root / ".venv" / "Scripts" / "python.exe")
+                and arguments == _windows_command_key(expected)):
+            return "data_close_pipeline"
+        return ""
+
     # The installer now launches the supervisor directly. Keep the old cmd
     # action valid for already-registered tasks until the next re-registration.
     cmd_runner = root / "scripts" / "run_daily_data_chain.cmd"
@@ -173,6 +189,66 @@ def _action_contract_kind(raw: dict[str, Any], project_root: Path) -> str:
     ):
         return "powershell_supervisor"
     return ""
+
+
+def _wrapped_pipeline_action(raw: dict[str, Any], root: Path) -> dict[str, Any] | None:
+    """Decode only the managed calendar wrapper, never execute its contents.
+
+    Returning an invalid inner action keeps a malformed wrapper fail-closed.
+    Case-folding the base64 string would corrupt the embedded action.
+    """
+    wrapper = root / "scripts" / "run_scheduled_task.py"
+    arguments = str(raw.get("arguments") or "")
+    if len(arguments) > 65536:
+        return {}
+    try:
+        tokens = [token[1:-1] if token.startswith('"') and token.endswith('"') else token
+                  for token in shlex.split(arguments, posix=False)]
+    except ValueError:
+        return {}
+    if len(tokens) < 2 or tokens[0] != "-B" or _windows_path_key(tokens[1]) != _windows_path_key(wrapper):
+        return None
+    executable = _windows_path_key(raw.get("execute"))
+    if executable not in {_windows_path_key(root / ".venv/Scripts/python.exe"),
+                          _windows_path_key(root / ".venv/Scripts/pythonw.exe")}:
+        return {}
+    options: dict[str, str] = {}
+    fields = tokens[2:]
+    if len(fields) % 2:
+        return {}
+    for key, value in zip(fields[::2], fields[1::2]):
+        if key not in {"--task-name", "--policy", "--action-base64", "--project-root"} or key in options:
+            return {}
+        options[key] = value
+    if (not {"--task-name", "--policy", "--action-base64"} <= options.keys()
+            or options["--task-name"] != CURRENT_TASK_NAME or options["--policy"] != "trading_day"
+            or ("--project-root" in options and _windows_path_key(options["--project-root"]) != _windows_path_key(root))):
+        return {}
+    try:
+        action = json.loads(base64.b64decode(options["--action-base64"], validate=True).decode("utf-8"))
+    except (ValueError, UnicodeError):
+        return {}
+    required = {"executable", "arguments", "working_directory"}
+    if (not isinstance(action, dict) or set(action) != required
+            or any(not isinstance(action[key], str) or "\x00" in action[key] for key in required)):
+        return {}
+    # Recursion is bounded: the accepted inner executable is python.exe and
+    # its script must be the original pipeline, never another wrapper.
+    if _windows_path_key(action["executable"]) != _windows_path_key(root / ".venv/Scripts/python.exe"):
+        return {}
+    runner = root / "scripts/run_data_close_pipeline.py"
+    try:
+        inner_tokens = [token[1:-1] if token.startswith('"') and token.endswith('"') else token
+                        for token in shlex.split(action["arguments"], posix=False)]
+    except ValueError:
+        return {}
+    if (len(inner_tokens) != 7 or inner_tokens[0] != "-B"
+            or _windows_path_key(inner_tokens[1]) != _windows_path_key(runner)
+            or inner_tokens[2:] != ["--enable-network", "--trigger", "scheduled", "--enable-alert-network", "--alert-push"]
+            or _windows_path_key(action["working_directory"]) != _windows_path_key(root)):
+        return {}
+    return {"task_name": CURRENT_TASK_NAME, "execute": action["executable"],
+            "arguments": action["arguments"], "working_directory": action["working_directory"]}
 
 
 def _action_contract_matches(raw: dict[str, Any], project_root: Path) -> bool:
@@ -369,12 +445,38 @@ def _linux_scheduler_status(
     return payload
 
 
+def _pipeline_receipt(root: Path, target_date: str | None) -> dict[str, Any]:
+    """Keep task exit and business-stage completion as separate observations."""
+
+    path = root / "results/data_close_pipeline/data_close_pipeline_latest.json"
+    result: dict[str, Any] = {"path": str(path), "status": "missing", "target_date": "",
+                              "run_id": "", "read_only": True, "reason_codes": []}
+    try:
+        raw = path.read_bytes()
+        data = json.loads(raw.decode("utf-8-sig"))
+        if not isinstance(data, dict) or data.get("schema_version") != "data_close_pipeline_v1":
+            raise ValueError("pipeline_receipt_schema_mismatch")
+        result.update(status=str(data.get("status") or "unknown"),
+                      target_date=str(data.get("target_date") or "")[:10],
+                      run_id=str(data.get("run_id") or ""), sha256=hashlib.sha256(raw).hexdigest(),
+                      skipped_stages=list(data.get("skipped_stages") or []),
+                      generated_at=str(data.get("completed_at") or data.get("finished_at") or data.get("started_at") or ""))
+        if target_date and result["target_date"] != target_date:
+            result["reason_codes"].append("pipeline_receipt_not_target_date")
+    except FileNotFoundError:
+        result["reason_codes"] = ["pipeline_receipt_missing"]
+    except (OSError, UnicodeError, ValueError) as exc:
+        result.update(status="invalid", reason_codes=["pipeline_receipt_invalid"], error=str(exc)[:300])
+    return result
+
+
 def daily_data_scheduler_status(
     *,
     project_root: Path = PROJECT_ROOT,
     platform_name: str | None = None,
     runner: Runner | None = None,
     status_path: Path | None = None,
+    target_date: str | None = None,
 ) -> dict[str, Any]:
     """Return structured scheduler health without running or changing the task."""
 
@@ -396,7 +498,7 @@ def daily_data_scheduler_status(
         return payload
 
     run = runner or subprocess.run
-    command = _probe_command(TASK_NAME)
+    command = _probe_command(CURRENT_TASK_NAME)
     try:
         completed = run(
             command,
@@ -443,6 +545,20 @@ def daily_data_scheduler_status(
         return payload
     if not isinstance(raw, dict):
         raw = {}
+    if raw.get("task_name") != CURRENT_TASK_NAME or raw.get("exists") is not True:
+        # Backward compatibility is used only when the current writer is absent.
+        # A present but failed/disabled current task must remain visibly unhealthy.
+        try:
+            legacy = run(_probe_command(TASK_NAME), cwd=Path(project_root), check=False,
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+            if int(getattr(legacy, "returncode", 1) or 0) == 0:
+                decoded = json.loads(str(getattr(legacy, "stdout", "") or "{}"))
+                raw = decoded if isinstance(decoded, dict) else {}
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            payload.update(ok=False, status="unavailable", reason_codes=["scheduled_task_probe_failed"],
+                           error=f"{type(exc).__name__}:{exc}"[:1000])
+            return payload
+    payload["task_name"] = str(raw.get("task_name") or TASK_NAME)
 
     exists = raw.get("exists") is True
     managed = raw.get("managed") is True
@@ -560,6 +676,18 @@ def daily_data_scheduler_status(
             "reason_codes": reason_codes,
         }
     )
+    if payload["task_name"] == CURRENT_TASK_NAME:
+        receipt = _pipeline_receipt(Path(project_root), target_date)
+        payload["pipeline_receipt"] = receipt
+        if receipt["status"] in {"failed", "blocked", "invalid"} and (not target_date or receipt.get("target_date") == target_date):
+            payload.update(status="last_run_failed", last_run_succeeded=False)
+            payload["reason_codes"] = [*payload["reason_codes"], "data_close_pipeline_business_failed"]
+        elif receipt["status"] == "running":
+            payload.update(status="running", last_run_succeeded=False)
+        elif receipt["reason_codes"] and target_date:
+            payload.update(status="last_run_unknown", last_run_succeeded=False)
+            payload["reason_codes"] = [*payload["reason_codes"], *receipt["reason_codes"]]
+        payload["completion_status"] = receipt["status"]
     return payload
 
 

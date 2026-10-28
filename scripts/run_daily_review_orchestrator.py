@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +27,7 @@ from quantdesk.daily_review_orchestrator import (  # noqa: E402
     validate_stage4_terminal_evidence_pair,
 )
 from quantdesk.interprocess_lock import interprocess_file_lock  # noqa: E402
+from quantdesk.trading_calendar import resolve_target_complete_trade_date  # noqa: E402
 from quantdesk.update_task_lock import is_pid_alive  # noqa: E402
 from quantdesk.utils import atomic_write_json  # noqa: E402
 
@@ -41,12 +44,26 @@ class AbandonedDailyChainProducer(RuntimeError):
         )
 
 
+class DailyChainWaitTimeout(TimeoutError):
+    """No terminal event for the frozen business date arrived within the wait."""
+
+    def __init__(self, target_date: str, observed_date: str, reason: str) -> None:
+        self.target_date = target_date
+        self.observed_date = observed_date
+        self.reason_code = reason
+        super().__init__(
+            f"daily_data_chain_wait_timeout:target_date={target_date}:"
+            f"observed_target_date={observed_date or 'missing'}:reason={reason}"
+        )
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", default=str(DEFAULT_PROJECT_ROOT))
     parser.add_argument("--chain-manifest", default="")
+    parser.add_argument("--target-date", default="")
     parser.add_argument("--lease-seconds", type=int, default=7200)
-    parser.add_argument("--chain-wait-seconds", type=float, default=1800.0)
+    parser.add_argument("--chain-wait-seconds", type=float, default=7200.0)
     parser.add_argument("--json", dest="as_json", default="false")
     parser.add_argument("--summary", default="true")
     return parser.parse_args(argv)
@@ -77,6 +94,56 @@ def _read_chain_manifest(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _iso_day(value: str) -> str:
+    day = str(value or "").strip()
+    if not day or datetime.fromisoformat(day).date().isoformat() != day:
+        raise ValueError("target_date must be an ISO calendar date")
+    return day
+
+
+def _expected_chain_probe(
+    metadata: dict[str, Any], manifest_path: Path, target_date: str,
+) -> tuple[dict[str, Any] | None, str, str]:
+    """Read only: an earlier abandoned event is evidence, never a new review."""
+
+    status = str(metadata.get("status") or "")
+    if status in {"running", "abandoned"}:
+        run_id = str(metadata.get("run_id") or "").strip()
+        try:
+            observed_date = _iso_day(str(metadata.get("target_date") or ""))
+        except ValueError as exc:
+            raise RuntimeError("daily_data_chain_abandoned_identity_invalid") from exc
+        if not run_id:
+            raise RuntimeError("daily_data_chain_abandoned_identity_invalid")
+        if observed_date > target_date:
+            raise RuntimeError("daily_data_chain_target_date_in_future")
+        if status == "running":
+            try:
+                producer_pid = int(metadata["pid"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("daily_data_chain_running_pid_invalid") from exc
+            if producer_pid <= 0:
+                raise RuntimeError("daily_data_chain_running_pid_invalid")
+            if is_pid_alive(producer_pid):
+                raise RuntimeError("daily_data_chain_metadata_running_without_os_lock")
+        return None, observed_date, "daily_data_chain_producer_abandoned"
+    if metadata and status != "released":
+        raise RuntimeError("daily_data_chain_lock_status_invalid")
+    if not manifest_path.is_file():
+        return None, "", "authoritative_chain_manifest_missing"
+    manifest = _read_chain_manifest(manifest_path)
+    observed_date = _iso_day(str(manifest["target_date"]))
+    if observed_date > target_date:
+        raise RuntimeError("daily_data_chain_target_date_in_future")
+    if status == "released" and str(metadata.get("run_id") or "") != str(manifest["run_id"]):
+        raise RuntimeError("daily_data_chain_terminal_manifest_mismatch")
+    if observed_date != target_date:
+        return None, observed_date, "daily_data_chain_target_date_pending"
+    if not metadata:
+        return None, observed_date, "daily_data_chain_terminal_metadata_missing"
+    return manifest, observed_date, ""
+
+
 @contextmanager
 def locked_authoritative_chain_event(
     *,
@@ -84,12 +151,43 @@ def locked_authoritative_chain_event(
     manifest_path: Path,
     timeout_seconds: float = 1800.0,
     poll_seconds: float = 2.0,
+    expected_target_date: str | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Hold the producer's OS lock while selecting and consuming its event."""
+    """Release the producer lock while waiting; hold it once the date is selected.
+
+    Explicit historical callers may omit the expected date. Automatic launches
+    freeze it before waiting so yesterday's event cannot satisfy today's run.
+    """
 
     root = Path(project_root).resolve()
     os_lock = root / "state" / "daily_data_chain.lock"
     metadata_path = root / "state" / "daily_data_chain.lock.json"
+    if expected_target_date is not None:
+        expected = _iso_day(expected_target_date)
+        wait_seconds, poll = float(timeout_seconds), float(poll_seconds)
+        if not math.isfinite(wait_seconds) or wait_seconds < 0 or not math.isfinite(poll) or poll <= 0:
+            raise ValueError("daily_data_chain_wait_parameters_invalid")
+        deadline = time.monotonic() + wait_seconds
+        observed, reason = "", "daily_data_chain_producer_busy"
+        while True:
+            selected = False
+            try:
+                with interprocess_file_lock(os_lock, timeout_seconds=0):
+                    metadata = _read_json_object(metadata_path, "daily_data_chain_lock_unreadable") if metadata_path.exists() else {}
+                    manifest, observed, reason = _expected_chain_probe(metadata, Path(manifest_path), expected)
+                    if manifest is not None:
+                        selected = True
+                        yield manifest
+                        return
+            except TimeoutError:
+                if selected:
+                    raise
+                reason = "daily_data_chain_producer_busy"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DailyChainWaitTimeout(expected, observed, reason)
+            time.sleep(min(poll, remaining))
+        return
     acquired = False
     try:
         with interprocess_file_lock(
@@ -268,11 +366,19 @@ def main(argv: list[str] | None = None) -> int:
     manifest_path = Path(args.chain_manifest).resolve() if args.chain_manifest else (
         root / "results" / "data_chain" / "daily_data_chain_latest.json"
     )
+    expected_date: str | None = None
     try:
+        if args.target_date:
+            expected_date = _iso_day(args.target_date)
+        elif not args.chain_manifest:
+            expected_date = _iso_day(str(resolve_target_complete_trade_date(
+                calendar_path=root / "data/calendar/a_share_trading_calendar.csv",
+            )["target_date"]))
         with locked_authoritative_chain_event(
             project_root=root,
             manifest_path=manifest_path,
             timeout_seconds=args.chain_wait_seconds,
+            expected_target_date=expected_date,
         ) as chain:
             target_date = str(chain["target_date"])
             daily_command = [
@@ -287,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
             result = run_evening_review(
                 project_root=root,
                 target_date=target_date,
+                expected_target_date=expected_date,
                 authoritative_chain_run_id=str(chain["run_id"]),
                 trigger="scheduled_daily_review",
                 daily_runner=_command_runner(daily_command, root),
@@ -299,6 +406,18 @@ def main(argv: list[str] | None = None) -> int:
                 lease_seconds=args.lease_seconds,
             )
     except TimeoutError as exc:
+        if not isinstance(exc, DailyChainWaitTimeout) and str(exc) != "daily_data_chain_wait_timeout":
+            print(f"daily-review-orchestrator: operation-timeout: {exc}", file=sys.stderr)
+            return 2
+        if _truthy(args.as_json):
+            print(json.dumps({
+                "status": "deferred", "state": "awaiting_daily_data",
+                "target_date": expected_date,
+                "observed_target_date": getattr(exc, "observed_date", ""),
+                "reason_code": getattr(exc, "reason_code", "daily_data_chain_wait_timeout"),
+                "daily_executed": False, "stage4_executed": False,
+                "production_completed": False, "disclaimer": DISCLAIMER,
+            }, ensure_ascii=False, indent=2))
         print(f"daily-review-orchestrator: wait-timeout: {exc}", file=sys.stderr)
         return 4
     except AbandonedDailyChainProducer as exc:

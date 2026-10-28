@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import os
 import shutil
 import uuid
@@ -20,6 +21,7 @@ from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
+from quantdesk.csv_io import read_csv_frame
 from quantdesk.interprocess_lock import interprocess_file_lock
 from quantdesk.intraday.canonical_write_guard import (
     atomic_restore_from_backup,
@@ -29,9 +31,15 @@ from quantdesk.intraday.canonical_write_guard import (
 from quantdesk.intraday.stage6_append_only_import import (
     CANONICAL_WRITE_LOCK_TIMEOUT_SECONDS,
     canonical_intraday_write_lock_path,
+    _stage_frame,
 )
-from quantdesk.intraday.intraday_quality_audit import audit_intraday_file
-from quantdesk.intraday.intraday_schema import read_intraday_csv
+from quantdesk.intraday.intraday_quality_audit import audit_intraday_file, assess_complete_session
+from quantdesk.intraday.intraday_schema import STANDARD_COLUMNS, normalize_intraday_frame
+from quantdesk.intraday.minute_bar_lifecycle import (
+    LIFECYCLE_COLUMNS, LIFECYCLE_DIR, merge_bar_observation_logs, read_bar_observation_log,
+    select_bar_observations,
+)
+from quantdesk.intraday.minute_storage import resolve_minute_read_path
 from quantdesk.shared import normalize_symbol, now_text
 from quantdesk.utils import atomic_write_json
 
@@ -62,8 +70,11 @@ def _sha256(path: Path) -> str:
 
 
 def _frame_for_date(path: Path, symbol: str, target_date: str) -> pd.DataFrame:
-    payload = read_intraday_csv(
-        path,
+    # Comparison hashes name physical files. Do not redirect one side to a
+    # different schema segment while reporting the original file's digest.
+    raw = read_csv_frame(path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+    payload = normalize_intraday_frame(
+        raw,
         default_symbol=normalize_symbol(symbol),
         target_date=str(target_date)[:10],
     )
@@ -71,6 +82,33 @@ def _frame_for_date(path: Path, symbol: str, target_date: str) -> pd.DataFrame:
     if not isinstance(frame, pd.DataFrame):
         return pd.DataFrame()
     return frame.copy()
+
+
+def _final_evidence_candidate(canonical_dir: Path, staging_path: Path, symbol: str,
+                              target_date: str) -> tuple[Path, bytes]:
+    """Copy independently validated events without giving legacy rows finality."""
+    events, errors = _stage_frame(staging_path, symbol, target_date)
+    if events is None or errors or "evidence_hash" not in events.columns:
+        raise ValueError("final_minute_source_evidence_missing")
+    target = canonical_dir / LIFECYCLE_DIR / f"{symbol}.csv"
+    previous = read_bar_observation_log(target) if target.exists() else pd.DataFrame()
+    merged = merge_bar_observation_logs(previous, events)
+    known = set(previous["evidence_hash"]) if not previous.empty else set()
+    added = merged.loc[~merged["evidence_hash"].isin(known)]
+    original = target.read_bytes() if target.exists() else b""
+    if added.empty:
+        return target, original
+    columns = list(previous.columns) if not previous.empty else STANDARD_COLUMNS + list(LIFECYCLE_COLUMNS)
+    if set(STANDARD_COLUMNS + list(LIFECYCLE_COLUMNS)) - set(columns):
+        raise ValueError("minute_header_mismatch")
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
+    if not original:
+        writer.writeheader()
+    writer.writerows(added.to_dict("records"))
+    suffix = buffer.getvalue().encode("utf-8")
+    separator = b"" if not original or original.endswith((b"\n", b"\r")) else b"\n"
+    return target, original + separator + suffix
 
 
 def _decimal(value: Any) -> Decimal:
@@ -290,7 +328,7 @@ def _replace_target_date_bytes(
     if canonical_header != staging_header:
         staging_only = set(staging_header) - set(canonical_header)
         if (
-            staging_only == {"price_only_intraday"}
+            staging_only <= set(LIFECYCLE_COLUMNS) | {"price_only_intraday"}
             and set(canonical_header) <= set(staging_header)
             and len(set(staging_header)) == len(staging_header)
         ):
@@ -302,10 +340,18 @@ def _replace_target_date_bytes(
         for index, line in enumerate(canonical_lines[1:], start=1)
         if _row_date(_csv_fields(line), canonical_header) == target_date
     ]
+    latest_hashes: set[str] | None = None
+    if "evidence_hash" in canonical_header:
+        raise ValueError("signed_minute_event_requires_explicit_revision")
+    if "evidence_hash" in staging_header:
+        events = pd.DataFrame(list(csv.DictReader(io.StringIO(staging_content.decode("utf-8-sig")))))
+        latest_hashes = set(select_bar_observations(events)["evidence_hash"])
     stage_rows: list[bytes] = []
     for line in staging_lines[1:]:
         fields = _csv_fields(line)
         if _row_date(fields, staging_header) != target_date:
+            continue
+        if latest_hashes is not None and fields[staging_header.index("evidence_hash")] not in latest_hashes:
             continue
         if projection is None:
             stage_rows.append(line)
@@ -362,9 +408,10 @@ def _resolve_stage6_intraday_conflicts_locked(
     )
     items: list[dict[str, Any]] = []
     candidates: dict[str, bytes] = {}
+    evidence_candidates: dict[str, tuple[Path, bytes]] = {}
     for symbol in normalized_symbols:
         canonical_path = canonical_dir / f"{symbol}.csv"
-        staging_path = staging_dir / f"{symbol}.csv"
+        staging_path = resolve_minute_read_path(staging_dir / f"{symbol}.csv")
         canonical_audit = audit_intraday_file(
             symbol, date_text, intraday_dir=canonical_dir
         )
@@ -377,21 +424,39 @@ def _resolve_stage6_intraday_conflicts_locked(
             symbol=symbol,
             target_date=date_text,
         )
+        physical = read_csv_frame(canonical_path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+        signed = any(column in physical.columns for column in (
+            "evidence_hash", "revision", "supersedes_hash", "revision_reason",
+            "is_final", "finality", "bar_start", "bar_end", "fetched_at"))
+        legacy = canonical_path.is_file() and not signed
+        if legacy:
+            geometry = assess_complete_session(_frame_for_date(canonical_path, symbol, date_text),
+                                               symbol=symbol, target_date=date_text)
+            canonical_audit = {**canonical_audit, **geometry,
+                               "session_status": geometry["status"],
+                               "session_reason_codes": geometry["reason_codes"]}
         reasons = _audit_reasons(canonical_audit)
         real_quality_reasons = [
-            item for item in reasons if item != "price_basis_not_raw"
+            item for item in reasons if item not in {"price_basis_not_raw", "legacy_bar_lifecycle_unverified"}
         ]
         staging_passed = staging_audit.get("formal_execution_eligible") is True
         if canonical_audit.get("formal_execution_eligible") is True:
             decision = "audit_passed_zero_write"
+        elif signed:
+            # A label patch or target-date replacement would rewrite signed
+            # history. Only the append importer may accept explicit revisions.
+            decision = "unclassified_cross_source_mismatch"
+            reasons = list(dict.fromkeys([*reasons, "signed_minute_event_requires_explicit_revision"]))
         elif (
-            reasons == ["price_basis_not_raw"]
+            set(reasons) - {"legacy_bar_lifecycle_unverified"} == {"price_basis_not_raw"}
             and comparison["large_diff_count"] == 0
             and staging_passed
         ):
             decision = "bounded_price_basis_label_repair"
         elif real_quality_reasons and staging_passed:
             decision = "bounded_target_date_replacement"
+        elif legacy and not real_quality_reasons and staging_passed and comparison["large_diff_count"] == 0:
+            decision = "bounded_final_evidence_segment"
         else:
             decision = "unclassified_cross_source_mismatch"
         before = canonical_path.read_bytes() if canonical_path.exists() else b""
@@ -425,20 +490,30 @@ def _resolve_stage6_intraday_conflicts_locked(
         }
         atomic_write_json(comparison_artifact, comparison_payload)
         item["comparison_artifact_path"] = str(comparison_artifact)
-        if decision == "bounded_price_basis_label_repair":
-            candidate, changed_rows = _replace_target_basis_bytes(before, date_text)
-            candidates[symbol] = candidate
-            item["changed_label_row_count"] = changed_rows
-        elif decision == "bounded_target_date_replacement":
-            candidates[symbol] = _replace_target_date_bytes(
-                before, staging_path.read_bytes(), date_text
-            )
+        if decision in {"bounded_price_basis_label_repair", "bounded_target_date_replacement", "bounded_final_evidence_segment"}:
+            try:
+                if decision == "bounded_price_basis_label_repair":
+                    candidate, changed_rows = _replace_target_basis_bytes(before, date_text)
+                    candidates[symbol] = candidate
+                    item["changed_label_row_count"] = changed_rows
+                elif decision == "bounded_target_date_replacement":
+                    candidates[symbol] = _replace_target_date_bytes(before, staging_path.read_bytes(), date_text)
+                evidence_candidates[symbol] = _final_evidence_candidate(canonical_dir, staging_path, symbol, date_text)
+                item["evidence_segment_path"] = str(evidence_candidates[symbol][0])
+                item["evidence_source_path"] = str(staging_path)
+                item["evidence_source_sha256"] = _sha256(staging_path)
+                item["legacy_finality_promoted"] = False
+            except (OSError, ValueError) as exc:
+                candidates.pop(symbol, None)
+                evidence_candidates.pop(symbol, None)
+                item["decision"] = "unclassified_cross_source_mismatch"
+                item["canonical_reason_codes"] = [*reasons, str(exc)]
         items.append(item)
 
     has_unclassified = any(
         item["decision"] == "unclassified_cross_source_mismatch" for item in items
     )
-    mutation_items = [item for item in items if item["symbol"] in candidates]
+    mutation_items = [item for item in items if item["symbol"] in candidates or item["symbol"] in evidence_candidates]
     payload: dict[str, Any] = {
         "schema_version": 1,
         "contract_reference": SECTION_15_REFERENCE,
@@ -472,24 +547,34 @@ def _resolve_stage6_intraday_conflicts_locked(
         transaction = retained_backups / f".transaction-{uuid.uuid4().hex}"
         transaction.mkdir(parents=True, exist_ok=False)
         rollback_errors: list[str] = []
+        writes: list[dict[str, Any]] = []
         try:
             for item in mutation_items:
                 symbol = str(item["symbol"])
-                target = canonical_dir / f"{symbol}.csv"
-                backup = retained_backups / f"{symbol}.csv"
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(target, backup)
-                if sha256_path(backup) != str(item["canonical_sha256_before"]):
-                    raise ValueError(f"backup_hash_verification_failed:{symbol}")
-                item["backup_path"] = str(backup)
-                candidate_path = transaction / f"{symbol}.csv"
-                candidate_path.write_bytes(candidates[symbol])
-            for item in mutation_items:
-                symbol = str(item["symbol"])
-                os.replace(
-                    transaction / f"{symbol}.csv",
-                    canonical_dir / f"{symbol}.csv",
-                )
+                changes = []
+                if symbol in candidates:
+                    changes.append((canonical_dir / f"{symbol}.csv", candidates[symbol], "backup_path"))
+                if symbol in evidence_candidates:
+                    target, content = evidence_candidates[symbol]
+                    changes.append((target, content, "evidence_backup_path"))
+                for target, content, backup_key in changes:
+                    relative = target.relative_to(canonical_dir)
+                    backup = retained_backups / relative
+                    expected = sha256_path(target) if target.exists() else ""
+                    if expected:
+                        backup.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(target, backup)
+                        if sha256_path(backup) != expected:
+                            raise ValueError(f"backup_hash_verification_failed:{symbol}")
+                        item[backup_key] = str(backup)
+                    candidate_path = transaction / relative
+                    candidate_path.parent.mkdir(parents=True, exist_ok=True)
+                    candidate_path.write_bytes(content)
+                    writes.append({"target": target, "candidate": candidate_path, "backup": backup,
+                                   "expected_sha256": expected, "item": item})
+            for write in writes:
+                write["target"].parent.mkdir(parents=True, exist_ok=True)
+                os.replace(write["candidate"], write["target"])
             for item in mutation_items:
                 symbol = str(item["symbol"])
                 target = canonical_dir / f"{symbol}.csv"
@@ -502,6 +587,8 @@ def _resolve_stage6_intraday_conflicts_locked(
                 after = target.read_bytes()
                 item["canonical_sha256_after"] = hashlib.sha256(after).hexdigest()
                 item["non_label_sha256_after"] = _non_label_sha256(after)
+                if item.get("evidence_segment_path"):
+                    item["evidence_segment_sha256"] = sha256_path(Path(item["evidence_segment_path"]))
                 if item["decision"] == "bounded_price_basis_label_repair" and (
                     item["non_label_sha256_before"] != item["non_label_sha256_after"]
                 ):
@@ -515,32 +602,38 @@ def _resolve_stage6_intraday_conflicts_locked(
                 }
             )
         except Exception as exc:  # noqa: BLE001 - explicit rollback guard
-            for item in reversed(mutation_items):
-                backup_text = str(item.get("backup_path") or "")
-                target = canonical_dir / f"{item['symbol']}.csv"
-                expected_hash = str(item.get("canonical_sha256_before") or "")
+            for write in reversed(writes):
+                item = write["item"]
+                target = write["target"]
+                expected_hash = write["expected_sha256"]
                 try:
-                    if expected_hash and target.exists() and sha256_path(target) == expected_hash:
+                    if not expected_hash:
+                        target.unlink(missing_ok=True)
+                        restored_hash = ""
+                    elif target.exists() and sha256_path(target) == expected_hash:
                         restored_hash = expected_hash
-                    elif backup_text:
+                    elif write["backup"].is_file():
                         restored_hash = atomic_restore_from_backup(
                             target,
-                            Path(backup_text),
+                            write["backup"],
                             expected_sha256=expected_hash,
                         )
                     else:
                         raise ValueError("rollback_backup_missing")
                     item["rollback_verified"] = restored_hash == expected_hash
-                    item["canonical_sha256_restored"] = restored_hash
+                    if target == canonical_dir / f"{item['symbol']}.csv":
+                        item["canonical_sha256_restored"] = restored_hash
                     if not item["rollback_verified"]:
                         raise ValueError("rollback_hash_verification_failed")
                 except (OSError, ValueError) as rollback_exc:
                     item["rollback_verified"] = False
                     rollback_errors.append(f"{item['symbol']}:{rollback_exc}")
+            for item in mutation_items:
                 item["applied"] = False
                 item["post_repair_audit"] = {}
                 item["canonical_sha256_after"] = ""
                 item["non_label_sha256_after"] = ""
+                item["evidence_segment_sha256"] = ""
             payload.update(
                 {
                     "status": "failed",

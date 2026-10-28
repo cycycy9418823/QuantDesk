@@ -7,10 +7,12 @@ import hashlib
 import io
 import os
 import shutil
+import threading
 import uuid
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import pandas as pd
 
@@ -23,6 +25,11 @@ from quantdesk.intraday.canonical_write_guard import (
 )
 from quantdesk.intraday.intraday_quality_audit import audit_intraday_batch
 from quantdesk.intraday.intraday_schema import STANDARD_COLUMNS, read_intraday_csv
+from quantdesk.intraday.minute_bar_lifecycle import (
+    LIFECYCLE_COLUMNS, LIFECYCLE_DIR, select_bar_observations,
+    merge_bar_observation_logs, read_bar_observation_log,
+)
+from quantdesk.intraday.minute_storage import resolve_minute_read_path
 from quantdesk.shared import normalize_symbol, now_text
 from quantdesk.utils import atomic_write_json
 
@@ -73,12 +80,35 @@ STAGING_PRICE_ONLY_PROVENANCE_COLUMN = "price_only_intraday"
 # for real contention instead of narrowing the lock. A genuinely stuck holder is
 # still bounded by the scheduled task's own ExecutionTimeLimit.
 CANONICAL_WRITE_LOCK_TIMEOUT_SECONDS = 900.0
+_CANONICAL_TRANSACTION_LOCKS = threading.local()
 
 
 def canonical_intraday_write_lock_path(canonical_dir: Path) -> Path:
     """Return the singleton lock shared by every canonical minute writer."""
 
     return Path(canonical_dir) / ".locks" / CANONICAL_WRITE_LOCK_NAME
+
+
+@contextmanager
+def canonical_intraday_write_transaction(canonical_dir: Path) -> Iterator[Path]:
+    """Keep the singleton lock across several audited appends and their rollback."""
+
+    canonical = Path(canonical_dir)
+    key = canonical.resolve()
+    owned = getattr(_CANONICAL_TRANSACTION_LOCKS, "paths", ())
+    if key in owned:
+        yield canonical
+        return
+    canonical.mkdir(parents=True, exist_ok=True)
+    with interprocess_file_lock(
+        canonical_intraday_write_lock_path(canonical),
+        timeout_seconds=CANONICAL_WRITE_LOCK_TIMEOUT_SECONDS,
+    ):
+        _CANONICAL_TRANSACTION_LOCKS.paths = (*owned, key)
+        try:
+            yield canonical
+        finally:
+            _CANONICAL_TRANSACTION_LOCKS.paths = owned
 
 
 def _sha256(path: Path) -> str:
@@ -140,6 +170,8 @@ def _decimal_text(value: Any, *, quantum: Decimal | None = None) -> str:
 
 
 def _comparable_rows(rows: Sequence[Mapping[str, Any]]) -> list[tuple[str, ...]]:
+    if rows and any("evidence_hash" in row for row in rows):
+        rows = select_bar_observations(pd.DataFrame(rows)).to_dict("records")
     comparable: list[tuple[str, ...]] = []
     for row in rows:
         values: list[str] = []
@@ -183,6 +215,7 @@ def _staging_provenance_errors(path: Path) -> list[str]:
 
 
 def _stage_frame(path: Path, symbol: str, target_date: str) -> tuple[pd.DataFrame | None, list[str]]:
+    path = resolve_minute_read_path(path)
     provenance_errors = _staging_provenance_errors(path)
     if provenance_errors:
         return None, provenance_errors
@@ -200,6 +233,21 @@ def _stage_frame(path: Path, symbol: str, target_date: str) -> tuple[pd.DataFram
     )
     if observed_dates != [target_date]:
         return None, ["staging_contains_non_target_dates"]
+    if "evidence_hash" in frame.columns:
+        # The audit reads the latest view; import preserves every event needed
+        # to reconstruct that view and its historical as-of evidence.
+        try:
+            events = read_bar_observation_log(Path(payload["path"]))
+        except (OSError, ValueError, KeyError) as exc:
+            return None, [str(exc)]
+        events["revision"] = pd.to_numeric(events["revision"], errors="raise")
+        stamps = pd.to_datetime(events["datetime"], errors="coerce")
+        frame = events.loc[stamps.dt.strftime("%Y-%m-%d") == target_date].copy()
+        # date/time are compatibility columns, not signed event identity. Derive
+        # them from the signed datetime rather than trusting an unrelated date.
+        frame["date"] = stamps.loc[frame.index].dt.strftime("%Y-%m-%d")
+        frame["time"] = stamps.loc[frame.index].dt.strftime("%H:%M:%S")
+        return frame.sort_values(["datetime", "revision"], kind="stable").reset_index(drop=True), errors
     return frame.sort_values("datetime").reset_index(drop=True), errors
 
 
@@ -225,6 +273,38 @@ def _quality_gate(
         if str(item.get("price_basis") or "").lower() != "raw":
             passed = False
     return passed, by_symbol
+
+
+def _identical_non_execution_batch(
+    symbols: Sequence[str], *, staging: Path, canonical: Path, target_date: str,
+    audit_by_symbol: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]] | None:
+    """A byte-identical no-op may preserve zero-volume observations, never fill."""
+    items = []
+    for symbol in symbols:
+        audit_item = audit_by_symbol.get(symbol, {})
+        if set(audit_item.get("session_reason_codes", [])) != {"zero_volume_no_trade_evidence"}:
+            return None
+        stage_path = resolve_minute_read_path(staging / f"{symbol}.csv")
+        target_path = resolve_minute_read_path(canonical / f"{symbol}.csv")
+        frame, errors = _stage_frame(stage_path, symbol, target_date)
+        if frame is None or errors or "evidence_hash" not in frame.columns or not target_path.is_file():
+            return None
+        try:
+            prior = read_bar_observation_log(target_path)
+        except (OSError, ValueError):
+            return None
+        prior = prior.loc[prior["datetime"].str[:10] == target_date]
+        if set(prior["evidence_hash"]) != set(frame["evidence_hash"]):
+            return None
+        digest = _sha256(target_path)
+        items.append({"symbol": symbol, "target_date": target_date,
+                      "operation": "unchanged_identical_date", "formal_execution_eligible": False,
+                      "quality_status": "warning", "reason_codes": ["zero_volume_no_trade_evidence"],
+                      "canonical_path": str(target_path), "staging_path": str(stage_path),
+                      "canonical_sha256_before": digest, "canonical_sha256_after": digest,
+                      "staging_sha256": _sha256(stage_path)})
+    return items
 
 
 def _append_candidate(
@@ -418,6 +498,14 @@ def _apply_audited_intraday_batch_locked(
         "items": [],
     }
     if not normalized_symbols or not quality_passed:
+        identical = (_identical_non_execution_batch(normalized_symbols, staging=staging, canonical=canonical,
+                                                     target_date=date_text, audit_by_symbol=audit_by_symbol)
+                     if normalized_symbols and provided_quality_passed else None)
+        if identical:
+            base.update(status="completed", applied=False, quality_status="warning", items=identical,
+                        unchanged_symbol_count=len(identical), formal_execution_eligible=False,
+                        reason_codes=["unchanged_non_execution_evidence"])
+            return _write_payload(output_path, base)
         base.update(
             {
                 "status": "blocked",
@@ -432,9 +520,22 @@ def _apply_audited_intraday_batch_locked(
     planned: list[dict[str, Any]] = []
     conflicts: list[str] = []
     for symbol in normalized_symbols:
-        stage_path = staging / f"{symbol}.csv"
+        stage_path = resolve_minute_read_path(staging / f"{symbol}.csv")
         target_path = canonical / f"{symbol}.csv"
+        original_target = target_path
+        legacy_latest_date = ""
         frame, stage_errors = _stage_frame(stage_path, symbol, date_text)
+        if frame is not None and "evidence_hash" in frame.columns:
+            header, prior_rows, legacy_latest_date = _read_canonical_rows(target_path, date_text)
+            if (target_path.exists() and CANONICAL_APPEND_REQUIRED_COLUMNS <= set(header)
+                    and "evidence_hash" not in header
+                    and ((canonical / LIFECYCLE_DIR / f"{symbol}.csv").is_file()
+                         or not prior_rows or _comparable_rows(prior_rows) == _comparable_rows(frame.to_dict("records")))):
+                # Keep legacy archive bytes intact. New final evidence has its
+                # own schema segment; it cannot be appended under an old header.
+                target_path = canonical / LIFECYCLE_DIR / f"{symbol}.csv"
+            elif not target_path.exists() and (canonical / LIFECYCLE_DIR / f"{symbol}.csv").is_file():
+                target_path = canonical / LIFECYCLE_DIR / f"{symbol}.csv"
         audit_item = audit_by_symbol.get(symbol) or {}
         item: dict[str, Any] = {
             "symbol": symbol,
@@ -464,8 +565,23 @@ def _apply_audited_intraday_batch_locked(
         header, existing_target_rows, latest_date = _read_canonical_rows(
             target_path, date_text
         )
+        if "evidence_hash" in header and CANONICAL_APPEND_REQUIRED_COLUMNS <= set(header):
+            try:
+                read_bar_observation_log(target_path)
+            except (OSError, ValueError) as exc:
+                item.update(operation="conflict_existing_date", reason_codes=["canonical_symbol_date_conflict", str(exc)])
+                conflicts.append(symbol)
+                planned.append(item)
+                continue
         if not target_path.exists():
-            item["operation"] = "append_new_symbol"
+            item["operation"] = (
+                "append_missing_historical_date" if original_target != target_path
+                and original_target.exists() and legacy_latest_date > date_text
+                else "append_new_date" if original_target != target_path and original_target.exists()
+                else "append_new_symbol")
+            if original_target != target_path and original_target.is_file():
+                item["legacy_segment_path"] = str(original_target)
+                item["legacy_segment_sha256"] = _sha256(original_target)
         elif CANONICAL_APPEND_REQUIRED_COLUMNS - set(header):
             item["operation"] = "conflict_invalid_canonical_header"
             item["reason_codes"] = ["canonical_header_missing_required_fields"]
@@ -474,13 +590,21 @@ def _apply_audited_intraday_batch_locked(
             )
             conflicts.append(symbol)
         elif existing_target_rows:
-            if _comparable_rows(existing_target_rows) == _comparable_rows(
-                frame.to_dict(orient="records")
-            ):
-                item["operation"] = "unchanged_identical_date"
-            else:
+            try:
+                if "evidence_hash" in header and "evidence_hash" in frame.columns:
+                    previous = pd.DataFrame(existing_target_rows)
+                    merged = merge_bar_observation_logs(previous, frame)
+                    extra = merged.loc[~merged["evidence_hash"].isin(previous["evidence_hash"])]
+                    item["operation"] = "append_bar_revisions" if not extra.empty else "unchanged_identical_date"
+                    if not extra.empty:
+                        frame = extra.reset_index(drop=True)
+                elif _comparable_rows(existing_target_rows) == _comparable_rows(frame.to_dict("records")):
+                    item["operation"] = "unchanged_identical_date"
+                else:
+                    raise ValueError("canonical_symbol_date_conflict")
+            except ValueError as exc:
                 item["operation"] = "conflict_existing_date"
-                item["reason_codes"] = ["canonical_symbol_date_conflict"]
+                item["reason_codes"] = list(dict.fromkeys(["canonical_symbol_date_conflict", str(exc)]))
                 conflicts.append(symbol)
         elif latest_date and latest_date > date_text:
             # Stage 6 task-book section 14.3 permits a missing date to be
@@ -559,7 +683,7 @@ def _apply_audited_intraday_batch_locked(
     try:
         for item in append_items:
             symbol = str(item["symbol"])
-            target = canonical / f"{symbol}.csv"
+            target = Path(item["canonical_path"])
             candidate = candidates / f"{symbol}.csv"
             candidate.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
@@ -571,7 +695,8 @@ def _apply_audited_intraday_batch_locked(
                 )
             else:
                 candidate.parent.mkdir(parents=True, exist_ok=True)
-                item["_frame"][STANDARD_COLUMNS].to_csv(
+                columns = list(STANDARD_COLUMNS) + [key for key in LIFECYCLE_COLUMNS if key in item["_frame"].columns]
+                item["_frame"][columns].to_csv(
                     candidate,
                     index=False,
                     encoding="utf-8-sig",
@@ -581,7 +706,8 @@ def _apply_audited_intraday_batch_locked(
         backups.mkdir(parents=True, exist_ok=True)
         for item in append_items:
             symbol = str(item["symbol"])
-            target = canonical / f"{symbol}.csv"
+            target = Path(item["canonical_path"])
+            target.parent.mkdir(parents=True, exist_ok=True)
             candidate = candidates / f"{symbol}.csv"
             if target.exists():
                 backup = backups / f"{symbol}.csv"
@@ -650,7 +776,7 @@ def _apply_audited_intraday_batch_locked(
     for item in append_items:
         symbol = str(item["symbol"])
         by_symbol[symbol]["canonical_sha256_after"] = _sha256(
-            canonical / f"{symbol}.csv"
+            Path(item["canonical_path"])
         )
     for item in unchanged_items:
         symbol = str(item["symbol"])
@@ -714,6 +840,17 @@ def apply_audited_intraday_batch(
             apply=False,
         )
     canonical.mkdir(parents=True, exist_ok=True)
+    if canonical.resolve() in getattr(_CANONICAL_TRANSACTION_LOCKS, "paths", ()):
+        return _apply_audited_intraday_batch_locked(
+            staging_dir=staging_dir,
+            canonical_dir=canonical,
+            symbols=symbols,
+            target_date=target_date,
+            run_id=run_id,
+            quality_audit=quality_audit,
+            output_path=output_path,
+            apply=True,
+        )
     with interprocess_file_lock(
         canonical_intraday_write_lock_path(canonical),
         timeout_seconds=CANONICAL_WRITE_LOCK_TIMEOUT_SECONDS,

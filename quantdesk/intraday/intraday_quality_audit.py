@@ -13,6 +13,7 @@ from typing import Any, Mapping
 import pandas as pd
 
 from quantdesk.intraday.intraday_schema import read_intraday_csv
+from quantdesk.intraday.minute_bar_lifecycle import frame_bar_evidence
 from quantdesk.shared import normalize_symbol, now_text, write_json
 from quantdesk.version import API_SCHEMA_VERSION, APP_VERSION
 
@@ -173,9 +174,36 @@ def assess_complete_session(
     if largest_missing_gap > int(max_missing_gap_minutes):
         reasons.append("unexplained_gap_over_5_minutes")
 
-    reason_codes = list(dict.fromkeys(hard_reasons + reasons))
+    observed_grid = set(unique_times.dt.strftime("%Y-%m-%d %H:%M:%S"))
+    standard_grids = [
+        {stamp.strftime("%Y-%m-%d %H:%M:%S")
+         for hour, minute in ((9, 30 + offset), (13, offset))
+         for stamp in pd.date_range(f"{target} {hour:02d}:{minute:02d}:00", periods=120, freq="min")}
+        for offset in (0, 1)
+    ]
+    if observed_grid not in standard_grids:
+        reasons.append("session_minute_grid_incomplete")
+    bar_evidence = frame_bar_evidence(work)
+    if bar_evidence["lifecycle_present"]:
+        # New-schema data has an explicit clock/profile and finality contract.
+        # Legacy geometry remains readable, with its unverified finality label.
+        reasons.extend(bar_evidence["reason_codes"])
+        conventions = set(work.get("timestamp_convention", pd.Series(dtype=str)).astype(str))
+        if len(conventions) == 1 and conventions <= {"minute_start", "minute_end"}:
+            offset = 0 if conventions == {"minute_start"} else 1
+            expected = {
+                stamp.strftime("%Y-%m-%d %H:%M:%S")
+                for hour, minute in ((9, 30 + offset), (13, offset))
+                for stamp in pd.date_range(f"{target} {hour:02d}:{minute:02d}:00", periods=120, freq="min")
+            }
+            observed = set(unique_times.dt.strftime("%Y-%m-%d %H:%M:%S"))
+            if observed != expected:
+                reasons.append("session_minute_grid_incomplete")
     status = "invalid_session" if hard_reasons else ("partial_session" if reasons else "complete_session")
-    eligible = status == "complete_session"
+    # Exact legacy geometry remains observable; finality/units/provenance are
+    # independent evidence and are required by every formal consumer.
+    reason_codes = list(dict.fromkeys(hard_reasons + reasons + bar_evidence["reason_codes"]))
+    eligible = status == "complete_session" and bar_evidence["signal_eligible"]
     return {
         "status": status,
         "price_basis": effective_basis,
@@ -189,6 +217,10 @@ def assess_complete_session(
         "max_missing_gap_minutes": largest_missing_gap,
         "formal_execution_eligible": eligible,
         "reliable_no_fill_eligible": eligible,
+        "bar_evidence": bar_evidence,
+        "signal_eligible": eligible and bar_evidence["signal_eligible"],
+        "quality_status": "signal_eligible" if eligible else "execution_blocked",
+        "validation_scope": "minute_lifecycle_v1" if bar_evidence["lifecycle_present"] else "legacy_session_geometry_only",
         "reason_codes": reason_codes,
     }
 
@@ -332,6 +364,10 @@ def _audit_frame(
         "formal_execution_eligible": formal["formal_execution_eligible"],
         "reliable_no_fill_eligible": formal["reliable_no_fill_eligible"],
         "session_reason_codes": formal["reason_codes"],
+        "bar_evidence": formal.get("bar_evidence", {}),
+        "signal_eligible": formal.get("signal_eligible", False),
+        "validation_scope": formal.get("validation_scope", ""),
+        "quality_status": formal.get("quality_status", "execution_blocked"),
     }
 
 

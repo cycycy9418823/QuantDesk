@@ -12,6 +12,7 @@ from typing import Any
 import pandas as pd
 
 from quantdesk.utils import safe_float
+from quantdesk.board_rules import classify_board, listing_marker_from_name
 
 
 def is_st_or_delisting(name: str) -> bool:
@@ -19,13 +20,9 @@ def is_st_or_delisting(name: str) -> bool:
     return "ST" in text or "退" in text
 
 
-def limit_rate_for_symbol(symbol: str, name: str = "") -> float:
-    code = str(symbol or "")
-    if is_st_or_delisting(name):
-        return 0.05
-    if code.startswith(("300", "301", "688")):
-        return 0.20
-    return 0.10
+def limit_rate_for_symbol(symbol: str, name: str = "", *, trade_date: Any = None) -> float:
+    """Use the project's shared board/date rules; this is not a fill guard."""
+    return classify_board(symbol, is_st=is_st_or_delisting(name), trade_date=trade_date).limit_up_pct / 100.0
 
 
 def add_signal_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -94,7 +91,14 @@ def board_signal_from_row(row: dict[str, Any], *, symbol: str, name: str = "") -
         return None
     liquidity = liquidity_status_from_row(row)
     pct = close / prev_close - 1.0
-    rate = limit_rate_for_symbol(symbol, name)
+    signal_date = str(row.get("date") or row.get("latest_date") or "")[:10]
+    # No-limit listing periods do not have a daily limit to approach. This
+    # helper still cannot infer unrecorded historical listing/ST information.
+    if (row.get("listing_first_day") is True or row.get("no_price_limit") is True
+            or listing_marker_from_name(name) in {"N", "C"}
+            or (signal_date and str(row.get("listing_date") or "")[:10] == signal_date)):
+        return None
+    rate = limit_rate_for_symbol(symbol, name, trade_date=signal_date or None)
     if pct >= rate * 0.92 and liquidity != "very_low":
         return {
             "symbol": symbol,
@@ -107,6 +111,10 @@ def board_signal_from_row(row: dict[str, Any], *, symbol: str, name: str = "") -
             "pct_change": pct,
             "limit_rate": rate,
             "limit_up_like": True,
+            "limit_rule_source": "quantdesk.board_rules.classify_board",
+            "rule_id": "daily_near_limit_approx_v2_shared_board_rules",
+            "validation_status": "research_unvalidated",
+            "intraday_queue_evidence": "not_available",
             "close": close,
             "prev_close": prev_close,
         }

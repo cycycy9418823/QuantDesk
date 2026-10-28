@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any
 
 from quantdesk.candidate_contract import (
@@ -17,7 +18,7 @@ from quantdesk.candidate_contract import (
     normalize_candidate_row,
 )
 from quantdesk.daily_data_chain import latest_daily_data_chain
-from quantdesk.daily_price_update_engine import daily_price_status
+from quantdesk.daily_price_update_engine import daily_price_status, infer_target_date
 from quantdesk.daily_scheduler_status import daily_data_scheduler_status
 from quantdesk.data_chain_consumer_gate import (
     evaluate_data_chain_consumer_gate,
@@ -28,6 +29,7 @@ from quantdesk.intraday.intraday_gap_checker import intraday_gap_status
 from quantdesk.intraday.intraday_provider_capability import latest_intraday_provider_capability
 from quantdesk.intraday.intraday_replay_self_validation import latest_intraday_replay_self_validation
 from quantdesk.paper.auto_paper_portfolio import auto_paper_portfolio_latest
+from quantdesk.paper.ledger_read_contract import inspect_strategy_ledger, strategy_initialization_evidence
 from quantdesk.real_intraday_sample_validation import latest_real_intraday_sample_validation
 from quantdesk.shared import now_text, read_json, safe_float, write_json
 from quantdesk.theme_current_candidate_validator import validate_theme_map_for_current_candidates
@@ -793,7 +795,16 @@ def _theme_card(theme: dict[str, Any], current_candidate_theme: dict[str, Any] |
 def _portfolio_card(portfolio: dict[str, Any], freshness: dict[str, Any], *, daily_status: str = "red") -> dict[str, Any]:
     positions = portfolio.get("positions") if isinstance(portfolio.get("positions"), list) else []
     position_count = len(positions)
-    if daily_status == "red":
+    ledger_health = portfolio.get("ledger_health") if isinstance(portfolio.get("ledger_health"), dict) else {}
+    reconciliation = portfolio.get("accounting_reconciliation") if isinstance(portfolio.get("accounting_reconciliation"), dict) else {}
+    invalid_book = (portfolio.get("ok") is False or portfolio.get("portfolio_review_valid") is False
+                    or ledger_health.get("ok") is False or reconciliation.get("status") == "invalid")
+    if invalid_book:
+        status = "red"
+        value = "账本或持仓估值未核验"
+        detail = "策略账读取、会计核对或逐只估值未通过，今日候选和日线新鲜不能替代账本证据。"
+        next_action = "核对策略账状态及持仓价格日期；有可恢复备份时先审查恢复方案。"
+    elif daily_status == "red":
         # Only block portfolio review when the daily layer is genuinely unusable
         # (no symbol reached the target day). A partial lag (yellow) still allows
         # a broadly-valid valuation, so we degrade to yellow instead of red.
@@ -1250,11 +1261,47 @@ def build_data_health_dashboard(
 
 
 
+def annotate_cached_card_scopes(payload: dict[str, Any]) -> None:
+    """Explain cached populations without inventing missing source counts."""
+    cards = {key: dict(value) for key, value in (payload.get("cards") or {}).items() if isinstance(value, dict)}
+    labels = {
+        "daily_data": "该健康快照的日线范围；与全A覆盖独立",
+        "intraday_data": "该快照的分钟研究池；有文件不等于全日验证",
+        "theme_map": "该快照候选池；与今日正式候选独立",
+    }
+    for key, label in labels.items():
+        card = cards.get(key)
+        if card is None:
+            continue
+        card["scope_label"] = label
+        card["snapshot_generated_at"] = payload.get("generated_at")
+        card["original_detail"] = card.get("detail")
+    daily = cards.get("daily_data", {})
+    detail = str(daily.get("detail") or "")
+    match = re.search(r"目标完整交易日\s*(\d{4}-\d{2}-\d{2}).*?(\d+)\s*/\s*(\d+).*?(\d+)\s*只滞后.*?最旧\s*(\d{4}-\d{2}-\d{2})", detail)
+    if match and match.group(5) >= match.group(1) and int(match.group(4)) > 0:
+        day, covered, total, gap, _ = match.groups()
+        daily["detail"] = (f"该快照目标日 {day}：覆盖 {covered}/{total}；{gap}只未满足目标覆盖。"
+                           "记录中的最旧日期不能解释这些缺口，逐只原因尚待核实；不把它们全部归为日期滞后。")
+        daily["gap_reason_status"] = "unresolved"
+    minute = cards.get("intraday_data", {})
+    match = re.search(r"(\d+)\s*/\s*(\d+)\s*只股票有分钟线.*?缺少\s*(\d+)\s*只", str(minute.get("detail") or ""))
+    if match:
+        present, total, explicitly_missing = map(int, match.groups())
+        remainder = total - present - explicitly_missing
+        if remainder > 0:
+            minute["unclassified_count"] = remainder
+            minute["detail"] = (f"该快照记录有分钟文件 {present}/{total}，显式缺失{explicitly_missing}只，"
+                                f"其余{remainder}只状态未归类；这些数字不代表全天覆盖。")
+    payload["cards"] = cards
+
+
 def build_cached_data_health_dashboard(
     *,
     snapshot_path: Path | None = None,
     daily_data_chain_payload: dict[str, Any] | None = None,
     evidence_freshness_payload: dict[str, Any] | None = None,
+    target_date: str | None = None,
 ) -> dict[str, Any]:
     """Serve the persisted dashboard with a lightweight live-chain overlay.
 
@@ -1309,7 +1356,8 @@ def build_cached_data_health_dashboard(
     # The task-scheduler probe is local and read-only.  It is deliberately
     # refreshed on GET because the persisted dashboard can otherwise show an
     # old "running" record after the actual task already failed.
-    scheduler = daily_data_scheduler_status(project_root=PROJECT_ROOT)
+    review_target = infer_target_date(target_date)[0]
+    scheduler = daily_data_scheduler_status(project_root=PROJECT_ROOT, target_date=review_target)
     formal_chain_status = build_formal_daily_chain_status(
         chain,
         scheduler=scheduler,
@@ -1320,6 +1368,38 @@ def build_cached_data_health_dashboard(
         else build_evidence_freshness(PROJECT_ROOT)
     )
     source_status = dict(payload.get("source_status") or {})
+    state_path = PROJECT_ROOT / "state" / "auto_paper_portfolio.json"
+    latest_path = RESULTS_DIR / "auto_paper_portfolio_latest.json"
+    latest_portfolio = read_json(latest_path, {})
+    latest_portfolio = latest_portfolio if isinstance(latest_portfolio, dict) else {}
+    portfolio = {
+        key: latest_portfolio[key] for key in
+        ("ok", "valuation_date", "portfolio_review_valid", "summary", "positions")
+        if key in latest_portfolio
+    }
+    portfolio["exists"] = bool(latest_portfolio)
+    initialized = strategy_initialization_evidence(
+        state_path, latest_path=latest_path,
+        history_path=RESULTS_DIR / "auto_paper_portfolio_history.json",
+    )
+    if initialized:
+        portfolio["ledger_health"] = inspect_strategy_ledger(
+            state_path, target_date=review_target, latest=latest_portfolio,
+        )
+        if not portfolio["ledger_health"]["ok"]:
+            portfolio["portfolio_review_valid"] = False
+    else:
+        portfolio["status"] = "not_initialized"
+    portfolio["read_only"] = True
+    cached_freshness = source_status.get("freshness")
+    cached_freshness = cached_freshness if isinstance(cached_freshness, dict) else {}
+    cards = dict(payload.get("cards") or {})
+    daily_card = cards.get("daily_data") or {}
+    cards["portfolio_review"] = _portfolio_card(
+        portfolio, cached_freshness, daily_status=str(daily_card.get("status") or "yellow"),
+    )
+    payload["cards"] = cards
+    source_status["auto_paper_portfolio"] = portfolio
     source_status["daily_data_chain"] = chain
     source_status["daily_data_scheduler"] = scheduler
     source_status["audit_evidence"] = evidence_freshness
@@ -1345,6 +1425,7 @@ def build_cached_data_health_dashboard(
     age = _snapshot_age_seconds(payload.get("generated_at"))
     payload["snapshot_age_seconds"] = age
     payload["snapshot_stale"] = age is None or age > 900
+    annotate_cached_card_scopes(payload)
 
     current_level = str(payload.get("health_level") or "yellow").lower()
     payload["health_level"], degraded_reasons = _apply_health_evidence_overlay(
@@ -1354,6 +1435,16 @@ def build_cached_data_health_dashboard(
         evidence_freshness=evidence_freshness,
         snapshot_stale=bool(payload["snapshot_stale"]),
     )
+    if cards["portfolio_review"]["status"] == "red":
+        payload["health_level"] = "red"
+        degraded_reasons = list(dict.fromkeys([
+            *degraded_reasons, "strategy_ledger_or_valuation_invalid",
+            *((portfolio.get("ledger_health") or {}).get("reason_codes") or []),
+        ]))
+        payload["summary_text"] = cards["portfolio_review"]["detail"]
+    elif cards["portfolio_review"]["status"] == "yellow" and payload["health_level"] == "green":
+        payload["health_level"] = "yellow"
+        degraded_reasons.append("strategy_ledger_review_unavailable")
     payload["health_degraded_reason_codes"] = degraded_reasons
     payload["health_level_overridden_from_snapshot"] = bool(
         degraded_reasons and str(payload.get("health_level") or "").lower() != current_level
