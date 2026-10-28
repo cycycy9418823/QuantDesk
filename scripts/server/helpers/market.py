@@ -26,6 +26,7 @@ from scripts.server.helpers.util import (
 from quantdesk.csv_io import read_csv_frame
 from quantdesk.market_clock import expected_settlement_date, get_market_session, to_shanghai_datetime
 from quantdesk.column_aliases import find_column
+from quantdesk.quote_evidence import provider_quote_datetime, quote_number
 
 __all__ = ['spot_snapshot_updated_at', 'spot_snapshot_age_seconds', 'snapshot_quote_date', 'realtime_freshness_state', 'realtime_provider_error_summary', 'realtime_provider_note', 'sector_cache_has_usable_rows', 'realtime_network_enabled', 'normalize_symbol', '_load_stock_data_cached', 'load_stock_data', 'latest_pct_change', 'load_benchmark_index', 'load_benchmark_series', 'spot_market_breadth', '_canonical_spot_frame', 'load_spot_snapshot_frame', '_write_spot_meta', '_call_with_timeout', 'fetch_eastmoney_spot_direct', 'fetch_sina_spot_direct', '_cached_spot_refresh_payload', '_realtime_background_worker', 'start_realtime_background_refresh', 'realtime_background_snapshot', 'realtime_background_attempt_age_seconds', 'maybe_start_realtime_background_refresh', 'refresh_spot_snapshot_cache', 'eastmoney_secid', '_em_scaled', 'fetch_eastmoney_single_quote', 'upsert_spot_snapshot_row', 'refresh_single_quote_cache', 'spot_quote_for_symbol', '_amount_to_yi', 'realtime_market_summary', 'spot_rank_rows', 'market_session_label', 'read_theme_map', '_board_name', 'calculate_sector_stats', 'refresh_industry_board_cache']
 
@@ -53,17 +54,16 @@ def spot_snapshot_age_seconds() -> float | None:
 
 
 def snapshot_quote_date(frame: pd.DataFrame, updated_at: Any = "") -> str:
-    """Best-effort date of the market quote represented by the snapshot."""
+    """Read a recorded quote date; collection time is not a quote date."""
     if not frame.empty:
         for col in ("quote_time", "quote_date", "date", "trade_date"):
             if col not in frame.columns:
                 continue
-            parsed = pd.to_datetime(frame[col], errors="coerce").dropna()
+            values = frame[col].astype(str)
+            dated = values[values.str.match(r"^\d{4}-\d{2}-\d{2}")]
+            parsed = pd.to_datetime(dated, errors="coerce").dropna()
             if not parsed.empty:
                 return parsed.max().date().isoformat()
-    parsed_updated = pd.to_datetime(str(updated_at or ""), errors="coerce")
-    if not pd.isna(parsed_updated):
-        return parsed_updated.date().isoformat()
     return ""
 
 
@@ -204,6 +204,14 @@ def _load_stock_data_cached(clean_symbol: str, _mtime_ns: int) -> pd.DataFrame:
     except Exception as exc:
         LOG.warning("load_stock_data(%s): CSV read failed: %s", clean_symbol, exc)
         return pd.DataFrame()
+    # Classify the original bytes before date/row cleaning. The chart must
+    # report the original price basis, rather than infer it from a directory.
+    from quantdesk.price_basis import classify_frame_price_basis, validate_price_frame_set
+    basis, basis_reason = classify_frame_price_basis(df)
+    policy = validate_price_frame_set({clean_symbol: df}, consumer="feature")
+    df.attrs["price_basis"] = basis
+    df.attrs["price_basis_eligible"] = bool(policy.get("eligible"))
+    df.attrs["price_basis_reason"] = basis_reason
     for warning in df.attrs.get("warnings", []) or []:
         LOG.warning("load_stock_data(%s): %s", clean_symbol, warning)
     if "date" in df.columns:
@@ -438,6 +446,7 @@ def spot_market_breadth() -> dict[str, Any]:
     changes = pd.to_numeric(df[change_col], errors="coerce").dropna() if change_col else pd.Series(dtype=float)
     amount = pd.to_numeric(df[amount_col], errors="coerce").sum() if amount_col else math.nan
     total_amount = f"{amount / 100000000:.2f}亿元" if math.isfinite(float(amount)) and amount > 0 else "数据缺失"
+    meta = read_json_file(SPOT_SNAPSHOT_META)
     return {
         "advancing_count": int((changes > 0).sum()),
         "declining_count": int((changes < 0).sum()),
@@ -446,6 +455,10 @@ def spot_market_breadth() -> dict[str, Any]:
         "total_amount": total_amount,
         "hint": "涨跌家数来自本地 spot snapshot 样本。",
         "warnings": csv_read_warnings,
+        "quote_date": snapshot_quote_date(df),
+        "fetched_at": meta.get("fetched_at") or meta.get("updated_at") or "",
+        "source": meta.get("source") or "data/cache/spot_snapshot_latest.csv",
+        "date_note": "报价日只取行情字段；抓取时刻不证明报价属于当天。",
     }
 
 
@@ -478,7 +491,7 @@ def _canonical_spot_frame(raw: pd.DataFrame) -> pd.DataFrame:
     }
     frame = raw.rename(columns={col: rename_map.get(str(col).strip(), str(col).strip()) for col in raw.columns}).copy()
     frame = frame.loc[:, ~frame.columns.duplicated()]
-    for column in ("symbol", "name", "price", "pct_chg", "change", "pre_close", "open", "high", "low", "volume", "amount", "quote_time", "source", "updated_at"):
+    for column in ("symbol", "name", "price", "pct_chg", "change", "pre_close", "open", "high", "low", "volume", "amount", "quote_time", "quote_timestamp", "quote_date", "price_basis", "source", "updated_at"):
         if column not in frame.columns:
             frame[column] = ""
     frame["symbol"] = frame["symbol"].astype(str).map(normalize_symbol)
@@ -486,11 +499,14 @@ def _canonical_spot_frame(raw: pd.DataFrame) -> pd.DataFrame:
     for column in ("price", "pct_chg", "change", "pre_close", "open", "high", "low", "volume", "amount"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame["quote_time"] = frame["quote_time"].astype(str).replace({"nan": ""})
+    frame["quote_timestamp"] = frame["quote_timestamp"].astype(str).replace({"nan": ""})
+    frame["quote_date"] = frame["quote_date"].astype(str).replace({"nan": ""})
+    frame["price_basis"] = frame["price_basis"].astype(str).replace({"nan": ""})
     frame["source"] = frame["source"].astype(str).replace({"nan": ""})
     frame["updated_at"] = frame["updated_at"].astype(str).replace({"nan": ""})
     frame = frame[frame["symbol"].astype(str).str.len() == 6]
     frame = frame.drop_duplicates("symbol", keep="last")
-    return frame[["symbol", "name", "price", "pct_chg", "change", "pre_close", "open", "high", "low", "volume", "amount", "quote_time", "source", "updated_at"]].reset_index(drop=True)
+    return frame[["symbol", "name", "price", "pct_chg", "change", "pre_close", "open", "high", "low", "volume", "amount", "quote_time", "quote_timestamp", "quote_date", "price_basis", "source", "updated_at"]].reset_index(drop=True)
 
 
 def load_spot_snapshot_frame() -> pd.DataFrame:
@@ -913,12 +929,12 @@ def refresh_spot_snapshot_cache(*, network: bool, force: bool = False) -> dict[s
 
 def eastmoney_secid(symbol: str) -> str:
     clean_symbol = normalize_symbol(symbol)
-    market = "1" if clean_symbol.startswith(("5", "6", "9")) else "0"
+    market = "0" if clean_symbol.startswith(("4", "8", "92")) else "1" if clean_symbol.startswith(("5", "6", "9")) else "0"
     return f"{market}.{clean_symbol}"
 
 
 def _em_scaled(value: Any, *, digits: int = 2) -> float | None:
-    number = finite_float(value)
+    number = quote_number(value)
     if number is None or number <= -100000:
         return None
     return round(number / 100, digits)
@@ -943,16 +959,25 @@ def fetch_eastmoney_single_quote(symbol: str, *, timeout_seconds: float = 8.0) -
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://quote.eastmoney.com/",
     }
-    try:
-        response = requests.get(url, params=params, headers=headers, timeout=timeout_seconds)
-        response.raise_for_status()
-        payload = response.json()
-    except Exception as exc:  # noqa: BLE001
+    # The provider closes connections intermittently; one bounded retry keeps a
+    # single dropped socket from being reported as "source unavailable".
+    payload = None
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=timeout_seconds)
+            response.raise_for_status()
+            payload = response.json()
+            last_error = None
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+    if last_error is not None:
         return {
             "ok": False,
             "symbol": clean_symbol,
             "source": "eastmoney.single_quote",
-            "message_for_ui": f"单股实时 fallback 失败：{exc}",
+            "message_for_ui": f"单股实时 fallback 失败（已重试1次）：{last_error}",
         }
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, dict) or str(data.get("f57") or "").strip() == "":
@@ -963,7 +988,14 @@ def fetch_eastmoney_single_quote(symbol: str, *, timeout_seconds: float = 8.0) -
             "message_for_ui": "单股实时 fallback 返回空数据。",
         }
     timestamp = finite_float(data.get("f86"))
-    quote_dt = datetime.fromtimestamp(timestamp) if timestamp else datetime.now()
+    # f86 is the provider's quote clock. Missing f86 must not become "now".
+    from datetime import timezone
+    try:
+        quote_dt = to_shanghai_datetime(datetime.fromtimestamp(timestamp, timezone.utc)) if timestamp and timestamp > 0 else None
+    except (ValueError, OverflowError, OSError):
+        return {"ok": False, "status": "quote_timestamp_invalid", "source": "eastmoney.single_quote",
+                "message_for_ui": "报价源返回无效时间戳，保留已有报价。"}
+    collected_at = to_shanghai_datetime().isoformat(timespec="seconds")
     row = {
         "symbol": normalize_symbol(data.get("f57") or clean_symbol),
         "name": str(data.get("f58") or "").strip() or clean_symbol,
@@ -974,20 +1006,26 @@ def fetch_eastmoney_single_quote(symbol: str, *, timeout_seconds: float = 8.0) -
         "open": _em_scaled(data.get("f46")),
         "high": _em_scaled(data.get("f44")),
         "low": _em_scaled(data.get("f45")),
-        "volume": finite_float(data.get("f47"), 0.0),
-        "amount": finite_float(data.get("f48"), 0.0),
-        "quote_time": quote_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "volume": finite_float(data.get("f47")),
+        "amount": finite_float(data.get("f48")),
+        "volume_unit": "手",
+        "amount_unit": "元",
+        "quote_time": quote_dt.strftime("%Y-%m-%d %H:%M:%S") if quote_dt else "",
+        "quote_date": quote_dt.date().isoformat() if quote_dt else "",
+        "price_basis": "raw",
         "source": "eastmoney.single_quote",
-        "updated_at": quote_dt.isoformat(timespec="seconds"),
+        "updated_at": collected_at,
     }
+    valid = quote_dt is not None and (row["price"] or 0) > 0 and row["symbol"] == clean_symbol
     return {
-        "ok": True,
-        "status": "single_quote_refreshed",
+        "ok": valid,
+        "status": "single_quote_refreshed" if valid else "quote_evidence_incomplete",
         "symbol": row["symbol"],
         "row": row,
         "source": "eastmoney.single_quote",
         "updated_at": row["updated_at"],
-        "message_for_ui": f"已刷新 {row['name']} {row['symbol']} 单股实时快照；不覆盖正式日线。",
+        "message_for_ui": (f"已刷新 {row['name']} {row['symbol']} 单股实时快照；不覆盖正式日线。"
+                           if valid else "报价源缺少匹配证券的有效价格或时间，保留已有报价。"),
     }
 
 
@@ -1031,27 +1069,29 @@ def spot_quote_for_symbol(symbol: str) -> dict[str, Any]:
         }
     row = hits.iloc[0]
     raw_quote_time = str(row.get("quote_time") or "").strip()
-    quote_date = datetime.now().strftime("%Y-%m-%d")
-    quote_time = raw_quote_time
-    if " " in raw_quote_time:
-        quote_date, quote_time = raw_quote_time.split(" ", 1)
+    quote_dt = provider_quote_datetime(row.to_dict())
+    quote_date = str(row.get("quote_date") or "").strip() or (quote_dt.date().isoformat() if quote_dt else "")
+    quote_time = quote_dt.strftime("%H:%M:%S") if quote_dt else raw_quote_time
     row_updated_at = str(row.get("updated_at") or "").strip()
     row_source = str(row.get("source") or "").strip()
+    price = finite_float(row.get("price"))
     return {
-        "available": True,
+        "available": price is not None and price > 0,
         "symbol": clean_symbol,
         "name": str(row.get("name") or "").strip() or clean_symbol,
-        "price": chart_number(row.get("price")),
-        "pct_chg": chart_number(row.get("pct_chg"), 0.0),
-        "change": chart_number(row.get("change"), 0.0),
-        "pre_close": chart_number(row.get("pre_close")),
-        "open": chart_number(row.get("open")),
-        "high": chart_number(row.get("high")),
-        "low": chart_number(row.get("low")),
-        "volume": chart_number(row.get("volume")),
-        "amount": chart_number(row.get("amount")),
+        "price": price,
+        "pct_chg": finite_float(row.get("pct_chg")),
+        "change": finite_float(row.get("change")),
+        "pre_close": finite_float(row.get("pre_close")),
+        "open": finite_float(row.get("open")),
+        "high": finite_float(row.get("high")),
+        "low": finite_float(row.get("low")),
+        "volume": finite_float(row.get("volume")),
+        "amount": finite_float(row.get("amount")),
         "quote_date": quote_date,
-        "quote_time": quote_time or datetime.now().strftime("%H:%M:%S"),
+        "quote_time": quote_time,
+        "quote_timestamp": str(row.get("quote_timestamp") or "").strip() or (quote_dt.isoformat(timespec="seconds") if quote_dt else ""),
+        "price_basis": str(row.get("price_basis") or "").strip(),
         "updated_at": row_updated_at or spot_snapshot_updated_at(),
         "source": row_source or read_json_file(SPOT_SNAPSHOT_META).get("source", "local_cache"),
         "temporary": True,
@@ -1326,7 +1366,7 @@ def _board_name(code: str) -> str:
     return "其他板块"
 
 
-def calculate_sector_stats() -> dict[str, list[dict[str, Any]]]:
+def calculate_sector_stats() -> dict[str, Any]:
     """Real industry-sector gainers/losers from the local industry-board cache.
 
     The cache (``data/cache/industry_board_latest.csv``) is populated on demand by
@@ -1370,10 +1410,15 @@ def calculate_sector_stats() -> dict[str, list[dict[str, Any]]]:
         return {"gainers": missing, "losers": missing, "stale": True}
 
     rows.sort(key=lambda item: item["change"], reverse=True)
+    as_of = snapshot_quote_date(board_df)
     return {
         "gainers": rows[:5],
         "losers": list(reversed(rows[-5:])),
         "stale": False,
+        "as_of": as_of,
+        "freshness_status": "recorded_date" if as_of else "unknown",
+        "cache_modified_at": datetime.fromtimestamp(INDUSTRY_BOARD_CACHE.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+        "source": "data/cache/industry_board_latest.csv",
         "warnings": csv_read_warnings,
     }
 
