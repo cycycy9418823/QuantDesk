@@ -83,7 +83,11 @@ def test_deferred_plan_is_not_overwritten_by_tonights_plan() -> None:
 
     from ai_trader import overnight
 
-    source = inspect.getsource(overnight.run_evening)
+    # run_evening now waits for the requested day's data; the existing plan
+    # protection lives in its ready-data delegate. Keep checking both wiring
+    # and the original preservation statements after that split.
+    assert "_run_evening_ready(" in inspect.getsource(overnight.run_evening)
+    source = inspect.getsource(overnight._run_evening_ready)
     assert "deferred_plan = existing" in source
     assert "save_plan(deferred_plan, runtime.plan_latest)" in source, (
         "a committed but unsettled plan can again be destroyed by tonight's plan"

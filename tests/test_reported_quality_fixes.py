@@ -31,6 +31,11 @@ def test_walk_forward_executes_on_next_open_when_available() -> None:
             "date": pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-05"]),
             "open": [100.0, 50.0, 70.0],
             "close": [100.0, 500.0, 700.0],
+            "high": [101.0, 501.0, 701.0], "low": [99.0, 49.0, 69.0],
+            "volume": 1000, "adjust": "raw",
+            # This fixture isolates next-open pricing within a new listing's
+            # first five sessions, whose C marker explicitly has no daily limit.
+            "name": "C测试新股",
         }
     )
     signals = pd.DataFrame(

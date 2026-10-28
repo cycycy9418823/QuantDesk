@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import pytest
 
 from quantdesk.intraday_refresh import collector
@@ -15,6 +16,7 @@ from quantdesk.intraday.intraday_schema import read_intraday_csv
 from quantdesk.intraday.intraday_quality_audit import audit_intraday_file
 from quantdesk import data_freshness_gate, plan_review_receipts
 from quantdesk.paper import position_management_engine
+from tests.minute_evidence_fixture import final_minute_fixture, seal_minute_csv_fixture
 
 DAY = "2026-10-08"
 NOW = datetime(2026, 10, 8, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -147,8 +149,10 @@ def test_review_receipt_binds_real_files_when_one_symbol_uses_legacy_supplement(
     legacy = minute_dir/"600000.csv"
     write_csv(legacy, [bar("2026-09-30 15:00:00")], legacy=True)
     original = legacy.read_bytes()
-    assert collector._append_rows(legacy, full_day(), now_iso=NOW.isoformat())[0] == 240
+    final_rows = final_minute_fixture(pd.DataFrame(full_day()), convention="minute_end").to_dict("records")
+    assert collector._append_rows(legacy, final_rows, now_iso=NOW.isoformat())[0] == 240
     write_csv(minute_dir/"600001.csv", full_day("600001"))
+    seal_minute_csv_fixture(minute_dir/"600001.csv", convention="minute_end")
     plan = {
         "ok": True, "plan_id": "minute-recovery", "plan_date": "2026-09-30", "trade_date": DAY,
         "source_data_cutoff": "2026-09-30", "formal_execution_eligible": True,
@@ -231,9 +235,13 @@ def test_local_provider_returns_actual_supplement_path(tmp_path):
     assert Path(empty["path"]) == Path(payload["path"])
 
 
-def test_quality_reader_finds_surviving_supplement_without_legacy_file(tmp_path):
+@pytest.mark.parametrize("final_evidence", [False, True])
+def test_quality_reader_finds_surviving_supplement_without_legacy_file(tmp_path, final_evidence):
     segment = tmp_path/"declared_basis/600000.csv"
     write_csv(segment, full_day())
+    if final_evidence:
+        seal_minute_csv_fixture(segment, convention="minute_end")
     result = audit_intraday_file("600000", DAY, intraday_dir=tmp_path)
-    assert result["exists"] and result["formal_execution_eligible"] is True
+    assert result["exists"]
+    assert result["formal_execution_eligible"] is final_evidence
     assert Path(result["path"]) == segment

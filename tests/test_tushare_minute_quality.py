@@ -5,25 +5,29 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.minute_evidence_fixture import seal_minute_csv_fixture
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = sys.executable
 
 
-def _write_minute_csv(path: Path, *, symbol: str, date: str = "2026-07-03", rows: int = 181) -> None:
+def _write_minute_csv(path: Path, *, symbol: str, date: str = "2026-07-03", rows: int = 240) -> None:
+    # Positive fixtures explicitly declare synthetic final/share/raw evidence.
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["symbol,datetime,date,time,open,high,low,close,volume,amount,source,updated_at"]
+    lines = ["symbol,datetime,date,time,open,high,low,close,volume,amount,source,updated_at,price_basis"]
     for index in range(rows):
-        minute = 31 + index
-        hour = 9 + minute // 60
+        minute = 31 + index if index < 120 else 1 + index - 120
+        hour = (9 if index < 120 else 13) + minute // 60
         minute_in_hour = minute % 60
         time_text = f"{hour:02d}:{minute_in_hour:02d}:00"
         price = 10 + index * 0.001
         lines.append(
             f"{symbol},{date} {time_text},{date},{time_text},"
-            f"{price:.3f},{price + 0.01:.3f},{price - 0.01:.3f},{price:.3f},100,1000,tushare_proxy_stk_mins,2026-07-05T00:00:00"
+            f"{price:.3f},{price + 0.01:.3f},{price - 0.01:.3f},{price:.3f},100,1000,tushare_proxy_stk_mins,2026-07-05T00:00:00,raw"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+    seal_minute_csv_fixture(path)
 
 
 def test_tushare_minute_quality_audits_latest_completed_job(tmp_path: Path) -> None:
@@ -133,12 +137,14 @@ def test_tushare_minute_quality_snapshot_summary_is_cheap_and_match_checked(tmp_
         json.dumps(
             {
                 "task_type": "tushare_minute_quality_audit",
+                "eligibility_standard": "finalized_session_evidence_v3",
                 "status": "passed",
                 "job": {"path": "data/vendor_staging/tushare_proxy_minutes_250d_phase2_top200_x"},
                 "target_date": "2026-07-03",
                 "total_symbols": 200,
                 "quality_summary": {
                     "usable": 200,
+                    "formal_execution_eligible": 200,
                     "partial": 0,
                     "insufficient": 0,
                     "invalid": 0,
@@ -196,12 +202,14 @@ def _write_completed_job_summary(root: Path, job_name: str, download: list[dict]
 def _quality_snapshot_payload(job_name: str, *, status: str, usable: int, partial: int, total: int) -> dict:
     return {
         "task_type": "tushare_minute_quality_audit",
+        "eligibility_standard": "finalized_session_evidence_v3",
         "status": status,
         "job": {"path": f"data/vendor_staging/{job_name}"},
         "target_date": "2026-07-03",
         "total_symbols": total,
         "quality_summary": {
             "usable": usable,
+            "formal_execution_eligible": usable,
             "partial": partial,
             "insufficient": 0,
             "invalid": 0,

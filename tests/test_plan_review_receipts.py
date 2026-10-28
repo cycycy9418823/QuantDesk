@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import csv
 import json
 from datetime import date, timedelta
 from pathlib import Path
@@ -10,6 +11,9 @@ import pytest
 
 from quantdesk import daily_candidate_refresh as refresh
 from quantdesk import plan_review_receipts as receipts
+from quantdesk.intraday.intraday_schema import STANDARD_COLUMNS
+from quantdesk.intraday.minute_bar_lifecycle import LIFECYCLE_COLUMNS, observation_hash
+from tests.minute_evidence_fixture import final_minute_fixture
 
 
 def make_plan(trade_date: str = "2026-08-03", plan_id: str = "due-plan", symbols: int = 1) -> dict:
@@ -36,10 +40,16 @@ def write_minutes(root: Path, plan: dict) -> None:
     for row in plan["symbols"]:
         path = root / "data/intraday/1m" / f"{row['symbol']}.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame([{"symbol": row["symbol"], "datetime": at.strftime("%Y-%m-%d %H:%M:%S"),
-                       "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.0,
-                       "volume": 1000, "amount": 10000, "source": "deterministic_fixture", "price_basis": "raw"}
-                      for at in times]).to_csv(path, index=False)
+        frame = pd.DataFrame([
+            {"symbol": row["symbol"], "datetime": at.strftime("%Y-%m-%d %H:%M:%S"),
+             "date": target, "time": at.strftime("%H:%M:%S"),
+             "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.0,
+             "volume": 1000, "amount": 10000, "source": "deterministic_fixture", "price_basis": "raw",
+             "updated_at": f"{target}T16:00:00+08:00"}
+            for at in times
+        ])
+        final = final_minute_fixture(frame, convention="minute_end")
+        final[STANDARD_COLUMNS + list(LIFECYCLE_COLUMNS)].to_csv(path, index=False)
 
 
 def v1_replay(plan: dict) -> dict:
@@ -165,9 +175,21 @@ def test_store_is_immutable_idempotent_and_keeps_changed_input_version(tmp_path:
     assert second["status"] == "idempotent"
     assert path.read_bytes() == initial_bytes
     source = tmp_path / "data/intraday/1m/600000.csv"
-    source.write_text(source.read_text(encoding="utf-8").replace("1000", "1100"), encoding="utf-8")
+    original_events = source.read_bytes()
+    events = pd.read_csv(source, dtype=str, keep_default_na=False)
+    prior = events.iloc[0].to_dict()
+    correction = {
+        **prior, "volume": 1100, "amount": 11000, "finality": "revised", "revision": 2,
+        "supersedes_hash": prior["evidence_hash"], "revision_reason": "synthetic_volume_correction",
+        "fetched_at": "2026-08-04T16:00:00+08:00", "updated_at": "2026-08-04T16:00:00+08:00",
+    }
+    correction["evidence_hash"] = observation_hash(correction)
+    with source.open("a", encoding="utf-8", newline="") as stream:
+        csv.DictWriter(stream, fieldnames=list(events.columns), lineterminator="\n").writerow(correction)
+    assert source.read_bytes().startswith(original_events)
     third = receipts.publish_plan_review_receipt(tmp_path, review(tmp_path, plan, checked_at="2026-08-04T18:00:00+08:00"), plan=plan)
     assert third["status"] == "completed" and third["path"] != first["path"]
+    assert third["receipt"]["status"] == "passed"
     assert path.read_bytes() == initial_bytes
     assert third["receipt"]["reconstruction"] == "retrospective_reconstruction"
     scan = refresh.scan_unreplayed_archived_plans(tmp_path, as_of="2026-08-06")

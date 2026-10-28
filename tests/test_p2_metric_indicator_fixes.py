@@ -96,6 +96,8 @@ def test_walk_forward_trade_pnl_deducts_entry_exit_cost_and_stamp_duty() -> None
             "date": pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-05"]),
             "open": [10.0, 10.0, 11.0],
             "close": [10.0, 10.0, 11.0],
+            "high": [10.1, 10.1, 11.1], "low": [9.9, 9.9, 10.9],
+            "volume": 1000, "adjust": "raw",
         }
     )
     signals = pd.DataFrame(
@@ -118,6 +120,8 @@ def test_walk_forward_trade_costs_apply_minimum_commission() -> None:
             "date": pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-05"]),
             "open": [10.0, 10.0, 11.0],
             "close": [10.0, 10.0, 11.0],
+            "high": [10.1, 10.1, 11.1], "low": [9.9, 9.9, 10.9],
+            "volume": 1000, "adjust": "raw",
         }
     )
     signals = pd.DataFrame(
@@ -140,6 +144,8 @@ def test_walk_forward_respects_max_position_pct() -> None:
             "date": pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-05"]),
             "open": [10.0, 10.0, 11.0],
             "close": [10.0, 10.0, 11.0],
+            "high": [10.1, 10.1, 11.1], "low": [9.9, 9.9, 10.9],
+            "volume": 1000, "adjust": "raw",
         }
     )
     signals = pd.DataFrame(

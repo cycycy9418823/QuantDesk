@@ -54,7 +54,8 @@ def _write_window_snapshot(
             for row in rows
         ),
         "symbols": rows,
-        "criteria": {"usable_standard": "existing_intraday_quality_audit_v1"},
+        "criteria": {"usable_standard": "existing_intraday_quality_audit_v1",
+                     "eligibility_standard": "finalized_session_evidence_v3"},
         "read_only": True,
         "network_used": False,
         "canonical_write": False,
@@ -67,6 +68,10 @@ def _window_row(symbol: str, status: str) -> dict:
     return {
         "symbol": symbol,
         "day_status": {WINDOW_START: status, WINDOW_END: status},
+        "day_evidence": {day: {"formal_execution_eligible": status == "usable",
+                               "reliable_no_fill_eligible": status == "usable",
+                               "session_status": "complete_session" if status == "usable" else "missing_session"}
+                         for day in (WINDOW_START, WINDOW_END)},
         "usable_day_count": 2 if status == "usable" else 0,
         "all_days_usable": status == "usable",
     }
@@ -376,12 +381,14 @@ def _write_top200_snapshot(root: Path, symbols: list[str], job_name: str = "top2
         json.dumps(
             {
                 "task_type": "tushare_minute_quality_audit",
+                "eligibility_standard": "finalized_session_evidence_v3",
                 "status": "passed",
                 "job": {"path": f"data/vendor_staging/{job_name}"},
                 "target_date": WINDOW_START,
                 "total_symbols": len(symbols),
                 "quality_summary": {
                     "usable": len(symbols),
+                    "formal_execution_eligible": len(symbols),
                     "partial": 0,
                     "insufficient": 0,
                     "invalid": 0,

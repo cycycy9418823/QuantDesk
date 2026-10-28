@@ -691,7 +691,8 @@ def test_paper_simulation_refresh_updates_local_tracking(monkeypatch, tmp_path) 
     assert item["latest_reference_date"] == "2026-06-22"
     assert item["return_since_added_pct"] == 5.0
     assert item["max_gain_since_added"] == 10.0
-    assert item["max_drawdown_since_added"] == 0.0
+    # Closing prices 10 -> 11 -> 10.5 stay above entry but fall from the peak.
+    assert item["max_drawdown_since_added"] == -4.55
     assert item["elapsed_trading_days"] == 2
     assert item["review_status"] in {"board_following_expected", "paper_tracking"}
     assert item["expectation_fit_status"] == "fit"
@@ -833,7 +834,7 @@ def test_paper_simulation_lifecycle_action_marks_review_and_archive(monkeypatch,
     assert watchlist["archived_watchlist_count"] == 1
 
 
-def test_strategy_lab_summary_endpoint_is_read_only_evidence(monkeypatch) -> None:
+def test_strategy_lab_summary_endpoint_is_read_only_evidence(monkeypatch, tmp_path: Path) -> None:
     def fake_read_json_file(path: Path) -> dict[str, object]:
         text = str(path).replace("\\", "/")
         if text.endswith("results/strategy_lab/v420_strategy_leaderboard_latest.json"):
@@ -880,6 +881,23 @@ def test_strategy_lab_summary_endpoint_is_read_only_evidence(monkeypatch) -> Non
         return {}
 
     monkeypatch.setattr(api_server, "read_json_file", fake_read_json_file)
+    from datetime import date
+    from quantdesk.research.evidence_identity import stamp_research_evidence
+    monkeypatch.setattr(api_server, "project_root", tmp_path)
+    monkeypatch.setattr(api_server, "expected_settlement_date", lambda *_a: date(2026, 10, 19))
+    for filename in (
+        "v420_strategy_leaderboard_latest.json",
+        "v420_real_use_strategy_lab_handoff_latest.json",
+        "v421_strategy_statistics_latest.json",
+    ):
+        path = tmp_path / "results/strategy_lab" / filename
+        value = fake_read_json_file(path)
+        if filename == "v420_strategy_leaderboard_latest.json":
+            value = stamp_research_evidence(value, target_date="2026-10-19", run_id="fixture-run",
+                code_identity={"source_sha256":"a" * 64},
+                data_identity={"fixture.csv":"b" * 64}, config_identity={"scope":"summary-contract"})
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
 
     payload = app.test_client().get("/api/strategy-lab/summary").get_json()
 

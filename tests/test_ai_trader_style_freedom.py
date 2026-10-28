@@ -210,7 +210,8 @@ def test_closed_sell_carries_style_for_attribution() -> None:
     for field in ('"style": pos.get("style")', '"held_days"', '"net_return"'):
         assert field in trader_source, f"sell trade no longer carries {field}"
 
-    overnight_source = inspect.getsource(overnight.run_evening)
+    assert "_run_evening_ready(" in inspect.getsource(overnight.run_evening)
+    overnight_source = inspect.getsource(overnight._run_evening_ready)
     assert "record_closed_trade" in overnight_source, "attribution is not wired into the cycle"
     # Rule-engine exits close positions too, so saving must not require an LLM.
     assert "philosophy_dirty" in overnight_source

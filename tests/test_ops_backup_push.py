@@ -25,7 +25,8 @@ def seed(mod, tmp: Path, files: dict[str, str] | None = None) -> None:
     canon.mkdir()
     (canon / "docs").mkdir()
     (canon / "docs" / "learning_log.md").write_text("note\n", encoding="utf-8")
-    payload = {"files": [{"path": "docs/learning_log.md", "kind": "paper_backup"}]}
+    (canon / "docs" / "owner_learning_log.md").write_text("owner note\n", encoding="utf-8")
+    payload = {"files": [{"path": "docs/owner_learning_log.md", "kind": "paper_backup"}]}
     if files:
         payload["files"] = [{"path": name, "kind": "paper_backup"} for name in files]
         for name, text in files.items():
@@ -197,3 +198,19 @@ def test_success_path_keeps_match(tmp_path: Path) -> None:
     assert row["file_count"] == 2
     utc = str(row["stamp"]).replace("snapshot_", "")
     assert (mod.TMP / f"verify_{utc}.py").is_file()
+
+
+def test_no_prune_verifies_new_archive_without_listing_or_deleting_old_snapshots(tmp_path: Path) -> None:
+    mod = load_mod()
+    seed(mod, tmp_path)
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append(" ".join(map(str, cmd)))
+        return FakeProc(returncode=0, stdout="MATCH\n" if "python3" in calls[-1] else "", stderr="")
+    def no_listing(*args, **kwargs):
+        raise AssertionError("No-prune verification must not enumerate old remote backups")
+    assert mod.main(["--no-prune"], run=run, check_output=no_listing) == 0
+    final = json.loads(mod.LOG.read_text(encoding="utf-8").splitlines()[-1])
+    assert final["all_hashes_match"] is True and final["retention_executed"] is False
+    assert final["status"] == "backup_verified_retention_skipped"
+    assert not any("rm -rf" in command for command in calls)

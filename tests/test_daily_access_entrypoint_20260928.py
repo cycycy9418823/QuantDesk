@@ -58,8 +58,10 @@ def test_partial_day_reports_24_of_48_and_never_claims_full(tmp_path) -> None:
     assert facts["expected_slots"] == 48
     assert facts["collected_slots"] == 24, "半份必须原样报 24，不能凑成 48"
     assert facts["collected_slots"] < facts["expected_slots"]
-    assert "已采集 24/48 次" in facts["message"]
-    assert "已采集 48/48 次" not in facts["message"]
+    assert "已收到 24/48 份" in facts["message"]
+    assert "已收到 48/48 份" not in facts["message"]
+    assert facts["received_slots"] == 24
+    assert facts["strict_qualified_slots"] == 24
     assert facts["blocks_workflow"] is False
 
 
@@ -69,7 +71,8 @@ def test_full_day_reports_48_of_48(tmp_path) -> None:
     facts = snapshot_facts(tmp_path)
 
     assert (facts["collected_slots"], facts["expected_slots"]) == (48, 48)
-    assert "已采集 48/48 次" in facts["message"]
+    assert "已收到 48/48 份" in facts["message"]
+    assert facts["received_slots"] == facts["strict_qualified_slots"] == 48
 
 
 def test_manifest_of_another_day_is_not_used_as_today(tmp_path) -> None:
@@ -105,9 +108,10 @@ vm.runInContext(`
 `, context);
 """)
     html = partial["html"]
-    assert "24 / 48 次" in html
-    assert "48 / 48 次" not in html, "半份不能显示成跑满"
-    assert "半份·当日未跑满" in html
+    assert "24 / 48 份" in html
+    assert "48 / 48 份" not in html, "半份不能显示成跑满"
+    assert "文件未齐" in html
+    assert "严格时段合格 24" in html
     assert DAY in html
 
     seed_day(tmp_path, collected=48, expected=48)
@@ -118,8 +122,9 @@ vm.runInContext(`
     console.log(JSON.stringify({{ html: document.getElementById('projectRuntimeSummary').innerHTML }}));
 `, context);
 """)
-    assert "48 / 48 次" in full["html"]
-    assert "半份" not in full["html"]
+    assert "48 / 48 份" in full["html"]
+    assert "文件未齐" not in full["html"]
+    assert "严格时段合格 48" in full["html"]
 
 
 def test_page_unknown_counts_do_not_look_like_a_full_day(tmp_path) -> None:
@@ -133,8 +138,8 @@ vm.runInContext(`
 `, context);
 """)
 
-    assert "采集次数未知" in result["html"]
-    assert "48 / 48 次" not in result["html"]
+    assert "收到文件数量未知" in result["html"]
+    assert "48 / 48 份" not in result["html"]
 
 
 def test_page_tells_the_owner_how_to_open_the_fixed_door_when_server_is_down() -> None:

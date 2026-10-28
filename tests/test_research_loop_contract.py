@@ -346,9 +346,29 @@ class ResearchLoopContractTests(unittest.TestCase):
                 }
             return {}
 
+        from datetime import date
+        from quantdesk.research.evidence_identity import stamp_research_evidence
+
         context: dict[str, object] = {}
-        with mock.patch.object(api_server, "read_json_file", side_effect=fake_read_json_file):
-            api_server._attach_latest_research_evidence_context(context)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for relative in (
+                "results/backtest/backtest_latest.json",
+                "results/factor_health_latest.json",
+                "results/strategy_lab/v420_strategy_leaderboard_latest.json",
+                "results/strategy_lab/v420_real_use_strategy_lab_handoff_latest.json",
+                "results/strategy_lab/v421_strategy_statistics_latest.json",
+            ):
+                path = root / relative
+                value = stamp_research_evidence(fake_read_json_file(path), target_date="2026-06-23",
+                    run_id="research-context-fixture", code_identity={"source_sha256": "a" * 64},
+                    data_identity={"fixture.csv": "b" * 64}, config_identity={"scope": "context-contract"})
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(value), encoding="utf-8")
+            with mock.patch.object(api_server, "project_root", root), \
+                 mock.patch.object(api_server, "expected_settlement_date", return_value=date(2026, 6, 23)), \
+                 mock.patch.object(api_server, "read_json_file", side_effect=fake_read_json_file):
+                api_server._attach_latest_research_evidence_context(context)
 
         backtest = context["backtest_summary"]
         factor = context["factor_health"]

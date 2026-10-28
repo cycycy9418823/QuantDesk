@@ -352,6 +352,7 @@ def test_auto_paper_state_writer_persists_reconciled_summary(tmp_path, monkeypat
 
     auto_paper_portfolio._write_auto_paper_state(
         {
+            "initial_cash": 100000.0,
             "cash": 50.0,
             "positions": [{"symbol": "000001", "market_value": 125.0, "unrealized_pnl": -2.5}],
             "closed_positions": [{"symbol": "000002", "realized_pnl": 4.0}],
@@ -618,9 +619,9 @@ def test_auto_portfolio_daily_quote_exposes_csv_warnings(tmp_path: Path, monkeyp
         encoding="utf-8",
     )
     (daily_dir / "000001.csv").write_text(
-        "date,close\n"
-        "2026-06-18,10.5\n"
-        "2026-06-19,11.0,unexpected_extra_field\n",
+        "date,open,high,low,close,volume,adjust\n"
+        "2026-06-18,10,10.5,10,10.5,1000,raw\n"
+        "2026-06-19,10,11,10,11.0,1000,raw,unexpected_extra_field\n",
         encoding="utf-8",
     )
 

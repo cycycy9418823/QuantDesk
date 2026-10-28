@@ -18,6 +18,7 @@ from typing import Any
 
 import pandas as pd
 import pytest
+from tests.minute_evidence_fixture import final_minute_fixture
 
 import quantdesk.paper.stage4_tri_account_replay as stage4_replay
 from quantdesk.intraday.minute_pool_capability import minute_pool_capability_source_hash
@@ -428,7 +429,8 @@ def _tiny_fill_world(tmp_path: Path) -> dict[str, Any]:
             {"symbol": symbol, "datetime": f"{exec_day} 09:31:00", "open": 10.25, "high": 10.35, "low": 10.2, "close": 10.3, "volume": 1200, "amount": 12360, "adjust": "raw"},
         ]
     )
-    minute.to_csv(intraday_dir / "1m" / f"{symbol}.csv", index=False, encoding="utf-8")
+    final_minute_fixture(minute.rename(columns={"adjust": "price_basis"})).assign(adjust="raw").to_csv(
+        intraday_dir / "1m" / f"{symbol}.csv", index=False, encoding="utf-8")
 
     return {
         "as_of": as_of,

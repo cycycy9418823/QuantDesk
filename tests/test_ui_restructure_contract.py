@@ -118,7 +118,8 @@ def test_today_kpi_does_not_treat_zero_new_generation_as_empty_pool() -> None:
     assert "当日批次已核验为 0 只" in JS
     assert "可读复核池" in JS
     assert "health-bad" in JS
-    assert "成绩单仍在读" in JS
+    assert "候选与两本账读取后，再核对成绩单" in JS
+    assert "visiblePageLoaders" in JS
 
 
 def test_chart_layers_keep_rule_ai_and_fill_separate() -> None:

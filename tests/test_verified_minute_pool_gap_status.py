@@ -61,12 +61,14 @@ def test_intraday_gap_status_marks_available_symbols_from_passed_minute_quality_
         json.dumps(
             {
                 "task_type": "tushare_minute_quality_audit",
+                "eligibility_standard": "finalized_session_evidence_v3",
                 "status": "passed",
                 "job": {"path": "data/vendor_staging/tushare_proxy_minutes_250d_phase2_top200_x"},
                 "target_date": "2026-07-03",
                 "total_symbols": 1,
                 "quality_summary": {
                     "usable": 1,
+                    "formal_execution_eligible": 1,
                     "partial": 0,
                     "insufficient": 0,
                     "invalid": 0,

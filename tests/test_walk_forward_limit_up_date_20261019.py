@@ -26,6 +26,7 @@ def test_walk_forward_blocks_pre_reform_chinext_one_word_limit_up() -> None:
             "low": [10.0, 11.0, 11.1, 11.2],
             "close": [10.0, 11.0, 11.25, 11.35],
             "volume": [1_000_000] * 4,
+            "adjust": "raw",
         }
     )
     signals = pd.DataFrame({"date": [dates[0], dates[1]], "signal": ["entry", "exit"]})
@@ -46,6 +47,7 @@ def test_walk_forward_still_blocks_post_reform_one_word_limit_up() -> None:
             "low": [10.0, 12.0, 12.1, 12.2],
             "close": [10.0, 12.0, 12.25, 12.35],
             "volume": [1_000_000] * 4,
+            "adjust": "raw",
         }
     )
     signals = pd.DataFrame({"date": [dates[0], dates[1]], "signal": ["entry", "exit"]})
@@ -66,6 +68,7 @@ def test_walk_forward_does_not_block_ordinary_pre_reform_bar() -> None:
             "low": [9.9, 10.0, 10.1],
             "close": [10.0, 10.1, 10.2],
             "volume": [1_000_000] * 3,
+            "adjust": "raw",
         }
     )
     signals = pd.DataFrame({"date": [dates[0], dates[1]], "signal": ["entry", "exit"]})

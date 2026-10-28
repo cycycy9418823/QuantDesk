@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
@@ -24,7 +25,11 @@ from quantdesk.intraday.historical_gap_backfill import (
     validate_round13_backfill_scope,
 )
 from quantdesk.intraday.intraday_schema import STANDARD_COLUMNS
-from quantdesk.intraday.stage6_append_only_import import apply_audited_intraday_batch
+from quantdesk.intraday.stage6_append_only_import import (
+    apply_audited_intraday_batch,
+    canonical_intraday_write_lock_path,
+)
+from tests.minute_evidence_fixture import final_minute_fixture
 
 
 @pytest.mark.parametrize(
@@ -436,10 +441,19 @@ def _provider_updater(symbols: list[str], target_date: str, **kwargs) -> dict:
     staging = Path(kwargs["intraday_dir"])
     staging.mkdir(parents=True, exist_ok=True)
     for symbol in symbols:
-        _session(symbol, target_date).to_csv(
+        final_minute_fixture(_session(symbol, target_date), convention="minute_end").to_csv(
             staging / f"{symbol}.csv", index=False, encoding="utf-8-sig", lineterminator="\n"
         )
     return {"status": "completed", "updated_symbol_list": list(symbols)}
+
+
+def _write_existing_lifecycle(root: Path) -> None:
+    directory = root / "data" / "intraday" / "1m" / "lifecycle_v1"
+    directory.mkdir(parents=True, exist_ok=True)
+    for symbol in sorted({symbol for symbol, _target in ROUND13_MINUTE_BACKFILL_ALLOWLIST}):
+        final_minute_fixture(_session(symbol, "2026-07-01"), convention="minute_end").to_csv(
+            directory / f"{symbol}.csv", index=False, encoding="utf-8-sig", lineterminator="\n"
+        )
 
 
 def test_end_to_end_staging_only_is_whole_batch_and_canonical_read_only(
@@ -474,6 +488,8 @@ def test_end_to_end_apply_uses_stage6_and_records_five_before_after_pairs(
     tmp_path: Path,
 ) -> None:
     root = _runtime_root(tmp_path)
+    minute_dir = root / "data" / "intraday" / "1m"
+    legacy_before = {path: path.read_bytes() for path in minute_dir.glob("*.csv")}
 
     payload = run_round13_minute_gap_backfill(
         root,
@@ -493,6 +509,9 @@ def test_end_to_end_apply_uses_stage6_and_records_five_before_after_pairs(
         == item["canonical_target_row_set_sha256"]
         for item in provenance
     )
+    assert all(Path(item["canonical_path"]).parent == minute_dir / "lifecycle_v1" for item in provenance)
+    assert all(item["legacy_canonical_sha256_before"] == item["legacy_canonical_sha256_after"] for item in provenance)
+    assert all(path.read_bytes() == content for path, content in legacy_before.items())
 
 
 def test_end_to_end_apply_avoids_windows_max_path_for_stage6_candidates(
@@ -522,6 +541,9 @@ def test_end_to_end_apply_avoids_windows_max_path_for_stage6_candidates(
     padding_length = max(0, 270 - len(str(legacy_candidate_path(probe_root))))
     padded_parent = tmp_path / ("x" * padding_length) if padding_length else tmp_path
     root = _runtime_root(padded_parent)
+    # Keep this a real append: the new contract stores signed observations in
+    # their own schema segment instead of rewriting an old CSV header.
+    _write_existing_lifecycle(root)
     legacy_candidate = legacy_candidate_path(root)
     staged_file = (
         root
@@ -602,18 +624,43 @@ def test_missing_one_stage_file_blocks_whole_batch_before_import(tmp_path: Path)
     importer.assert_not_called()
 
 
+@pytest.mark.parametrize("existing_segments", [False, True])
 def test_second_date_import_failure_restores_first_date_canonical_files(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_segments: bool,
 ) -> None:
+    from quantdesk.intraday import historical_gap_backfill as module
+
     root = _runtime_root(tmp_path)
+    if existing_segments:
+        _write_existing_lifecycle(root)
+    minute_dir = root / "data" / "intraday" / "1m"
     before = {
-        path.name: path.read_bytes()
-        for path in (root / "data" / "intraday" / "1m").glob("*.csv")
+        path.relative_to(minute_dir).as_posix(): path.read_bytes()
+        for path in minute_dir.rglob("*.csv")
     }
     apply_calls = 0
+    restore_calls = 0
+
+    def assert_singleton_lock_held() -> None:
+        with pytest.raises(TimeoutError):
+            with interprocess_file_lock(canonical_intraday_write_lock_path(minute_dir), timeout_seconds=0):
+                pass
+
+    original_restore = module._restore_snapshot
+
+    def restore_while_locked(*args, **kwargs):
+        nonlocal restore_calls
+        restore_calls += 1
+        assert_singleton_lock_held()
+        return original_restore(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_restore_snapshot", restore_while_locked)
 
     def importer(**kwargs) -> dict:
         nonlocal apply_calls
+        assert_singleton_lock_held()
         if kwargs["apply"] is False:
             return apply_audited_intraday_batch(**kwargs)
         apply_calls += 1
@@ -632,8 +679,86 @@ def test_second_date_import_failure_restores_first_date_canonical_files(
 
     assert payload["status"] == "failed"
     assert payload["canonical_import"]["rollback_verified"] is True
+    assert restore_calls == 1
+    after = {
+        path.relative_to(minute_dir).as_posix(): path.read_bytes()
+        for path in minute_dir.rglob("*.csv")
+    }
+    assert after == before, "whole-batch rollback must also remove or restore new-schema segments"
     for name, content in before.items():
         assert (root / "data" / "intraday" / "1m" / name).read_bytes() == content
+    with interprocess_file_lock(canonical_intraday_write_lock_path(minute_dir), timeout_seconds=0):
+        pass
+
+
+def test_post_import_evidence_corruption_restores_every_schema_segment(tmp_path: Path) -> None:
+    root = _runtime_root(tmp_path)
+    minute_dir = root / "data" / "intraday" / "1m"
+    before = {path.relative_to(minute_dir): path.read_bytes() for path in minute_dir.rglob("*.csv")}
+
+    def importer(**kwargs) -> dict:
+        result = apply_audited_intraday_batch(**kwargs)
+        if kwargs["apply"] and kwargs["target_date"] == "2026-07-28" and result["status"] == "completed":
+            target = Path(result["items"][0]["canonical_path"])
+            events = pd.read_csv(target, dtype=str, keep_default_na=False)
+            events.loc[0, "evidence_hash"] = "0" * 64
+            events.to_csv(target, index=False, encoding="utf-8-sig", lineterminator="\n")
+        return result
+
+    result = run_round13_minute_gap_backfill(
+        root, network=True, apply=True, run_id="round13-post-read-corruption",
+        provider_updater=_provider_updater, append_importer=importer,
+    )
+
+    assert result["status"] == "failed", result
+    assert "minute_event_hash_mismatch" in result["canonical_import"]["error"]
+    assert result["canonical_import"]["rollback_verified"] is True
+    assert {path.relative_to(minute_dir): path.read_bytes() for path in minute_dir.rglob("*.csv")} == before
+
+
+def test_preflight_rejects_receipt_target_outside_requested_schema_paths(tmp_path: Path) -> None:
+    root = _runtime_root(tmp_path)
+    minute_dir = root / "data" / "intraday" / "1m"
+    before = {path.relative_to(minute_dir): path.read_bytes() for path in minute_dir.rglob("*.csv")}
+
+    def importer(**kwargs) -> dict:
+        assert kwargs["apply"] is False, "a mismatched target must be rejected before any write"
+        result = apply_audited_intraday_batch(**kwargs)
+        result["items"][0]["canonical_path"] = str(minute_dir / "unrequested.csv")
+        return result
+
+    result = run_round13_minute_gap_backfill(
+        root, network=True, apply=True, run_id="round13-target-mismatch",
+        provider_updater=_provider_updater, append_importer=importer,
+    )
+
+    assert result["status"] == "blocked", result
+    assert result["canonical_import"]["error"] == "canonical_import_path_mismatch"
+    assert {path.relative_to(minute_dir): path.read_bytes() for path in minute_dir.rglob("*.csv")} == before
+
+
+def test_outer_transaction_lock_ownership_is_local_to_the_holding_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quantdesk.intraday import stage6_append_only_import as module
+
+    canonical, staging = tmp_path / "canonical", tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(module, "CANONICAL_WRITE_LOCK_TIMEOUT_SECONDS", 0)
+
+    def competing_append() -> None:
+        module.apply_audited_intraday_batch(
+            canonical_dir=canonical, staging_dir=staging, symbols=["600000"],
+            target_date="2026-07-28", run_id="competing-thread", apply=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with module.canonical_intraday_write_transaction(canonical):
+            pending = executor.submit(competing_append)
+            with pytest.raises(TimeoutError, match="interprocess_file_lock_timeout:"):
+                pending.result(timeout=5)
+    with interprocess_file_lock(canonical_intraday_write_lock_path(canonical), timeout_seconds=0):
+        pass
 
 
 def test_offline_apply_gate_and_shared_lock_precede_provider_or_output(tmp_path: Path) -> None:

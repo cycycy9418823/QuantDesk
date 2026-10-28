@@ -28,6 +28,7 @@ from quantdesk.risk.risk_gate import (
     evaluate_paper_risk_gate,
 )
 from quantdesk.version import API_SCHEMA_VERSION
+from tests.minute_evidence_fixture import final_minute_fixture
 
 
 try:
@@ -193,7 +194,10 @@ def _minute_frame(symbol: str, day: str = "2026-07-13") -> pd.DataFrame:
 def _execution(case: dict[str, Any], *, frame: pd.DataFrame | None = None):
     symbol = case["intent"].symbol
     day = "2026-07-13"
-    minute_frame = _minute_frame(symbol, day) if frame is None else frame
+    minute_frame = (
+        final_minute_fixture(_minute_frame(symbol, day).rename(columns={"adjust": "price_basis"})).assign(adjust="raw")
+        if frame is None else frame
+    )
     pool = {
         "schema_version": API_SCHEMA_VERSION,
         "task_type": "verified_minute_pool_snapshot",

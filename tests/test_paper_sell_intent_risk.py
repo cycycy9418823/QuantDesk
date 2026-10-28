@@ -19,6 +19,7 @@ from quantdesk.paper.portfolio_contracts import (
 from quantdesk.paper.trade_costs import sell_cash_inflow
 from quantdesk.risk.risk_gate import compute_risk_evidence_source_hash, evaluate_paper_risk_gate
 from quantdesk.version import API_SCHEMA_VERSION
+from tests.minute_evidence_fixture import final_minute_fixture
 
 
 kernel = importlib.import_module("quantdesk.paper.simulation_kernel")
@@ -161,7 +162,7 @@ def _minute_frame(day: str = "2026-07-13") -> pd.DataFrame:
 
 
 def _execution(case: dict[str, Any], *, day: str = "2026-07-13"):
-    frame = _minute_frame(day)
+    frame = final_minute_fixture(_minute_frame(day).rename(columns={"adjust": "price_basis"})).assign(adjust="raw")
     pool = {
         "schema_version": API_SCHEMA_VERSION,
         "task_type": "verified_minute_pool_snapshot",

@@ -918,7 +918,10 @@ class TestFrontendWiring:
         assert 'data-side-module-target="ai-trader-section"' in template
         assert 'id="ai-trader-section"' in template
         js = FRONTEND_JS.read_text(encoding="utf-8")
-        assert '"ai-trader-section": () => loadAiTraderPanel()' in js
+        # Visible modules now run through the bounded page-read plan.
+        assert '"ai-trader-section": [loadAiTraderPanel]' in js
+        assert 'function visiblePageLoaders(' in js
+        assert 'runVisiblePageReads(visiblePageLoaders(targetId))' in js
         # Label drifted to "AI脑" in the 2026-09-11 UI; the guard is that the
         # section still has a module label, not the exact wording.
         assert re.search(r'"ai-trader-section":\s*"[^"]+"', js)

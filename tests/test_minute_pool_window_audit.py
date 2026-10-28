@@ -21,6 +21,7 @@ from quantdesk.intraday.minute_pool_window_audit import (
     load_window_verified_minute_pool,
     window_pool_covers,
 )
+from tests.minute_evidence_fixture import final_minute_fixture
 
 WINDOW_DAYS = ("2026-07-13", "2026-07-14", "2026-07-15")
 
@@ -69,10 +70,10 @@ def _pool_dir(root: Path) -> Path:
     rows = []
     for day in WINDOW_DAYS:
         rows += _minute_rows("600001", day)
-    pd.DataFrame(rows).to_csv(intraday / "600001.csv", index=False, encoding="utf-8")
+    final_minute_fixture(pd.DataFrame(rows)).to_csv(intraday / "600001.csv", index=False, encoding="utf-8")
     # holed: middle day entirely missing (e.g. suspension)
     rows = _minute_rows("600002", WINDOW_DAYS[0]) + _minute_rows("600002", WINDOW_DAYS[2])
-    pd.DataFrame(rows).to_csv(intraday / "600002.csv", index=False, encoding="utf-8")
+    final_minute_fixture(pd.DataFrame(rows)).to_csv(intraday / "600002.csv", index=False, encoding="utf-8")
     # corrupt: middle day has broken OHLC (high < low)
     rows = (
         _minute_rows("600003", WINDOW_DAYS[0])

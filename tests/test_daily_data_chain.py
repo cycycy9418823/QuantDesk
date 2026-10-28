@@ -8,6 +8,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from tests.minute_evidence_fixture import final_minute_fixture
+
 
 def _write_full_a_fixture(root: Path, symbols: list[str]) -> None:
     path = root / "data" / "universe" / "a_share_symbols.csv"
@@ -115,10 +117,18 @@ def test_runtime_preflight_blocks_without_mootdx(tmp_path: Path) -> None:
     assert "required_module_missing:mootdx" in result["reason_codes"]
 
 
-def test_complete_session_requires_95_percent_and_both_sessions() -> None:
+@pytest.mark.parametrize("missing_count", [1, 13])
+def test_complete_session_requires_exact_grid_and_final_evidence(missing_count: int) -> None:
     from quantdesk.intraday.intraday_quality_audit import assess_complete_session
 
-    full = _full_session_frame()
+    legacy = assess_complete_session(
+        _full_session_frame(), symbol="600000", target_date="2026-07-16", price_basis="raw",
+    )
+    assert legacy["status"] == "complete_session"
+    assert legacy["formal_execution_eligible"] is False
+    assert legacy["reliable_no_fill_eligible"] is False
+    assert "legacy_bar_lifecycle_unverified" in legacy["reason_codes"]
+    full = final_minute_fixture(_full_session_frame(), convention="minute_end")
     complete = assess_complete_session(
         full,
         symbol="600000",
@@ -126,7 +136,7 @@ def test_complete_session_requires_95_percent_and_both_sessions() -> None:
         price_basis="raw",
     )
     partial = assess_complete_session(
-        full.drop(index=range(20, 33)).reset_index(drop=True),
+        full.drop(index=range(20, 20 + missing_count)).reset_index(drop=True),
         symbol="600000",
         target_date="2026-07-16",
         price_basis="raw",
@@ -138,10 +148,12 @@ def test_complete_session_requires_95_percent_and_both_sessions() -> None:
     assert complete["formal_execution_eligible"] is True
     assert complete["reliable_no_fill_eligible"] is True
     assert partial["status"] == "partial_session"
-    assert partial["unique_session_minutes"] == 227
+    assert partial["unique_session_minutes"] == 240 - missing_count
     assert partial["formal_execution_eligible"] is False
     assert partial["reliable_no_fill_eligible"] is False
-    assert "session_coverage_below_0_95" in partial["reason_codes"]
+    assert "session_minute_grid_incomplete" in partial["reason_codes"]
+    if missing_count == 13:
+        assert "session_coverage_below_0_95" in partial["reason_codes"]
 
 
 def test_universe_contract_is_deterministic_and_versioned() -> None:

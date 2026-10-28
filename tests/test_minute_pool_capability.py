@@ -73,12 +73,14 @@ def _write_passed_top200_quality_snapshot(root: Path) -> None:
         json.dumps(
             {
                 "task_type": "tushare_minute_quality_audit",
+                "eligibility_standard": "finalized_session_evidence_v3",
                 "status": "passed",
                 "job": {"path": "data/vendor_staging/tushare_proxy_minutes_250d_phase2_top200_20260704_163110"},
                 "target_date": "2026-07-03",
                 "total_symbols": 1,
                 "quality_summary": {
                     "usable": 1,
+                    "formal_execution_eligible": 1,
                     "partial": 0,
                     "insufficient": 0,
                     "invalid": 0,
@@ -116,12 +118,14 @@ def _write_partial_top200_quality_snapshot(root: Path) -> None:
         json.dumps(
             {
                 "task_type": "tushare_minute_quality_audit",
+                "eligibility_standard": "finalized_session_evidence_v3",
                 "status": "partial",
                 "job": {"path": "data/vendor_staging/tushare_proxy_minutes_250d_phase2_top200_20260704_163110"},
                 "target_date": "2026-07-03",
                 "total_symbols": 2,
                 "quality_summary": {
                     "usable": 1,
+                    "formal_execution_eligible": 1,
                     "partial": 1,
                     "insufficient": 0,
                     "invalid": 0,
@@ -173,12 +177,14 @@ def _write_last_passed_top200_with_partial_latest(root: Path) -> None:
         json.dumps(
             {
                 "task_type": "tushare_minute_quality_audit",
+                "eligibility_standard": "finalized_session_evidence_v3",
                 "status": "partial",
                 "job": {"path": "data/vendor_staging/tushare_proxy_minutes_250d_project_real_2656_20260706"},
                 "target_date": "2026-07-03",
                 "total_symbols": 2,
                 "quality_summary": {
                     "usable": 1,
+                    "formal_execution_eligible": 1,
                     "partial": 1,
                     "insufficient": 0,
                     "invalid": 0,
@@ -195,12 +201,14 @@ def _write_last_passed_top200_with_partial_latest(root: Path) -> None:
         json.dumps(
             {
                 "task_type": "tushare_minute_quality_audit",
+                "eligibility_standard": "finalized_session_evidence_v3",
                 "status": "passed",
                 "job": {"path": "data/vendor_staging/tushare_proxy_minutes_250d_phase2_top200_20260704_163110"},
                 "target_date": "2026-07-03",
                 "total_symbols": 1,
                 "quality_summary": {
                     "usable": 1,
+                    "formal_execution_eligible": 1,
                     "partial": 0,
                     "insufficient": 0,
                     "invalid": 0,

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 import pandas as pd
+from tests.minute_evidence_fixture import final_minute_fixture
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -258,7 +259,8 @@ class RealIntradayProviderCapabilityTests(unittest.TestCase):
             # ohlcv_complete / signal_eligible exactly like the real fetch path;
             # a raw dict would (correctly) fail-close as missing_quality_gate.
             return _normalize_provider_frame(
-                provider, symbol, target_date, _mock_frame(symbol, target_date), source=provider,
+                provider, symbol, target_date,
+                final_minute_fixture(_mock_frame(symbol, target_date).drop(columns=["adjust"])), source=provider,
             )
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch("quantdesk.intraday_update_engine.fetch_intraday_1m", side_effect=fake_fetch):

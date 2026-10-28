@@ -228,7 +228,8 @@ def test_home_cards_keep_small_gaps_and_fallback_visible_in_chinese():
                 glm:{as_of:'2026-09-21',model_replied:false,message:'连接失败；固定规则接管'}},
         });
         const rendered = node('projectRuntimeSummary').innerHTML;
-        assert.match(rendered, /48 \/ 48 次/);
+        assert.match(rendered, /已收到 48 \/ 48 份/);
+        assert.match(rendered, /严格时段合格 未核实/);
         assert.match(rendered, /99\.89%/);
         assert.match(rendered, /Kimi/);
         assert.match(rendered, /固定规则接管/);

@@ -215,6 +215,7 @@ def test_tushare_minute_status_surfaces_completed_quality_pool(tmp_path: Path) -
         json.dumps(
             {
                 "task_type": "tushare_minute_quality_audit",
+                "eligibility_standard": "finalized_session_evidence_v3",
                 "status": "passed",
                 "job": {
                     "path": "data/vendor_staging/tushare_proxy_minutes_250d_phase2_top200_20260704_163110",
@@ -224,6 +225,7 @@ def test_tushare_minute_status_surfaces_completed_quality_pool(tmp_path: Path) -
                 "target_date": "2026-07-03",
                 "total_symbols": 200,
                 "quality_summary": {"usable": 200, "partial": 0, "insufficient": 0, "invalid": 0, "missing": 0},
+                "formal_execution_eligible": 200,
                 "suggested_next_action": "use_completed_minute_pool_for_research",
             },
             ensure_ascii=False,

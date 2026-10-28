@@ -24,6 +24,7 @@ import types
 
 import pandas as pd
 import pytest
+from tests.minute_evidence_fixture import final_minute_fixture, seal_minute_csv_fixture
 
 import quantdesk.intraday.intraday_providers as providers
 import quantdesk.intraday.intraday_update_engine as engine
@@ -37,6 +38,7 @@ from quantdesk.intraday.intraday_schema import (
     diagnose_intraday_price_conflict,
     filter_intraday_trading_session,
     source_time_order_state,
+    read_intraday_csv,
 )
 
 TARGET = "2026-05-15"
@@ -103,11 +105,11 @@ class TestSinaSessionFilter:
 
 class TestQualityGate:
     def _sina_frame(self):
-        return pd.DataFrame([
+        return final_minute_fixture(pd.DataFrame([
             _ohlcv_row(f"{TARGET} 09:30:00", 10.0, 10.2, 9.9, 10.1, 200),
             _ohlcv_row(f"{TARGET} 09:31:00", 10.1, 10.3, 10.0, 10.2, 300),
             _ohlcv_row(f"{TARGET} 09:32:00", 10.2, 10.4, 10.1, 10.3, 400),
-        ])
+        ]))
 
     def test_full_sina_ohlcv_gate_allows_full_minute_signal(self):
         gate = build_intraday_quality_gate(
@@ -169,7 +171,7 @@ class TestQualityGate:
 
         assert result["price_only_intraday"] is False
         assert result["ohlcv_complete"] is True
-        assert result["signal_eligible"] is True
+        assert result["signal_eligible"] is False  # Legacy shape does not prove finality.
 
     @pytest.mark.parametrize("source_column", ["price", "close"])
     def test_synthesized_ohlc_remains_price_only_and_blocked(self, source_column):
@@ -421,10 +423,7 @@ class TestAkshareRealFallbackChain:
 
         def sina(**kwargs):
             calls["sina"] = kwargs
-            return pd.DataFrame([
-                _ohlcv_row(f"{TARGET} 09:30:00", 10.0, 10.2, 9.9, 10.1, 200),
-                _ohlcv_row(f"{TARGET} 09:31:00", 10.1, 10.3, 10.0, 10.2, 300),
-            ])
+            return _full_ohlcv_frame(TARGET, symbol=kwargs["symbol"][-6:])
 
         module = _fake_akshare_module(stock_zh_a_hist_min_em=em, stock_zh_a_minute=sina)
         self._install(monkeypatch, module)
@@ -443,10 +442,7 @@ class TestAkshareRealFallbackChain:
 
         def sina(**kwargs):
             calls["sina"] = kwargs
-            return pd.DataFrame([
-                _ohlcv_row(f"{TARGET} 09:30:00", 10.0, 10.2, 9.9, 10.1, 200),
-                _ohlcv_row(f"{TARGET} 09:31:00", 10.1, 10.3, 10.0, 10.2, 300),
-            ])
+            return _full_ohlcv_frame(TARGET, symbol=kwargs["symbol"][-6:])
 
         module = _fake_akshare_module(stock_zh_a_hist_min_em=em, stock_zh_a_minute=sina)
         self._install(monkeypatch, module)
@@ -468,10 +464,7 @@ class TestAkshareRealFallbackChain:
 
         def sina(**kwargs):
             calls["sina"] = kwargs
-            return pd.DataFrame([
-                _ohlcv_row(f"{TARGET} 09:30:00", 10.0, 10.2, 9.9, 10.1, 200),
-                _ohlcv_row(f"{TARGET} 09:31:00", 10.1, 10.3, 10.0, 10.2, 300),
-            ])
+            return _full_ohlcv_frame(TARGET, symbol=kwargs["symbol"][-6:])
 
         module = _fake_akshare_module(stock_zh_a_hist_min_em=em, stock_zh_a_minute=sina)
         self._install(monkeypatch, module)
@@ -490,10 +483,7 @@ class TestAkshareRealFallbackChain:
 
         def sina(**kwargs):
             seen.append(kwargs["symbol"])
-            return pd.DataFrame([
-                _ohlcv_row(f"{TARGET} 09:30:00", 10.0, 10.2, 9.9, 10.1, 200),
-                _ohlcv_row(f"{TARGET} 09:31:00", 10.1, 10.3, 10.0, 10.2, 300),
-            ])
+            return _full_ohlcv_frame(TARGET, symbol=kwargs["symbol"][-6:])
 
         module = _fake_akshare_module(stock_zh_a_hist_min_em=em, stock_zh_a_minute=sina)
         self._install(monkeypatch, module)
@@ -536,7 +526,7 @@ class TestSinaProviderPathFiltersSession:
         assert result["session_filtered_count"] == 1
         times = list(result["data"]["datetime"].str[11:16])
         assert "15:30" not in times
-        assert result["signal_eligible"] is True
+        assert result["signal_eligible"] is False  # Filtering does not supply finality.
 
 
 # --- 9. price-only not accepted as a formal minute update --------------------
@@ -596,7 +586,7 @@ class TestPriceOnlyNotFormalUpdate:
                     _ohlcv_row(f"{target_date} 09:31:00", 10.1, 10.3, 10.0, 10.2, 300),
                 ])
                 return providers._normalize_provider_frame(
-                    "sina_intraday", symbol, target_date, frame,
+                    "sina_intraday", symbol, target_date, final_minute_fixture(frame),
                     source="sina_intraday",
                 )
             return providers._empty_result(provider, symbol, target_date, "failed", "no data")
@@ -692,10 +682,11 @@ class TestOhlcvValueIntegrity:
 
     def test_zero_volume_no_trade_minute_is_allowed(self):
         # a genuine no-trade minute (volume 0) is still valid OHLCV
-        frame = self._two_rows(volume=[0, 0])
+        frame = final_minute_fixture(self._two_rows(volume=[0, 0]))
         gate = build_intraday_quality_gate(frame, provider="sina_intraday", target_date=TARGET)
         assert gate["ohlcv_complete"] is True
-        assert gate["signal_eligible"] is True
+        assert gate["signal_eligible"] is False
+        assert "zero_volume_no_trade_evidence" in gate["bar_evidence"]["reason_codes"]
 
     def test_non_positive_price_is_not_complete(self):
         frame = self._two_rows(close=[0.0, -1.0])
@@ -715,10 +706,10 @@ class TestOhlcvValueIntegrity:
 
 
 def _full_ohlcv_frame(target_date, symbol="600000"):
-    return pd.DataFrame([
+    return final_minute_fixture(pd.DataFrame([
         _ohlcv_row(f"{target_date} 09:30:00", 10.0, 10.2, 9.9, 10.1, 200, symbol),
         _ohlcv_row(f"{target_date} 09:31:00", 10.1, 10.3, 10.0, 10.2, 300, symbol),
-    ])
+    ]))
 
 
 class TestUpdateEngineFailClose:
@@ -968,6 +959,7 @@ class TestLocalExistingGoesThroughGate:
             _ohlcv_row(f"{TARGET} 09:31:00", 10.1, 10.3, 10.0, 10.2, 300),
             _ohlcv_row(f"{TARGET} 09:32:00", 10.2, 10.4, 10.1, 10.3, 400),
         ])
+        seal_minute_csv_fixture(tmp_path / "600000.csv", convention="minute_start")
 
         real_fetch = providers.fetch_intraday_1m
 
@@ -1125,7 +1117,7 @@ class TestFormalSessionPriceBasis:
 
     def test_all_explicit_raw_rows_are_formally_eligible(self):
         result = assess_complete_session(
-            _formal_session_frame(),
+            final_minute_fixture(_formal_session_frame(), convention="minute_end"),
             symbol="600000",
             target_date=TARGET,
             price_basis="raw",
@@ -1147,7 +1139,7 @@ class TestFormalSessionPriceBasis:
         )
 
         result = assess_complete_session(
-            frame,
+            final_minute_fixture(frame, convention="minute_end"),
             symbol="600722",
             target_date=TARGET,
             price_basis="raw",
@@ -1199,10 +1191,10 @@ class TestLocalMixedPriceBasisFallsThrough:
             if provider == "mootdx_intraday":
                 return providers._normalize_provider_frame(
                     "mootdx_intraday", symbol, target_date,
-                    _formal_session_frame(
+                    final_minute_fixture(_formal_session_frame(
                         symbol=symbol,
                         target_date=target_date,
-                    ),
+                    ), convention="minute_end"),
                     source="mootdx_intraday", price_basis="raw",
                 )
             return providers._empty_result(provider, symbol, target_date, "failed", "no data")
@@ -1229,7 +1221,7 @@ class TestLocalMixedPriceBasisFallsThrough:
         assert "not formal" in str(
             local_result["suggested_next_action"]
         ).lower()
-        written = pd.read_csv(tmp_path / "600000.csv", encoding="utf-8-sig")
+        written = read_intraday_csv(tmp_path / "600000.csv", default_symbol="600000")["frame"]
         assert len(written) == 240
         assert set(written["price_basis"].astype(str)) == {"raw"}
         audit = assess_complete_session(

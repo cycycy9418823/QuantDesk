@@ -10,9 +10,10 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from tests.minute_evidence_fixture import final_minute_fixture
 
 
-def _session_frame(symbol: str, target_date: str, *, close_offset: float = 0.0) -> pd.DataFrame:
+def _legacy_session_frame(symbol: str, target_date: str, *, close_offset: float = 0.0) -> pd.DataFrame:
     times = list(pd.date_range(f"{target_date} 09:31", periods=120, freq="min"))
     times += list(pd.date_range(f"{target_date} 13:01", periods=120, freq="min"))
     rows: list[dict[str, object]] = []
@@ -36,6 +37,11 @@ def _session_frame(symbol: str, target_date: str, *, close_offset: float = 0.0) 
             }
         )
     return pd.DataFrame(rows)
+
+
+def _session_frame(symbol: str, target_date: str, *, close_offset: float = 0.0) -> pd.DataFrame:
+    return final_minute_fixture(
+        _legacy_session_frame(symbol, target_date, close_offset=close_offset), convention="minute_end")
 
 
 def _write_stage(
@@ -157,7 +163,7 @@ def test_concurrent_different_date_label_repairs_do_not_revert_each_other(
     dates = ("2026-07-15", "2026-07-16")
     pd.concat(
         [
-            _session_frame("600000", target_date).assign(
+            _legacy_session_frame("600000", target_date).assign(
                 price_basis="unknown",
                 source="mootdx_intraday",
             )
@@ -522,7 +528,7 @@ def test_conflict_batch_rollback_resets_item_state_and_verifies_hashes(
     for symbol in ("600000", "600001"):
         frame = _session_frame(symbol, "2026-07-16")
         target = canonical / f"{symbol}.csv"
-        frame.assign(price_basis="unknown", source="mootdx_intraday").to_csv(
+        _legacy_session_frame(symbol, "2026-07-16").assign(price_basis="unknown", source="mootdx_intraday").to_csv(
             target,
             index=False,
             encoding="utf-8-sig",
@@ -562,6 +568,7 @@ def test_conflict_batch_rollback_resets_item_state_and_verifies_hashes(
         assert item["post_repair_audit"] == {}
         assert item["canonical_sha256_after"] == ""
         assert item["rollback_verified"] is True
+    assert not list((canonical / "lifecycle_v1").glob("*.csv"))
 
 
 def test_section16_label_repair_dry_run_is_ready_and_preserves_apply_outputs(
@@ -577,7 +584,7 @@ def test_section16_label_repair_dry_run_is_ready_and_preserves_apply_outputs(
     output = tmp_path / "output"
     canonical.mkdir()
     frame = _session_frame("600000", target_date)
-    frame.assign(price_basis="unknown", source="mootdx_intraday").to_csv(
+    _legacy_session_frame("600000", target_date).assign(price_basis="unknown", source="mootdx_intraday").to_csv(
         canonical / "600000.csv",
         index=False,
         encoding="utf-8-sig",
@@ -732,8 +739,9 @@ def test_existing_date_zero_volume_round_trip_is_idempotent(tmp_path: Path) -> N
     canonical = tmp_path / "canonical"
     staging = tmp_path / "staging"
     canonical.mkdir()
-    frame = _session_frame("600000", "2026-07-13")
-    frame.loc[frame.index[-1], ["volume", "amount"]] = 0
+    unsealed = _legacy_session_frame("600000", "2026-07-13")
+    unsealed.loc[unsealed.index[-1], ["volume", "amount"]] = 0
+    frame = final_minute_fixture(unsealed, convention="minute_end")
     target = canonical / "600000.csv"
     frame.to_csv(target, index=False, encoding="utf-8-sig")
     before = target.read_bytes()
@@ -1071,7 +1079,7 @@ def test_batch_audit_accepts_raw_basis_only_for_symbols_proven_by_stage6_manifes
 
     canonical = tmp_path / "canonical"
     canonical.mkdir()
-    frame = _session_frame("600000", "2026-07-13").drop(columns=["price_basis"])
+    frame = _legacy_session_frame("600000", "2026-07-13").drop(columns=["price_basis"])
     frame.to_csv(canonical / "600000.csv", index=False, encoding="utf-8")
 
     without_provenance = audit_intraday_batch(
@@ -1086,7 +1094,9 @@ def test_batch_audit_accepts_raw_basis_only_for_symbols_proven_by_stage6_manifes
     )
 
     assert without_provenance["items"][0]["formal_execution_eligible"] is False
-    assert with_provenance["items"][0]["formal_execution_eligible"] is True
+    # Explicit basis provenance supplies only the basis. It never supplies
+    # finality, units, or a signed observation chain.
+    assert with_provenance["items"][0]["formal_execution_eligible"] is False
     assert with_provenance["items"][0]["price_basis"] == "raw"
 
 
@@ -1246,7 +1256,7 @@ def test_section15_cross_source_compare_excludes_opening_and_absent_bars(
 
     canonical = tmp_path / "canonical.csv"
     staging = tmp_path / "staging.csv"
-    left = _session_frame("600000", "2026-07-14")
+    left = _legacy_session_frame("600000", "2026-07-14")
     right = left.copy()
     right = right.loc[right["time"] != "14:59:00"].copy()
     right.loc[right["time"] == "09:31:00", "close"] += 9.0
@@ -1295,8 +1305,8 @@ def test_section15_basis_only_conflict_repairs_only_target_labels_with_backup(
     frame = _session_frame("600000", "2026-07-14")
     canonical_frame = pd.concat(
         [
-            _session_frame("600000", "2026-07-13").assign(price_basis="unknown"),
-            frame.assign(price_basis="unknown", source="mootdx_intraday"),
+            _legacy_session_frame("600000", "2026-07-13").assign(price_basis="unknown"),
+            _legacy_session_frame("600000", "2026-07-14").assign(price_basis="unknown", source="mootdx_intraday"),
         ],
         ignore_index=True,
     )
@@ -1348,7 +1358,7 @@ def test_section16_label_repair_supports_approved_symbol_date_scope_atomically(
     target = canonical_dir / "600000.csv"
     canonical = pd.concat(
         [
-            _session_frame("600000", date_text).assign(
+            _legacy_session_frame("600000", date_text).assign(
                 price_basis="unknown", source="mootdx_intraday"
             )
             for date_text in ("2026-07-14", "2026-07-15", "2026-07-16")
@@ -1395,10 +1405,10 @@ def test_section15_large_diff_is_zero_write_and_stays_quarantined(tmp_path: Path
     canonical_dir = tmp_path / "canonical"
     staging_dir = tmp_path / "staging"
     canonical_dir.mkdir()
-    canonical = _session_frame("600000", "2026-07-14").assign(
+    canonical = _legacy_session_frame("600000", "2026-07-14").assign(
         price_basis="unknown", source="mootdx_intraday"
     )
-    staging = _session_frame("600000", "2026-07-14")
+    staging = _legacy_session_frame("600000", "2026-07-14")
     staging.loc[staging["time"] == "10:00:00", "close"] += 0.04
     target = canonical_dir / "600000.csv"
     canonical.to_csv(target, index=False, encoding="utf-8-sig")
@@ -1434,8 +1444,8 @@ def test_section15_true_quality_failure_allows_bounded_target_date_replacement(
     canonical_dir = tmp_path / "canonical"
     staging_dir = tmp_path / "staging"
     canonical_dir.mkdir()
-    prior = _session_frame("600000", "2026-07-13").assign(price_basis="raw")
-    bad = _session_frame("600000", "2026-07-14").assign(price_basis="raw")
+    prior = _legacy_session_frame("600000", "2026-07-13").assign(price_basis="raw")
+    bad = _legacy_session_frame("600000", "2026-07-14").assign(price_basis="raw")
     bad.loc[bad["time"] == "10:00:00", "high"] = 1.0
     good = _session_frame("600000", "2026-07-14")
     target = canonical_dir / "600000.csv"

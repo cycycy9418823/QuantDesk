@@ -38,9 +38,12 @@ def test_candidate_intake_today_does_not_prove_today_valuation(tmp_path: Path, c
 
 
 def test_today_valuation_is_independent_of_old_candidate_intake(tmp_path: Path) -> None:
+    values = {"cash":100000.0, "initial_cash":100000.0, "positions":[],
+        "market_value":0.0, "total_equity":100000.0, "valuation_date":DAY,
+        "portfolio_review_valid":True}
+    _json(tmp_path, "state/auto_paper_portfolio.json", values)
     _json(tmp_path, "results/auto_paper_portfolio_latest.json", {
-        "ok": True, "valuation_date": DAY, "portfolio_review_valid": True,
-        "candidate_intake": {"as_of": PRIOR}})
+        "ok": True, **values, "candidate_intake": {"as_of": PRIOR}})
     assert health.strategy_cell(tmp_path, DAY)[0] == "策略账 ✓"
 
 
