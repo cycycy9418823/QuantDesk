@@ -19,6 +19,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -32,7 +34,22 @@ from scripts.run_data_close_pipeline import (  # noqa: E402
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 APPROVED = "stock_info_a_code_name"
-TODAY = datetime.now(SHANGHAI).strftime("%Y-%m-%d")
+# This file can be collected before midnight and executed after it. Use the
+# same explicit synthetic clock for its date fixtures and the pipeline reader.
+_TEST_NOW = datetime(2026, 10, 30, 18, 0, tzinfo=SHANGHAI)
+TODAY = _TEST_NOW.strftime("%Y-%m-%d")
+
+
+class _FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return _TEST_NOW.astimezone(tz) if tz else _TEST_NOW.replace(tzinfo=None)
+
+
+@pytest.fixture(autouse=True)
+def _fixed_test_clock(monkeypatch):
+    monkeypatch.setitem(globals(), "datetime", _FixedDateTime)
+    monkeypatch.setattr(sys.modules[run_pipeline.__module__], "datetime", _FixedDateTime)
 
 
 def _sha(path: Path) -> str:

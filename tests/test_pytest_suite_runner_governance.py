@@ -4,6 +4,7 @@ import json
 import math
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -63,9 +64,24 @@ class PytestSuiteRunnerGovernanceTests(unittest.TestCase):
     def test_003_classifier_places_representative_files(self) -> None:
         by_path = {item.path: item for item in pytest_suite_runner.discover_pytest_suite_files(ROOT)}
         self.assertEqual(by_path["tests/test_daily_research_phase1.py"].suite, "slow")
-        # R4 slim: test_backtest_module.py was never migrated. Use a file that
-        # still exists and is classified slow via subprocess usage.
-        self.assertEqual(by_path["tests/test_candidate_status_reconciliation.py"].suite, "slow")
+        # The retained candidate-card checks no longer launch the retired CLI.
+        self.assertEqual(by_path["tests/test_candidate_status_reconciliation.py"].suite, "research")
+        # Keep subprocess classification explicit instead of depending on an
+        # unrelated file continuing to contain a CLI test after source retirement.
+        with tempfile.TemporaryDirectory(prefix="suite-classification-") as directory:
+            root = Path(directory)
+            tests = root / "tests"
+            tests.mkdir()
+            probe = tests / "test_candidate_classifier_probe.py"
+            probe.write_text(
+                "import subprocess\n\ndef test_probe():\n    subprocess.run(['python', '--version'])\n",
+                encoding="utf-8",
+            )
+            classified = {item.path: item for item in pytest_suite_runner.discover_pytest_suite_files(root)}
+            self.assertEqual(classified["tests/test_candidate_classifier_probe.py"].suite, "slow")
+            probe.write_text("def test_probe():\n    assert True\n", encoding="utf-8")
+            classified = {item.path: item for item in pytest_suite_runner.discover_pytest_suite_files(root)}
+            self.assertEqual(classified["tests/test_candidate_classifier_probe.py"].suite, "research")
         self.assertEqual(by_path["tests/test_frontend_api_contract_governance.py"].suite, "v3_v4_governance")
         self.assertEqual(by_path["tests/test_v370_data_provider_chain_and_quality.py"].suite, "v3_v4_governance")
 

@@ -1,9 +1,18 @@
+"""Retained active contracts; original mixed tests remain in the retirement evidence archive."""
+
+
 from __future__ import annotations
 
+
 from quantdesk.strategy_lab.daily_research_signal_engine import combine_daily_signals
+
+
 from quantdesk.strategy_lab.rolling_strategy_backtest import backtest_summary
-from quantdesk.strategy_lab.sector_industry_mapping import sector_mapping_quality
+
+
 from quantdesk.strategy_lab.sector_strategy import generate_sector_rotation
+
+
 from quantdesk.strategy_lab.strategy_family_registry import strategy_family_registry
 
 
@@ -112,34 +121,6 @@ def test_sector_rotation_degrades_visibly_when_theme_map_missing() -> None:
     assert summary["mapping_coverage"] == 0.0
     assert {row["sector_mapping_source"] for row in rows} == {"symbol_prefix_proxy"}
     assert all(row["risk_flags"] == "sector_proxy_mapping_warning" for row in rows)
-
-
-def test_sector_mapping_quality_counts_theme_mapped_rows() -> None:
-    payload, unmapped = sector_mapping_quality(
-        [
-            {"stock_symbol": "600001", "sector_name": "Bank", "sector_mapping_source": "stock_theme_map"},
-            {"stock_symbol": "000002", "sector_name": "sz_main_board_proxy", "risk_flags": "sector_proxy_mapping_warning"},
-        ]
-    )
-
-    assert payload["mapped_rows"] == 1
-    assert payload["total_stock_rows"] == 2
-    assert payload["mapping_coverage"] == 0.5
-    assert payload["status"] == "completed_with_mapping_gaps"
-    assert unmapped == [{"symbol": "000002", "reason": "formal sector map missing; proxy sector may be Unknown"}]
-
-
-def test_sector_mapping_quality_does_not_count_unknown_concept_as_formal_mapping() -> None:
-    payload, unmapped = sector_mapping_quality(
-        [
-            {"stock_symbol": "000725", "sector_name": "未知概念", "sector_mapping_source": "stock_theme_map"},
-        ]
-    )
-
-    assert payload["mapped_rows"] == 0
-    assert payload["mapping_coverage"] == 0.0
-    assert payload["status"] == "completed_with_mapping_gaps"
-    assert unmapped == [{"symbol": "000725", "reason": "formal sector map missing; proxy sector may be Unknown"}]
 
 
 def test_daily_signal_stock_candidates_carry_formal_theme_mapping(monkeypatch, tmp_path) -> None:

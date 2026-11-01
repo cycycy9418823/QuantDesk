@@ -1,16 +1,36 @@
-"""Original DS12-07: real producer schema and actual MD/Word/meta saves."""
+"""Retained active contracts; original mixed tests remain in the retirement evidence archive."""
+
+
 from __future__ import annotations
 
+
 from datetime import datetime
+
+
 import hashlib
+
+
 import io
+
+
 import json
+
+
 import os
+
+
 from pathlib import Path
+
+
 import sys
+
+
 import zipfile
 
+
 import pandas as pd
+
+
 import pytest
 
 
@@ -27,59 +47,6 @@ def digest(path):
 
 def save_observation(path, payload):
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-
-
-@pytest.mark.parametrize("schema_case", ["normal_producer", "missing_current_metrics", "missing_risk_summary"])
-def test_real_card_producer_and_missing_fields_have_truthful_publish_results(tmp_path, monkeypatch, schema_case):
-    from quantdesk import research_outputs_refresh as refresh
-    from quantdesk.candidate_monitoring import refresh_candidate_monitoring
-    from tests.test_candidate_monitoring_pipeline import _write_current_files
-
-    root = tmp_path / "scenario"
-    root.mkdir()
-    inputs = _write_current_files(root)
-    monitoring_path = root / "results/portfolio_candidate_monitoring_refresh_latest.json"
-    save_observation(monitoring_path, refresh_candidate_monitoring(root=root))
-    registry = json.loads(inputs["registry"].read_text(encoding="utf-8"))
-    assert registry["candidate_pool"]
-    assert "current_metrics" in registry["candidate_pool"][0]
-    assert "risk_summary" in registry["candidate_pool"][0]
-    serial = [0]
-    def deterministic_upstream(path, **kwargs):
-        assert kwargs["network"] is False
-        serial[0] += 1
-        page = path / "reports/daily_research/v421_daily_result_page_latest.md"
-        page.parent.mkdir(parents=True, exist_ok=True)
-        page.write_text(f"deterministic upstream attempt {serial[0]}", encoding="utf-8")
-        for relative in ("results/daily_research/v420_daily_stock_candidates_latest.csv",
-                         "results/daily_research/v420_daily_sector_candidates_latest.csv",
-                         "results/strategy_lab/v420_strategy_leaderboard_latest.csv"):
-            target = path / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("symbol\n600000\n", encoding="utf-8")
-        return {"handoff": {"status": "completed"}}
-    monkeypatch.setattr(refresh, "run_daily_open_workflow", deterministic_upstream)
-    first = refresh.refresh_research_outputs(root, network=False)
-    assert first["refresh_success"] is True, first
-    success = root / refresh._SUCCESS_RECEIPT_RELATIVE
-    before_success = success.read_bytes()
-    if schema_case == "normal_producer":
-        payload = first
-    else:
-        field = "current_metrics" if schema_case == "missing_current_metrics" else "risk_summary"
-        del registry["candidate_pool"][0][field]
-        save_observation(inputs["registry"], registry)
-        if field == "risk_summary":
-            monitoring = json.loads(monitoring_path.read_text(encoding="utf-8"))
-            monitoring.get("metrics", {}).pop("main_risk_source", None)
-            save_observation(monitoring_path, monitoring)
-        payload = refresh.refresh_research_outputs(root, network=False)
-        assert payload["refresh_success"] is False, payload
-        assert any(step.startswith("dashboard_cards:") and field in step for step in payload["failed_steps"])
-        assert success.read_bytes() == before_success
-        assert list((root / refresh._ATTEMPT_RECEIPT_DIR).glob("*.json"))
-    save_observation(tmp_path / "schema_observation.json", {"case": schema_case, "payload": payload,
-        "success_receipt_preserved_on_failure": success.read_bytes() == before_success})
 
 
 class FixedTime(datetime):

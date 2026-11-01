@@ -1,14 +1,16 @@
+"""Retained active contracts; original mixed tests remain in the retirement evidence archive."""
+
+
 from __future__ import annotations
 
+
 import json
-import subprocess
-import sys
+
+
 from pathlib import Path
 
+
 from quantdesk.dashboard_candidate_cards import build_dashboard_cards
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def write_candidate_status_fixture(root: Path) -> None:
@@ -101,28 +103,6 @@ def write_candidate_status_fixture(root: Path) -> None:
     )
 
 
-def ensure_candidate_review_pack() -> None:
-    manifest = ROOT / "dist/portfolio_low_vol_rev120_candidate_monitoring_review_manifest.json"
-    zip_path = ROOT / "dist/portfolio_low_vol_rev120_candidate_monitoring_review_pack.zip"
-    if manifest.exists() and zip_path.exists():
-        return
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "scripts/run_research_candidate_daily_maintenance.py",
-            "--refresh-review-pack",
-            "true",
-            "--stop-on-human-review",
-            "false",
-        ],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert proc.returncode == 0, proc.stderr + proc.stdout[-2000:]
-
-
 def test_candidate_status_and_dashboard_data_risk_fields(tmp_path: Path) -> None:
     write_candidate_status_fixture(tmp_path)
 
@@ -134,39 +114,3 @@ def test_candidate_status_and_dashboard_data_risk_fields(tmp_path: Path) -> None
     assert card["data_truth_status"] == "candidate_valid_but_data_risk_high"
     assert card["display_status"] == "candidate_watch_due_to_data_gaps"
     assert card["candidate_upgrade_blocked_by_data_gaps"] is True
-
-
-def test_review_pack_manifest_has_data_truth_status(tmp_path: Path) -> None:
-    # Run the maintenance CLI in a disposable source clone seeded with the same
-    # deterministic fixture, so the assertion never depends on stale dist/
-    # artifacts or whatever happens to be in the real project tree.
-    from tests._isolated_project import IsolatedProject
-
-    source = Path(__file__).resolve().parents[1]
-    with IsolatedProject(source, temp_parent=tmp_path) as project:
-        root = project.root
-        assert root is not None
-        write_candidate_status_fixture(root)
-        proc = subprocess.run(
-            [
-                sys.executable,
-                "-B",
-                str(root / "scripts" / "run_research_candidate_daily_maintenance.py"),
-                "--refresh-review-pack",
-                "true",
-                "--stop-on-human-review",
-                "false",
-            ],
-            cwd=root,
-            env=project.subprocess_env(),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert proc.returncode == 0, proc.stderr + proc.stdout[-2000:]
-        manifest = json.loads(
-            (root / "dist/portfolio_low_vol_rev120_candidate_monitoring_review_manifest.json").read_text(encoding="utf-8")
-        )
-
-    assert manifest.get("data_truth_status") == "candidate_valid_but_data_risk_high"
-    assert manifest.get("display_status") == "candidate_watch_due_to_data_gaps"

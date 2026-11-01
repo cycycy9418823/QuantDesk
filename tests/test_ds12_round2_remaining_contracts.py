@@ -1,8 +1,14 @@
-"""Original DS12 legacy-store and research-report contracts left outside the 35 probes."""
+"""Retained active contracts; original mixed tests remain in the retirement evidence archive."""
+
+
 from __future__ import annotations
 
+
 from pathlib import Path
+
+
 import warnings
+
 
 import pytest
 
@@ -61,41 +67,3 @@ def test_conflicting_preexisting_aliases_are_not_silently_selected(tmp_path: Pat
         assert notices or row_diagnostics or log_diagnostics, {"stored_rows": raw, "returned_rows": result, "warnings": list(notices)}
     finally:
         db.close()
-
-
-def seed_report_counts(root: Path) -> None:
-    for rel in ("results/daily_research/v420_daily_stock_candidates_latest.csv",
-                "results/daily_research/v420_daily_sector_candidates_latest.csv",
-                "results/strategy_lab/v420_strategy_leaderboard_latest.csv"):
-        path = root / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("symbol\n", encoding="utf-8")
-
-
-@pytest.mark.parametrize("workflow_fails", [False, True], ids=["new_publication_positive", "failed_refresh_old_page_only"])
-def test_result_page_updated_refers_to_this_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workflow_fails: bool) -> None:
-    import quantdesk.research_outputs_refresh as refresh
-    seed_report_counts(tmp_path)
-    page = tmp_path / "reports/daily_research/v421_daily_result_page_latest.md"
-    page.parent.mkdir(parents=True, exist_ok=True)
-    page.write_text("OLD SUCCESSFUL PAGE\n", encoding="utf-8")
-    old_bytes = page.read_bytes()
-
-    def workflow(root, **kwargs):
-        assert Path(root) == tmp_path and kwargs["network"] is False
-        if workflow_fails:
-            raise OSError("deterministic workflow failure before publication")
-        page.write_text("CURRENT SUCCESSFUL PAGE\n", encoding="utf-8")
-        return {"handoff": {"status": "completed"}}
-
-    monkeypatch.setattr(refresh, "run_daily_open_workflow", workflow)
-    monkeypatch.setattr(refresh, "write_dashboard_cards", lambda root: {"status": "ok"})
-    result = refresh.refresh_research_outputs(tmp_path, network=False)
-    if workflow_fails:
-        assert result["refresh_success"] is False
-        assert any("daily_open_workflow" in failure for failure in result["failed_steps"])
-        assert page.read_bytes() == old_bytes
-        assert result["result_page_updated"] is False, result
-    else:
-        assert result["refresh_success"] is True and result["result_page_updated"] is True
-        assert page.read_bytes() != old_bytes

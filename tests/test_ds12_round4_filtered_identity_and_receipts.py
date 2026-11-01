@@ -1,11 +1,17 @@
-"""Bounded follow-through checks for the revised C2/C4 public contracts."""
+"""Retained active contracts; original mixed tests remain in the retirement evidence archive."""
+
+
 from __future__ import annotations
 
-import hashlib
+
 import json
-import os
+
+
 import warnings
+
+
 from pathlib import Path
+
 
 import pytest
 
@@ -59,81 +65,3 @@ def test_filtered_query_cannot_hide_conflict_in_selected_identity(tmp_path: Path
                   or any(r.levelno >= 30 for r in caplog.records)
                   or any(r.get("identity_conflict") or r.get("warnings") for r in actual.get("rows", [])))
     assert diagnostic, observation
-
-
-def fingerprint(path: Path) -> dict | None:
-    if not path.is_file():
-        return None
-    data = path.read_bytes()
-    return {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
-
-
-@pytest.mark.parametrize("failure_stage", [None, "refresh_md", "success_receipt"], ids=["normal_publication_positive", "markdown_failure", "receipt_failure"])
-def test_receipt_declared_after_fingerprint_matches_its_persisted_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str | None) -> None:
-    import quantdesk.research_outputs_refresh as refresh
-
-    paths = {
-        "page": tmp_path / "reports/daily_research/v421_daily_result_page_latest.md",
-        "refresh_json": tmp_path / "results/data_update/v424_research_outputs_refresh_latest.json",
-        "refresh_md": tmp_path / "reports/data_update/v424_research_outputs_refresh_latest.md",
-        "success_receipt": tmp_path / "results/data_update/v424_research_outputs_publish_receipt_latest.json",
-        "attempts": tmp_path / "results/data_update/v424_research_outputs_publish_attempts",
-    }
-    for rel in ("results/daily_research/v420_daily_stock_candidates_latest.csv",
-                "results/daily_research/v420_daily_sector_candidates_latest.csv",
-                "results/strategy_lab/v420_strategy_leaderboard_latest.csv"):
-        path = tmp_path / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("symbol\n", encoding="utf-8")
-    paths["page"].parent.mkdir(parents=True, exist_ok=True)
-    generation = 0
-
-    def workflow(root, **kwargs):
-        nonlocal generation
-        assert Path(root) == tmp_path and kwargs["network"] is False
-        generation += 1
-        paths["page"].write_text(f"INDEPENDENT GENERATION {generation}\n", encoding="utf-8")
-        return {"handoff": {"status": "completed"}}
-
-    monkeypatch.setattr(refresh, "run_daily_open_workflow", workflow)
-    monkeypatch.setattr(refresh, "write_dashboard_cards", lambda root: {"status": "ok"})
-    first = refresh.refresh_research_outputs(tmp_path, network=False)
-    assert first["refresh_success"] is True
-    old_success = paths["success_receipt"].read_bytes()
-    before = {"result_page": fingerprint(paths["page"]), "refresh_json": fingerprint(paths["refresh_json"]), "refresh_md": fingerprint(paths["refresh_md"])}
-    injected = []
-    real_replace = os.replace
-
-    def replace(src, dst, *args, **kwargs):
-        if failure_stage is not None and Path(dst).resolve() == paths[failure_stage].resolve():
-            injected.append(str(dst))
-            raise OSError(5, "independent single-target publication fault", str(dst))
-        return real_replace(src, dst, *args, **kwargs)
-
-    monkeypatch.setattr(os, "replace", replace)
-    result = refresh.refresh_research_outputs(tmp_path, network=False)
-    if failure_stage is None:
-        assert result["refresh_success"] is True
-        receipt_path = paths["success_receipt"]
-    else:
-        assert injected and result["refresh_success"] is False
-        assert paths["success_receipt"].read_bytes() == old_success
-        receipt_path = tmp_path / result["publish_failure_receipt_path"]
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert receipt["attempt_id"] == result["publish_attempt_id"]
-    mismatches = []
-    observed = {}
-    for name, artifact in receipt["artifacts"].items():
-        path = tmp_path / artifact["relative_path"]
-        actual = fingerprint(path)
-        observed[name] = actual
-        if artifact.get("before") != before[name]:
-            mismatches.append({"artifact": name, "phase": "before", "declared": artifact.get("before"), "actual": before[name]})
-        # Do not require a failed/unpublished artifact to have an after hash.
-        # If the receipt declares one, its associated persisted path must match.
-        if artifact.get("after") is not None and artifact["after"] != actual:
-            mismatches.append({"artifact": name, "phase": "after", "declared": artifact["after"], "actual": actual})
-    observation = {"failure_stage": failure_stage, "injected": injected, "result": result,
-                   "receipt_path": str(receipt_path), "receipt": receipt, "observed": observed, "mismatches": mismatches}
-    (tmp_path / "receipt_fingerprint_observation.json").write_text(json.dumps(observation, ensure_ascii=False, indent=2), encoding="utf-8")
-    assert not mismatches, observation

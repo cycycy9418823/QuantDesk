@@ -1,10 +1,14 @@
-"""Independent DS12 C2/C4 boundaries; all data lives in pytest tmp_path."""
+"""Retained active contracts; original mixed tests remain in the retirement evidence archive."""
+
+
 from __future__ import annotations
 
-import json
-import os
+
 import warnings
+
+
 from pathlib import Path
+
 
 import pytest
 
@@ -153,83 +157,3 @@ def test_cross_section_counts_securities_once(tmp_path: Path, entry: str, with_d
         actual = run_safe_query("cross-section", date="2026-06-02", adjustment="raw", db_path=str(path))["rows"]
     assert len(actual) == 2, actual
     assert {(normalize_symbol(row["symbol"]), row["close"]) for row in actual} == {("600000", 10.0), ("000001", 20.0)}
-
-
-@pytest.mark.parametrize("failure_stage", [None, "refresh_json", "refresh_md", "success_receipt"], ids=["successful_publish_positive", "json_replace_failure", "markdown_replace_failure", "receipt_replace_failure"])
-def test_actual_publication_io_failure_has_receipt_and_no_false_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str | None) -> None:
-    import quantdesk.research_outputs_refresh as refresh
-
-    paths = {
-        "page": tmp_path / "reports/daily_research/v421_daily_result_page_latest.md",
-        "refresh_json": tmp_path / "results/data_update/v424_research_outputs_refresh_latest.json",
-        "refresh_md": tmp_path / "reports/data_update/v424_research_outputs_refresh_latest.md",
-        "success_receipt": tmp_path / "results/data_update/v424_research_outputs_publish_receipt_latest.json",
-        "attempts": tmp_path / "results/data_update/v424_research_outputs_publish_attempts",
-    }
-    for rel in ("results/daily_research/v420_daily_stock_candidates_latest.csv",
-                "results/daily_research/v420_daily_sector_candidates_latest.csv",
-                "results/strategy_lab/v420_strategy_leaderboard_latest.csv"):
-        path = tmp_path / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("symbol\n", encoding="utf-8")
-    paths["page"].parent.mkdir(parents=True, exist_ok=True)
-    generation = 0
-
-    def workflow(root, **kwargs):
-        nonlocal generation
-        assert Path(root) == tmp_path and kwargs["network"] is False
-        generation += 1
-        paths["page"].write_text(f"INDEPENDENT FIXTURE GENERATION {generation}\n", encoding="utf-8")
-        return {"handoff": {"status": "completed"}}
-
-    monkeypatch.setattr(refresh, "run_daily_open_workflow", workflow)
-    monkeypatch.setattr(refresh, "write_dashboard_cards", lambda root: {"status": "ok"})
-    first = refresh.refresh_research_outputs(tmp_path, network=False)
-    assert first["refresh_success"] and first["result_page_updated"]
-    old = {name: path.read_bytes() for name, path in paths.items() if name != "attempts"}
-    old_success = json.loads(old["success_receipt"])
-    assert old_success["status"] == "published"
-
-    injected = []
-    real_replace = os.replace
-
-    def replace_with_one_unwritable_target(src, dst, *args, **kwargs):
-        if failure_stage is not None and Path(dst).resolve() == paths[failure_stage].resolve():
-            injected.append(str(dst))
-            raise OSError(5, "independent deterministic publication replace failure", str(dst))
-        return real_replace(src, dst, *args, **kwargs)
-
-    # The real JSON/Markdown writers run. Fail one final filesystem replace;
-    # the independent attempt-receipt directory remains fully writable.
-    monkeypatch.setattr(os, "replace", replace_with_one_unwritable_target)
-    error = None
-    result = None
-    try:
-        result = refresh.refresh_research_outputs(tmp_path, network=False)
-    except (OSError, RuntimeError) as exc:
-        error = str(exc)
-    receipt_files = list(paths["attempts"].glob("*.json"))
-    receipts = [json.loads(path.read_text(encoding="utf-8")) for path in receipt_files]
-    latest = json.loads(paths["refresh_json"].read_text(encoding="utf-8"))
-    success = json.loads(paths["success_receipt"].read_text(encoding="utf-8"))
-    observation = {
-        "failure_stage": failure_stage, "injected": injected, "exception": error,
-        "return_value": result, "latest_refresh": latest, "success_receipt": success,
-        "failure_receipts": receipts,
-        "old_success_receipt_preserved": paths["success_receipt"].read_bytes() == old["success_receipt"],
-        "old_refresh_json_preserved": paths["refresh_json"].read_bytes() == old["refresh_json"],
-        "old_refresh_md_preserved": paths["refresh_md"].read_bytes() == old["refresh_md"],
-    }
-    (tmp_path / "publication_observation.json").write_text(json.dumps(observation, ensure_ascii=False, indent=2), encoding="utf-8")
-    if failure_stage is None:
-        assert error is None and result["refresh_success"] is True, observation
-        assert latest["publish_attempt_id"] == success["attempt_id"] == result["publish_attempt_id"], observation
-        assert success["status"] == "published", observation
-        return
-    assert injected, "the intended filesystem failure was not reached"
-    current_failure_receipts = [receipt for receipt in receipts
-                                if receipt.get("attempt_id") != first["publish_attempt_id"]
-                                and receipt.get("status") == "failed" and receipt.get("failed_steps")]
-    assert current_failure_receipts, observation
-    assert observation["old_success_receipt_preserved"], observation
-    assert latest.get("publish_attempt_id") == first["publish_attempt_id"] or latest.get("refresh_success") is False, observation

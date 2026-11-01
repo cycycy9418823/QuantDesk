@@ -1,25 +1,16 @@
-﻿"""DS12-07 Section-C4/C6: report publish / multi-artifact and atomic text save.
+"""Retained active contracts; original mixed tests remain in the retirement evidence archive."""
 
-Offline only: a throwaway ``tmp_path`` project root; no real providers, no real
-project writes.
-
-- C6: the report/note text writer must be atomic, so an interrupted save cannot
-  truncate the previous file.
-- C4: the data-close pipeline publish must keep ``last_successful`` in its own
-  pointer (a later failure must not erase the last success), keep the archive
-  manifest immutable, and reject an invalid attempt/report schema before writing.
-"""
 
 from __future__ import annotations
 
+
 import json
+
 
 import pytest
 
+
 import quantdesk.shared as shared
-
-
-# --- C6: atomic text save -------------------------------------------------
 
 
 def test_atomic_text_replace_failure_preserves_old_bytes(tmp_path, monkeypatch) -> None:
@@ -76,9 +67,6 @@ def test_atomic_text_partial_write_failure_preserves_old_bytes(tmp_path, monkeyp
         shared.write_text(target, "NEW")
 
     assert target.read_text(encoding="utf-8") == "OLD\n"
-
-
-# --- C4: multi-artifact publish / success pointer -------------------------
 
 
 def _report(run_id: str, attempt_id: str, status: str, *, reuse_only: bool = False) -> dict:
@@ -148,60 +136,3 @@ def test_invalid_attempt_schema_is_rejected_before_write(tmp_path) -> None:
 
     latest_path = tmp_path / "results/data_close_pipeline/data_close_pipeline_latest.json"
     assert not latest_path.exists()
-
-
-# --- C4: research-report publish receipt + old-success preservation -------
-
-
-def _seed_refresh_inputs(tmp_path) -> Path:
-    for rel in (
-        "results/daily_research/v420_daily_stock_candidates_latest.csv",
-        "results/daily_research/v420_daily_sector_candidates_latest.csv",
-        "results/strategy_lab/v420_strategy_leaderboard_latest.csv",
-    ):
-        path = tmp_path / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("symbol\n", encoding="utf-8")
-    page = tmp_path / "reports/daily_research/v421_daily_result_page_latest.md"
-    page.parent.mkdir(parents=True, exist_ok=True)
-    page.write_text("OLD SUCCESSFUL PAGE\n", encoding="utf-8")
-    return page
-
-
-def test_research_report_publish_receipt_and_old_success_preserved(tmp_path, monkeypatch) -> None:
-    import quantdesk.research_outputs_refresh as refresh
-
-    page = _seed_refresh_inputs(tmp_path)
-
-    def ok_workflow(root, **kwargs):
-        page.write_text("CURRENT SUCCESSFUL PAGE\n", encoding="utf-8")
-        return {"handoff": {"status": "completed"}}
-
-    monkeypatch.setattr(refresh, "run_daily_open_workflow", ok_workflow)
-    monkeypatch.setattr(refresh, "write_dashboard_cards", lambda root: {"status": "ok"})
-
-    first = refresh.refresh_research_outputs(tmp_path)
-    assert first["result_page_updated"] is True
-    success_receipt = tmp_path / "results/data_update/v424_research_outputs_publish_receipt_latest.json"
-    assert success_receipt.is_file()
-    receipt_payload = json.loads(success_receipt.read_text(encoding="utf-8"))
-    assert receipt_payload["schema_version"] == refresh.PUBLISH_SCHEMA_VERSION
-    assert receipt_payload["status"] == "published"
-    before = success_receipt.read_bytes()
-
-    def failing_workflow(root, **kwargs):
-        raise OSError("deterministic workflow failure before publication")
-
-    monkeypatch.setattr(refresh, "run_daily_open_workflow", failing_workflow)
-    second = refresh.refresh_research_outputs(tmp_path)
-
-    assert second["refresh_success"] is False
-    assert second["result_page_updated"] is False
-    assert page.read_text(encoding="utf-8").strip() == "CURRENT SUCCESSFUL PAGE"
-    # The last successful receipt is preserved; the failure gets its own receipt.
-    assert success_receipt.read_bytes() == before
-    assert second["publish_failure_receipt_path"]
-    failure_path = tmp_path / second["publish_failure_receipt_path"]
-    assert failure_path.is_file()
-    assert json.loads(failure_path.read_text(encoding="utf-8"))["status"] == "failed"
-
