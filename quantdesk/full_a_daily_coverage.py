@@ -19,6 +19,7 @@ import io
 import json
 import re
 from collections import Counter
+from collections.abc import Iterable
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -59,18 +60,27 @@ def load_roster_evidence(project_root: Path, *, target_date: str) -> dict[str, A
         try:
             if pointer.is_symlink() or pointer.stat().st_size > 256 * 1024:
                 raise ValueError("pointer_size_or_link")
-            meta = json.loads(pointer.read_text(encoding="utf-8-sig"))
+            pointer_raw = pointer.read_bytes()
+            meta = json.loads(pointer_raw.decode("utf-8-sig"))
             path = root / meta["path"]
             resolved = path.resolve()
             if (path.is_symlink() or not resolved.is_relative_to(root / "data/universe/versions")
                     or meta.get("schema") != "a_share_roster.v1" or meta.get("accepted") is not True
                     or meta.get("status") != "accepted" or not meta.get("source")
+                    or not isinstance(meta.get("run_id"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", meta["run_id"])
                     or date.fromisoformat(meta["as_of"]) > date.fromisoformat(target_date)
                     or datetime.fromisoformat(meta["accepted_at"]).tzinfo is None
                     or path.stat().st_size > 8 * 1024 * 1024):
                 raise ValueError("roster_identity_or_path_invalid")
             raw = path.read_bytes()
-            codes = _read_universe(path)
+            records = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
+            codes = [row.get("symbol") for row in records]
+            if (not codes or len(set(codes)) != len(codes)
+                    or any(not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code) for code in codes)
+                    or any(row.get("source") != meta["source"] or row.get("as_of") != meta["as_of"]
+                           or row.get("updated_at") != meta["accepted_at"] for row in records)):
+                raise ValueError("roster_row_identity_mismatch")
             symbols_sha = hashlib.sha256(json.dumps(sorted(codes), separators=(",", ":")).encode()).hexdigest()
             if (hashlib.sha256(raw).hexdigest() != meta["sha256"] or len(codes) != meta["row_count"]
                     or symbols_sha != meta["symbols_sha256"]):
@@ -78,15 +88,15 @@ def load_roster_evidence(project_root: Path, *, target_date: str) -> dict[str, A
             return {**meta, "symbols": sorted(codes), "identity_status": "verified_version",
                 "fallback": pointer_name != "a_share_roster_latest.json",
                 "age_days": (date.fromisoformat(target_date) - date.fromisoformat(meta["as_of"])).days,
-                "pointer_path": str(pointer), "pointer_sha256": hashlib.sha256(pointer.read_bytes()).hexdigest(),
+                "pointer_path": str(pointer), "pointer_sha256": hashlib.sha256(pointer_raw).hexdigest(),
                 "reason_codes": reasons, "read_only": True}
-        except (OSError, ValueError, TypeError, KeyError, UnicodeError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, UnicodeError, csv.Error) as exc:
             reasons.append("roster_pointer_invalid:" + pointer_name + ":" + type(exc).__name__)
     legacy = root / "data/universe/a_share_symbols.csv"
     try:
         raw = legacy.read_bytes()
         records = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
-        codes = _read_universe(legacy)
+        codes = _symbols_from_rows(records)
         days = {_date_text(r.get("as_of") or r.get("updated_at")) for r in records} - {""}
         day = next(iter(days)) if len(days) == 1 else ""
         sources = {str(r.get("source") or "") for r in records} - {""}
@@ -114,18 +124,22 @@ def _date_text(value: Any) -> str:
     return ""
 
 
-def _read_universe(path: Path) -> list[str]:
-    """Return the current, de-duplicated six-digit universe in file order."""
-
+def _symbols_from_rows(rows: Iterable[dict[str, Any]]) -> list[str]:
+    """Preserve the permissive legacy CSV policy without rereading its file."""
     symbols: list[str] = []
     seen: set[str] = set()
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        for row in csv.DictReader(handle):
-            symbol = str(row.get("symbol") or row.get("code") or "").strip()
-            if len(symbol) == 6 and symbol.isdigit() and symbol not in seen:
-                seen.add(symbol)
-                symbols.append(symbol)
+    for row in rows:
+        symbol = str(row.get("symbol") or row.get("code") or "").strip()
+        if len(symbol) == 6 and symbol.isdigit() and symbol not in seen:
+            seen.add(symbol)
+            symbols.append(symbol)
     return symbols
+
+
+def _read_universe(path: Path) -> list[str]:
+    """Return the current, de-duplicated six-digit universe in file order."""
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return _symbols_from_rows(csv.DictReader(handle))
 
 
 def _last_date_and_rows(path: Path) -> tuple[str, int, bool]:

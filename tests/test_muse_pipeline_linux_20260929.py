@@ -113,6 +113,25 @@ deadline = time.monotonic() + 6
 while not (root / 'grandchild_ready.json').exists() and child.poll() is None and time.monotonic() < deadline:
     time.sleep(.02)
 assert (root / 'grandchild_ready.json').exists(), 'bounded inherited writer did not start'
+# The guarded publisher now requires a receipt bound to this invocation and
+# the complete fixture roster. Keep the real inherited-fd assertions above.
+import csv, hashlib
+arg = lambda name: sys.argv[sys.argv.index(name) + 1]
+universe = Path(arg('--output'))
+raw = universe.read_bytes()
+with universe.open(newline='', encoding='utf-8') as handle:
+    codes = sorted(row['symbol'] for row in csv.DictReader(handle))
+sha = hashlib.sha256(raw).hexdigest()
+receipt = {'run_id': arg('--run-id'), 'ok': True, 'full_roster_published': True,
+    'preview': False, 'dry_run': False, 'status': 'refreshed',
+    'previous_roster_sha256': sha, 'roster_sha256': sha,
+    'row_count': len(codes), 'provider_used': 'fixture', 'minimum_complete_rows': 5000,
+    'source_snapshots': [{'source': 'fixture', 'status': 'complete', 'response_complete': True,
+        'row_count': len(codes), 'symbols': codes,
+        'symbols_sha256': hashlib.sha256(json.dumps(codes, separators=(',', ':')).encode()).hexdigest()}]}
+status = Path(arg('--status-path'))
+status.parent.mkdir(parents=True, exist_ok=True)
+status.write_text(json.dumps(receipt), encoding='utf-8')
 print(json.dumps({'fixture_updater': True, 'grandchild_pid': child.pid}))
 '''
 
@@ -308,7 +327,8 @@ class LinuxWriterLease(unittest.TestCase):
             {'rules': {'approved_market_universe_sources': ['fixture']}}), encoding='utf-8')
         from datetime import date
         (self.root / 'data/universe/a_share_symbols.csv').write_text(
-            f'symbol,source,updated_at\n000001,fixture,{date.today().isoformat()}\n', encoding='utf-8')
+            'symbol,source,updated_at\n' + ''.join(
+                f'{600000 + i},fixture,{date.today().isoformat()}\n' for i in range(5500)), encoding='utf-8')
 
     def test_same_byte_contends_and_distinct_byte_is_independent_across_processes(self) -> None:
         child = self._spawn('lock_byte', extra=('0',))

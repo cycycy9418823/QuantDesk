@@ -222,6 +222,7 @@ def direct(url, *, params, headers, timeout):
     return SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
 
 requests.get = direct
+requests.sessions.Session.get = lambda self, url, **kwargs: direct(url, **kwargs)
 
 def login():
     record('baostock_login')

@@ -100,10 +100,13 @@ def normalize_universe_frame(df: pd.DataFrame, source: str) -> list[dict[str, st
         return []
     rows: list[dict[str, str]] = []
     seen: set[str] = set()
-    for _, row in df.iterrows():
-        symbol = normalize_symbol(row.get(code_col))
+    # Iterate columns without constructing thousands of Series or coercing an
+    # integer stock code to float because an unrelated quote column is float.
+    names = df[name_col] if name_col else [""] * len(df)
+    for code, name in zip(df[code_col], names):
+        symbol = normalize_symbol(code)
         if symbol and symbol not in seen:
-            rows.append({"symbol": symbol, "name": str(row.get(name_col) or "") if name_col else "", "source": source})
+            rows.append({"symbol": symbol, "name": str(name or ""), "source": source})
             seen.add(symbol)
     return rows
 
@@ -253,18 +256,21 @@ def _universe_source_worker(provider: str, context: dict[str, Any]) -> dict[str,
         from quantdesk.universe_refresh import build_default_fetchers
         import requests
 
-        def request_get(url: str, **kwargs: Any) -> Any:
-            remaining = float(context["fetch_deadline_monotonic"]) - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("roster_source_deadline_exhausted")
-            kwargs["timeout"] = min(float(kwargs.get("timeout", 5)), remaining)
-            return requests.get(url, **kwargs)
+        # One source, one session: reuse connections across all pages. The
+        # existing watchdog still bounds imports, requests, close and encoding.
+        with requests.Session() as session:
+            def request_get(url: str, **kwargs: Any) -> Any:
+                remaining = float(context["fetch_deadline_monotonic"]) - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("roster_source_deadline_exhausted")
+                kwargs["timeout"] = min(float(kwargs.get("timeout", 5)), remaining)
+                return session.get(url, **kwargs)
 
-        # Membership needs no market-clock-derived quote date. Only identities
-        # and terminal pagination evidence leave this worker.
-        fetch = build_default_fetchers(request_get=request_get, clock=lambda: "", retries=0, timeout_seconds=5.0)["sina"]
-        phase("provider_call")
-        frame = fetch(target_date=datetime.now(SHANGHAI).date().isoformat())
+            # Membership needs no market-clock-derived quote date. Only
+            # identities and terminal pagination evidence leave this worker.
+            fetch = build_default_fetchers(request_get=request_get, clock=lambda: "", retries=0, timeout_seconds=5.0)["sina"]
+            phase("provider_call")
+            frame = fetch(target_date=datetime.now(SHANGHAI).date().isoformat())
         phase("normalize")
         complete = frame.attrs.get("pagination_complete") is True
         return {"rows": normalize_universe_frame(frame, provider), "response_complete": complete,
@@ -650,6 +656,14 @@ def run_update_universe(args: argparse.Namespace, *, started_monotonic: float | 
     started = time.monotonic() if started_monotonic is None else started_monotonic
     budget = max(0.0, min(90.0, float(getattr(args, "budget_seconds", 35))))
     deadline = started + budget
+    parent_deadline = getattr(args, "deadline_monotonic", None)
+    if parent_deadline is not None:
+        if not math.isfinite(parent_deadline):
+            raise ValueError("roster_parent_deadline_invalid")
+        deadline = min(deadline, parent_deadline)
+    run_id = str(getattr(args, "run_id", "") or uuid.uuid4().hex)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
+        raise ValueError("roster_run_id_invalid")
     config = load_config(args.config or None)
     output_path, status_path = resolve_output_paths(config, args.output, args.status_path)
     configured_output, _ = resolve_output_paths(config)
@@ -694,6 +708,7 @@ def run_update_universe(args: argparse.Namespace, *, started_monotonic: float | 
         result_status = "dry_run" if args.dry_run else "refreshed"
     status = {
         "schema_version": "universe_update.v2",
+        "run_id": run_id,
         "started_at": started_at,
         "finished_at": now_text(),
         "provider_used": provider_used,
@@ -738,6 +753,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Preview at most N rows; requires --dry-run or an explicit non-default --output.")
     parser.add_argument("--dry-run", action="store_true", help="Resolve universe without writing files.")
     parser.add_argument("--budget-seconds", type=float, default=35.0, help="Shared bounded source-refresh budget (max 90s).")
+    parser.add_argument("--run-id", default="", help="Receipt identity supplied by the guarded publisher; generated if omitted.")
+    parser.add_argument("--deadline-monotonic", type=float, default=None, help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
