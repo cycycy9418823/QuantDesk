@@ -3163,7 +3163,7 @@ function renderDataHealthHome(data) {
                 `run_id ${chainRunId}`,
                 `日线 ${ratioLabel(minuteUniverse.daily_coverage?.coverage_ratio)}`,
                 `关键分钟 ${ratioLabel(criticalTier.coverage_ratio)}（${numericValue(criticalTier.complete_session_count) ?? 0}/${numericValue(criticalTier.requested_count) ?? "?"}）`,
-                `914 分析池 ${ratioLabel(analysisTier.coverage_ratio)}（${numericValue(analysisTier.complete_session_count) ?? 0}/${numericValue(analysisTier.requested_count) ?? "?"}）`,
+                `研究池分钟 ${ratioLabel(analysisTier.coverage_ratio)}（${numericValue(analysisTier.complete_session_count) ?? 0}/${numericValue(analysisTier.requested_count) ?? "?"}）`,
                 `池版本 ${safeText(analysisTier.pool_version || "—")}`,
                 safeText(minuteUniverse.next_action || dailyChain.next_action || ""),
             ].filter((item) => item && item !== "数据缺失").join("；"))
@@ -3198,7 +3198,7 @@ function renderDataHealthHome(data) {
         ? `missing/retry ${formalRetrySymbols.slice(0, 12).join(", ")}${formalRetrySymbols.length > 12 ? " ..." : ""}`
         : "no explicit missing/retry symbol in latest formal chain";
     const formalChainExtraCardHtml = dataHealthHomeCard(
-        "Formal 914 Chain",
+        "正式研究链记录",
         formalPoolValue || humanStatus(formalChain.status || "not_run"),
         [
             formalChain.run_id ? `run_id ${safeText(formalChain.run_id)}` : "",
@@ -3281,7 +3281,7 @@ function renderDataHealthHome(data) {
     ].filter(Boolean).join("；");
     const minuteExpansionValue = minuteTotal > 0 ? `${minuteDone}/${minuteTargetTotal || minuteTotal}` : "未发现运行中的扩展池";
     const minuteExpansionDetail = minuteTotal > 0
-        ? `扩展历史 1m 队列下载中；${minuteAvailabilityDetail}；last ${minuteLastSymbol}；动作 ${humanStatus(minuteCoverageAction)}。${minuteWarningDetail} 该队列不作为当天 914 分析池质量门。`
+        ? `扩展历史 1m 队列下载中；${minuteAvailabilityDetail}；last ${minuteLastSymbol}；动作 ${humanStatus(minuteCoverageAction)}。${minuteWarningDetail} 该队列不作为当天研究链完成条件。`
         : "未发现扩展历史分钟下载；若需要扩大历史验证范围，请先运行只读 minute status/coverage 检查。";
     const importGate = safeText(data.extended_import_preapply_gate || data.extended_import_gate || data.extended_data_current_gate || "unknown");
     const waitReason = safeText(data.extended_data_operator_wait_reason || data.extended_data_gate_suggested_next_action || data.suggested_next_action || "—");
@@ -3689,6 +3689,7 @@ function renderDataHealth(data) {
             <strong>数据健康总览 <span class="health-badge ${topCls}">${escapeHtml(topLabel)}</span></strong>
             <div class="section-note">${escapeHtml(safeText(data.summary_text || "后端已启用新版数据健康结构；以下为核心摘要，完整明细见首页「数据健康」卡片。"))}</div>
         </div>
+        ${dailyGapReviewHtml(data.daily_gap_review)}
         ${scopeSummaryHtml}
         ${alertSummaryHtml}
         <div class="health-grid">${cardHtml || fallbackHtml || missingBlock("暂无数据卡片。")}</div>
@@ -3696,6 +3697,38 @@ function renderDataHealth(data) {
         <p class="panel-disclaimer">${escapeHtml(safeText(data.message || "只读聚合；未联网、未更新数据、未改变虚拟组合。"))}</p>`;
     attachHealthDetails(panel, data);
     if (note) note.textContent = `数据健康：${topLabel} · ${safeText(data.generated_at || "")}`;
+}
+
+function dailyGapReviewHtml(review) {
+    if (!review) return "";
+    if (!review.available) return missingBlock(escapeHtml(review.message || "日线缺口尚未核实。"));
+    const labels = { present: ["health-ok", "已核到当日日线"],
+        verified_no_session: ["health-ok", "已核实无交易"], unresolved: ["health-warn", "缺口待核实"] };
+    const order = { present: 0, unresolved: 1, verified_no_session: 2 };
+    const rows = Object.values(review.by_symbol || {})
+        .sort((a, b) => (order[a.status] ?? 1) - (order[b.status] ?? 1) || String(a.symbol).localeCompare(String(b.symbol)))
+        .map(row => {
+        const [tone, label] = labels[row.status] || ["health-warn", "尚未核实"];
+        const symbol = String(row.symbol || "");
+        const stock = `${escapeHtml(row.name || "")} ${escapeHtml(symbol)}`;
+        const link = /^[0-9]{6}$/.test(symbol) ? `<a href="#watch/${symbol}">${stock}</a>` : stock;
+        const before = row.previously_flagged ? "研究链曾标为缺失/滞后" : "核对记录中的无日线项";
+        const price = row.status === "present" && Number.isFinite(row.close)
+            ? `${row.data_date} · 收盘 ${row.close.toFixed(2)} 元 · 原始价格`
+            : `最后日线 ${row.data_date || "未知"}；${review.target_date} 无有效日线`;
+        return `<tr><td>${link}</td><td>${escapeHtml(before)}</td><td><span class="health-badge ${tone}">${label}</span>
+            <p>${escapeHtml(price)}</p><p class="section-note">${escapeHtml(row.message || "")}
+            ${row.source ? ` 来源：${escapeHtml(row.source)}。` : ""}</p></td></tr>`;
+    }).join("");
+    return `<section class="health-card" data-daily-gap-review>
+        <h3>日线缺口逐只核对</h3><p>${escapeHtml(review.message || "")}</p>
+        <p class="section-note">核对记录更新：${escapeHtml(review.record_updated_at || "未知")}；资料交易日：${escapeHtml(review.target_date)}。
+        当前复核 ${escapeHtml(String(review.reviewed_count))}/${escapeHtml(String(review.review_total))} 只原缺口。点击股票可查看同一日期的K线。</p>
+        ${review.files_changed_since_audit?.length ? '<p class="section-note">部分文件在核对记录后发生变化，下表展示当前文件；全市场总数仍为核对记录的口径。</p>' : ""}
+        ${review.review_truncated ? '<p class="section-note">本页复核数量有限，其余缺口仍未核实。</p>' : ""}
+        <div style="overflow-x:auto"><table style="width:100%;text-align:left"><thead><tr><th>股票</th><th>原记录</th><th>当前文件核对结果</th></tr></thead><tbody>${rows}</tbody></table></div>
+        <p class="section-note">本次查看只读取已有真实资料，未补写行情、重算账本或触发采集。无交易证据不等于存在当日K线。</p>
+        </section>`;
 }
 
 function attachHealthDetails(panel, data) {
@@ -4763,6 +4796,7 @@ async function loadPerformance() {
 }
 
 async function loadStrategyScorecard() {
+    if (window.QuantDeskPaperObserved) void window.QuantDeskPaperObserved.load(requestJson);
     const isCurrent = beginReadRender("scorecard");
     const note = document.getElementById("performanceNote");
     const panel = document.getElementById("performancePanel");
@@ -8315,7 +8349,8 @@ function renderResearchBrief(brief) {
     const kl = brief.key_levels || {};
     return `
         <div class="research-brief">
-            <div class="rb-line"><span class="rb-tag">现在</span><p>${highlightText(safeText(brief.current_state))}</p></div>
+            <p class="section-note">完整日线截至 ${escapeHtml(safeText(brief.data_date || "日期未核实"))}；盘中报价见上方“当前行情”，本段采用日线收盘价。</p>
+            <div class="rb-line"><span class="rb-tag">日线观察</span><p>${highlightText(safeText(brief.current_state))}</p></div>
             <div class="rb-line"><span class="rb-tag rb-tag-lean">研究倾向</span><p>${highlightText(safeText(brief.research_lean))}</p></div>
             <div class="rb-line"><span class="rb-tag rb-tag-go">继续关注 · 若</span><p>${highlightText(safeText(brief.continue_if))}</p></div>
             <div class="rb-line"><span class="rb-tag rb-tag-stop">看错放弃 · 若</span><p>${highlightText(safeText(brief.invalidate_if))}</p></div>

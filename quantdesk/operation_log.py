@@ -33,36 +33,6 @@ def _project_path(path: str | Path) -> Path:
 
 
 def _environment_log_base() -> Path | None:
-    """Return the operation-log override dir when the env var is set.
-
-    Tests isolate the real ``results/operation_log`` sink by exporting
-    ``QUANTDESK_OPERATION_LOG_DIR`` to a temp directory.  The override only
-    applies when callers use the default sink paths so explicit per-test paths
-    keep their exact destination.
-    """
-    raw = os.environ.get("QUANTDESK_OPERATION_LOG_DIR", "").strip()
-    if not raw:
-        return None
-    return Path(raw).expanduser().resolve()
-
-
-def _resolve_timeline_path(log_path: str | Path) -> str | Path:
-    if log_path == DEFAULT_TIMELINE_PATH:
-        base = _environment_log_base()
-        if base is not None:
-            return base / "operation_timeline.jsonl"
-    return log_path
-
-
-def _resolve_status_path(output_path: str | Path) -> str | Path:
-    if output_path == DEFAULT_STATUS_PATH:
-        base = _environment_log_base()
-        if base is not None:
-            return base / "latest_operation_status.json"
-    return output_path
-
-
-def _environment_log_base() -> Path | None:
     """Resolve the optional QUANTDESK_OPERATION_LOG_DIR test-isolation override.
 
     Tests that spawn ``scripts/qd.py`` subprocesses (or call the default-path

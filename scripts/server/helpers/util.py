@@ -41,15 +41,18 @@ def chart_number(value: Any, default: float = 0.0) -> float:
 
 
 def clean_payload(value: Any) -> Any:
-    if value is None:
-        return "数据缺失"
-    cleaned = sanitize_json_value(value)
+    # Sanitize the complete tree once. Repeating it at every subtree made large
+    # health evidence take over a minute to serialize without changing values.
+    return _display_missing_values(sanitize_json_value(value))
+
+
+def _display_missing_values(cleaned: Any) -> Any:
     if cleaned is None:
         return "数据缺失"
     if isinstance(cleaned, dict):
-        return {str(k): clean_payload(v) for k, v in cleaned.items()}
+        return {str(k): _display_missing_values(v) for k, v in cleaned.items()}
     if isinstance(cleaned, list):
-        return [clean_payload(v) for v in cleaned]
+        return [_display_missing_values(v) for v in cleaned]
     return cleaned
 
 

@@ -491,6 +491,15 @@ def _canonical_spot_frame(raw: pd.DataFrame) -> pd.DataFrame:
     }
     frame = raw.rename(columns={col: rename_map.get(str(col).strip(), str(col).strip()) for col in raw.columns}).copy()
     frame = frame.loc[:, ~frame.columns.duplicated()]
+    # Preserve an actual per-row collection record. A snapshot's file mtime or
+    # global update time is not proof of when this particular quote was read.
+    if "fetched_at" in frame.columns:
+        if "updated_at" not in frame.columns:
+            frame["updated_at"] = frame["fetched_at"]
+        else:
+            recorded = frame["updated_at"].fillna("").astype(str)
+            missing = recorded.str.strip().str.lower().isin({"", "nan", "none", "null"})
+            frame["updated_at"] = recorded.where(~missing, frame["fetched_at"].fillna(""))
     for column in ("symbol", "name", "price", "pct_chg", "change", "pre_close", "open", "high", "low", "volume", "amount", "quote_time", "quote_timestamp", "quote_date", "price_basis", "source", "updated_at"):
         if column not in frame.columns:
             frame[column] = ""
@@ -1092,7 +1101,7 @@ def spot_quote_for_symbol(symbol: str) -> dict[str, Any]:
         "quote_time": quote_time,
         "quote_timestamp": str(row.get("quote_timestamp") or "").strip() or (quote_dt.isoformat(timespec="seconds") if quote_dt else ""),
         "price_basis": str(row.get("price_basis") or "").strip(),
-        "updated_at": row_updated_at or spot_snapshot_updated_at(),
+        "updated_at": row_updated_at,
         "source": row_source or read_json_file(SPOT_SNAPSHOT_META).get("source", "local_cache"),
         "temporary": True,
         "label": "盘中/实时临时数据，不覆盖正式日线。",

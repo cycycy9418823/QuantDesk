@@ -27,6 +27,7 @@ from quantdesk.daily_review_orchestrator import (  # noqa: E402
     validate_stage4_terminal_evidence_pair,
 )
 from quantdesk.interprocess_lock import interprocess_file_lock  # noqa: E402
+from quantdesk.daily_data_chain import _read_chain_progress  # noqa: E402
 from quantdesk.trading_calendar import resolve_target_complete_trade_date  # noqa: E402
 from quantdesk.update_task_lock import is_pid_alive  # noqa: E402
 from quantdesk.utils import atomic_write_json  # noqa: E402
@@ -47,10 +48,12 @@ class AbandonedDailyChainProducer(RuntimeError):
 class DailyChainWaitTimeout(TimeoutError):
     """No terminal event for the frozen business date arrived within the wait."""
 
-    def __init__(self, target_date: str, observed_date: str, reason: str) -> None:
+    def __init__(self, target_date: str, observed_date: str, reason: str,
+                 producer_progress: dict[str, Any] | None = None) -> None:
         self.target_date = target_date
         self.observed_date = observed_date
         self.reason_code = reason
+        self.producer_progress = dict(producer_progress or {})
         super().__init__(
             f"daily_data_chain_wait_timeout:target_date={target_date}:"
             f"observed_target_date={observed_date or 'missing'}:reason={reason}"
@@ -103,6 +106,7 @@ def _iso_day(value: str) -> str:
 
 def _expected_chain_probe(
     metadata: dict[str, Any], manifest_path: Path, target_date: str,
+    *, progress: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str, str]:
     """Read only: an earlier abandoned event is evidence, never a new review."""
 
@@ -129,13 +133,29 @@ def _expected_chain_probe(
         return None, observed_date, "daily_data_chain_producer_abandoned"
     if metadata and status != "released":
         raise RuntimeError("daily_data_chain_lock_status_invalid")
+    # A controlled interruption executes the lock's finally block, but it still
+    # has no terminal event. A released lock alone does not mean completed.
+    unfinished = bool(
+        status == "released" and progress and progress.get("status") == "running"
+        and progress.get("run_id") == metadata.get("run_id")
+        and progress.get("pid") == metadata.get("pid")
+    )
+    interrupted_date = _iso_day(str(progress["target_date"])) if unfinished else ""
     if not manifest_path.is_file():
+        if unfinished:
+            if interrupted_date > target_date:
+                raise RuntimeError("daily_data_chain_target_date_in_future")
+            return None, interrupted_date, "daily_data_chain_producer_abandoned"
         return None, "", "authoritative_chain_manifest_missing"
     manifest = _read_chain_manifest(manifest_path)
     observed_date = _iso_day(str(manifest["target_date"]))
     if observed_date > target_date:
         raise RuntimeError("daily_data_chain_target_date_in_future")
     if status == "released" and str(metadata.get("run_id") or "") != str(manifest["run_id"]):
+        if unfinished:
+            if interrupted_date > target_date:
+                raise RuntimeError("daily_data_chain_target_date_in_future")
+            return None, interrupted_date, "daily_data_chain_producer_abandoned"
         raise RuntimeError("daily_data_chain_terminal_manifest_mismatch")
     if observed_date != target_date:
         return None, observed_date, "daily_data_chain_target_date_pending"
@@ -171,10 +191,17 @@ def locked_authoritative_chain_event(
         observed, reason = "", "daily_data_chain_producer_busy"
         while True:
             selected = False
+            producer_progress: dict[str, Any] = {}
             try:
                 with interprocess_file_lock(os_lock, timeout_seconds=0):
                     metadata = _read_json_object(metadata_path, "daily_data_chain_lock_unreadable") if metadata_path.exists() else {}
-                    manifest, observed, reason = _expected_chain_probe(metadata, Path(manifest_path), expected)
+                    producer_progress = _read_chain_progress(
+                        root, str(metadata.get("run_id") or ""),
+                        str(metadata.get("target_date") or "")[:10],
+                    )
+                    manifest, observed, reason = _expected_chain_probe(
+                        metadata, Path(manifest_path), expected, progress=producer_progress,
+                    )
                     if manifest is not None:
                         selected = True
                         yield manifest
@@ -185,7 +212,7 @@ def locked_authoritative_chain_event(
                 reason = "daily_data_chain_producer_busy"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise DailyChainWaitTimeout(expected, observed, reason)
+                raise DailyChainWaitTimeout(expected, observed, reason, producer_progress)
             time.sleep(min(poll, remaining))
         return
     acquired = False
@@ -415,6 +442,7 @@ def main(argv: list[str] | None = None) -> int:
                 "target_date": expected_date,
                 "observed_target_date": getattr(exc, "observed_date", ""),
                 "reason_code": getattr(exc, "reason_code", "daily_data_chain_wait_timeout"),
+                "producer_progress": getattr(exc, "producer_progress", {}),
                 "daily_executed": False, "stage4_executed": False,
                 "production_completed": False, "disclaimer": DISCLAIMER,
             }, ensure_ascii=False, indent=2))

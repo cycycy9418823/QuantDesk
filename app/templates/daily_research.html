@@ -4490,6 +4490,9 @@
                     <button id="rebuildPerformanceButton" class="action-button" type="button">重建绩效样本</button>
                 </div>
             </div>
+            <div id="paperObservedPanel" class="performance-panel" aria-live="polite">
+                <div class="empty-state">正在读取策略账与指数的同日期对照…</div>
+            </div>
             <div id="strategyBrainShadowPanel" class="performance-panel">
                 <div class="empty-state">正在加载 Strategy Brain 影子选择快照…</div>
             </div>
@@ -4674,6 +4677,7 @@
     </script>
     <script src="/static/echarts.min.js?v={{ asset_versions.echarts | default('dev') }}" defer></script>
     <script src="/static/js/stock_workbench.js?v={{ asset_versions.stock_workbench | default('dev') }}" defer></script>
+    <script src="/static/js/paper_observed.js?v={{ asset_versions.paper_observed | default('dev') }}" defer></script>
     <script src="/static/js/daily_research.js?v={{ asset_versions.daily_research | default('dev') }}" defer></script>
 </body>
 </html>

@@ -65,25 +65,16 @@ def inspect_quote(
     expected_trade_date: date | None,
     max_age_seconds: float = 60.0,
 ) -> dict[str, Any]:
-    """Keep an old/missing timestamp visible instead of replacing it with now.
+    """Use only the provider's dated quote evidence to judge freshness.
 
-    Some providers (e.g. the Sina spot snapshot) publish only a clock such as
-    "15:05:09" with no date. When our own record carries a dated collection
-    timestamp, the display date is derived from that record and reported as
-    inferred -- never from now() or a file mtime of an unrelated file. The
-    inference is labelled, and a clock far away from its own collection record
-    is rejected instead of being accepted as a fresh quote.
+    A local collection timestamp proves when we received a row, not when the
+    provider's price was observed. A time-only quote remains visible as an
+    unverified cached price and is never compared with research levels.
     """
     current = to_shanghai_datetime(now)
     price = quote_number(row.get("price"))
     timestamp = provider_quote_datetime(row)
     collected = quote_datetime(row.get("updated_at"))
-    timestamp_inferred = False
-    if timestamp is None and collected is not None:
-        clock = quote_time_of_day(row.get("quote_time"))
-        if clock is not None:
-            timestamp = datetime.combine(collected.date(), clock, tzinfo=collected.tzinfo)
-            timestamp_inferred = True
     actual_symbol = str(row.get("symbol") or "").strip()
     source = str(row.get("source") or "").strip()
     price_valid = bool(price is not None and price > 0)
@@ -102,7 +93,7 @@ def inspect_quote(
         status, label = "unverified_source", "报价来源未记录"
         reason_codes.append("quote_source_missing")
     elif timestamp is None:
-        status, label = "unverified_time", "报价日期未核实（来源只给了时刻，且无采集时间）"
+        status, label = "unverified_time", "报价日期未核实"
         reason_codes.append("quote_timestamp_missing")
     elif str(row.get("quote_date") or "").strip() not in {"", "nan", "None", timestamp.date().isoformat()}:
         status, label = "invalid_time", "报价日期与时间不一致"
@@ -135,20 +126,14 @@ def inspect_quote(
     elif expected_trade_date and timestamp.date() == expected_trade_date and (
             CLOSING_SNAPSHOT_START <= timestamp.time() <= CLOSING_SNAPSHOT_END):
         status, label, usable = "session_snapshot", "最近交易日收盘附近快照", True
-        if timestamp_inferred:
-            label = "最近交易日收盘附近快照（日期按采集记录推定）"
     else:
         status, label = "stale", "历史报价，等待更新"
         reason_codes.append("quote_not_latest_session_snapshot")
-    if timestamp_inferred:
-        reason_codes.append("quote_date_inferred_from_collection")
     basis = str(row.get("price_basis") or "").strip()
     raw_verified = basis == "raw"
     if price_valid and not raw_verified:
         reason_codes.append("quote_price_basis_unverified")
-    if usable and timestamp_inferred:
-        message = "报价只有时刻没有日期；显示日期按本地采集记录推定，未采信来源日期。"
-    elif usable:
+    if usable:
         message = "报价日期不从今天或文件修改时间补造；价格触及日线参考位仍需收盘确认。"
     else:
         message = "当前报价不能作为实时信号依据；日线参考和历史图仍可查看。"
@@ -160,7 +145,7 @@ def inspect_quote(
         "comparable_to_raw_daily": usable and raw_verified,
         "price_basis": basis or "mixed_or_unknown",
         "quote_timestamp": timestamp.isoformat(timespec="seconds") if timestamp else "",
-        "quote_timestamp_inferred": timestamp_inferred,
+        "quote_timestamp_inferred": False,
         "collection_timestamp": collected.isoformat(timespec="seconds") if collected else "",
         "age_seconds": round(age, 1) if age is not None else None,
         "checked_at": current.isoformat(timespec="seconds"),

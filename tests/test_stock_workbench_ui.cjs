@@ -130,6 +130,20 @@ test("unverified quote and missing historical reference remain visible", () => {
     assert.doesNotMatch(html, /NaN|undefined|null/);
 });
 
+test("time-only cache shows its price and unknown date without inventing a timestamp", () => {
+    const h = harness();
+    const html = h.toolkit.render(view("600000", {
+        quote: { price: 9.82, quote_time: "15:05:09", source: "fixture" },
+        quote_evidence: { price_valid: true, usable_latest_quote: false, comparable_to_raw_daily: false,
+            quote_timestamp: "", collection_timestamp: "2026-10-27T15:05:02+08:00", label: "报价日期未核实" },
+    }));
+    assert.match(html, /缓存报价/);
+    assert.match(html, /9\.82 元/);
+    assert.match(html, /报价时间 日期未核实 · 15:05:09/);
+    assert.match(html, /采集时间 2026-10-27T15:05:02/);
+    assert.match(html, /暂不判定实时价格是否触发参考位/);
+});
+
 test("strings from providers and algorithm reasons are escaped", () => {
     const h = harness();
     const data = view();

@@ -72,12 +72,12 @@
         const rawClock = (() => {
             const stamp = String(e.quote_timestamp || "");
             if (stamp) {
-                const shown = stamp.replace("T", " ").slice(0, 16);
+                const shown = stamp.replace("T", " ").slice(0, 19);
                 return e.quote_timestamp_inferred ? shown + "（日期按采集记录推定）" : shown;
             }
             return q.quote_time ? "日期未核实 · " + q.quote_time : "日期和时间未记录";
         })();
-        const quoteLabel = error ? "本次刷新未成功 · 仍显示上次结果" : e.label || "报价待核验";
+        const quoteLabel = error ? "更新失败 · 上次结果" : e.label || "报价待核验";
         const warning = error || !e.usable_latest_quote;
         const levels = Array.isArray(ref.levels) ? ref.levels : [];
         const reason = (Array.isArray(ref.reasons) ? ref.reasons : []).filter(Boolean).map(text).join(" ");
@@ -121,7 +121,8 @@
             + text(state.symbol || q.symbol || ref.symbol || "") + '">加入本机自选</button><span class="sq-badge">'
             + text(ref.label || "纸面 · 未验证") + '</span></div>'
             + '<div class="sq-quote-meta ' + (warning ? "sq-warning" : "") + '"><strong>' + text(quoteLabel)
-            + '</strong><span>报价时间 ' + text(rawClock) + '</span><span>来源 ' + text(e.source || q.source || "未记录")
+            + '</strong><span' + (e.quote_timestamp ? ' title="' + text(e.quote_timestamp) + '"' : '')
+            + '>报价时间 ' + text(rawClock) + '</span><span>来源 ' + text(e.source || q.source || "未记录")
             + '</span><span>采集时间 ' + text(e.collection_timestamp || q.updated_at || "未记录") + '</span></div>'
             + '<div class="sq-metrics">' + metrics + '</div>'
             + (error ? '<p class="sq-warning">' + text(error) + '</p>' : "")

@@ -81,10 +81,10 @@
     .topbar-right { display: none; }
     .detail-nav-head, .detail-nav-summary { display: none; }
     .detail-nav, .detail-panel-area { overflow: visible; }
-    .detail-shell { display: block; min-height: 0; }
+    .detail-shell { display: block; min-height: 0; height: auto; overflow: visible; }
     .detail-nav-strip { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); overflow: visible; gap: 4px; }
     .detail-nav-button { min-width: 0; width: 100%; padding: 7px 4px; }
     .detail-nav-title { white-space: normal; font-size: 12px; }
-    .modal-body { overflow-y: auto; }
+    .modal-body { display: block; overflow-y: auto; }
     .detail-panel-area { padding: 10px; }
 }

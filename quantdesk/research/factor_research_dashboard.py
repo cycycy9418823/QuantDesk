@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from quantdesk.research._serialization import json_safe as _json_safe
+
 import pandas as pd
 
 from quantdesk.factor_evaluation import PIT_UNIVERSE_WARNING, pit_universe_assumption
@@ -88,28 +90,6 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 def _as_list(value: Any) -> list[Any]:
     return list(value) if isinstance(value, list) else []
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, tuple):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if hasattr(value, "item"):
-        try:
-            return _json_safe(value.item())
-        except Exception:
-            pass
-    try:
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
-    return value
 
 
 def _project_path(path: str | Path) -> Path:

@@ -1427,6 +1427,34 @@ def build_cached_data_health_dashboard(
     payload["snapshot_stale"] = age is None or age > 900
     annotate_cached_card_scopes(payload)
 
+    from quantdesk.daily_gap_review import build_daily_gap_review
+
+    gap_review = build_daily_gap_review(PROJECT_ROOT, chain=chain, target_date=review_target)
+    payload["daily_gap_review"] = gap_review
+    if gap_review["available"]:
+        counts = gap_review["observed_counts"]
+        # Keep the old filter's card as evidence, but do not present its 914
+        # denominator as the current all-A market status.
+        payload["source_status"]["previous_daily_card"] = payload["cards"].get("daily_data", {})
+        payload["cards"]["daily_data"] = {
+            "title": "全A日线核对", "status": "yellow" if gap_review["status"] != "complete" else "green",
+            "value": f"{gap_review['target_date']} 日线 {counts['with_bar']}/{counts['total']}",
+            "latest_local_date": gap_review["target_date"],
+            "target_complete_trade_date": gap_review["target_date"],
+            "scope_label": "全A当前名册；最近一次核对记录",
+            "snapshot_generated_at": gap_review["record_updated_at"],
+            "detail": gap_review["message"],
+            "next_action": "查看“日线缺口逐只核对”；已有日线可打开K线，原因待核实的保留警告。",
+        }
+        recovered = gap_review["previously_flagged_now_present"]
+        research_scope = (payload["scope_health"].get("scopes") or {}).get("research_pool")
+        if recovered and isinstance(research_scope, dict):
+            research_scope["label"] = "研究链当时记录"
+            research_scope["detail"] = str(research_scope.get("detail") or "") + (
+                " 当前只读复核已找到 " + "、".join(recovered) +
+                " 的当日日线，见逐只核对表；此处保留原运行记录的数量。"
+            )
+
     current_level = str(payload.get("health_level") or "yellow").lower()
     payload["health_level"], degraded_reasons = _apply_health_evidence_overlay(
         current_level,
@@ -1446,6 +1474,9 @@ def build_cached_data_health_dashboard(
         payload["health_level"] = "yellow"
         degraded_reasons.append("strategy_ledger_review_unavailable")
     payload["health_degraded_reason_codes"] = degraded_reasons
+    if gap_review["available"] and gap_review["status"] != "complete" and payload["health_level"] == "green":
+        payload["health_level"] = "yellow"
+        degraded_reasons.append("full_a_daily_gaps_unresolved")
     payload["health_level_overridden_from_snapshot"] = bool(
         degraded_reasons and str(payload.get("health_level") or "").lower() != current_level
     )

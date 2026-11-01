@@ -86,7 +86,7 @@ class StockQuoteMemory:
             # checks; keep the established status but do not repeat a success
             # message that would contradict the refusal.
             return {"ok": False, "status": "provider_failed",
-                    "message_for_ui": "报价源返回的数据未通过日期/来源/口径核验，已保留原有行情与时间。" if result.get("ok")
+                    "message_for_ui": "报价源返回的数据未通过日期、来源或新鲜度核验，已保留原有行情与时间。" if result.get("ok")
                     else str(result.get("message_for_ui") or "报价源未返回匹配证券的价格，保留已有行情。")}
         except Exception:
             return {"ok": False, "status": "provider_failed", "message_for_ui": "报价源暂不可用，保留已有行情和时间。"}
@@ -208,7 +208,7 @@ def create_stock_workbench_blueprint(deps: StockWorkbenchDeps, *, memory: StockQ
             _, current_session, current_complete = market_context(checked_at)
             checked = inspect_quote(row, symbol=symbol, now=checked_at,
                                     session=current_session, expected_trade_date=current_complete)
-            return checked["status"] not in REJECTED_QUOTE_STATES
+            return checked["usable_latest_quote"]
         refreshed = quotes.refresh(
             symbol, deps.fetch_quote, validator=valid,
             previous_quote=previous if previous_evidence["status"] not in REJECTED_QUOTE_STATES else None,

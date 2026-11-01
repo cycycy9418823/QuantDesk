@@ -204,6 +204,19 @@ def _seed_root(root: Path, *, target_date: str = "2026-07-31") -> dict[str, Path
             "conclusion_drawn": False,
         },
     )
+    # Sending a current brief needs a known prior trading day.  The old
+    # fixture had no calendar, which masked the missing business-date check.
+    calendar = root / "data/calendar/a_share_trading_calendar.csv"
+    calendar.parent.mkdir(parents=True, exist_ok=True)
+    calendar.write_text(
+        "date,is_open,source\n"
+        "2026-07-30,1,fixture\n2026-07-31,1,fixture\n"
+        "2026-08-01,0,fixture\n2026-08-02,0,fixture\n"
+        "2026-08-03,1,fixture\n2026-08-04,1,fixture\n",
+        encoding="utf-8",
+    )
+    from quantdesk.trading_calendar import clear_calendar_cache
+    clear_calendar_cache()
     return paths
 
 
@@ -674,7 +687,7 @@ def test_success_commits_channel_scoped_dedupe_and_safe_receipt(
     assert "浦发银行" not in receipt_text
 
 
-def test_same_snapshot_is_eligible_once_on_the_next_delivery_day(
+def test_same_snapshot_on_next_delivery_day_is_rejected_as_stale(
     tmp_path: Path,
 ) -> None:
     _seed_root(tmp_path)
@@ -709,8 +722,11 @@ def test_same_snapshot_is_eligible_once_on_the_next_delivery_day(
     )
 
     assert first["status"] == "sent"
-    assert second["status"] == "sent"
-    assert sends == ["sent", "sent"]
+    assert second["status"] == "blocked"
+    assert second["reason_code"] == "brief_business_date_stale"
+    assert second["as_of"] == "2026-07-31"
+    assert second["expected_as_of"] == "2026-08-03"
+    assert sends == ["sent"]
 
 
 def test_same_day_a_b_a_content_sequence_sends_only_a_and_b(tmp_path: Path) -> None:

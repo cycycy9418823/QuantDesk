@@ -12,10 +12,12 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
@@ -45,6 +47,7 @@ from quantdesk.daily_price_update_engine import (
     update_daily_prices,
 )
 from quantdesk.price_basis import classify_frame_price_basis
+from quantdesk.process_deadline import run_process_tasks_until_deadline
 from quantdesk.data_close_upstream_contract import validate_upstream_reuse_manifest
 from quantdesk.data_truth.benchmark_incremental_update import update_benchmark_files
 from quantdesk.data_truth.sector_history_archive import (
@@ -95,6 +98,15 @@ INTRADAY_PROVIDER_ORDER = tuple(DEFAULT_INTRADAY_PROVIDER_ORDER)
 # that fail-closed boundary without quarantining unrelated complete symbols;
 # callers may still choose a larger explicitly reviewed transaction batch.
 DEFAULT_BATCH_SIZE = 1
+# Optional sector observation must leave time for the daily research core.
+# The existing process deadline runner confirms worker exit before returning.
+SECTOR_REFRESH_TIMEOUT_SECONDS = 1200.0
+CHAIN_PHASE_LABELS = {
+    "preflight": "启动核对", "universe_refresh": "名册更新", "sector_refresh": "板块资料采集",
+    "research_inputs": "研究输入核对", "daily_prices": "日线处理",
+    "session_expectation": "交易日资料核对", "features": "特征计算",
+    "candidate_research": "候选研究", "publishing": "研究结果发布", "finished": "运行结束",
+}
 SECTION15_CONFLICT_DATE = "2026-07-14"
 SECTION15_CONFLICT_SYMBOLS = ("002115", "300323", "600744", "600958", "601975")
 DAILY_DATA_CHAIN_CONTRACT_VERSION = REQUIRED_DATA_CHAIN_CONTRACT_VERSION
@@ -522,6 +534,7 @@ def _daily_chain_lock(
                         "run_id": run_id,
                         "pid": os.getpid(),
                         "status": "released",
+                        "target_date": str(target_date or "")[:10],
                         "released_at": now_text(),
                     },
                 )
@@ -994,7 +1007,63 @@ def _isolated_critical_append_conflict(
     }
 
 
+def _sector_snapshot_worker(task: str, context: dict[str, Any]) -> dict[str, Any]:
+    """Spawn entrypoint; a Windows worker also owns any provider descendants."""
+    if os.name == "nt":
+        from scripts.run_data_close_pipeline import _protect_child_process_tree
+
+        _protect_child_process_tree()
+    return _refresh_sector_snapshot_inline(Path(task), network=True)
+
+
 def _refresh_sector_snapshot(
+    root: Path,
+    *,
+    network: bool,
+    board_refresher: Any | None = None,
+    member_fetcher: Any | None = None,
+    timeout_seconds: float = SECTOR_REFRESH_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Bound the whole optional observation, including provider fallbacks.
+
+    Explicit offline fixture dependencies keep the existing inline test seam.
+    Real providers run in one killable process, never a detached writer thread.
+    Process cleanup failures propagate: work cannot continue beside a writer
+    whose exit has not been confirmed.
+    """
+    if not network or board_refresher is not None or member_fetcher is not None:
+        return _refresh_sector_snapshot_inline(
+            root, network=network, board_refresher=board_refresher,
+            member_fetcher=member_fetcher,
+        )
+    if Path(root).resolve() != _CANONICAL_PROJECT_ROOT.resolve():
+        return {"ok": False, "status": "blocked", "network": True,
+                "reason_codes": ["sector_refresh_custom_root_not_supported"]}
+    budget = float(timeout_seconds)
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("sector_refresh_timeout_invalid")
+    started = time.monotonic()
+    batch = run_process_tasks_until_deadline(
+        _sector_snapshot_worker, [str(Path(root).resolve())], context={},
+        max_workers=1, timeout_seconds=budget,
+    )
+    evidence = {
+        "timeout_seconds": budget, "elapsed_seconds": round(time.monotonic() - started, 3),
+        "worker_pids": list(batch.worker_pids), "worker_exit_confirmed": True,
+    }
+    result = batch.results.get(0)
+    if not batch.timed_out and not batch.unfinished_indices and not batch.failures and isinstance(result, Mapping):
+        return {**result, **evidence}
+    return {
+        "ok": False, "status": "blocked", "network": True, **evidence,
+        "reason_codes": ["sector_refresh_timeout" if batch.timed_out else "sector_refresh_worker_failed"],
+        "timed_out": batch.timed_out,
+        # Provider errors may contain URLs or credentials; only retain their type.
+        "worker_error_type": str(batch.failures.get(0) or "").split(":", 1)[0][:80],
+    }
+
+
+def _refresh_sector_snapshot_inline(
     root: Path,
     *,
     network: bool,
@@ -2591,6 +2660,83 @@ def _refresh_t0_birth_evidence(root: Path) -> dict[str, Any]:
     }
 
 
+def _read_chain_progress(root: Path, run_id: str, target_date: str = "") -> dict[str, Any]:
+    """Read bounded run identity/phase evidence, never a completion authority."""
+    if not _is_valid_recovery_source_run_id(run_id):
+        return {}
+    runs = Path(root).resolve() / "results/data_chain/runs"
+    path = (runs / run_id / "progress.json").resolve()
+    if path.parent.parent != runs:
+        return {}
+    try:
+        if not path.is_file() or path.stat().st_size > 65536:
+            return {}
+    except OSError:
+        return {}
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(65537)
+        if len(raw) > 65536:
+            return {}
+        payload = json.loads(raw)
+    except (OSError, ValueError):
+        return {}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != "daily_chain_progress_v1"
+        or payload.get("contract_version") != DAILY_DATA_CHAIN_CONTRACT_VERSION
+        or payload.get("run_id") != run_id
+        or not payload.get("target_date")
+        or (target_date and payload.get("target_date") != target_date)
+        or payload.get("authoritative") is not False
+        or payload.get("published_latest") is not False
+        or payload.get("completion_scope") != "run_progress_only"
+        or not isinstance(payload.get("phase"), str)
+        or not isinstance(payload.get("status"), str)
+        or type(payload.get("pid")) is not int or payload["pid"] <= 0
+    ):
+        return {}
+    try:
+        if date.fromisoformat(payload["target_date"]).isoformat() != payload["target_date"]:
+            return {}
+    except (TypeError, ValueError):
+        return {}
+    return {key: payload[key] for key in (
+        "schema_version", "contract_version", "run_id", "pipeline_run_id", "target_date", "pid",
+        "status", "phase", "phase_label", "started_at", "phase_started_at", "updated_at", "finished_at",
+        "sector_refresh_timeout_seconds", "authoritative", "published_latest", "completion_scope",
+    ) if key in payload}
+
+
+def _write_chain_progress(root: Path, manifest: Mapping[str, Any], phase: str) -> None:
+    run_id = str(manifest["run_id"])
+    if not _is_valid_recovery_source_run_id(run_id):
+        raise ValueError("chain_progress_run_id_invalid")
+    runs = Path(root).resolve() / "results/data_chain/runs"
+    destination = (runs / run_id / "progress.json").resolve()
+    if destination.parent.parent != runs:
+        raise ValueError("chain_progress_path_escape")
+    previous = _read_chain_progress(root, run_id)
+    now = now_text()
+    status = str(manifest.get("status") or "running")
+    if status != "running":
+        phase = str(previous.get("phase") or phase)
+    payload = {
+        "schema_version": "daily_chain_progress_v1",
+        "contract_version": DAILY_DATA_CHAIN_CONTRACT_VERSION,
+        "run_id": run_id, "pipeline_run_id": str(manifest.get("pipeline_run_id") or ""),
+        "target_date": str(manifest.get("target_date") or "")[:10], "pid": os.getpid(),
+        "status": status, "phase": phase, "phase_label": CHAIN_PHASE_LABELS.get(phase, phase),
+        "started_at": previous.get("started_at") or manifest.get("started_at") or now,
+        "phase_started_at": previous.get("phase_started_at") if previous.get("phase") == phase else now,
+        "updated_at": now, "finished_at": None if status == "running" else now,
+        "sector_refresh_timeout_seconds": SECTOR_REFRESH_TIMEOUT_SECONDS,
+        "authoritative": False, "published_latest": False,
+        "completion_scope": "run_progress_only",
+    }
+    atomic_write_json(destination, payload)
+
+
 def _publish_manifest(
     manifest: dict[str, Any],
     *,
@@ -2604,6 +2750,8 @@ def _publish_manifest(
     atomic_write_json(manifest_path, manifest)
     if publish_latest:
         atomic_write_json(latest_path, manifest)
+    if _read_chain_progress(root, str(manifest.get("run_id") or "")):
+        _write_chain_progress(root, manifest, "finished")
     return manifest
 
 
@@ -2706,6 +2854,16 @@ def _run_daily_data_chain_impl(
     formal_stage6_apply = bool(network and not dry_run)
     formal_authorized = bool(network and not dry_run and symbols is None)
     started_at = now_text()
+    progress_context = {
+        "run_id": current_run_id, "pipeline_run_id": str(pipeline_run_id),
+        "target_date": resolved_target, "started_at": started_at, "status": "running",
+    }
+
+    def progress(phase: str) -> None:
+        if _lock_already_held:
+            _write_chain_progress(root, progress_context, phase)
+
+    progress("preflight")
 
     # Recovery lineage for this run.  A stale ``running`` lock still wins; when
     # the predecessor instead ended cleanly as ``blocked`` (a scheduled retry
@@ -2814,6 +2972,7 @@ def _run_daily_data_chain_impl(
     # providers or touch canonical bytes; they continue with the previous pool.
     universe_refresh_payload: dict[str, Any]
     universe_refresh_blocked = False
+    progress("universe_refresh")
     if upstream_reuse_normalized is not None:
         universe_refresh_payload = {
             "ok": True,
@@ -2921,6 +3080,7 @@ def _run_daily_data_chain_impl(
         and refresh_universe
         and symbols is None
     )
+    progress("sector_refresh")
     # A same-target predecessor may already hold a sealed forward sector
     # snapshot. Re-capturing that day can only return identical bytes or raise a
     # fail-closed conflict, so verify and reuse the existing evidence instead of
@@ -2959,6 +3119,7 @@ def _run_daily_data_chain_impl(
         and sector_reuse_payload is None
         and str(sector_refresh_payload.get("status") or "") != "completed"
     )
+    progress("research_inputs")
 
     low_price_filter = _low_price_filter_inventory(root)
     low_price_filter["used"] = bool(use_low_price_filter and symbols is None)
@@ -3285,6 +3446,7 @@ def _run_daily_data_chain_impl(
         daily_network_effective = bool(
             network and (symbols is not None or use_low_price_filter)
         )
+        progress("daily_prices")
         daily_workers, daily_sleep_seconds = _daily_update_rate_contract(
             network=daily_network_effective,
             dry_run=dry_run,
@@ -3387,6 +3549,11 @@ def _run_daily_data_chain_impl(
             ) if touched else {}
             daily_payload = merge_recovered_daily_status(
                 daily_payload, refreshed, touched, target_gap_payload,
+                ledger_reference={
+                    "path": _display_path(manifest_path, root),
+                    "json_pointer": "/components/target_day_gap_recovery/historical_ledger",
+                    "run_id": current_run_id, "target_date": resolved_target,
+                },
             )
             atomic_write_json(run_dir / "daily_update.json", daily_payload)
         # Bind the run-scoped no-session evidence to the run that produced it, so
@@ -3414,6 +3581,7 @@ def _run_daily_data_chain_impl(
         session_network = bool(
             network and not dry_run and root == PROJECT_ROOT
         )
+        progress("session_expectation")
         session_payload = build_session_expectation(
             session_symbols,
             resolved_target,
@@ -4001,6 +4169,7 @@ def _run_daily_data_chain_impl(
         base_manifest["coverage"]["critical"] = critical_coverage
         base_manifest["coverage"]["current_analysis_pool"] = analysis_coverage
 
+        progress("features")
         if rebuild_features and not dry_run and analysis_symbols:
             feature_payload = build_daily_features(
                 only_low_price=bool(low_price_filter.get("used")),
@@ -4220,6 +4389,7 @@ def _run_daily_data_chain_impl(
             }
         )
 
+        progress("candidate_research")
         if formal_authorized:
             _run_candidate_refresh_step(
                 root=root,
@@ -4427,6 +4597,7 @@ def _run_daily_data_chain_impl(
                         "计划已在内存完成校验，但归档发布失败；旧计划保持不变。"
                     )
 
+        progress("publishing")
         if formal_authorized:
             current_state_update = _update_current_state(root, base_manifest)
         else:
@@ -4768,6 +4939,13 @@ def latest_daily_data_chain(project_root: Path = PROJECT_ROOT) -> dict[str, Any]
     if not isinstance(lock_metadata, Mapping):
         lock_metadata = {}
     lock_held = _lock_is_held(lock_path)
+    progress = _read_chain_progress(
+        root, str(lock_metadata.get("run_id") or ""),
+        str(lock_metadata.get("target_date") or "")[:10],
+    )
+    phase_evidence = {key: progress[key] for key in (
+        "phase", "phase_label", "phase_started_at", "updated_at", "sector_refresh_timeout_seconds",
+    ) if key in progress}
     if lock_held and isinstance(lock_metadata, dict):
         previous_payload = read_json(path, {})
         previous_terminal = {}
@@ -4787,14 +4965,19 @@ def latest_daily_data_chain(project_root: Path = PROJECT_ROOT) -> dict[str, Any]
             "run_id": active_run_id,
             "target_date": str(lock_metadata.get("target_date") or "")[:10],
             "pid": int(lock_metadata.get("pid") or 0),
-            "started_at": str(lock_metadata.get("acquired_at") or ""),
+            "started_at": str(lock_metadata.get("acquired_at") or progress.get("started_at") or ""),
             "generated_at": now_text(),
             "authoritative": False,
             "published_latest": False,
             "previous_terminal": previous_terminal,
             "path": _display_path(path, root),
-            "message": "The daily data chain is running; terminal evidence is not published yet.",
+            "message": (
+                f"研究链正在执行：{progress['phase_label']}；尚未发布本次完成结果。"
+                if progress.get("phase_label") else
+                "The daily data chain is running; terminal evidence is not published yet."
+            ),
             "disclaimer": DISCLAIMER,
+            **phase_evidence,
         }
         active_target_date = str(lock_metadata.get("target_date") or "")[:10]
         if isinstance(checkpoint, Mapping):
@@ -4855,7 +5038,10 @@ def latest_daily_data_chain(project_root: Path = PROJECT_ROOT) -> dict[str, Any]
     )
     if (
         not lock_held
-        and metadata_status == "running"
+        and (
+            metadata_status == "running"
+            or (metadata_status == "released" and progress.get("status") == "running")
+        )
         and lock_run_id
         and terminal_run_id != lock_run_id
     ):
@@ -4880,9 +5066,14 @@ def latest_daily_data_chain(project_root: Path = PROJECT_ROOT) -> dict[str, Any]
             "generated_at": now_text(),
             "previous_terminal": previous_terminal,
             "path": _display_path(path, root),
-            "message": "The previous process released its OS lock without a matching terminal manifest.",
+            "message": (
+                f"上次研究运行在“{progress['phase_label']}”阶段中断，没有该次运行的完成结果。"
+                if progress.get("phase_label") else
+                "The previous process released its OS lock without a matching terminal manifest."
+            ),
             "next_action": "Treat the run as failed/abandoned and execute a full idempotent retry.",
             "disclaimer": DISCLAIMER,
+            **phase_evidence,
         }
     if not isinstance(payload, dict) or not payload:
         lock_path = root / "state" / "daily_data_chain.lock"

@@ -37,13 +37,53 @@ function harness(options = {}) {
         runVisiblePageReads, visiblePageLoaders, loadVisiblePageData, syncStartupStatusPolling,
         prepareVisiblePagePlaceholders,
         startupReadState: () => ({ sequence: visiblePageReadSequence, taskId: startupRefreshTaskId, applied: startupRefreshApplied }),
-        personalWatchlist, setPersonalWatch, paperReportDate, renderOwnerRuntimeSummary,
-        loadCandidates, loadMarketOverview, RUNTIME_WRITE_SELECTOR,
+        personalWatchlist, setPersonalWatch, paperReportDate, renderOwnerRuntimeSummary, dailyGapReviewHtml,
+        loadCandidates, loadMarketOverview, RUNTIME_WRITE_SELECTOR, renderResearchBrief,
         retainReadFixtures: () => {lastCandidatesReadSucceeded = true; lastMarketReadSucceeded = true;}};`, context);
     return { api: window.testApi, window, nodes, selectors, timers, storage, calls,
         evaluate: (source) => vm.runInNewContext(source, context),
         fetch: (fn) => { impl = fn; } };
 }
+
+test("daily research brief labels its own date separately from live quote", () => {
+    const h = harness();
+    const html = h.api.renderResearchBrief({ available: true, data_date: "2026-10-28", current_state: "日线收盘 9.85", key_levels: {} });
+    assert.match(html, /完整日线截至 2026-10-28/);
+    assert.match(html, /盘中报价见上方/);
+    assert.match(html, /日线观察/);
+    assert.match(h.api.renderResearchBrief({ available: true }), /日期未核实/);
+});
+
+test("daily gap comparison links dated real rows and keeps unverified gaps visible", () => {
+    const h = harness();
+    const html = h.api.dailyGapReviewHtml({ available: true, target_date: "2026-10-30",
+        reviewed_count: 3, review_total: 3, message: "1只待核实", by_symbol: {
+            a: { symbol: "600621", name: "华鑫股份", status: "present", previously_flagged: true,
+                data_date: "2026-10-30", close: 13.6, source: "sina_spot_close" },
+            b: { symbol: "301139", status: "unresolved", data_date: "2026-10-27", close: null },
+            c: { symbol: "002717", status: "verified_no_session", data_date: "2026-10-23", close: null },
+        } });
+    assert.match(html, /href="#watch\/600621"/);
+    assert.match(html, /研究链曾标为缺失\/滞后/);
+    assert.match(html, /2026-10-30 · 收盘 13\.60 元/);
+    assert.match(html, /缺口待核实/);
+    assert.match(html, /最后日线 2026-10-27/);
+    assert.match(html, /已核实无交易/);
+    assert.match(html, /无交易证据不等于存在当日K线/);
+    assert.doesNotMatch(html, /收盘 0\.00 元/);
+});
+
+test("daily gap source errors and hostile labels cannot become a green result or HTML", () => {
+    const h = harness();
+    const unavailable = h.api.dailyGapReviewHtml({ available: false, message: "日期不一致" });
+    assert.match(unavailable, /日期不一致/);
+    assert.doesNotMatch(unavailable, /health-ok/);
+    const html = h.api.dailyGapReviewHtml({ available: true, by_symbol: {
+        x: { symbol: '600000\" onclick=\"bad()', name: "<script>bad()</script>", status: "unresolved" },
+    } });
+    assert.doesNotMatch(html, /<script>|href="#watch/);
+    assert.match(html, /&lt;script&gt;/);
+});
 
 test("a hung fetch times out, clears single-flight and permits a fresh retry", async () => {
     const h = harness();

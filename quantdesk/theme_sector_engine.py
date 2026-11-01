@@ -108,30 +108,6 @@ def _merge_tags(*values: str) -> str:
     return ";".join(tags)
 
 
-def _is_unknown_value(key: str, value: Any) -> bool:
-    text = str(value or "").strip()
-    if not text:
-        return True
-    if key == "sector":
-        return text == UNKNOWN_THEME["sector"]
-    if key == "industry":
-        return text == UNKNOWN_THEME["industry"]
-    if key in {"primary_theme", "concept_tags", "theme_tags"}:
-        return text == UNKNOWN_THEME["primary_theme"]
-    return False
-
-
-def _row_needs_pending(row: dict[str, Any]) -> bool:
-    return _is_unknown_value("sector", row.get("sector")) or _is_unknown_value("primary_theme", row.get("primary_theme"))
-
-
-def _row_has_theme_data(row: dict[str, Any]) -> bool:
-    return any(
-        not _is_unknown_value(key, row.get(key))
-        for key in ("sector", "industry", "concept_tags", "theme_tags", "primary_theme")
-    )
-
-
 def _theme_row_from_sources(symbol: str, name: str, low_row: dict[str, Any], spot_row: dict[str, Any]) -> dict[str, Any]:
     sector = _first_text(low_row, ["sector", "板块", "market_sector"]) or _first_text(spot_row, ["sector", "板块", "市场板块"])
     industry = _first_text(low_row, ["industry", "行业"]) or _first_text(spot_row, ["industry", "行业", "所属行业"])

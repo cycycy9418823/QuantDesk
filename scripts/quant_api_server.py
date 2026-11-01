@@ -190,6 +190,7 @@ def daily_research_asset_versions() -> dict[str, str]:
         "echarts": static_asset_version("echarts.min.js"),
         "daily_research": static_asset_version("js/daily_research.js"),
         "stock_workbench": static_asset_version("js/stock_workbench.js"),
+        "paper_observed": static_asset_version("js/paper_observed.js"),
         "stock_workbench_css": static_asset_version("css/stock_workbench.css"),
     }
 
@@ -202,7 +203,7 @@ def set_research_cache_headers(response: Response) -> Response:
     if (
         request.path == "/"
         or request.path.startswith("/api/")
-        or request.path.endswith(("/daily_research.js", "/stock_workbench.js", "/stock_workbench.css"))
+        or request.path.endswith(("/daily_research.js", "/stock_workbench.js", "/stock_workbench.css", "/paper_observed.js"))
     ):
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["Pragma"] = "no-cache"
@@ -379,6 +380,8 @@ def _ui_dependency_paths() -> list[Path]:
         return [PAPER_WATCHLIST_JSON, *portfolio, *chain, project_root / STORE_PATH / "latest.json",
             BENCHMARK_DIR / "hs300.csv", *market[-2:]]
     if scope == "/api/data-health/dashboard":
+        from quantdesk.daily_gap_review import daily_gap_review_input_paths
+
         ai_inputs = [project_root / "state/ai_trader/ledger.json", project_root / "state/ai_trader/plan_latest.json"]
         paths = [*chain, *portfolio, *ai_inputs, *market[-2:],
             project_root / "results/data_health/data_health_dashboard_latest.json",
@@ -387,6 +390,10 @@ def _ui_dependency_paths() -> list[Path]:
             project_root / "results/candidate_tracking/latest.json", TRACKING_DIR / "candidate_ledger.csv",
             TRACKING_DIR / "candidate_performance.csv", TRACKING_DIR / "tracking_summary.json"]
         paths.extend(DAILY_DIR / f"{symbol}.csv" for symbol in sorted(_ui_symbols_in_files(ai_inputs)))
+        # Changed gap rows (even same-size/same-mtime replacements) invalidate
+        # both the summary and its paged evidence. This is a bounded read set.
+        paths.extend(daily_gap_review_input_paths(project_root,
+            chain=_ui_input_object(chain[0], fields=("target_date", "coverage"))))
         return paths
     generation_paths = _ui_generation_dependency_paths(target_text)
     paths = [*generation_paths, *market, TRACKING_DIR / "candidate_review_overrides.json",
@@ -7061,7 +7068,7 @@ def get_stock_detail(symbol: str):
             **build_structured_chart_series(stock_df),
         },
         "research_reference": (_research_reference := build_research_reference(stock_df)),
-        "research_brief": build_stock_research_brief(_research_reference, name=candidate_name(clean_symbol), strategy_lane=detail_lane(strategy_type)),
+        "research_brief": build_stock_research_brief(_research_reference, name=candidate_name(clean_symbol), strategy_lane=detail_lane(strategy_type), as_of=latest_date),
         "news_summary": build_news_summary(clean_symbol),
         "industry_comparison": build_industry_comparison(clean_symbol, pct_chg),
         "tracking_vs_benchmark": build_tracking_vs_benchmark(stock_df, chart_select_date),
@@ -7569,7 +7576,7 @@ def build_research_reference(stock_df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-def build_stock_research_brief(reference: dict[str, Any], *, name: str = "", strategy_lane: str = "") -> dict[str, Any]:
+def build_stock_research_brief(reference: dict[str, Any], *, name: str = "", strategy_lane: str = "", as_of: str = "") -> dict[str, Any]:
     """Beginner-friendly, DIRECT research brief synthesized from research_reference.
 
     Plain and opinionated (a "看盘搭子" view a beginner can act on), but framed as
@@ -7605,7 +7612,7 @@ def build_stock_research_brief(reference: dict[str, Any], *, name: str = "", str
     if ret_20d is not None:
         moves.append(f"近20日 {ret_20d:+.1f}%")
     move_text = "、".join(moves) or "近期涨跌数据缺失"
-    price_text = f"现价 {latest:.2f}" if latest is not None else "现价数据缺失"
+    price_text = f"日线收盘 {latest:.2f}" if latest is not None else "日线收盘价缺失"
     current_state = f"{price_text}，{position}，{move_text}，{vol_label}。{structure}".strip()
 
     lean = (f"研究倾向：{bias}。{thesis}".strip()).rstrip("。") + "。"
@@ -7624,6 +7631,7 @@ def build_stock_research_brief(reference: dict[str, Any], *, name: str = "", str
     return {
         "available": True,
         "headline": f"{(name or '').strip()} · {bias}".strip(" ·"),
+        "data_date": as_of,
         "current_state": current_state,
         "research_lean": lean,
         "continue_if": continue_if,

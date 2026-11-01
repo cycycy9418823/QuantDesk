@@ -1103,6 +1103,20 @@ def stage_research_chain(
         root, "research_chain", command, timeout=timeout, pipeline_run_id=pipeline_run_id,
         pipeline_lock=pipeline_lock, target=target,
     )
+    # A killed child cannot publish a terminal manifest. Keep its small phase
+    # record for diagnosis, bound to this pipeline, business date and child PID;
+    # it must never replace the final artifact or turn a timeout into success.
+    from quantdesk.daily_data_chain import _read_chain_progress
+
+    metadata, _ = _read_json_artifact(root / "state/daily_data_chain.lock.json")
+    progress = _read_chain_progress(root, str((metadata or {}).get("run_id") or ""), target)
+    if (
+        progress and pipeline_run_id and target
+        and progress.get("pipeline_run_id") == pipeline_run_id
+        and payload.get("child_pid") is not None
+        and progress.get("pid") == payload["child_pid"]
+    ):
+        payload["progress_evidence"] = progress
     return StageResult(
         stage="research_chain", status=status, started_at=started,
         reason_codes=reasons, network=network, canonical_write=True,
@@ -1478,7 +1492,7 @@ def save_checkpoint(root: Path, run_id: str, payload: dict[str, Any]) -> None:
     path = checkpoint_path(root, run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -1496,7 +1510,7 @@ def _write_attempt(root: Path, report: dict[str, Any], *, terminal: bool) -> Non
     path = root / ATTEMPTS_DIR_RELATIVE / attempt_id / "manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.write_text(json.dumps(report, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     os.replace(temporary, path)
 
 
@@ -2248,15 +2262,15 @@ def _publish_shadow(root: Path, report: dict[str, Any]) -> None:
         )
     _require_plain_directory(run_dir, label="shadow_run")
     (run_dir / "manifest.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(report, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
     )
     latest = shadow_dir / "data_close_pipeline_shadow_latest.json"
     tmp = latest.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(report, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     os.replace(tmp, latest)
     last_ok = shadow_dir / "data_close_pipeline_shadow_last_successful.json"
     tmp2 = last_ok.with_suffix(".json.tmp")
-    tmp2.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp2.write_text(json.dumps(report, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     os.replace(tmp2, last_ok)
 
 
@@ -2291,7 +2305,7 @@ def _publish(root: Path, report: dict[str, Any]) -> None:
     report["latest_attempt_is_successful"] = payload["latest_attempt_is_successful"]
     _write_attempt(root, report, terminal=True)
     payload = dict(report)
-    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     # The original run manifest is a historical receipt, never a latest pointer.
     # Each invocation also has a unique attempts/<id>/manifest.json, including
     # callers that explicitly reuse a run_id and concurrent busy attempts.
@@ -2311,6 +2325,40 @@ def _publish(root: Path, report: dict[str, Any]) -> None:
     os.replace(tmp, latest_path)
     report["last_successful_run_id"] = payload["last_successful_run_id"]
     report["latest_attempt_is_successful"] = payload["latest_attempt_is_successful"]
+
+
+def _console_summary(root: Path, report: dict[str, Any]) -> dict[str, Any]:
+    """Link this attempt's complete evidence instead of logging it again."""
+    attempt = str(report.get("attempt_id") or "")
+    if not re.fullmatch(r"[0-9a-f]{24}", attempt):
+        return report
+    relative = ATTEMPTS_DIR_RELATIVE / attempt / "manifest.json"
+    if not (root / relative).is_file():
+        # Early errors, dry runs and shadow/recovery previews may have no
+        # saved attempt. Keep their only detailed diagnostic in stdout.
+        return report
+    from quantdesk.pipeline_terminal import pipeline_failure_details
+
+    summary = {**report, "output_detail": "summary", "detail_path": relative.as_posix(),
+               "failure_details": pipeline_failure_details(report), "stages": {}}
+    diagnostic_keys = {"schema_version", "status", "ok", "reason_code", "reason_codes",
+                       "warnings", "errors", "error_type", "error"}
+    for name, stage in (report.get("stages") or {}).items():
+        if not isinstance(stage, Mapping):
+            summary["stages"][name] = stage
+            continue
+        reduced = dict(stage)
+        payload = stage.get("payload")
+        if isinstance(payload, Mapping):
+            reduced["payload"] = {k: v for k, v in payload.items()
+                                  if k not in {"stdout_json", "stdout_tail"}}
+            stdout = payload.get("stdout_json")
+            if isinstance(stdout, Mapping):
+                reduced["payload"]["stdout_json"] = {
+                    k: v for k, v in stdout.items() if k in diagnostic_keys
+                }
+        summary["stages"][name] = reduced
+    return summary
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2339,6 +2387,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", default="normal", choices=["normal", "shadow"],
                         help="normal writes canonical; shadow is read-only evidence mode.")
     parser.add_argument("--json", default="true")
+    parser.add_argument("--summary", default="auto", choices=["auto", "true", "false"],
+                        help="auto summarizes scheduled stdout; false prints full JSON. Saved evidence stays complete.")
     args = parser.parse_args(argv)
 
     # Round-6b: the scheduled task launches this script as a bare file
@@ -2367,7 +2417,9 @@ def main(argv: list[str] | None = None) -> int:
         recovery_plan_only=args.recovery_plan,
     )
     if truthy(args.json):
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        summarize = args.summary == "true" or (args.summary == "auto" and args.trigger == "scheduled")
+        output = _console_summary(PROJECT_ROOT, report) if summarize else report
+        print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     return STATUS_TO_EXIT.get(str(report.get("status")), EXIT_INTERNAL_ERROR)
 
 

@@ -33,16 +33,13 @@ def test_invalid_price_is_never_a_usable_quote(price):
 def test_clock_without_date_does_not_become_today():
     result = check(quote(quote_time="15:00:02"),
                    now="2026-10-24T03:00:00+08:00", session="non_trading_day", expected=date(2026, 10, 23))
-    # A clock is never promoted to the viewer's date: the display date comes
-    # from the dated collection record (2026-10-23), not from now().
-    assert result["quote_timestamp_inferred"] is True
-    assert result["quote_timestamp"].startswith("2026-10-23")
-    assert not result["quote_timestamp"].startswith("2026-10-24")
+    # Collection time is not evidence of the provider quote date.
+    assert result["quote_timestamp_inferred"] is False
+    assert result["quote_timestamp"] == ""
     assert not result["usable_latest_quote"]
     assert not result["comparable_to_raw_daily"]
-    # 15:00 against a 10:00 collection record is not a plausible pair.
-    assert result["status"] == "invalid_time"
-    assert "quote_clock_after_collection" in result["reason_codes"]
+    assert result["status"] == "unverified_time"
+    assert "quote_timestamp_missing" in result["reason_codes"]
 
 
 def test_clock_without_date_and_without_collection_stays_unverified():
@@ -55,26 +52,25 @@ def test_clock_without_date_and_without_collection_stays_unverified():
     assert not result["usable_latest_quote"]
 
 
-def test_sina_style_clock_is_dated_by_our_own_collection_record():
-    # Real shape of the Sina spot snapshot: clock only, collection written a
-    # moment before the provider stamped the quote.
+def test_sina_style_clock_keeps_date_unknown_despite_collection_record():
+    # A recently collected quote can still be a previous day's cached quote.
     result = check(quote(quote_time="15:05:09", updated_at="2026-10-27T15:05:02+08:00",
                          quote_timestamp="", price_basis=""),
                    now="2026-10-27T20:00:00+08:00", session="non_trading_day", expected=date(2026, 10, 27))
-    assert result["quote_timestamp_inferred"] is True
-    assert result["quote_timestamp"] == "2026-10-27T15:05:09+08:00"
-    assert result["status"] == "session_snapshot"
-    assert result["usable_latest_quote"]
-    assert "quote_date_inferred_from_collection" in result["reason_codes"]
-    # The price basis is still unknown, so comparability is not claimed.
+    assert result["quote_timestamp_inferred"] is False
+    assert result["quote_timestamp"] == ""
+    assert result["collection_timestamp"] == "2026-10-27T15:05:02+08:00"
+    assert result["price_valid"]
+    assert result["status"] == "unverified_time"
+    assert not result["usable_latest_quote"]
     assert not result["comparable_to_raw_daily"]
 
 
 def test_closing_snapshot_window_covers_a_late_closing_print():
-    late = check(quote(quote_time="15:09:30", updated_at="2026-10-27T15:09:00+08:00", quote_timestamp=""),
+    late = check(quote(quote_time="15:09:30", quote_date="2026-10-27", updated_at="2026-10-27T15:09:00+08:00", quote_timestamp=""),
                  now="2026-10-27T20:00:00+08:00", session="non_trading_day", expected=date(2026, 10, 27))
     assert late["usable_latest_quote"]
-    too_late = check(quote(quote_time="15:30:00", updated_at="2026-10-27T15:29:00+08:00", quote_timestamp=""),
+    too_late = check(quote(quote_time="15:30:00", quote_date="2026-10-27", updated_at="2026-10-27T15:29:00+08:00", quote_timestamp=""),
                      now="2026-10-27T20:00:00+08:00", session="non_trading_day", expected=date(2026, 10, 27))
     assert not too_late["usable_latest_quote"]
 

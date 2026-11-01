@@ -56,6 +56,26 @@ def create_research_blueprint(deps: ResearchRouteDeps) -> Blueprint:
 
     bp = Blueprint("research_api", __name__)
 
+    @bp.route("/api/paper/observed-performance", methods=["GET"])
+    def get_paper_observed_performance() -> Any:
+        """Read recorded equity and exact-date local benchmarks without writing."""
+        from scripts.report_strategy_vs_benchmark import make_payload
+
+        root = deps.project_root()
+        try:
+            payload = make_payload(
+                root / "results/auto_paper_portfolio_history.json",
+                root / "state/auto_paper_portfolio.json",
+                root / "data/benchmark",
+                root / "data/calendar/a_share_trading_calendar.csv",
+            )
+            return jsonify(clean_payload({"ok": True, "research_only": True,
+                                          "paper_only": True, "report": payload}))
+        except (OSError, ValueError) as exc:
+            return jsonify({"ok": False, "status": "unavailable", "research_only": True,
+                            "message_for_ui": "账本或历史记录不可读，不能计算已有记录对照。",
+                            "error_type": type(exc).__name__}), 200
+
     @bp.route("/api/strategy-scorecard", methods=["GET"])
     def get_strategy_scorecard() -> Any:
         """Read-only strategy scorecard for the active 8000 UI."""

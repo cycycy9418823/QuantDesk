@@ -516,6 +516,7 @@ def recover_target_day_gaps(
 def merge_recovered_daily_status(
     original: Mapping[str, Any], refreshed: Mapping[str, Any], touched: Sequence[str],
     recovery: Mapping[str, Any],
+    *, ledger_reference: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Replace only touched securities; preserve the complete universe scope."""
     result, changed = dict(original), set(touched)
@@ -534,7 +535,13 @@ def merge_recovered_daily_status(
         value = {s: v for s, v in dict(original.get(key) or {}).items() if s not in changed}
         value.update({s: v for s, v in dict(refreshed.get(key) or {}).items() if s in changed})
         result[key] = value
-    result["target_day_gap_recovery"] = dict(recovery)
+    recovery_view = dict(recovery)
+    if ledger_reference is not None and "historical_ledger" in recovery_view:
+        # The chain owns the complete ledger once, in its run manifest.
+        # Standalone callers retain the original full-report contract.
+        recovery_view.pop("historical_ledger")
+        recovery_view["historical_ledger_ref"] = dict(ledger_reference)
+    result["target_day_gap_recovery"] = recovery_view
     calls = int(recovery.get("provider_calls_started") or 0)
     result["provider_calls"] = int(original.get("provider_calls") or 0) + calls
     result["network_effective"] = bool(original.get("network_effective") or calls)

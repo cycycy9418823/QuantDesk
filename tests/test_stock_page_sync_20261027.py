@@ -26,6 +26,24 @@ def _minute_frame(dates: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def test_research_brief_names_the_daily_close_and_preserves_its_data_date():
+    import scripts.quant_api_server as api
+    reference = {"available": True, "price_band": {"latest": 9.85}}
+    brief = api.build_stock_research_brief(reference, as_of="2026-10-28")
+    assert brief["data_date"] == "2026-10-28"
+    assert "日线收盘 9.85" in brief["current_state"]
+    assert "现价" not in brief["current_state"]
+    assert api.build_stock_research_brief(reference)["data_date"] == ""
+
+
+def test_observed_script_has_own_version_and_no_store_header():
+    import scripts.quant_api_server as api
+    assert "paper_observed" in api.daily_research_asset_versions()
+    response = api.app.test_client().get("/static/js/paper_observed.js")
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store, max-age=0"
+
+
 def test_minute_view_returns_only_the_latest_local_session(tmp_path, monkeypatch):
     import scripts.quant_api_server as api
     minute_dir = tmp_path / "1m"
@@ -92,14 +110,18 @@ def _client(deps: StockWorkbenchDeps):
     return app.test_client()
 
 
-def test_view_reports_the_selected_quote_scope_and_a_usable_closing_snapshot():
+def test_view_keeps_time_only_cached_price_visible_but_not_verified():
     client = _client(_deps(Path("."), network=True))
     payload = client.get("/api/stock/600000/workbench").get_json()
     assert payload["network_enabled"] is True
     evidence = payload["quote_evidence"]
-    assert evidence["usable_latest_quote"] is True
-    assert evidence["quote_timestamp_inferred"] is True
-    assert evidence["quote_timestamp"] == "2026-10-27T15:05:09+08:00"
+    assert payload["quote"]["price"] == 9.82
+    assert evidence["usable_latest_quote"] is False
+    assert evidence["status"] == "unverified_time"
+    assert evidence["quote_timestamp_inferred"] is False
+    assert evidence["quote_timestamp"] == ""
+    assert evidence["collection_timestamp"] == "2026-10-27T15:05:02+08:00"
+    assert evidence["comparable_to_raw_daily"] is False
 
 
 def test_auto_refresh_stays_off_when_the_quote_scope_is_closed():

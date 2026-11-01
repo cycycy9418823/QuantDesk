@@ -135,6 +135,26 @@ def test_cache_normalization_preserves_explicit_date_and_basis():
     assert frame.iloc[0]["price_basis"] == "raw"
 
 
+def test_cache_keeps_row_fetched_at_as_collection_evidence():
+    from scripts.server.helpers import market
+    frame = market._canonical_spot_frame(pd.DataFrame([
+        {"symbol": "600000", "price": 10, "quote_time": "15:05:22",
+         "fetched_at": "2026-10-28T15:05:25+08:00"},
+        {"symbol": "000001", "price": 10, "quote_time": "15:05:22",
+         "fetched_at": "2026-10-28T15:05:25+08:00", "updated_at": "2026-10-28T15:05:26+08:00"},
+    ]))
+    assert frame.iloc[0]["updated_at"] == "2026-10-28T15:05:25+08:00"
+    assert frame.iloc[1]["updated_at"] == "2026-10-28T15:05:26+08:00"
+
+
+def test_missing_row_collection_time_does_not_use_global_cache_or_file_time(monkeypatch):
+    from scripts.server.helpers import market
+    monkeypatch.setattr(market, "load_spot_snapshot_frame", lambda: pd.DataFrame([
+        {"symbol": "600000", "price": 10, "quote_time": "15:05:22", "source": "fixture"}]))
+    monkeypatch.setattr(market, "spot_snapshot_updated_at", lambda: "2026-10-28T15:05:25+08:00")
+    assert market.spot_quote_for_symbol("600000")["updated_at"] == ""
+
+
 def test_provider_missing_clock_does_not_invent_quote_timestamp(monkeypatch):
     from scripts.server.helpers import market
     import requests

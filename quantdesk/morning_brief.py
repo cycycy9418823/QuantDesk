@@ -8,7 +8,7 @@ import re
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -669,12 +669,18 @@ def build_morning_brief(
     as_of = str(chain.get("target_date") or "")
     run_id = str(chain.get("run_id") or "")
     generated = now or datetime.now(SHANGHAI)
+    if generated.tzinfo is None:
+        generated = generated.replace(tzinfo=SHANGHAI)
+    date_check = _brief_business_date(Path(project_root), generated, as_of)
+    if date_check["date_reason_code"]:
+        reasons.append(date_check["date_reason_code"])
     payload: dict[str, Any] = {
         "schema_version": "1",
         "task_type": "morning_brief",
-        "status": "blocked" if snapshot.get("status") == "blocked" else "passed",
+        "status": "blocked" if snapshot.get("status") == "blocked" else "warning" if date_check["date_reason_code"] else "passed",
         "generated_at": generated.astimezone(SHANGHAI).isoformat(timespec="seconds"),
         "as_of": as_of,
+        **date_check,
         "run_id": run_id,
         "source_mode": str(snapshot.get("source_mode") or "none"),
         "lock_snapshot": dict(snapshot.get("lock_snapshot") or {}),
@@ -1011,6 +1017,12 @@ def render_morning_brief_markdown(payload: Mapping[str, Any]) -> str:
     lines = [
         "# QuantDesk 研究早报",
         f"- 数据日期：{as_of}",
+        (
+            f"- 早报应对应：{_safe_text(payload.get('expected_as_of'), limit=10) or '未核实'}；日期核对："
+            + {"current": "已核对", "stale": "旧日资料", "future": "日期超前"}.get(
+                str(payload.get("date_status") or ""), "未核实"
+            )
+        ),
         f"- 数据链：{run_id} / {_safe_text(health.get('chain_status'), limit=32) or '不可用'}",
         (
             "- 数据健康：日线 "
@@ -1184,6 +1196,61 @@ def _receipt_path(root: Path, now: datetime, content_sha256: str) -> Path:
     )
 
 
+def _brief_business_date(root: Path, now: datetime, as_of: object) -> dict[str, str]:
+    """Verify every consulted calendar day, then compare the original data date.
+
+    Taking the largest recorded open date can silently jump over a missing or
+    malformed row. Walk backwards instead; only the consulted interval matters,
+    so provisional future years do not invalidate a verified historical date.
+    """
+    from quantdesk.trading_calendar import load_a_share_trading_calendar
+
+    local = now.replace(tzinfo=SHANGHAI) if now.tzinfo is None else now.astimezone(SHANGHAI)
+    unverified = {
+        "expected_as_of": "", "date_status": "unverified",
+        "date_reason_code": "brief_delivery_calendar_unverified",
+    }
+    calendar = load_a_share_trading_calendar(root / "data/calendar/a_share_trading_calendar.csv")
+    lookup = calendar.get("is_open_by_date") or {}
+    rows = calendar.get("rows_by_date") or {}
+    if calendar.get("weekend_only"):
+        return {**unverified, "date_reason_detail": "calendar_not_verified"}
+    true_flags = {"1", "true", "t", "yes", "y", "是"}
+    false_flags = {"0", "false", "f", "no", "n", "否"}
+    cursor = local.date()
+    expected = ""
+    for _ in range(371):
+        day = cursor.isoformat()
+        row = rows.get(day)
+        if day not in lookup or not isinstance(row, Mapping):
+            return {**unverified, "date_reason_detail": f"calendar_interval_row_missing:{day}"}
+        if row.get("row_count") != "1":
+            return {**unverified, "date_reason_detail": f"calendar_interval_row_ambiguous:{day}"}
+        flag = str(row.get("is_open_raw") or "").strip().lower()
+        if flag not in true_flags | false_flags or (flag in true_flags) != lookup[day]:
+            return {**unverified, "date_reason_detail": f"calendar_interval_open_flag_unverified:{day}"}
+        if "provisional" in (str(row.get("source") or "") + " " + str(row.get("note") or "")).lower():
+            return {**unverified, "date_reason_detail": f"calendar_interval_provisional:{day}"}
+        if cursor < local.date() and lookup[day] is True:
+            expected = day
+            break
+        cursor -= timedelta(days=1)
+    if not expected:
+        return {**unverified, "date_reason_code": "brief_previous_trade_date_unverified"}
+    observed = str(as_of or "")
+    try:
+        valid_date = bool(_DATE_RE.fullmatch(observed)) and date.fromisoformat(observed).isoformat() == observed
+    except ValueError:
+        valid_date = False
+    if not valid_date:
+        return {"expected_as_of": expected, "date_status": "unverified", "date_reason_code": "brief_business_date_missing"}
+    if observed == expected:
+        return {"expected_as_of": expected, "date_status": "current", "date_reason_code": ""}
+    return {"expected_as_of": expected,
+            "date_status": "stale" if observed < expected else "future",
+            "date_reason_code": "brief_business_date_stale" if observed < expected else "brief_business_date_future"}
+
+
 def run_morning_brief(
     project_root: str | Path,
     *,
@@ -1207,6 +1274,12 @@ def run_morning_brief(
     try:
         with interprocess_file_lock(lock_path, timeout_seconds=0):
             payload = build_morning_brief(root, now=current)
+            date_check = _brief_business_date(root, current, payload.get("as_of"))
+            payload.update(date_check)
+            if date_check["date_reason_code"]:
+                payload["reason_codes"] = _unique([*(payload.get("reason_codes") or []), date_check["date_reason_code"]])
+                if payload.get("status") != "blocked":
+                    payload["status"] = "warning"
             markdown = render_morning_brief_markdown(payload)
             title = f"QuantDesk 研究早报 {payload.get('as_of') or '数据待核'}"
             content_sha256 = hashlib.sha256(
@@ -1221,6 +1294,9 @@ def run_morning_brief(
                 "task_type": "morning_brief_delivery",
                 "brief_status": payload.get("status"),
                 "as_of": payload.get("as_of"),
+                "expected_as_of": date_check["expected_as_of"],
+                "date_status": date_check["date_status"],
+                "date_reason_detail": date_check.get("date_reason_detail", ""),
                 "run_id": payload.get("run_id"),
                 "content_sha256": content_sha256,
                 "external_sent_count": 0,
@@ -1261,6 +1337,12 @@ def run_morning_brief(
                     **base_result,
                     "status": "blocked",
                     "reason_code": "outside_delivery_window",
+                }
+            if date_check["date_reason_code"]:
+                return {
+                    **base_result,
+                    "status": "blocked",
+                    "reason_code": date_check["date_reason_code"],
                 }
 
             # Every gate below must stay ahead of the secret loader and the

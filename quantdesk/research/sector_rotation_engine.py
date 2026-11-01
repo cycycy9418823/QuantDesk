@@ -5,6 +5,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from quantdesk.research._serialization import json_safe as _json_safe
+
 import pandas as pd
 
 from quantdesk.csv_io import read_csv_frame
@@ -35,28 +37,6 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     except Exception:
         return default
     return number if math.isfinite(number) else default
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, tuple):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if hasattr(value, "item"):
-        try:
-            return _json_safe(value.item())
-        except Exception:
-            pass
-    try:
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
-    return value
 
 
 def _prepare_price_panel(price_panel: pd.DataFrame) -> pd.DataFrame:

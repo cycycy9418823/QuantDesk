@@ -116,6 +116,23 @@ def test_real_chain_publishes_final_history_even_when_today_is_present(
     assert (DAY in first["recovered_dates"]) == (mode != "no_session")
     assert first["verified_no_session_dates"] == ([DAY] if mode == "no_session" else [])
     assert result["status"] == "completed"  # Historical labels never add a chain gate.
+    # The full ledger belongs to the run's recovery component. Daily and
+    # critical summaries must not serialize two more copies of every date.
+    manifest_path = tmp_path / result["manifest_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert json.dumps(manifest).count('"historical_ledger":') == 1
+    views = [manifest["components"]["daily_update"],
+             manifest["components"]["critical_daily_update"],
+             json.loads((manifest_path.parent / "daily_update.json").read_text(encoding="utf-8"))]
+    for view in views:
+        reference = view["target_day_gap_recovery"]["historical_ledger_ref"]
+        assert reference["run_id"] == "ledger-" + mode
+        assert reference["target_date"] == DAY
+        evidence = json.loads((tmp_path / reference["path"]).read_text(encoding="utf-8"))
+        for key in reference["json_pointer"].strip("/").split("/"):
+            evidence = evidence[key]
+        assert evidence == ledger
+        assert "historical_ledger" not in view["target_day_gap_recovery"]
     if mode == "already_today":
         assert calls == []
     else:
