@@ -25,6 +25,7 @@ from quantdesk.candidate_contract import candidate_rows_from_strategy_payload
 from quantdesk.data_update_staging import atomic_write_text
 from quantdesk.interprocess_lock import interprocess_file_lock
 from quantdesk.shared import normalize_symbol
+from quantdesk.shared import read_json_strict as _read_json_strict
 from quantdesk.utils import atomic_write_json
 
 
@@ -2016,22 +2017,6 @@ def enrich_legacy_due_plan_candidate_envelopes(
     }
 
 
-def _read_json_strict(path: Path) -> tuple[dict[str, Any] | None, str]:
-    if not path.exists():
-        return None, "missing"
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeError):
-        return None, "unreadable"
-    if not text.strip():
-        return None, "empty"
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return None, "invalid_json"
-    if not isinstance(payload, dict) or not payload:
-        return None, "invalid_object"
-    return payload, ""
 
 
 def _exclusive_write_json(path: Path, payload: Mapping[str, Any]) -> None:

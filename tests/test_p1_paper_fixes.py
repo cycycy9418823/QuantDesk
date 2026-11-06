@@ -900,6 +900,7 @@ def test_conditional_execution_applies_unified_trade_costs() -> None:
                     "strategy_type": "long",
                     "quantity": 100,
                     "sellable_quantity": 100,
+                    "entry_date": "2026-06-19",
                     "avg_cost": 10.055,
                     "entry_price": 10.055,
                 }

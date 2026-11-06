@@ -141,6 +141,24 @@ def read_json(path: str | Path, default: Any = None) -> Any:
         return default
 
 
+def read_json_strict(path: Path) -> tuple[dict[str, Any] | None, str]:
+    if not path.exists():
+        return None, "missing"
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        return None, "unreadable"
+    if not text.strip():
+        return None, "empty"
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None, "invalid_json"
+    if not isinstance(payload, dict) or not payload:
+        return None, "invalid_object"
+    return payload, ""
+
+
 def read_json_default_dict(path: str | Path, default: Any = None) -> Any:
     return read_json(path, {} if default is None else default)
 

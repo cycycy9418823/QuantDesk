@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 
 from quantdesk.csv_io import read_csv_frame
 from quantdesk.interprocess_lock import interprocess_file_lock
-from quantdesk.intraday.minute_storage import minute_write_path, resolve_minute_read_path
+from quantdesk.intraday.minute_storage import resolve_minute_read_path
 from quantdesk.price_basis import classify_frame_price_basis
 from quantdesk.shared import normalize_symbol
 
@@ -296,8 +296,11 @@ def verify_plan_review_receipt(
                 errors.append("receipt_input_path_invalid")
             else:
                 requested = _input_path(root, item.get("requested_path")) if item.get("requested_path") else path
-                if (requested is None or requested.name != path.name
-                        or (requested != path and minute_write_path(requested).resolve() != path)):
+                try:
+                    selected = resolve_minute_read_path(requested).resolve() if requested is not None else None
+                except (OSError, RuntimeError, ValueError):
+                    selected = None
+                if requested is None or requested.name != path.name or selected != path:
                     errors.append("receipt_input_path_invalid")
                 else:
                     input_parents.add(requested.parent)
@@ -452,9 +455,9 @@ def plan_review_snapshot(
 
 def load_plan_review_snapshot(project_root: Path) -> dict[str, Any]:
     """Read the published review view; never review inputs or write on GET."""
-    from quantdesk.daily_candidate_refresh import _read_json_strict
+    from quantdesk.shared import read_json_strict
 
-    payload, error = _read_json_strict(Path(project_root) / STORE_PATH / "latest.json")
+    payload, error = read_json_strict(Path(project_root) / STORE_PATH / "latest.json")
     if error or not isinstance(payload, dict):
         return {"plan_review_summary": {"status": "missing" if error == "missing" else "blocked",
                                         "reason_codes": [f"plan_review_snapshot_{error or 'invalid'}"]},

@@ -231,6 +231,10 @@ class BacktestStatisticalValidationAndFeatureQualityAuditTests(unittest.TestCase
                     "2026-05-19",
                     "--backtest-result",
                     str(backtest_path),
+                    "--output-path",
+                    str(Path(tmp) / "validation.json"),
+                    "--report-path",
+                    str(Path(tmp) / "validation.md"),
                     "--network",
                     "false",
                     "--iterations",
@@ -245,8 +249,11 @@ class BacktestStatisticalValidationAndFeatureQualityAuditTests(unittest.TestCase
                 capture_output=True,
                 check=False,
             )
+            result = json.loads((Path(tmp) / "validation.json").read_text(encoding="utf-8"))
+            self.assertTrue((Path(tmp) / "validation.md").is_file())
         self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
         self.assertIn("不主动联网", completed.stdout)
+        self.assertEqual(result["status"], "insufficient_sample")
 
     def test_feature_audit_empty_data_returns_warning_exit_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

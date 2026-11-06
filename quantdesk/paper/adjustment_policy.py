@@ -235,11 +235,18 @@ def load_adjustment_factor_table(
 
 def _raw_valuation(position: dict[str, Any], latest_price: float) -> dict[str, Any]:
     quantity = safe_int(position.get("quantity") or position.get("shares"), 0) or 0
-    entry_price = safe_float(position.get("entry_price") or position.get("avg_cost") or position.get("buy_price"), latest_price) or latest_price
-    cost = entry_price * quantity
+    # Only recorded shares and cost belong to the cash ledger. A factor is not
+    # evidence of a share distribution or a cash dividend.
+    unit_cost = safe_float(position.get("avg_cost") or position.get("entry_price") or position.get("buy_price"), latest_price) or latest_price
+    cost = unit_cost * quantity
     market_value = latest_price * quantity
     pnl = market_value - cost
     row = dict(position)
+    for key in ("adjusted_quantity_for_valuation", "adjusted_avg_cost", "adjustment_factor_ratio",
+                "factor_research_proxy", "adj_factor_table_last_date"):
+        row.pop(key, None)
+    row["valuation_quantity_basis"] = "recorded_shares"
+    row["corporate_action_status"] = "unverified"
     row["latest_price"] = _round_number(latest_price)
     row["market_value"] = round(market_value, 2)
     row["unrealized_pnl"] = round(pnl, 2)
@@ -255,16 +262,10 @@ def apply_paper_adjustment_policy(
     latest_date: str,
     factors: AdjustmentFactorTable | None,
 ) -> dict[str, Any]:
-    """Mark a paper position using raw price plus adjustment-factor evidence.
-
-    The policy keeps the paper ledger on current-share economic exposure:
-    `factor_ratio = latest_adj_factor / entry_adj_factor`.
-    """
+    """Mark recorded shares at raw price; expose factors only as research evidence."""
 
     row = _raw_valuation(position, latest_price)
     row["latest_date"] = latest_date or row.get("latest_date") or ""
-    quantity = safe_int(row.get("quantity") or row.get("shares"), 0) or 0
-    entry_price = safe_float(row.get("avg_cost") or row.get("entry_price") or row.get("buy_price"), latest_price) or latest_price
     entry_date = row.get("entry_date") or row.get("buy_date") or row.get("first_buy_date") or ""
     symbol = row.get("symbol") or row.get("code")
     entry_factor = factors.factor_at_or_before(symbol, entry_date) if factors else None
@@ -299,23 +300,22 @@ def apply_paper_adjustment_policy(
         return row
 
     ratio = latest_factor / entry_factor
-    adjusted_quantity = quantity * ratio
-    adjusted_avg_cost = entry_price / ratio if ratio else entry_price
-    market_value = latest_price * adjusted_quantity
-    cost = entry_price * quantity
-    pnl = market_value - cost
-    row["price_adjustment_status"] = "adjusted"
-    row["price_adjustment_mode"] = "raw_price_with_adj_factor_current_basis"
-    row["price_adjustment_warning_level"] = "none"
+    row["price_adjustment_status"] = "factor_reference_only"
+    row["price_adjustment_mode"] = "raw_price_recorded_shares"
+    row["price_adjustment_warning_level"] = "warning"
+    row["price_adjustment_warning"] = (
+        "adjustment factors are research evidence, not verified share or dividend events; "
+        "recorded shares and cash retained; corporate-action total return remains unverified"
+    )
     row["entry_adj_factor"] = float(entry_factor)
     row["latest_adj_factor"] = float(latest_factor)
-    row["adjustment_factor_ratio"] = _round_number(ratio, 6)
-    row["adjusted_avg_cost"] = _round_number(adjusted_avg_cost)
-    row["adjusted_quantity_for_valuation"] = int(adjusted_quantity) if abs(adjusted_quantity - round(adjusted_quantity)) < 1e-9 else round(adjusted_quantity, 4)
-    row["market_value"] = round(market_value, 2)
-    row["unrealized_pnl"] = round(pnl, 2)
-    row["return_pct"] = round((pnl / cost) * 100.0, 2) if cost else 0.0
-    row["unrealized_return_pct"] = row["return_pct"]
+    row["factor_research_proxy"] = {
+        "factor_ratio": _round_number(ratio, 6),
+        "from_date": str(entry_date)[:10], "to_date": str(latest_date)[:10],
+        "included_in_equity": False, "executable_quantity": False,
+        "status": "research_only_unverified", "lot_history_verified": False,
+        "note": "first-entry factor comparison only; later additions and cash entitlements are not reconstructed",
+    }
     return row
 
 
@@ -331,6 +331,27 @@ def apply_suspension_valuation_policy(position: dict[str, Any], quote: dict[str,
     row = dict(position)
     quote = dict(quote or {})
     if not _is_suspended_quote(quote):
+        price = safe_float(quote.get("price", quote.get("close")), None)
+        quote_day = _date_key(quote.get("date") or quote.get("quote_date"))
+        target_day = _date_key(row.get("valuation_date") or row.get("expected_settlement_date") or row.get("settlement_date"))
+        volume = safe_float(quote.get("volume"), None)
+        resumed = (price is not None and price > 0 and quote.get("price_basis") == "raw"
+                   and not quote.get("price_basis_reason") and not quote.get("missing")
+                   and quote.get("bar_valid") is not False and volume is not None and volume > 0
+                   and quote_day is not None and quote_day == target_day)
+        # A fresh quote clears only this policy's own suspension restriction.
+        # Delisting/manual blocks and unrelated valuation warnings remain in force.
+        suspension_only = (row.get("tradeability_status") == "suspended"
+                           and row.get("valuation_status") in {"suspended_frozen", "normal"}
+                           and str(row.get("valuation_warning") or "").startswith("suspended:"))
+        if resumed and suspension_only:
+            row.update(tradeability_status="tradable", tradable=True, can_sell=True)
+            if row.get("valuation_status") == "suspended_frozen":
+                row["valuation_status"] = "normal"
+            for key in ("suspend_type", "suspend_reason"):
+                row.pop(key, None)
+            if str(row.get("valuation_warning") or "").startswith("suspended:"):
+                row.pop("valuation_warning", None)
         row.setdefault("valuation_status", "normal")
         row.setdefault("tradeability_status", "tradable")
         row.setdefault("tradable", True)

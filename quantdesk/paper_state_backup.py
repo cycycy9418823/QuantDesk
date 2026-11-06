@@ -66,6 +66,15 @@ def _allow_evidence_path(relative: Path) -> bool:
         "results/strategy_decision_log_latest.json", "results/strategy_decision_review_latest.json",
         "results/auto_paper_portfolio_latest.json", "results/auto_paper_portfolio_history.json"}:
         return True
+    name = relative.as_posix()
+    if name in {"results/strategy_evidence/latest.json", "data/metadata/adjustment_evidence/index.json"}:
+        return True
+    if re.fullmatch(r"results/(?:strategy_evidence|daily_evidence)/\d{4}-\d{2}-\d{2}/(?:[0-9a-f]{64}|latest)\.json", name):
+        return True
+    if re.fullmatch(r"results/strategy_evidence/blobs/[0-9a-f]{64}\.(?:json|csv|bin)", name):
+        return True
+    if re.fullmatch(r"data/metadata/adjustment_evidence/(?:blobs/[0-9a-f]{64}\.(?:json|csv|bin)|\d{4}-\d{2}-\d{2}/[0-9a-f]{64}\.json)", name):
+        return True
     if len(parts) >= 3 and parts[0] in {"state", "results"} and parts[1] in {"ai_trader", "ai_trader_glm"}:
         return ((len(parts) == 3 and parts[-1] in _EVIDENCE_NAMES)
             or (len(parts) == 4 and parts[2] == "llm_requests" and parts[-1].endswith(".json"))
@@ -112,7 +121,7 @@ def _check_evidence_object(obj: Any, relative: Path, *, expected_account: str | 
                 reference_key = key in {"capture_path", "evidence_path", "body_path", "manifest_path", "archive_path"}
                 reference_key |= relative.name == "decision_run_manifest.json" and key in {"page_html", "page_md", "log"}
                 if reference_key and isinstance(item, str) and item:
-                    expected_sha = value.get("capture_sha256") or value.get("file_sha256") or value.get("sha256")
+                    expected_sha = value.get("capture_sha256") or value.get("file_sha256") or value.get("sha256") or value.get("manifest_sha256")
                     reference = {"path": item, "sha256": str(expected_sha or "")}
                     if key == "archive_path":
                         from ai_trader.execution_evidence import verify_execution_receipt
@@ -165,8 +174,87 @@ def _verify_execution_reference(relative: Path, raw: bytes, reference: Mapping[s
         raise ValueError("backup_execution_archive_binding_mismatch:" + relative.as_posix())
 
 
+def _research_evidence_seeds(root: Path) -> list[str]:
+    """Only immutable manifests and their declared dependencies, not all daily CSVs."""
+    paths = []
+    for base in (root / "results/strategy_evidence", root / "results/daily_evidence"):
+        if base.is_dir():
+            paths.extend(path.relative_to(root).as_posix() for path in base.glob("????-??-??/latest.json"))
+    for relative in (Path("results/strategy_evidence/latest.json"), Path("data/metadata/adjustment_evidence/index.json")):
+        if (root / relative).is_file():
+            paths.append(relative.as_posix())
+    return sorted(set(paths))
+
+
+def _research_business_scope(contents: Mapping[str, bytes], target_date: str | None = None) -> dict[str, Any]:
+    """Describe frozen business dates separately from byte-copy integrity."""
+    assessments = []
+    for name, raw in contents.items():
+        if name.startswith(("results/daily_evidence/", "results/strategy_evidence/")) and name.endswith(".json"):
+            try:
+                value = json.loads(raw.decode("utf-8-sig"))
+            except (ValueError, UnicodeError):
+                continue
+            if isinstance(value, dict) and value.get("schema") == "daily_evidence.v1" and value.get("kind") == "assessment":
+                assessments.append(value)
+    target = target_date or max((row.get("target_date", "") for row in assessments), default="") or None
+    try:
+        raw_book = contents["state/auto_paper_portfolio.json"]
+        book = json.loads(raw_book.decode("utf-8-sig"))
+        valuation = book.get("valuation_date")
+        book_sha = hashlib.sha256(raw_book).hexdigest()
+    except (KeyError, ValueError, AttributeError, UnicodeError):
+        valuation, book_sha = None, None
+
+    def captured_object(reference: Mapping[str, Any]) -> dict[str, Any]:
+        raw = contents[reference["capture_path"]]
+        if hashlib.sha256(raw).hexdigest() != reference["capture_sha256"]:
+            raise ValueError("backup_research_reference_hash_mismatch")
+        value = json.loads(raw.decode("utf-8-sig"))
+        if not isinstance(value, dict):
+            raise ValueError("backup_research_reference_object_invalid")
+        return value
+
+    current: dict[str, Any] = {}
+    archive: dict[str, Any] = {}
+    bound = False
+    try:
+        # A retained earlier success must never override the latest receipt.
+        review_pointer = json.loads(contents[f"results/daily_evidence/{target}/latest.json"].decode("utf-8-sig"))
+        archive_pointer = json.loads(contents[f"results/strategy_evidence/{target}/latest.json"].decode("utf-8-sig"))
+        current = captured_object(review_pointer)
+        archive = captured_object(archive_pointer)
+        same_requirements = captured_object(archive["requirements_source"]) == current["requirements"]
+        bound = bool(
+            review_pointer.get("schema") == "daily_evidence.v1"
+            and archive_pointer.get("schema") == "strategy_evidence.v1"
+            and review_pointer.get("target_date") == archive_pointer.get("target_date") == target
+            and current.get("schema") == "daily_evidence.v1" and current.get("kind") == "assessment"
+            and archive.get("schema") == "strategy_evidence.v1"
+            and current.get("target_date") == archive.get("target_date") == target
+            and current.get("stage") == "evening_review"
+            and current.get("run_id") == archive.get("run_id")
+            and (archive.get("after_state") or {}).get("capture_sha256") == book_sha
+            and current["current"]["archive"]["manifest_reference"]["capture_sha256"] == archive_pointer["capture_sha256"]
+            and same_requirements
+        )
+    except (KeyError, ValueError, TypeError, AttributeError, UnicodeError):
+        bound = False
+    ready = bool(target and valuation == target and bound
+                 and current.get("current", {}).get("status") == "ready"
+                 and archive.get("status") == "ready")
+    return {"target_date": target, "strategy_valuation_date": valuation,
+        "ledger_current": valuation == target if target else None,
+        "dated_review_and_book_bound": bound, "material_restore_ready": ready,
+        "status": "ready" if ready else "incomplete" if target else "not_assessed",
+        "historical_trade_evidence_complete": False,
+        "reason_codes": [] if ready else ["backup_copied_bytes_do_not_prove_dated_research_materials"],
+        "note": "byte verification and an actually restored directory are reported separately; no old trades reconstructed"}
+
+
 def build_backup_evidence_closure(source_root: Path | str, *, seed_paths: list[str] | None = None,
-                                 reference_origin_root: Path | str | None = None) -> dict[str, Any]:
+                                 reference_origin_root: Path | str | None = None,
+                                 target_date: str | None = None) -> dict[str, Any]:
     """Bounded allowlisted dependency closure for three formal paper ledgers."""
     root = Path(source_root).resolve()
     origin = Path(reference_origin_root).resolve() if reference_origin_root is not None else root
@@ -180,6 +268,7 @@ def build_backup_evidence_closure(source_root: Path | str, *, seed_paths: list[s
         pending.extend(p.as_posix() for p in (Path("docs/learning_log.md"),
             Path("results/auto_paper_portfolio_latest.json"), Path("results/auto_paper_portfolio_history.json"),
             Path("results/strategy_decision_log_latest.json"), Path("results/strategy_decision_review_latest.json")) if (root / p).is_file())
+        pending.extend(_research_evidence_seeds(root))
     content: dict[str, bytes] = {}
     references = []
     errors: list[str] = []
@@ -223,20 +312,22 @@ def build_backup_evidence_closure(source_root: Path | str, *, seed_paths: list[s
     files = [{"path": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
         for name, raw in sorted(content.items())]
     return {"ok": not errors, "status": "ready" if not errors else "blocked", "files": files,
+        "research_business_scope": _research_business_scope(content, target_date),
         "contents": content, "references": references, "errors": errors, "bytes": total,
         "network_used": False, "runtime_written": False, "source_root": str(root), "reference_origin_root": str(origin)}
 
 
 def pack_backup_evidence(source_root: Path | str, archive_path: Path | str, *, seed_paths: list[str] | None = None,
-                         reference_origin_root: Path | str | None = None) -> dict[str, Any]:
+                         reference_origin_root: Path | str | None = None, target_date: str | None = None) -> dict[str, Any]:
     source, target = Path(source_root).resolve(), Path(archive_path).resolve()
     _assert_external_destination(source, target)
-    closure = build_backup_evidence_closure(source, seed_paths=seed_paths, reference_origin_root=reference_origin_root)
+    closure = build_backup_evidence_closure(source, seed_paths=seed_paths, reference_origin_root=reference_origin_root, target_date=target_date)
     if not closure["ok"]:
         return {k: v for k, v in closure.items() if k != "contents"}
     if target.exists():
         raise FileExistsError("backup_archive_already_exists")
     manifest = {"schema": "paper_evidence_closure.v1", "source_root": str(source), "files": closure["files"],
+        "research_business_scope": closure["research_business_scope"],
         "reference_origin_root": closure["reference_origin_root"],
         "references": closure["references"], "network_used": False, "restore_apply": False}
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -251,7 +342,8 @@ def pack_backup_evidence(source_root: Path | str, archive_path: Path | str, *, s
     return {**verification, "archive": str(target), "archive_sha256": _sha256(target)[1], "runtime_written": False}
 
 
-def verify_backup_archive(archive_path: Path | str, *, isolated_restore_root: Path | str | None = None) -> dict[str, Any]:
+def verify_backup_archive(archive_path: Path | str, *, isolated_restore_root: Path | str | None = None,
+                          target_date: str | None = None) -> dict[str, Any]:
     """Verify bytes and closure before optionally restoring into a NEW empty folder."""
     path = Path(archive_path).resolve()
     errors: list[str] = []
@@ -317,6 +409,10 @@ def verify_backup_archive(archive_path: Path | str, *, isolated_restore_root: Pa
                 raise ValueError("backup_archive_reference_incomplete")
         if sorted(derived_refs) != sorted((r["from"], r["path"], r["sha256"]) for r in manifest["references"]):
             raise ValueError("backup_archive_dependency_closure_mismatch")
+        if "research_business_scope" in manifest:
+            actual = _research_business_scope(blobs, manifest["research_business_scope"].get("target_date"))
+            if actual != manifest["research_business_scope"]:
+                raise ValueError("backup_archive_business_scope_mismatch")
     except (OSError, ValueError, TypeError, KeyError, UnicodeError, tarfile.TarError) as exc:
         errors.append(type(exc).__name__ + ":" + str(exc))
     restored = False
@@ -339,6 +435,7 @@ def verify_backup_archive(archive_path: Path | str, *, isolated_restore_root: Pa
     execution_refs = [row for row in archive_references if isinstance(row, dict)
                       and "/execution_evidence/" in str(row.get("path") or "")]
     return {"ok": not errors, "status": "passed" if not errors else "blocked", "errors": errors,
+        "research_business_scope": _research_business_scope(blobs, target_date or (manifest.get("research_business_scope") or {}).get("target_date")),
         "file_count": len(blobs), "references": archive_references,
         "execution_archive_reference_count": len(execution_refs),
         "historical_trade_evidence_complete": None,
@@ -549,6 +646,12 @@ def backup_paper_state(
         raise FileExistsError(f"backup destination already exists: {backup_dir}")
 
     specs = _specs(source, owner_learning_log)
+    research_seeds = _research_evidence_seeds(source)
+    research_closure = build_backup_evidence_closure(source, seed_paths=research_seeds) if research_seeds else None
+    if research_closure is not None:
+        existing_paths = {spec.relative_path.as_posix() for spec in specs}
+        specs += tuple(ArtifactSpec("evidence:" + row["path"], Path(row["path"]))
+                       for row in research_closure["files"] if row["path"] not in existing_paths)
     for spec in specs:
         resolved = (source / spec.relative_path).resolve()
         if source not in resolved.parents:
@@ -558,6 +661,8 @@ def backup_paper_state(
     required_missing = set(spec.name for spec in _missing_required_specs(source, owner_learning_log))
     artifacts: list[dict[str, Any]] = []
     warnings: list[str] = []
+    if research_closure is not None:
+        warnings.extend(research_closure["errors"])
     before: dict[str, tuple[int, str]] = {}
     for spec in specs:
         path = source / spec.relative_path
@@ -638,6 +743,10 @@ def backup_paper_state(
         "restore_apply": False,
         "network_used": False,
         "canonical_runtime_written": False,
+        "research_business_scope": (_research_business_scope({**research_closure["contents"],
+            **({"state/auto_paper_portfolio.json": (source / "state/auto_paper_portfolio.json").read_bytes()}
+               if (source / "state/auto_paper_portfolio.json").is_file() else {})})
+            if research_closure is not None else {"status": "not_assessed"}),
     }
     if not dry_run:
         _atomic_json(manifest_path, manifest)

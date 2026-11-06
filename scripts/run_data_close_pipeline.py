@@ -1085,6 +1085,8 @@ def stage_research_chain(
     **_kw: Any,
 ) -> StageResult:
     started = _now_iso()
+    stage_started = time.monotonic()
+    evidence_reserve = min(65, max(0, int(timeout) // 10)) if network and pipeline_run_id and pipeline_lock is not None else 0
     command = [
         sys.executable, "-B", str(root / "scripts" / "run_daily_data_chain.py"),
         "--trigger", str(trigger or "manual"), "--json", "true",
@@ -1100,7 +1102,7 @@ def stage_research_chain(
     if network:
         command.append("--enable-network")
     status, reasons, payload = _run_owned_subprocess(
-        root, "research_chain", command, timeout=timeout, pipeline_run_id=pipeline_run_id,
+        root, "research_chain", command, timeout=max(1, timeout - evidence_reserve), pipeline_run_id=pipeline_run_id,
         pipeline_lock=pipeline_lock, target=target,
     )
     # A killed child cannot publish a terminal manifest. Keep its small phase
@@ -1117,6 +1119,31 @@ def stage_research_chain(
         and progress.get("pid") == payload["child_pid"]
     ):
         payload["progress_evidence"] = progress
+    # Candidates exist only after the research child. Factor maintenance uses
+    # the same OS-locked Pipeline writer, not a second scheduler or bar sweep.
+    candidate = root / "results/candidate_refresh/daily" / f"{target}.json"
+    remaining = max(0, int(timeout - (time.monotonic() - stage_started)))
+    if (network and pipeline_run_id and pipeline_lock is not None
+            and status in {"completed", "completed_with_warnings"} and candidate.is_file()
+            and not payload.get("orphan_alive") and remaining > 5):
+        factor_timeout = min(65, remaining)
+        factor_command = [sys.executable, "-B", str(root / "scripts/run_daily_data_refresh.py"),
+            "--evidence-only", "--enable-network", "--target-date", target,
+            "--pipeline-run-id", pipeline_run_id, "--max-refresh-seconds", str(max(0, factor_timeout - 5)),
+            "--json", "true"]
+        factor_status, factor_reasons, factor_payload = _run_owned_subprocess(
+            root, "market_refresh", factor_command, timeout=factor_timeout,
+            pipeline_run_id=pipeline_run_id, pipeline_lock=pipeline_lock, target=target,
+        )
+        payload["daily_evidence_phase"] = {"status": factor_status, "reason_codes": factor_reasons, "payload": factor_payload}
+        if factor_payload.get("orphan_alive"):
+            payload["orphan_alive"] = True
+        if factor_status != "completed":
+            reasons = [*reasons, "research_materials_incomplete:see_daily_evidence_phase"]
+            if status == "completed":
+                status = "completed_with_warnings"
+    else:
+        payload["daily_evidence_phase"] = {"status": "not_executed", "reason_codes": ["factor_phase_requires_completed_candidates_writer_and_budget"]}
     return StageResult(
         stage="research_chain", status=status, started_at=started,
         reason_codes=reasons, network=network, canonical_write=True,
@@ -1212,7 +1239,7 @@ def _stage_version(stage: str) -> str:
         5 if stage == "market_refresh"
         else 4 if stage == "universe"
         else 4 if stage == "reconcile"
-        else 3 if stage == "research_chain"
+        else 4 if stage == "research_chain"
         else 2
     )
     return f"{SCHEMA_VERSION}:{stage}:{revision}"
@@ -1234,6 +1261,7 @@ def _input_manifest_for(stage: str, root: Path, target: str) -> str:
         inputs["universe_csv"] = _file_hash(root / "data" / "universe" / "a_share_symbols.csv")
     elif stage == "research_chain":
         inputs["universe_csv"] = _file_hash(root / "data" / "universe" / "a_share_symbols.csv")
+        inputs["research_requirements_registry"] = _file_hash(root / "state/daily_evidence/requests.json")
         inputs["refresh_latest"] = _file_hash(
             root / "results" / "data_refresh" / "data_refresh_latest.json"
         )
@@ -1301,6 +1329,8 @@ def _output_manifest_for(stage: str, root: Path) -> str:
         outputs["chain_latest"] = _file_hash(
             root / "results" / "data_chain" / "daily_data_chain_latest.json"
         )
+        outputs["adjustment_refresh_latest"] = _file_hash(root / "results/data_refresh/adjustment_refresh_latest.json")
+        outputs["adjustment_factor_index"] = _file_hash(root / "data/metadata/adjustment_evidence/index.json")
     elif stage == "reconcile":
         outputs["recon_latest"] = _file_hash(
             root / "results" / "data_chain" / "full_a_daily_reconciliation_latest.json"
@@ -1669,7 +1699,7 @@ def _find_scheduled_checkpoint(
             continue
         if str(doc.get("target_date") or "") != target:
             continue
-        if require_config_hash and str(doc.get("config_hash") or "") not in {"", config_hash}:
+        if require_config_hash and str(doc.get("config_hash") or "") != config_hash:
             continue
         retry_universe = bool(universe_retry_at and _universe_retry_due(
             doc, target=target, invocation_started=universe_retry_at,
@@ -1899,7 +1929,7 @@ def run_pipeline(
         if not resume_run_id and trigger == "scheduled":
             incomplete_id = _find_scheduled_checkpoint(
                 root, target=target, config_hash=config_hash, incomplete=True,
-                require_config_hash=False,
+                require_config_hash=True,
                 universe_retry_at=invocation_started if universe_retry_allowed else None,
             )
             if incomplete_id:

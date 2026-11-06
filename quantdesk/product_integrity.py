@@ -9,8 +9,10 @@ from collections import Counter
 from datetime import date, timedelta
 from decimal import Decimal, DecimalException, ROUND_HALF_EVEN, localcontext
 from typing import Any, Mapping, Sequence
+from quantdesk.paper.performance_report import iso_date, observed_history
 
 from quantdesk.paper.ledger_read_contract import day, number, strategy_pnl_identity
+from quantdesk.paper.realized_corrections import inspect_realized_adjustment
 
 UNKNOWN_LABELS = {"", "unknown", "none", "null", "未知", "未知板块", "未知行业", "未知题材", "--"}
 
@@ -37,15 +39,24 @@ def position_cost_evidence(position: Mapping[str, Any]) -> dict[str, Any]:
     """Identify the existing PnL cost without inventing a replacement basis."""
     entry, shown = number(position.get("entry_price")), number(position.get("avg_cost"))
     quantity, price, declared = (number(position.get(k)) for k in ("quantity", "latest_price", "unrealized_pnl"))
-    computed = round((price - entry) * quantity, 2) if None not in (entry, quantity, price) else None
+    unit_cost = shown if shown is not None and shown > 0 else entry
+    valuation_cost, valuation_quantity = unit_cost, quantity
+    if (position.get("price_adjustment_status") == "adjusted"
+            and position.get("valuation_quantity_basis") != "recorded_shares"):
+        valuation_cost = number(position.get("adjusted_avg_cost"))
+        valuation_quantity = number(position.get("adjusted_quantity_for_valuation"))
+    computed = round((price - valuation_cost) * valuation_quantity, 2) if None not in (valuation_cost, valuation_quantity, price) else None
     delta = round(declared - computed, 2) if declared is not None and computed is not None else None
     return {
-        "symbol": str(position.get("symbol") or ""), "pnl_cost_price": entry,
+        "symbol": str(position.get("symbol") or ""), "pnl_cost_price": unit_cost,
+        "reported_entry_price": entry, "valuation_cost_price": valuation_cost,
+        "valuation_quantity": valuation_quantity,
         "reported_avg_cost": shown, "reported_adjusted_avg_cost": number(position.get("adjusted_avg_cost")),
-        "cost_source": "entry_price" if entry is not None else "missing",
+        "cost_source": "avg_cost" if shown is not None and shown > 0 else "entry_price" if entry is not None else "missing",
         "cost_label": "当前浮盈亏使用成本（历史费用口径见记录）", "declared_unrealized_pnl": declared,
         "recomputed_unrealized_pnl": computed, "pnl_difference": delta,
-        "display_cost_differs": entry is not None and shown is not None and abs(entry - shown) > 0.00005,
+        "display_cost_differs": unit_cost is not None and shown is not None and abs(unit_cost - shown) > 0.00005,
+        "entry_cost_differs": entry is not None and unit_cost is not None and abs(entry - unit_cost) > 0.00005,
         "status": "missing" if computed is None or declared is None else ("mismatch" if abs(delta) > 0.01 else "consistent"),
         "buy_fee_included": position.get("entry_cost_basis_includes_buy_fee") if isinstance(position.get("entry_cost_basis_includes_buy_fee"), bool) else None,
         "read_only": True,
@@ -75,6 +86,8 @@ def cost_basis_conflict_evidence(state: Mapping[str, Any]) -> dict[str, Any]:
         return float(value) if value is not None else None
 
     items: list[dict[str, Any]] = []
+    correction = inspect_realized_adjustment(state)
+    applied_by_index = {row["source_record_index"]: row for row in correction["applied_corrections"]}
     invalid_rows = 0
     collections_valid = True
     for group in ("positions", "closed_positions"):
@@ -116,7 +129,8 @@ def cost_basis_conflict_evidence(state: Mapping[str, Any]) -> dict[str, Any]:
                     missing.append("calculation_outside_supported_precision")
                     entry_pnl = avg_pnl = delta = None
                     entry_matches = avg_matches = None
-            candidate = match == "matches_entry_only"
+            applied = applied_by_index.get(index) if group == "closed_positions" else None
+            candidate = match == "matches_entry_only" and applied is None
             items.append({"record_group": group, "source_index": index, "symbol": str(record.get("symbol") or ""),
                 "entry_date": day(record.get("entry_date")) or None, "exit_date": day(record.get("exit_date")) or None,
                 "source_fields": fields,
@@ -126,6 +140,8 @@ def cost_basis_conflict_evidence(state: Mapping[str, Any]) -> dict[str, Any]:
                 "pnl_using_entry_price": display(entry_pnl), "pnl_using_avg_cost": display(avg_pnl),
                 "alternative_pnl_delta": display(delta), "entry_matches_recorded": entry_matches,
                 "avg_matches_recorded": avg_matches, "match_status": match,
+                "applied_correction": applied,
+                "effective_pnl": applied["corrected_realized_pnl"] if applied else number(record.get(pnl_field)),
                 "explanation_candidate": candidate, "missing_fields": missing,
                 "net_proceeds_include_recorded_exit_fees": group == "closed_positions",
                 "read_only": True})
@@ -140,8 +156,9 @@ def cost_basis_conflict_evidence(state: Mapping[str, Any]) -> dict[str, Any]:
             remainder = money(reported - candidate_sum) if reported is not None else None
     except DecimalException:
         collections_valid = False
-    explains = bool(collections_valid and candidates and reported is not None and reported != 0 and remainder == 0)
-    status = ("unavailable" if reported is None or not collections_valid else "explains_reported_difference" if explains
+    explains = bool(collections_valid and correction["status"] != "invalid" and candidates
+                    and reported is not None and reported != 0 and remainder == 0)
+    status = ("unavailable" if reported is None or not collections_valid or correction["status"] == "invalid" else "explains_reported_difference" if explains
               else "partial_explanation" if candidates else "no_matching_conflicts")
     label = {"unavailable": "成本字段诊断资料不足", "explains_reported_difference": "成本字段冲突解释了报告差额",
              "partial_explanation": "成本字段冲突尚未完整解释报告差额", "no_matching_conflicts": "未发现匹配条件的成本差额解释"}[status]
@@ -149,6 +166,7 @@ def cost_basis_conflict_evidence(state: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_adjustment_sum": display(candidate_sum) if items or collections_valid else None,
         "remaining_reported_difference": display(remainder), "explains_reported_difference": explains,
         "candidate_count": len(candidates), "candidates": candidates, "items": items,
+        "realized_correction_evidence": correction,
         "unknown_count": sum(item["match_status"] == "unknown" for item in items), "invalid_record_count": invalid_rows,
         "source": "recorded positions and closed_positions; market_value or net_amount minus the recorded cost times quantity",
         "comparison_policy": "ROUND_HALF_EVEN to cents; candidate recorded PnL must match entry_price and differ from avg_cost",
@@ -175,25 +193,36 @@ def holding_period_evidence(record: Mapping[str, Any], *, calendar: Mapping[str,
 def history_coverage(history: Mapping[str, Any] | Sequence[Any] | None, *, calendar: Mapping[str, Any] | None = None,
                      created_at: Any = "", target_date: Any = "") -> dict[str, Any]:
     """Describe dated evidence coverage; never fill missing equity observations."""
-    rows = _rows(history.get("items", [])) if isinstance(history, Mapping) else _rows(history)
-    row_dates = [day(row.get("valuation_date") or row.get("date") or row.get("generated_at")) for row in rows]
+    raw = history.get("items", []) if isinstance(history, Mapping) else history
+    malformed_collection = raw is not None and not isinstance(raw, (list, tuple))
+    original_rows = list(raw) if isinstance(raw, (list, tuple)) else []
+    rows = _rows(original_rows)
+    observed = observed_history({"items": original_rows})
+    row_dates = [iso_date(row.get("valuation_date")) for row in rows]
     counts = Counter(value for value in row_dates if value)
+    valid_dates = {point.date for point in observed.points}
     start = min(counts) if counts else ""
     end = day(target_date) or (max(counts) if counts else "")
     opens = _open_dates(calendar)
     covered = bool(start and end and start <= end and opens and opens[0] <= start and opens[-1] >= end)
     expected = [value for value in opens if start <= value <= end] if covered else []
-    missing = [value for value in expected if value not in counts]
+    missing = [value for value in expected if value not in valid_dates]
     duplicate = sorted(value for value, count in counts.items() if count > 1)
     malformed = sum(not value for value in row_dates)
-    malformed_rows = len(history.get("items", [])) - len(rows) if isinstance(history, Mapping) and isinstance(history.get("items"), list) else len(history) - len(rows) if isinstance(history, (list, tuple)) else 0
+    malformed_rows = len(original_rows) - len(rows) + int(malformed_collection)
     after_target = sorted(value for value in counts if end and value > end)
     nontrading = sorted(value for value in counts if covered and start <= value <= end and value not in expected)
     equity_missing = [row_dates[i] or f"row:{i}" for i, row in enumerate(rows) if number(row.get("total_equity")) is None]
-    recovered = [row_dates[i] for i, row in enumerate(rows) if str(row.get("mode") or "").lower().startswith(("recover", "valuation")) or row.get("portfolio_review_valid") is False]
-    complete = bool(rows and covered and not missing and not duplicate and not malformed and not malformed_rows and not after_target and not nontrading and not equity_missing and not recovered)
-    return {"status": "complete" if complete else ("partial" if rows else "missing"),
-            "row_count": len(rows), "unique_dates": len(counts), "first_date": start, "target_date": end,
+    recovered = [row_dates[i] for i, row in enumerate(rows) if row_dates[i] and (
+        str(row.get("mode") or "").lower().startswith(("recover", "valuation")) or row.get("portfolio_review_valid") is not True)]
+    complete = bool(observed.points and covered and not missing and not duplicate and not malformed
+                    and not malformed_rows and not observed.invalid_count and not observed.conflicting_dates
+                    and not after_target and not nontrading and not equity_missing and not recovered)
+    return {"status": "complete" if complete else ("partial" if original_rows or malformed_collection else "missing"),
+            "row_count": len(rows), "unique_dates": len(valid_dates), "first_date": start, "target_date": end,
+            "observed_row_count": len(observed.points), "undated_rows": observed.undated_count,
+            "invalid_amount_rows": observed.invalid_count - (len(original_rows) - len(rows)),
+            "conflicting_dates": observed.conflicting_dates, "date_source": "valuation_date",
             "account_created_date": day(created_at), "before_first_history_unverified": bool(day(created_at) and start and day(created_at) < start),
             "calendar_verified_for_interval": covered, "expected_trading_days": len(expected) if covered else None,
             "missing_dates": missing, "duplicate_dates": duplicate, "invalid_date_rows": malformed,
@@ -320,8 +349,13 @@ def build_product_integrity(state: Mapping[str, Any], history: Mapping[str, Any]
         for key in ("positions", "closed_positions", "realized_reductions")}
     identity = strategy_pnl_identity(dict(state))
     cost_explanation = cost_basis_conflict_evidence(state)
-    held_costs = [number(row.get("entry_price")) * number(row.get("quantity"))
-                  for row in positions if number(row.get("entry_price")) is not None and number(row.get("quantity")) is not None]
+    correction = inspect_realized_adjustment(state)
+    costs = [position_cost_evidence(row) for row in positions]
+    held_costs = [cost["pnl_cost_price"] * number(row.get("quantity"))
+                  for row, cost in zip(positions, costs)
+                  if cost["pnl_cost_price"] is not None and number(row.get("quantity")) is not None]
+    held_entry_costs = [number(row.get("entry_price")) * number(row.get("quantity"))
+                        for row in positions if number(row.get("entry_price")) is not None and number(row.get("quantity")) is not None]
     cash, initial, realized = (number(state.get(key)) for key in ("cash", "initial_cash", "realized_pnl"))
     bridge = None
     if collections["positions"]["valid"] and len(held_costs) == len(positions) and None not in (cash, initial, realized):
@@ -338,8 +372,21 @@ def build_product_integrity(state: Mapping[str, Any], history: Mapping[str, Any]
     # fields do not. An absent legacy adjustment is not silently assumed zero.
     known_closed = (0.0 if not closed else closed_sum["amount"]) if closed_sum["complete"] else None
     known_reductions = (0.0 if not reductions else reduction_sum["amount"]) if reduction_sum["complete"] else None
-    components = round(known_closed + known_reductions + legacy, 2) if None not in (known_closed, known_reductions, legacy) else None
-    costs = [position_cost_evidence(row) for row in positions]
+    effective_adjustment = number(correction["effective_realized_adjustment"])
+    components = round(known_closed + known_reductions + effective_adjustment, 2) if None not in (known_closed, known_reductions, effective_adjustment) else None
+    corrections_by_index = ({row["source_record_index"]: row for row in correction["applied_corrections"]}
+                            if collections["closed_positions"]["valid"] else {})
+    effective_closed = []
+    for index, row in enumerate(closed):
+        effective_row = dict(row)
+        applied = corrections_by_index.get(index)
+        if applied:
+            effective_row.update(recorded_realized_pnl=row.get("realized_pnl"),
+                realized_pnl=applied["corrected_realized_pnl"], realized_correction_id=applied["correction_id"])
+        effective_closed.append(effective_row)
+    effective_closed_sum = _sum_known(effective_closed, "realized_pnl")
+    if not collections["closed_positions"]["valid"] or correction["status"] == "invalid":
+        effective_closed_sum.update(amount=None, complete=False)
     holding = [holding_period_evidence(row, calendar=calendar) for row in closed]
     exposures: dict[str, dict[str, Any]] = {}
     unknown_sectors = []
@@ -359,10 +406,12 @@ def build_product_integrity(state: Mapping[str, Any], history: Mapping[str, Any]
         adj_status = str(row.get("price_adjustment_status") or "")
         if "stale" in adj_status:
             adjustment_stale.append(symbol)
-        elif not adj_status or adj_status in {"unknown", "missing"}:
+        elif not adj_status or adj_status in {"unknown", "missing", "missing_adj_factor", "factor_reference_only"}:
             adjustment_unknown.append(symbol)
     warnings = [str(value) for value in state.get("warnings", [])] if isinstance(state.get("warnings"), list) else []
     historical_prefixes = ("paper_position_status_mismatch_reconciled:", "paper_account_top_level_drift_fields:", "paper_account_top_level_drift_detected", "paper_account_legacy_realized_adjustment_preserved")
+    if identity.get("status") == "consistent" and correction["status"] == "valid":
+        historical_prefixes += ("paper_account_pnl_identity_mismatch",)
     warning_history = [value for value in warnings if value.startswith(historical_prefixes)]
     warning_current = [value for value in warnings if value not in warning_history]
     ai_evidence = {}
@@ -386,14 +435,18 @@ def build_product_integrity(state: Mapping[str, Any], history: Mapping[str, Any]
         "read_only": True, "label": "纸面 · 未验证", "valuation_date": day(state.get("valuation_date")),
         "collection_validity": collections,
         "pnl_identity": identity,
-        "capital_cost_bridge": {"difference": bridge, "held_entry_cost": round(sum(held_costs), 2) if collections["positions"]["valid"] and len(held_costs) == len(positions) else None,
-            "definition": "cash + sum(entry_price * quantity) - initial_cash - realized_pnl",
-            "status": "unverified" if bridge is None else ("mismatch" if abs(bridge) > 0.01 else "consistent"),
+        "capital_cost_bridge": {"difference": bridge,
+            "held_pnl_cost": round(sum(held_costs), 2) if collections["positions"]["valid"] and len(held_costs) == len(positions) else None,
+            "held_entry_cost": round(sum(held_entry_costs), 2) if collections["positions"]["valid"] and len(held_entry_costs) == len(positions) else None,
+            "definition": "cash + sum(recorded_avg_cost_or_entry_fallback * quantity) - initial_cash - realized_pnl",
+            "status": "invalid" if correction["status"] == "invalid" else "unverified" if bridge is None else ("mismatch" if abs(bridge) > 0.01 else "consistent"),
             "source_of_difference": "cost_field_conflicts_explain_reported_pnl_difference" if cost_explanation["explains_reported_difference"] else ("unresolved" if bridge is None or abs(bridge) > 0.01 else "none"),
             "message": cost_explanation["message"] if cost_explanation["explains_reported_difference"] else "未以调整项抹平差额；历史全部资金流水尚未由此投影重建。",
             "cost_basis_explanation": cost_explanation},
         "realized_components": {"closed": known_closed, "reductions": known_reductions, "legacy_adjustment": legacy,
+            "corrections": correction["realized_corrections_total"], "effective_adjustment": effective_adjustment,
             "sum": components, "declared": realized, "difference": round(realized - components, 2) if realized is not None and components is not None else None},
+        "realized_correction_evidence": correction,
         "position_costs": costs,
         "history": history_coverage(history, calendar=calendar, created_at=state.get("created_at"), target_date=state.get("valuation_date")),
         "closed_holding_periods": holding, "closed_zero_holding_conflicts": sum(row["recorded_zero_conflicts_with_dates"] for row in holding),
@@ -401,17 +454,20 @@ def build_product_integrity(state: Mapping[str, Any], history: Mapping[str, Any]
             "source_policy": "reported sector, falling back to reported industry; taxonomy not normalized", "exposures": list(exposures.values())},
         "corporate_action_evidence": {"stale_symbols": adjustment_stale, "unknown_symbols": adjustment_unknown,
             "complete_total_return_proven": False, "message": "原始收盘估值一致不证明分红送转与总回报证据完整。"},
-        "loss_contribution": {"closed_realized": closed_sum, "held_unrealized": unrealized_sum,
+        "loss_contribution": {"closed_realized": effective_closed_sum, "closed_recorded": closed_sum, "held_unrealized": unrealized_sum,
+            "realized_corrections": correction["realized_corrections_total"],
             "legacy_adjustment": legacy, "partial_realized": reduction_sum, "recorded_exit_fees": _sum_known(fee_rows, "total_fee"),
             "reconciled_total": identity.get("status") == "consistent" and all(value["valid"] for value in collections.values())
                 and closed_sum["complete"] and reduction_sum["complete"] and unrealized_sum["complete"]
                 and all(row["status"] == "consistent" for row in costs),
             "unexplained_difference": identity.get("difference"),
             "causal_attribution": False, "fee_note": "费用仅作记录覆盖统计，已计入盈亏的费用不得再扣一次。",
-            "top_losses": sorted([{"symbol": str(row.get("symbol") or ""), "exit_date": day(row.get("exit_date")), "realized_pnl": number(row.get("realized_pnl"))}
-                                  for row in closed if number(row.get("realized_pnl")) is not None], key=lambda row: row["realized_pnl"])[:5]},
+            "top_losses": sorted([{"symbol": str(row.get("symbol") or ""), "exit_date": day(row.get("exit_date")), "realized_pnl": number(row.get("realized_pnl")),
+                                    "recorded_realized_pnl": number(row.get("recorded_realized_pnl", row.get("realized_pnl"))),
+                                    "realized_correction_id": row.get("realized_correction_id")}
+                                  for row in effective_closed if number(row.get("realized_pnl")) is not None], key=lambda row: row["realized_pnl"])[:5]},
         "warnings": {"current": warning_current, "historical_reconciliation_records": warning_history,
                      "current_count": len(warning_current), "historical_count": len(warning_history)},
         "ai_evidence_coverage": ai_evidence,
-        "learning": weekly_learning_review(state.get("closed_positions"), calendar=calendar, as_of=state.get("valuation_date")),
+        "learning": weekly_learning_review(effective_closed, calendar=calendar, as_of=state.get("valuation_date")),
     }

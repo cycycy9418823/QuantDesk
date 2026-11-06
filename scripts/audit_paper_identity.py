@@ -39,6 +39,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from quantdesk.product_integrity import cost_basis_conflict_evidence  # noqa: E402
+from quantdesk.paper.realized_corrections import inspect_realized_adjustment  # noqa: E402
 
 DEFAULT_STATE = PROJECT_ROOT / "state" / "auto_paper_portfolio.json"
 CENT = Decimal("0.01")
@@ -324,6 +325,22 @@ def audit(state_path: Path) -> dict[str, Any]:
     closed = [_closed_row(row, index) for index, row in enumerate(_rows(state, "closed_positions"))]
     reductions = _check_reductions(state)
     known_conflicts = cost_basis_conflict_evidence(state)
+    correction = inspect_realized_adjustment(state)
+    if correction["status"] == "invalid":
+        identity["ok"] = False
+        identity["reason_codes"] = correction["reason_codes"]
+    applied_by_index = {row["source_record_index"]: row for row in correction["applied_corrections"]}
+    for row in closed:
+        applied = applied_by_index.get(row["index"])
+        row["effective_realized_pnl"] = row["realized_pnl_recorded"]
+        if applied:
+            row["effective_realized_pnl"] = applied["corrected_realized_pnl"]
+            row["applied_realized_correction"] = applied
+            row["recorded_avg_basis_delta"] = row["canonical_avg_basis_delta"]
+            row["canonical_avg_basis_delta"] = _number(_diff(
+                _decimal(row["realized_pnl_avg_cost_basis"]), _decimal(row["effective_realized_pnl"])))
+            row["recorded_status"] = row["status"]
+            row["status"] = "matches_avg_cost_with_correction"
 
     position_delta = _sum_deltas(positions)
     closed_delta = _sum_deltas(closed)
@@ -346,16 +363,20 @@ def audit(state_path: Path) -> dict[str, Any]:
     closed_realized_sum = _money(_sum_known(closed_rows, "realized_pnl",
         complete=isinstance(raw_closed, list) and len(raw_closed) == len(closed_rows)))
     legacy_adjustment = _decimal(state.get("legacy_realized_adjustment"))
+    effective_adjustment = _decimal(correction["effective_realized_adjustment"])
     reduction_recorded_sum = _decimal(reductions["recorded_realized_pnl_sum"])
-    detail_realized = (_money(closed_realized_sum + reduction_recorded_sum + legacy_adjustment)
-                       if None not in (closed_realized_sum, reduction_recorded_sum, legacy_adjustment) else None)
+    detail_realized = (_money(closed_realized_sum + reduction_recorded_sum + effective_adjustment)
+                       if None not in (closed_realized_sum, reduction_recorded_sum, effective_adjustment) else None)
 
     consistency = {
         "top_level_unrealized_equals_position_sum": _number(_diff(_decimal(state.get("unrealized_pnl")), open_unrealized_sum)),
         "top_level_realized_equals_detail_sum": _number(_diff(_decimal(state.get("realized_pnl")), detail_realized)),
         "closed_realized_sum": _number(closed_realized_sum),
         "legacy_realized_adjustment": _number(legacy_adjustment),
+        "realized_corrections_total": correction["realized_corrections_total"],
+        "effective_realized_adjustment": _number(effective_adjustment),
         "detail_realized_with_legacy_adjustment": _number(detail_realized),
+        "detail_realized_with_effective_adjustment": _number(detail_realized),
     }
 
     conflicts_open = [row for row in positions if row["status"] == "matches_entry_price"]
@@ -377,7 +398,9 @@ def audit(state_path: Path) -> dict[str, Any]:
         consistency["top_level_realized_equals_detail_sum"],
     )
     details_match = all(value is not None and abs(value) <= float(TOLERANCE) for value in detail_differences)
-    if unexplained or missing or not reductions["complete"] or open_unrealized_sum is None or detail_realized is None:
+    if correction["status"] == "invalid":
+        status = "invalid"
+    elif unexplained or missing or not reductions["complete"] or open_unrealized_sum is None or detail_realized is None:
         status = "unexplained"
     elif identity["ok"] and balance["ok"] and details_match and all(row["fees_consistent"] for row in closed):
         status = "consistent"
@@ -421,6 +444,7 @@ def audit(state_path: Path) -> dict[str, Any]:
         },
         "realized_reductions": {**reductions, "canonical_avg_basis_delta_sum": _number(reduction_delta)},
         "top_level_consistency": consistency,
+        "realized_correction_evidence": correction,
         "decomposition": {
             "reported_identity_difference": _number(identity_difference),
             "position_cost_basis_delta_sum": _number(position_delta),
@@ -504,7 +528,7 @@ def render(report: dict[str, Any]) -> str:
             lines.append(f"      - {item['symbol']}: canonical delta {_fmt(item['delta'])}")
     lines.extend(["", "[4] CLOSED POSITION CHECKS"])
     for row in report["closed_positions"]["rows"]:
-        if row["status"] == "matches_avg_cost" and row["fees_consistent"]:
+        if row["status"] in {"matches_avg_cost", "matches_avg_cost_with_correction"} and row["fees_consistent"]:
             continue
         lines.append(
             f"    {row['symbol']:<8} qty={row['exit_quantity']} avg={row['avg_cost']} entry={row['entry_price']} "
@@ -521,6 +545,7 @@ def render(report: dict[str, Any]) -> str:
             "[5] TOP-LEVEL VS DETAIL SUMS",
             f"    unrealized: top - position sum = {_fmt(report['top_level_consistency']['top_level_unrealized_equals_position_sum'])}",
             f"    realized  : top - detail sum   = {_fmt(report['top_level_consistency']['top_level_realized_equals_detail_sum'])}",
+            f"    append-only corrections       = {_fmt(report['top_level_consistency']['realized_corrections_total'])}",
             "",
             "[6] DIFFERENCE DECOMPOSITION",
             f"    reported identity difference          : {_fmt(decomposition['reported_identity_difference'])}",

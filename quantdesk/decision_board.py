@@ -14,6 +14,7 @@ from datetime import date, datetime
 from typing import Any, Mapping, Sequence
 
 from quantdesk.trader_profile import ResearchPaperProfile, validate_research_paper_profile
+from quantdesk.paper.performance_report import finite_number, iso_date
 
 
 REQUIRED_BOUNDARY_BADGES = (
@@ -227,45 +228,121 @@ def _watchlist_rows(
 def _aligned_return_series(
     equity_history: Mapping[str, Any],
     benchmark: Mapping[str, Any],
+    *,
+    calendar_days: Sequence[str] = (),
 ) -> dict[str, Any]:
+    """Compare recorded equity and index points over one explicit date window."""
+
+    evidence = equity_history.get("history_evidence")
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+
+    def unavailable(reason: str, message: str) -> dict[str, Any]:
+        return {"status": "degraded", "available": False, "reason_code": reason,
+                "benchmark_label": benchmark.get("label") or "benchmark", "items": [],
+                "message_for_ui": message, "history_evidence": dict(evidence)}
+
+    if evidence.get("invalid_count") or evidence.get("conflicting_dates") or evidence.get("structure_invalid"):
+        return unavailable("paper_history_conflicting_or_invalid", "历史结构、金额或同日记录存在异常，暂不计算权益对照。")
     paper_by_date: dict[str, float] = {}
+    invalid_paper = False
+    undated = 0
+    unconfirmed = set(evidence.get("unconfirmed_review_dates") or [])
     for raw in equity_history.get("items") or []:
         if not isinstance(raw, Mapping):
+            invalid_paper = True
             continue
-        day = _date_text(raw.get("date") or raw.get("generated_at"))
-        value = _finite(raw.get("total_return_pct"))
-        if day and value is not None:
+        # Public history items carry an explicit valuation date. Never use a
+        # generation timestamp, even when a caller bypasses the usual reader.
+        day = iso_date(raw.get("valuation_date") or raw.get("date"))
+        if not day:
+            undated += 1
+            continue
+        value = finite_number(raw.get("total_equity"))
+        if value is None or value <= 0 or (day in paper_by_date and paper_by_date[day] != value):
+            invalid_paper = True
+        else:
             paper_by_date[day] = value
+        if raw.get("portfolio_review_valid") is False:
+            unconfirmed.add(day)
+    if invalid_paper:
+        return unavailable("paper_history_conflicting_or_invalid", "已记录权益缺失、无效或同日冲突，暂不计算对照。")
+    if len(paper_by_date) < 2:
+        return unavailable("insufficient_aligned_return_series", "明确估值日期的有效权益不足两条，暂不生成比较曲线。")
+
+    start, end = min(paper_by_date), max(paper_by_date)
     benchmark_by_date: dict[str, float] = {}
+    benchmark_conflicts: set[str] = set()
     for raw in benchmark.get("items") or []:
         if not isinstance(raw, Mapping):
             continue
-        day = _date_text(raw.get("date"))
-        close = _finite(raw.get("close"))
-        if day and close is not None and close > 0:
+        day = iso_date(raw.get("date"))
+        if not day or not start <= day <= end:
+            continue
+        close = finite_number(raw.get("close"))
+        if close is None or close <= 0 or (day in benchmark_by_date and benchmark_by_date[day] != close):
+            benchmark_conflicts.add(day)
+        else:
             benchmark_by_date[day] = close
-    dates = sorted(set(paper_by_date).intersection(benchmark_by_date))
-    if len(dates) < 2:
-        return {
-            "status": "degraded",
-            "reason_code": "insufficient_aligned_return_series",
-            "benchmark_label": benchmark.get("label") or "benchmark",
-            "items": [],
-        }
-    base = benchmark_by_date[dates[0]]
+    if benchmark_conflicts:
+        return unavailable("benchmark_conflicting_or_invalid", "同一对照期间的指数记录无效或冲突，暂不计算比较曲线。")
+    if start not in benchmark_by_date or end not in benchmark_by_date:
+        return unavailable("benchmark_endpoint_missing", f"指数缺少与账面记录相同的起止日（{start} 至 {end}），不能缩短期间代替。")
+
+    # Nulls are display gaps, not reconstructed observations. A known calendar
+    # or saved index date exposes absent equity instead of connecting across it.
+    dates = sorted(set(paper_by_date) | set(benchmark_by_date) |
+                   {day for value in calendar_days if (day := iso_date(value)) and start <= day <= end})
+    missing_paper = [day for day in dates if day not in paper_by_date]
+    missing_benchmark = [day for day in dates if day not in benchmark_by_date]
+
+    def change(value: float | None, base: float) -> float | None:
+        result = finite_number((value / base - 1) * 100) if value is not None else None
+        return round(result, 6) if result is not None else None
+
     items = [
         {
             "date": day,
-            "paper_return_pct": round(paper_by_date[day], 6),
-            "benchmark_return_pct": round((benchmark_by_date[day] / base - 1.0) * 100.0, 6),
+            "paper_return_pct": change(paper_by_date.get(day), paper_by_date[start]),
+            "benchmark_return_pct": change(benchmark_by_date.get(day), benchmark_by_date[start]),
         }
         for day in dates
     ]
+    if any((day in paper_by_date and row["paper_return_pct"] is None) or
+           (day in benchmark_by_date and row["benchmark_return_pct"] is None) for day, row in zip(dates, items)):
+        return unavailable("comparison_not_finite", "权益或指数比例无法得到有效数字，暂不生成比较曲线。")
+    undated += _int_value(evidence.get("undated_count")) or 0
+    warnings = [reason for condition, reason in (
+        (undated, "paper_history_valuation_dates_missing"),
+        (missing_paper, "paper_observations_missing_in_period"),
+        (missing_benchmark, "benchmark_observations_missing_in_period"),
+        (unconfirmed, "paper_history_review_unconfirmed"),
+        (evidence.get("duplicate_count"), "paper_history_duplicate_dates"),
+    ) if condition]
+    notes = [f"{start} 至 {end}，两条曲线均从共同首日归零；仅比较已记录权益与指数点位变化。"]
+    if undated:
+        notes.append(f"{undated} 条缺少估值日期的历史记录已排除。")
+    if missing_paper:
+        notes.append(f"缺权益记录 {len(missing_paper)} 天：{'、'.join(missing_paper)}；缺点未补。")
+    if missing_benchmark:
+        notes.append(f"缺指数记录 {len(missing_benchmark)} 天：{'、'.join(missing_benchmark)}。")
+    if unconfirmed:
+        notes.append(f"{len(unconfirmed)} 个估值日的复盘尚未确认。")
+    notes.append("纸面 · 未验证；不代表完整核账后的策略收益。")
     return {
-        "status": "passed",
-        "reason_code": "",
+        "status": "degraded" if warnings else "passed",
+        "available": True,
+        "reason_code": "partial_recorded_history" if warnings else "",
         "benchmark_label": benchmark.get("label") or "benchmark",
         "items": items,
+        "period_start": start,
+        "period_end": end,
+        "normalization": "common_first_recorded_equity_and_index",
+        "observation_count": len(paper_by_date),
+        "missing_valuation_dates": missing_paper,
+        "missing_benchmark_dates": missing_benchmark,
+        "warnings": warnings,
+        "history_evidence": dict(evidence),
+        "message_for_ui": " ".join(notes),
     }
 
 
@@ -298,7 +375,7 @@ def build_decision_board_snapshot(
         warnings=warnings,
     )
     watch_rows = _watchlist_rows(watchlist, as_of=as_of, calendar_days=calendar_days)
-    return_series = _aligned_return_series(equity_history, benchmark)
+    return_series = _aligned_return_series(equity_history, benchmark, calendar_days=calendar_days)
     if return_series["status"] != "passed":
         warnings.append(str(return_series["reason_code"]))
 
@@ -342,7 +419,8 @@ def build_decision_board_snapshot(
         "position_count": len(positions),
         "watchlist_count": len(watch_rows),
         "event_count": len(events),
-        "aligned_return_point_count": len(return_series.get("items") or []),
+        "aligned_return_point_count": sum(item["paper_return_pct"] is not None and item["benchmark_return_pct"] is not None
+                                          for item in return_series.get("items") or []),
         "position_metric_passed_count": sum(1 for item in positions if item["metric_status"] == "passed"),
         "watchlist_metric_passed_count": sum(1 for item in watch_rows if item["metric_status"] == "passed"),
     }

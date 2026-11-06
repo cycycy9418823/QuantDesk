@@ -18,6 +18,10 @@ from dataclasses import dataclass
 from typing import Any, BinaryIO, Callable
 
 
+ROUTE_DISCOVERY_TIMEOUT = 15
+DIRECT_CONNECT_TIMEOUT = 12
+
+
 @dataclass(frozen=True)
 class DirectRoute:
     index: int
@@ -49,24 +53,33 @@ def discover_route() -> DirectRoute:
     # Use current addresses and metrics: Wi-Fi/DHCP changes must not reuse a
     # hard-coded address or interface index from an earlier successful retry.
     script = r"""$ErrorActionPreference = 'Stop'
-$rows = foreach ($adapter in @(Get-NetAdapter -Physical | Where-Object Status -eq 'Up')) {
-    $route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue |
-        Where-Object NextHop -ne '0.0.0.0' | Sort-Object RouteMetric | Select-Object -First 1
+$adapters = @(Get-NetAdapter -Physical | Where-Object Status -eq 'Up')
+$routes = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
+    Where-Object NextHop -ne '0.0.0.0')
+$addresses = @(Get-NetIPAddress -AddressFamily IPv4 |
+    Where-Object { $_.AddressState -eq 'Preferred' -and -not $_.SkipAsSource -and $_.IPAddress -notlike '169.254.*' })
+$interfaces = @(Get-NetIPInterface -AddressFamily IPv4)
+$rows = foreach ($adapter in $adapters) {
+    $route = $routes | Where-Object InterfaceIndex -eq $adapter.ifIndex |
+        Sort-Object RouteMetric | Select-Object -First 1
     if ($null -eq $route) { continue }
-    $address = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue |
-        Where-Object { $_.AddressState -eq 'Preferred' -and -not $_.SkipAsSource -and $_.IPAddress -notlike '169.254.*' } |
+    $address = $addresses | Where-Object InterfaceIndex -eq $adapter.ifIndex |
         Sort-Object IPAddress | Select-Object -First 1
     if ($null -eq $address) { continue }
-    $ipif = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $adapter.ifIndex
+    $ipif = $interfaces | Where-Object InterfaceIndex -eq $adapter.ifIndex | Select-Object -First 1
+    if ($null -eq $ipif) { continue }
     [pscustomobject]@{index=[int]$adapter.ifIndex;address=$address.IPAddress;metric=([int]$route.RouteMetric+[int]$ipif.InterfaceMetric);physical=$true}
 }
 ConvertTo-Json -InputObject @($rows) -Compress
 """
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-        check=False, capture_output=True, timeout=10,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False, capture_output=True, timeout=ROUTE_DISCOVERY_TIMEOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise OSError(f"physical_route_inventory_timeout:{ROUTE_DISCOVERY_TIMEOUT}s") from exc
     if result.returncode:
         detail = result.stderr.decode("utf-8", "replace")[-400:]
         raise OSError("physical_route_inventory_failed:" + detail)
@@ -84,7 +97,7 @@ def connect_direct(
         # Windows IP_UNICAST_IF expects the index in network byte order.
         conn.setsockopt(socket.IPPROTO_IP, 31, struct.pack("!I", route.index))
         conn.bind((route.address, 0))
-        conn.settimeout(12)
+        conn.settimeout(DIRECT_CONNECT_TIMEOUT)
         conn.connect((host, port))
         conn.settimeout(60)
         return conn

@@ -1531,6 +1531,76 @@ def _quote_time_state(
     return "usable"
 
 
+def read_verified_snapshot_archive(
+    root: Path, trade_date: str, slot: str,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Read one hash-bound archive, without imposing a quote-quality policy.
+
+    The returned rows are parsed from the exact bytes checked against metadata.
+    Both current and legacy headers are supported. Missing optional quote values
+    remain missing; callers choose their own quality threshold. Invalid or
+    incomplete archive pairs raise a file, JSON, CSV, or validation exception.
+    """
+
+    root = Path(root)
+    if date.fromisoformat(trade_date).isoformat() != trade_date or slot not in expected_snapshot_slots(include_close=True):
+        raise ValueError("archive_identity_invalid")
+    target = root / SNAPSHOT_RELATIVE_DIR / trade_date / f"{slot}.csv"
+    metadata_path = target.with_suffix(".json")
+    if target.stat().st_size > 64 * 1024 * 1024 or metadata_path.stat().st_size > 2 * 1024 * 1024:
+        raise ValueError("archive_size_limit")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    content = target.read_bytes()
+    reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")), strict=True)
+    rows = list(reader)
+    if (not isinstance(metadata, dict) or not rows
+            or reader.fieldnames not in (list(SNAPSHOT_COLUMNS), list(LEGACY_SNAPSHOT_COLUMNS))
+            or any(None in row or any(value is None for value in row.values()) for row in rows)):
+        raise ValueError("archive_schema_invalid")
+    expected = metadata.get("expected_symbols")
+    if not isinstance(expected, list) or expected != _load_symbols(root, expected):
+        raise ValueError("archive_universe_invalid")
+    if metadata.get("universe_sha256") != _universe_hash(expected):
+        raise ValueError("archive_universe_hash_mismatch")
+    if metadata.get("csv_sha256") != hashlib.sha256(content).hexdigest():
+        raise ValueError("archive_csv_hash_mismatch")
+    if (
+        metadata.get("schema_version") != "a0_snapshot_history_v1"
+        or any(type(metadata.get(key)) is not int for key in ("row_count", "expected_symbol_count", "coverage_count"))
+        or metadata.get("trade_date") != trade_date
+        or metadata.get("slot_time") != slot
+        or metadata.get("snapshot_path") != _relative(root, target)
+        or metadata.get("row_count") != len(rows)
+        or metadata.get("expected_symbol_count") != len(expected)
+        or not metadata.get("source")
+    ):
+        raise ValueError("archive_metadata_mismatch")
+    fetched = datetime.fromisoformat(metadata["fetched_at"])
+    if fetched.tzinfo is None:
+        raise ValueError("archive_timestamp_timezone_missing")
+    observed = {row["symbol"] for row in rows}
+    if len(observed) != len(rows) or any(len(symbol) != 6 or not symbol.isdigit() for symbol in observed):
+        raise ValueError("archive_symbol_invalid")
+    if any(
+        row["snapshot_date"] != trade_date or row["snapshot_time"] != slot
+        or row["fetched_at"] != metadata["fetched_at"] or row["source"] != metadata["source"]
+        for row in rows
+    ):
+        raise ValueError("archive_row_evidence_mismatch")
+    missing = sorted(set(expected) - observed)
+    covered = len(set(expected) & observed)
+    if (
+        metadata.get("missing_symbols") != missing
+        or metadata.get("coverage_count") != covered
+        or metadata.get("coverage_ratio") != (covered / len(expected) if expected else None)
+        or metadata.get("unexpected_symbols") != sorted(observed - set(expected))
+    ):
+        raise ValueError("archive_coverage_mismatch")
+    if metadata.get("status") not in {"written", "partial"}:
+        raise ValueError("archive_status_invalid")
+    return metadata, rows
+
+
 def _slot_evidence(root: Path, trade_date: str, slot: str) -> dict[str, Any]:
     target = root / SNAPSHOT_RELATIVE_DIR / trade_date / f"{slot}.csv"
     metadata_path = target.with_suffix(".json")
@@ -1539,53 +1609,12 @@ def _slot_evidence(root: Path, trade_date: str, slot: str) -> dict[str, Any]:
     if not target.is_file() or not metadata_path.is_file():
         return {"status": "incomplete", "reason": "archive_pair_incomplete"}
     try:
-        if target.stat().st_size > 64 * 1024 * 1024 or metadata_path.stat().st_size > 2 * 1024 * 1024:
-            raise ValueError("archive_size_limit")
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        content = target.read_bytes()
-        reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
-        rows = list(reader)
-        if (not isinstance(metadata, dict) or not rows
-                or reader.fieldnames not in (list(SNAPSHOT_COLUMNS), list(LEGACY_SNAPSHOT_COLUMNS))):
-            raise ValueError("archive_schema_invalid")
-        expected = metadata.get("expected_symbols")
-        if not isinstance(expected, list) or expected != _load_symbols(root, expected):
-            raise ValueError("archive_universe_invalid")
-        if metadata.get("universe_sha256") != _universe_hash(expected):
-            raise ValueError("archive_universe_hash_mismatch")
-        if metadata.get("csv_sha256") != hashlib.sha256(content).hexdigest():
-            raise ValueError("archive_csv_hash_mismatch")
-        if (
-            metadata.get("schema_version") != "a0_snapshot_history_v1"
-            or metadata.get("trade_date") != trade_date
-            or metadata.get("slot_time") != slot
-            or metadata.get("snapshot_path") != _relative(root, target)
-            or metadata.get("row_count") != len(rows)
-            or metadata.get("expected_symbol_count") != len(expected)
-            or not metadata.get("source")
-        ):
-            raise ValueError("archive_metadata_mismatch")
-        fetched = datetime.fromisoformat(metadata["fetched_at"])
-        if fetched.tzinfo is None:
-            raise ValueError("archive_timestamp_timezone_missing")
+        metadata, rows = read_verified_snapshot_archive(root, trade_date, slot)
+        expected = metadata["expected_symbols"]
         observed = {row["symbol"] for row in rows}
-        if len(observed) != len(rows) or any(len(symbol) != 6 or not symbol.isdigit() for symbol in observed):
-            raise ValueError("archive_symbol_invalid")
-        if any(
-            row["snapshot_date"] != trade_date or row["snapshot_time"] != slot
-            or row["fetched_at"] != metadata["fetched_at"] or row["source"] != metadata["source"]
-            for row in rows
-        ):
-            raise ValueError("archive_row_evidence_mismatch")
         missing = sorted(set(expected) - observed)
         covered = len(set(expected) & observed)
-        if (
-            metadata.get("missing_symbols") != missing
-            or metadata.get("coverage_count") != covered
-            or metadata.get("coverage_ratio") != (covered / len(expected) if expected else None)
-            or metadata.get("unexpected_symbols") != sorted(observed - set(expected))
-        ):
-            raise ValueError("archive_coverage_mismatch")
+        fetched = datetime.fromisoformat(metadata["fetched_at"])
         quote_time_ok = all(
             _quote_time_state(row, trade_date, fetched_at=fetched) == "usable" for row in rows
         )
@@ -1603,8 +1632,6 @@ def _slot_evidence(root: Path, trade_date: str, slot: str) -> dict[str, Any]:
             and quote_time_ok
             and any(_valid_price(row["price"]) for row in rows)
         )
-        if metadata.get("status") not in {"written", "partial"}:
-            raise ValueError("archive_status_invalid")
         # A quote is only usable when its price is a real number AND its own
         # provider timestamp could have been observed by this capture (see
         # ``_quote_time_state``).  The archive's own recorded ``fetched_at`` is

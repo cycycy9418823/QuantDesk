@@ -7,6 +7,7 @@ connect to providers, generate strategies, or touch portfolio state.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 import re
@@ -28,7 +29,7 @@ from quantdesk.evidence_freshness import build_evidence_freshness
 from quantdesk.intraday.intraday_gap_checker import intraday_gap_status
 from quantdesk.intraday.intraday_provider_capability import latest_intraday_provider_capability
 from quantdesk.intraday.intraday_replay_self_validation import latest_intraday_replay_self_validation
-from quantdesk.paper.auto_paper_portfolio import auto_paper_portfolio_latest
+from quantdesk.paper.queries import portfolio as paper_queries
 from quantdesk.paper.ledger_read_contract import inspect_strategy_ledger, strategy_initialization_evidence
 from quantdesk.real_intraday_sample_validation import latest_real_intraday_sample_validation
 from quantdesk.shared import now_text, read_json, safe_float, write_json
@@ -38,6 +39,8 @@ from quantdesk.version import API_SCHEMA_VERSION, APP_VERSION
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = PROJECT_ROOT / "results"
+AUTO_PAPER_PORTFOLIO_STATE_JSON = PROJECT_ROOT / "state" / "auto_paper_portfolio.json"
+AUTO_PAPER_PORTFOLIO_LATEST_JSON = RESULTS_DIR / "auto_paper_portfolio_latest.json"
 AUTO_STRATEGY_LATEST_JSON = RESULTS_DIR / "auto_strategy_latest.json"
 DAILY_WORKFLOW_LATEST_JSON = RESULTS_DIR / "daily_workflow_latest.json"
 DATA_HEALTH_DASHBOARD_LATEST_JSON = RESULTS_DIR / "data_health" / "data_health_dashboard_latest.json"
@@ -46,6 +49,24 @@ FULL_A_UNIVERSE_CSV = PROJECT_ROOT / "data" / "universe" / "a_share_symbols.csv"
 CANONICAL_DAILY_DIR = PROJECT_ROOT / "data" / "daily"
 
 RISK_DISCLAIMER = "本系统仅用于本地学习与纸面模拟，不接券商、不真实下单、不构成投资建议。"
+
+
+def auto_paper_portfolio_latest() -> dict[str, Any]:
+    """Read this snapshot's account inputs; retain the legacy callback name.
+
+    Paths belong to this adapter and are resolved when called.  The cached
+    dashboard's target-date projection remains a separate read contract.
+    """
+    paths = replace(
+        paper_queries.PaperQueryPaths.from_root(PROJECT_ROOT),
+        state=AUTO_PAPER_PORTFOLIO_STATE_JSON,
+        latest=AUTO_PAPER_PORTFOLIO_LATEST_JSON,
+        review_root=RESULTS_DIR.parent,
+    )
+    return paper_queries.auto_paper_portfolio_latest(
+        paths, disclaimer=paper_queries.DISCLAIMER,
+        broker_boundary=paper_queries.BROKER_BOUNDARY,
+    )
 
 
 def _relpath_for_payload(path: Path | str) -> str:

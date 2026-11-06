@@ -833,6 +833,41 @@ def _complete_with_existing_stage4(
     return completed
 
 
+def _capture_review_materials(
+    root: Path, *, target_date: str, run_id: str, before_raw: bytes | None,
+    claimed_at: datetime, finished_at: datetime, returncode: int,
+) -> dict[str, Any]:
+    """Run under the existing date lock; evidence failure is a visible label."""
+    from quantdesk.daily_evidence_contract import (
+        audit_daily_evidence, build_requirements, publish_assessment, read_bytes,
+    )
+    from quantdesk.strategy_evidence_archive import archive_strategy_review
+
+    status = "completed" if returncode == 0 else "failed"
+    result: dict[str, Any] = {"status": "incomplete", "reason_codes": []}
+    try:
+        requirements = build_requirements(root, target_date)
+        try:
+            after_raw = read_bytes(root, "state/auto_paper_portfolio.json")
+        except FileNotFoundError:
+            after_raw = None
+        result["strategy_archive"] = archive_strategy_review(
+            root, target_date=target_date, run_id=run_id, before_raw=before_raw, after_raw=after_raw,
+            started_at=claimed_at, recorded_at=finished_at, process_status=status,
+            requirements=requirements, assert_write=lambda: None,
+        )
+        assessment = audit_daily_evidence(root, target_date, requirements=requirements)
+        result["daily_evidence_reference"] = publish_assessment(
+            root, assessment, stage="evening_review", run_id=run_id, process_status=status,
+            recorded_at=finished_at, assert_write=lambda: None,
+        )
+        result["status"] = assessment["current"]["status"]
+        result["reason_codes"] = assessment["current"]["reason_codes"]
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError) as exc:
+        result["reason_codes"] = [f"review_evidence_capture_failed:{type(exc).__name__}"]
+    return result
+
+
 def run_evening_review(
     *,
     project_root: Path,
@@ -971,9 +1006,19 @@ def run_evening_review(
                     "updated_at": claimed_at.isoformat(),
                 }
                 _write_receipt(path, running)
+                from quantdesk.daily_evidence_contract import read_bytes as _read_evidence_bytes
+                try:
+                    before_raw = _read_evidence_bytes(root, "state/auto_paper_portfolio.json")
+                except (OSError, ValueError):
+                    before_raw = None
                 daily_executed = True
                 daily_returncode, daily_error = _safe_run(daily_runner)
                 finished_at = clock()
+                materials = _capture_review_materials(
+                    root, target_date=target_date, run_id=selected_run_id, before_raw=before_raw,
+                    claimed_at=claimed_at, finished_at=finished_at, returncode=daily_returncode,
+                )
+                running = {**running, "research_evidence": materials}
                 if daily_returncode != 0:
                     failed = {
                         **running,

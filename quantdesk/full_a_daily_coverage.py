@@ -20,6 +20,8 @@ import json
 import re
 from collections import Counter
 from collections.abc import Iterable
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -145,54 +147,130 @@ def _read_universe(path: Path) -> list[str]:
 def _last_date_and_rows(path: Path) -> tuple[str, int, bool]:
     """Return max daily date, row count and duplicate-date evidence for one CSV."""
 
-    dates: list[str] = []
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.reader(handle)
+        return _date_summary(csv.reader(handle))
+
+
+def _date_summary(rows: Iterable[list[str]]) -> tuple[str, int, bool]:
+    dates: list[str] = []
+    reader = iter(rows)
+    try:
+        header = next(reader)
+    except StopIteration:
+        return "", 0, False
+    names = [str(column).strip().lower() for column in header]
+    try:
+        date_index = names.index("date")
+    except ValueError:
         try:
-            header = next(reader)
-        except StopIteration:
-            return "", 0, False
-        names = [str(column).strip().lower() for column in header]
-        try:
-            date_index = names.index("date")
+            date_index = names.index("trade_date")
         except ValueError:
-            try:
-                date_index = names.index("trade_date")
-            except ValueError:
-                date_index = 0
-        for row in reader:
-            if len(row) <= date_index:
-                continue
-            day = _date_text(row[date_index])
-            if day:
-                dates.append(day)
+            date_index = 0
+    for row in reader:
+        if len(row) <= date_index:
+            continue
+        day = _date_text(row[date_index])
+        if day:
+            dates.append(day)
     if not dates:
         return "", 0, False
     return max(dates), len(dates), len(set(dates)) != len(dates)
 
 
-def inspect_target_daily_row(path: Path, *, target_date: str) -> dict[str, Any]:
-    """Read original rows before selecting a day; date coverage is not price proof."""
+def _inspect_target_rows(path: Path, rows: list[dict[str, Any]], *, target_date: str,
+                         source_sha256: str) -> dict[str, Any]:
     from quantdesk.data_truth.daily_bar_validity import classify_daily_row
     from quantdesk.price_basis import validate_price_frame_set
     import pandas as pd
+
+    gate = validate_price_frame_set({path.stem: pd.DataFrame(rows)}, consumer="paper_execution")
+    selected = [r for r in rows if _date_text(r.get("date") or r.get("trade_date")) == target_date]
+    classification = classify_daily_row(selected[0]) if len(selected) == 1 else {
+        "classification": "unknown_gap", "valid_trading_bar": False, "execution_eligible": False,
+        "reason_code": "target_row_missing" if not selected else "duplicate_target_rows"}
+    if not gate.get("eligible"):
+        classification.update(classification="unknown_gap", valid_trading_bar=False, execution_eligible=False,
+            reason_code="price_basis_untrusted")
+    return {**classification, "target_date": target_date, "target_row_count": len(selected),
+        "target_row_present": bool(selected), "price_policy_validation": gate,
+        "source_sha256": source_sha256, "source_path": str(path)}
+
+
+def _daily_read_failure(exc: Exception) -> dict[str, Any]:
+    return {"classification": "unknown_gap", "valid_trading_bar": False, "execution_eligible": False,
+        "target_row_present": False, "target_row_count": 0, "reason_code": "daily_read_failed:" + type(exc).__name__}
+
+
+def inspect_target_daily_row(path: Path, *, target_date: str) -> dict[str, Any]:
+    """Read original rows before selecting a day; date coverage is not price proof."""
     try:
         raw = path.read_bytes()
         rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
-        gate = validate_price_frame_set({path.stem: pd.DataFrame(rows)}, consumer="paper_execution")
-        selected = [r for r in rows if _date_text(r.get("date") or r.get("trade_date")) == target_date]
-        classification = classify_daily_row(selected[0]) if len(selected) == 1 else {
-            "classification": "unknown_gap", "valid_trading_bar": False, "execution_eligible": False,
-            "reason_code": "target_row_missing" if not selected else "duplicate_target_rows"}
-        if not gate.get("eligible"):
-            classification.update(classification="unknown_gap", valid_trading_bar=False, execution_eligible=False,
-                reason_code="price_basis_untrusted")
-        return {**classification, "target_date": target_date, "target_row_count": len(selected),
-            "target_row_present": bool(selected), "price_policy_validation": gate,
-            "source_sha256": hashlib.sha256(raw).hexdigest(), "source_path": str(path)}
+        return _inspect_target_rows(path, rows, target_date=target_date, source_sha256=hashlib.sha256(raw).hexdigest())
     except (OSError, ValueError, UnicodeError, csv.Error) as exc:
-        return {"classification": "unknown_gap", "valid_trading_bar": False, "execution_eligible": False,
-            "target_row_present": False, "target_row_count": 0, "reason_code": "daily_read_failed:" + type(exc).__name__}
+        return _daily_read_failure(exc)
+
+
+@dataclass(frozen=True)
+class _DailyFileAudit:
+    source_sha256: str
+    target_row: dict[str, Any]
+    latest_date: str
+    coverage_dates: tuple[str, int, bool]
+    coverage_error: str = ""
+
+
+class DailyAuditCache:
+    """Reuse parsing in one read-only audit; rehash complete bytes on every read.
+
+    Only small summaries are retained, never CSV bytes or frames. The caller
+    owns the lifetime, and returned dictionaries cannot mutate cached evidence.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, str], _DailyFileAudit] = {}
+
+    def inspect(self, path: Path, *, target_date: str) -> _DailyFileAudit:
+        key = (str(path), target_date)
+        try:
+            raw = path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            prior = self._entries.get(key)
+            if prior is not None and prior.source_sha256 == digest:
+                return deepcopy(prior)
+            text = raw.decode("utf-8-sig")
+        except (OSError, ValueError, UnicodeError) as exc:
+            self._entries.pop(key, None)
+            return _DailyFileAudit("", _daily_read_failure(exc), "", ("", 0, False), type(exc).__name__)
+
+        rows = None
+        try:
+            rows = list(csv.DictReader(io.StringIO(text)))
+            target_row = _inspect_target_rows(path, rows, target_date=target_date, source_sha256=digest)
+        except (OSError, ValueError, UnicodeError, csv.Error) as exc:
+            target_row = _daily_read_failure(exc)
+
+        # Preserve the two existing date-only readers' distinct header/date
+        # policies, including their newline handling. Neither grants price proof.
+        latest = ""
+        try:
+            date_rows = rows
+            if date_rows is None or "\r" in text.replace("\r\n", ""):
+                date_rows = list(csv.DictReader(io.StringIO(text, newline="")))
+            for row in date_rows:
+                value = str(row.get("date") or row.get("trade_date") or "").strip()
+                day = value[:10].replace("/", "-") if len(value) >= 10 else ""
+                latest = max(latest, day)
+        except (OSError, UnicodeError, csv.Error):
+            latest = ""
+        try:
+            dates = _date_summary(csv.reader(io.StringIO(text, newline="")))
+            error = ""
+        except (OSError, UnicodeError, csv.Error) as exc:
+            dates, error = ("", 0, False), type(exc).__name__
+        result = _DailyFileAudit(digest, target_row, latest, dates, error)
+        self._entries[key] = result
+        return deepcopy(result)
 
 
 def build_full_a_daily_coverage(
@@ -200,6 +278,7 @@ def build_full_a_daily_coverage(
     target_date: str,
     universe_path: Path,
     daily_dir: Path,
+    inspection_cache: DailyAuditCache | None = None,
 ) -> dict[str, Any]:
     """Inspect current-universe daily coverage without fetching or writing.
 
@@ -225,8 +304,16 @@ def build_full_a_daily_coverage(
         if not path.is_file():
             missing.append(symbol)
             continue
+        audit = None
         try:
-            latest, row_count, has_duplicate = _last_date_and_rows(path)
+            if inspection_cache is not None and target:
+                audit = inspection_cache.inspect(path, target_date=target)
+                if audit.coverage_error:
+                    invalid.append(f"{symbol}:{audit.coverage_error}")
+                    continue
+                latest, row_count, has_duplicate = audit.coverage_dates
+            else:
+                latest, row_count, has_duplicate = _last_date_and_rows(path)
         except (OSError, UnicodeError, csv.Error) as exc:
             invalid.append(f"{symbol}:{type(exc).__name__}")
             continue
@@ -235,7 +322,8 @@ def build_full_a_daily_coverage(
             continue
         present.append(symbol)
         latest_by_symbol[symbol] = latest
-        target_rows[symbol] = inspect_target_daily_row(path, target_date=target) if target else {}
+        target_rows[symbol] = (audit.target_row if audit is not None else
+                              inspect_target_daily_row(path, target_date=target) if target else {})
         if has_duplicate:
             duplicate.append(symbol)
         if target and latest < target:

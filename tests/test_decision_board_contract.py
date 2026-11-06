@@ -150,11 +150,15 @@ def test_decision_board_aligns_paper_and_benchmark_returns_in_backend() -> None:
 
     payload = build_decision_board_snapshot(**_inputs())
 
-    assert payload["return_series"]["status"] == "passed"
+    assert payload["return_series"]["status"] == "degraded"
     assert payload["return_series"]["items"] == [
         {"date": "2026-07-07", "paper_return_pct": 0.0, "benchmark_return_pct": 0.0},
+        {"date": "2026-07-08", "paper_return_pct": None, "benchmark_return_pct": 1.0},
+        {"date": "2026-07-09", "paper_return_pct": None, "benchmark_return_pct": None},
         {"date": "2026-07-10", "paper_return_pct": 0.6, "benchmark_return_pct": 2.0},
     ]
+    assert payload["return_series"]["missing_valuation_dates"] == ["2026-07-08", "2026-07-09"]
+    assert payload["envelope"]["coverage"]["aligned_return_point_count"] == 2
     assert payload["return_series"]["benchmark_label"] == "沪深300"
 
 
@@ -193,8 +197,10 @@ def test_equity_history_accessor_normalizes_dates_and_is_read_only(tmp_path: Pat
                 "ok": True,
                 "updated_at": "2026-07-10T16:00:00",
                 "items": [
-                    {"generated_at": "2026-07-07T15:01:00", "total_equity": 10_000, "total_return_pct": 0},
-                    {"generated_at": "2026-07-10T15:01:00", "total_equity": 10_060, "total_return_pct": 0.6},
+                    {"valuation_date": "2026-07-07", "generated_at": "2026-07-08T01:01:00", "cash": 10_000,
+                     "market_value": 0, "total_equity": 10_000, "total_return_pct": 0, "portfolio_review_valid": True},
+                    {"valuation_date": "2026-07-10", "generated_at": "2026-07-10T15:01:00", "cash": 10_060,
+                     "market_value": 0, "total_equity": 10_060, "total_return_pct": 0.6, "portfolio_review_valid": True},
                 ],
             },
             ensure_ascii=False,
@@ -239,6 +245,6 @@ def test_decision_board_route_is_get_only_and_returns_authoritative_payload() ->
 
     assert response.status_code == 200
     assert payload["positions"][0]["unrealized_pnl"] == 50.0
-    assert payload["return_series"]["items"][1]["benchmark_return_pct"] == 2.0
+    assert payload["return_series"]["items"][-1]["benchmark_return_pct"] == 2.0
     assert post_response.status_code == 405
 

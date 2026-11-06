@@ -15,7 +15,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from quantdesk.paper.auto_paper_portfolio import reconcile_paper_account
+from quantdesk.paper.accounting.reconciliation import number, reconcile_paper_account
 from quantdesk.shared import safe_float
 from quantdesk.utils import atomic_write_json
 
@@ -192,9 +192,23 @@ def _paper_account_consistency(path: Path, *, latest_snapshot: bool = False) -> 
                 "invalid_reason_codes": ["paper_account_latest_summary_missing"],
             }
         source_summary = dict(summary)
+        correction_fields = ("legacy_realized_adjustment", "realized_corrections",
+            "realized_corrections_total", "effective_realized_adjustment")
+        correction_conflicts = [field for field in correction_fields
+            if field in summary and field in source and (summary[field] != source[field]
+                or (field != "realized_corrections" and number(summary[field]) is None))]
+        if correction_conflicts:
+            return {"status": "invalid", "reason": "paper_account_latest_correction_summary_conflict",
+                "drift_fields": correction_conflicts, "status_mismatch_symbols": [],
+                "legacy_realized_adjustment": None, "summary": {},
+                "invalid_reason_codes": ["paper_account_latest_correction_summary_conflict:" + field
+                    for field in correction_conflicts]}
         projected = dict(summary)
         projected["positions"] = source.get("positions", [])
         projected["closed_positions"] = source.get("closed_positions", [])
+        for field in ("realized_reductions", *correction_fields):
+            if field in source:
+                projected[field] = source[field]
         source = projected
 
     reconciled = reconcile_paper_account(source)
@@ -216,6 +230,9 @@ def _paper_account_consistency(path: Path, *, latest_snapshot: bool = False) -> 
         "drift_fields": drift_fields,
         "status_mismatch_symbols": mismatches,
         "legacy_realized_adjustment": detail.get("legacy_realized_adjustment"),
+        "realized_corrections_total": detail.get("realized_corrections_total"),
+        "effective_realized_adjustment": detail.get("effective_realized_adjustment"),
+        "realized_correction_evidence": detail.get("realized_correction_evidence"),
         "detail_market_value": detail.get("detail_market_value"),
         "detail_unrealized_pnl": detail.get("detail_unrealized_pnl"),
         "closed_realized_pnl": detail.get("closed_realized_pnl"),

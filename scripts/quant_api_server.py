@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import webbrowser
+from dataclasses import replace
 from io import BytesIO
 from threading import Thread
 
@@ -54,12 +55,34 @@ from quantdesk.daily_candidate_refresh import load_formal_candidate_intake
 from quantdesk.daily_price_update_engine import update_daily_prices
 from quantdesk.market_clock import expected_settlement_date, get_market_session, to_shanghai_datetime
 from quantdesk.market_intelligence_utils import intraday_file_exists
-from quantdesk.paper.auto_paper_portfolio import (
-    AUTO_PAPER_PORTFOLIO_HISTORY_JSON,
-    AUTO_PAPER_PORTFOLIO_LATEST_JSON,
-    auto_paper_portfolio_equity_history,
-    auto_paper_portfolio_latest,
-)
+from quantdesk.paper.queries import portfolio as paper_queries
+
+AUTO_PAPER_PORTFOLIO_HISTORY_JSON = paper_queries.PaperQueryPaths.from_root(project_root).history
+AUTO_PAPER_PORTFOLIO_LATEST_JSON = paper_queries.PaperQueryPaths.from_root(project_root).latest
+AUTO_PAPER_PORTFOLIO_STATE_JSON = paper_queries.PaperQueryPaths.from_root(project_root).state
+PAPER_REVIEW_RESULTS_DIR: Path | None = None
+
+
+def _paper_latest_query_paths() -> paper_queries.PaperQueryPaths:
+    return replace(paper_queries.PaperQueryPaths.from_root(project_root),
+                   latest=AUTO_PAPER_PORTFOLIO_LATEST_JSON,
+                   state=AUTO_PAPER_PORTFOLIO_STATE_JSON,
+                   review_root=PAPER_REVIEW_RESULTS_DIR.parent if PAPER_REVIEW_RESULTS_DIR is not None else project_root)
+
+
+def auto_paper_portfolio_latest() -> dict[str, Any]:
+    """Read the latest account and its warnings through the independent query."""
+    return paper_queries.auto_paper_portfolio_latest(_paper_latest_query_paths(),
+        disclaimer=paper_queries.DISCLAIMER, broker_boundary=paper_queries.BROKER_BOUNDARY)
+
+
+def auto_paper_portfolio_equity_history(limit: int = 250) -> dict[str, Any]:
+    """Read history through the query layer using current viewer path overrides."""
+    paths = replace(paper_queries.PaperQueryPaths.from_root(project_root),
+                    history=AUTO_PAPER_PORTFOLIO_HISTORY_JSON)
+    return paper_queries.auto_paper_portfolio_equity_history(paths, limit=limit)
+
+
 from quantdesk.providers.news_provider import fetch_news, news_cache_stats, refresh_single_news
 from quantdesk.theme_attribution import build_theme_attribution, summarize_attribution_sources
 from quantdesk.theme_current_candidate_validator import validate_theme_map_for_current_candidates
@@ -339,7 +362,7 @@ def _ui_symbols_in_files(paths: list[Path]) -> set[str]:
     return found
 
 
-def _ui_dependency_paths() -> list[Path]:
+def _ui_dependency_paths(paper_latest_inputs: paper_queries.PaperLatestReadInputs | None = None) -> list[Path]:
     """Hash the inputs of this read view; never read all-market bar contents."""
     from quantdesk.daily_candidate_refresh import _safe_run_id
     from quantdesk.plan_review_receipts import STORE_PATH
@@ -377,7 +400,8 @@ def _ui_dependency_paths() -> list[Path]:
     portfolio = [project_root / "state/auto_paper_portfolio.json",
         project_root / "results/auto_paper_portfolio_latest.json", project_root / "results/auto_paper_portfolio_history.json"]
     if scope == "/api/decision-board":
-        return [PAPER_WATCHLIST_JSON, *portfolio, *chain, project_root / STORE_PATH / "latest.json",
+        inputs = paper_latest_inputs or paper_queries.auto_paper_portfolio_latest_read_inputs(_paper_latest_query_paths())
+        return [PAPER_WATCHLIST_JSON, *inputs.files, AUTO_PAPER_PORTFOLIO_HISTORY_JSON, *chain,
             BENCHMARK_DIR / "hs300.csv", *market[-2:]]
     if scope == "/api/data-health/dashboard":
         from quantdesk.daily_gap_review import daily_gap_review_input_paths
@@ -436,12 +460,21 @@ def _ui_request_identity() -> dict[str, Any]:
     target = expected_settlement_date(to_shanghai_datetime())
     callbacks = (candidate_rows, latest_generation_status, load_stock_data, build_strategy_scorecard,
         load_paper_simulation_watchlist, auto_paper_portfolio_latest, load_a_share_trading_calendar)
-    return byte_identity(_ui_dependency_paths(), target_date=target.isoformat() if target else "",
+    config = {"network": realtime_network_enabled(), "root": str(project_root),
+              "configured_root": str(app.config.get("QUANTDESK_PROJECT_ROOT") or project_root)}
+    if request.path == "/api/decision-board":
+        callbacks += (auto_paper_portfolio_equity_history,)
+        inputs = paper_queries.auto_paper_portfolio_latest_read_inputs(_paper_latest_query_paths())
+        paths = _ui_dependency_paths(inputs)
+        config["paper_recovery_selection"] = {"backup_order": inputs.backup_order,
+                                               "bad_marker_exists": inputs.bad_marker_exists}
+    else:
+        paths = _ui_dependency_paths()
+    return byte_identity(paths, target_date=target.isoformat() if target else "",
         account="strategy/ai_trader/ai_trader_glm", scope=request.path,
         code_id=SERVER_BUILD_ID + ":" + ":".join(str(id(f)) for f in callbacks)
             + ":" + str(id(app.view_functions.get(request.endpoint))),
-        config_id=json.dumps({"network": realtime_network_enabled(), "root": str(project_root),
-            "configured_root": str(app.config.get("QUANTDESK_PROJECT_ROOT") or project_root)}, sort_keys=True))
+        config_id=json.dumps(config, sort_keys=True))
 
 
 @app.before_request
@@ -652,6 +685,7 @@ register_daily_generation_routes(
 register_research_routes(
     app,
     ResearchRouteDeps(
+        load_paper_portfolio=lambda: auto_paper_portfolio_latest(),
         project_root=lambda: project_root,
         paper_watchlist_json=lambda: PAPER_WATCHLIST_JSON,
         project_relative_path=lambda path: project_relative_path(path),
@@ -710,6 +744,7 @@ register_realtime_routes(
 register_paper_simulation_routes(
     app,
     PaperSimulationRouteDeps(
+        load_equity_history=lambda **kwargs: auto_paper_portfolio_equity_history(**kwargs),
         data_write_lock=lambda: DATA_WRITE_LOCK,
         paper_watchlist_json=lambda: PAPER_WATCHLIST_JSON,
         project_relative_path=lambda path: project_relative_path(path),

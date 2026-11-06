@@ -20,7 +20,9 @@ from uuid import uuid4
 
 from quantdesk.daily_price_update_engine import update_daily_prices
 from quantdesk.data_health_alert_delivery import dispatch_data_health_alerts
-from quantdesk.full_a_daily_coverage import build_full_a_daily_coverage, load_roster_evidence, inspect_target_daily_row
+from quantdesk.full_a_daily_coverage import (
+    DailyAuditCache, build_full_a_daily_coverage, load_roster_evidence, inspect_target_daily_row,
+)
 from quantdesk.interprocess_lock import interprocess_file_lock
 from quantdesk.suspension_aware_completeness import (
     SuspensionEvidence,
@@ -236,6 +238,7 @@ def build_reconciliation_partition(
     *,
     target_date: str,
     run_evidence: SuspensionEvidence | None = None,
+    inspection_cache: DailyAuditCache | None = None,
 ) -> dict[str, Any]:
     """Split the current universe into mutually exclusive update work classes."""
 
@@ -261,9 +264,13 @@ def build_reconciliation_partition(
     for symbol in universe:
         path = daily_dir / f"{symbol}.csv"
         exists = path.is_file()
-        latest = _last_date(path) if exists else ""
-        latest_by_symbol[symbol] = latest
-        row_evidence[symbol] = inspect_target_daily_row(path, target_date=target)
+        if inspection_cache is None:
+            latest_by_symbol[symbol] = _last_date(path) if exists else ""
+            row_evidence[symbol] = inspect_target_daily_row(path, target_date=target)
+        else:
+            audit = inspection_cache.inspect(path, target_date=target)
+            latest_by_symbol[symbol] = audit.latest_date if exists else ""
+            row_evidence[symbol] = audit.target_row
         if not exists:
             missing.append(symbol)
         elif symbol in research_set:
@@ -487,7 +494,11 @@ def run_full_a_daily_reconciliation(
             run_evidence_dir=run_evidence_dir,
             universe_symbols=_read_symbols(root / UNIVERSE_RELATIVE),
         )
-    partition = build_reconciliation_partition(root, target_date=target, run_evidence=run_evidence)
+    # The mutating update path retains its independent before/after inspections.
+    inspection_cache = DailyAuditCache() if audit_only else None
+    partition = build_reconciliation_partition(
+        root, target_date=target, run_evidence=run_evidence, inspection_cache=inspection_cache,
+    )
     if not target or not partition["universe_symbols"]:
         payload = _manifest(run_id=current_run_id, target=target, partition=partition, status="blocked")
         payload["reason_codes"] = ["universe_or_target_missing"]
@@ -504,6 +515,7 @@ def run_full_a_daily_reconciliation(
         raw_coverage = build_full_a_daily_coverage(
             target_date=target, universe_path=root / UNIVERSE_RELATIVE,
             daily_dir=root / DAILY_RELATIVE,
+            inspection_cache=inspection_cache,
         )
         coverage = _effective_coverage_from_partition(raw_coverage, partition, target_date=target)
         pending = list(partition["pending_symbols"])

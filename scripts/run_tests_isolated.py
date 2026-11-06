@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +18,9 @@ import tempfile
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _EXCLUDE = {"data", "state", "results", "reports", "logs", "dist", "attic", "test_runtime", ".venv", "node_modules", ".git", ".codex", ".pytest_cache", "__pycache__"}
 _EXCLUDE_ANYWHERE = {".venv", "node_modules", ".git", ".codex", ".pytest_cache", "__pycache__"}
+# These maintained source assets are ignored by Git but required by self_check.
+# Do not glob ignored directories: they can contain builds, images or secrets.
+_MAINTAINED_IGNORED_SOURCE = ("docs/screenshots/README.md", "build/QuantDesk.spec")
 
 
 def build_test_copy(source: Path, output: Path, *, include_git_metadata: bool = True) -> tuple[Path, dict]:
@@ -40,7 +42,7 @@ def build_test_copy(source: Path, output: Path, *, include_git_metadata: bool = 
         subprocess.run(["git", "-C", str(sandbox), "remote", "remove", "origin"], capture_output=True, check=True)
         subprocess.run(["git", "-C", str(sandbox), "read-tree", "HEAD"], capture_output=True, check=True)
     cp = subprocess.run(["git", "-C", str(source), "ls-files", "-z", "--cached", "--others", "--exclude-standard"], capture_output=True, check=True)
-    names = sorted(set(cp.stdout.decode("utf-8").split("\0")) - {""})
+    names = sorted((set(cp.stdout.decode("utf-8").split("\0")) | set(_MAINTAINED_IGNORED_SOURCE)) - {""})
     files: dict[str, str] = {}
     for name in names:
         relative = Path(name)
@@ -51,12 +53,16 @@ def build_test_copy(source: Path, output: Path, *, include_git_metadata: bool = 
         if relative.name.startswith(".env") or relative.suffix.lower() in {".key", ".pem", ".pfx", ".zip", ".pyc"}:
             continue
         original = source / relative
-        if not original.is_file() or original.is_symlink():
+        if (not original.is_file() or original.is_symlink()
+                or not original.resolve().is_relative_to(source)):
             continue
+        if name in _MAINTAINED_IGNORED_SOURCE and original.stat().st_size > 2_000_000:
+            raise ValueError(f"maintained_source_asset_too_large:{name}")
         destination = sandbox / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(original, destination)
-        files[name] = hashlib.sha256(original.read_bytes()).hexdigest()
+        raw = original.read_bytes()
+        destination.write_bytes(raw)
+        files[name] = hashlib.sha256(raw).hexdigest()
     manifest = {"source_root": str(source), "sandbox_root": str(sandbox), "base_commit": head,
                 "created_at": datetime.now(timezone.utc).isoformat(), "files": files,
                 "real_runtime_copied": False, "independent_git_metadata": include_git_metadata}
@@ -81,7 +87,11 @@ def main(argv: list[str] | None = None) -> int:
     env = dict(os.environ)
     roots = [args.source_root.resolve(), *(root.resolve() for root in args.protect_root)]
     env.update(QUANTDESK_TEST_SANDBOX=str(sandbox), QUANTDESK_TEST_PROTECTED_ROOTS=os.pathsep.join(map(str, roots)), PYTHONDONTWRITEBYTECODE="1")
-    env["PYTHONPATH"] = os.pathsep.join([str(guard), str(sandbox), env.get("PYTHONPATH", "")])
+    # An already guarded parent requires its bootstrap first. Pytest's conftest
+    # then adds this sandbox's protected roots; no inherited fence is replaced.
+    env["PYTHONPATH"] = os.pathsep.join(value for value in [
+        env.get("QUANTDESK_TEST_FENCE_BOOTSTRAP", ""), str(guard), str(sandbox), env.get("PYTHONPATH", "")
+    ] if value)
     pytest_args = args.pytest_args[1:] if args.pytest_args[:1] == ["--"] else args.pytest_args
     log = sandbox.parent / (sandbox.name + "-pytest.log")
     command = [sys.executable, "-X", "utf8", "-B", "-m", "pytest", *(pytest_args or ["tests", "-q"])]

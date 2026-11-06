@@ -569,7 +569,7 @@ def test_performance_summary_reads_local_metrics_after_blueprint_split(monkeypat
             {"date": "2026-06-03", "strategy_type": "alpha", "hold_5d_ret": 8.00, "hold_20d_ret": 0.30, "hit_flag": 1},
         ]
     ).to_csv(perf_dir / "candidate_performance.csv", index=False)
-    monkeypatch.setattr(auto_paper_portfolio, "auto_paper_portfolio_latest", lambda: {"ok": True, "paper_only": True})
+    monkeypatch.setattr(api_server, "auto_paper_portfolio_latest", lambda: {"ok": True, "paper_only": True})
 
     payload = app.test_client().get("/api/performance/summary").get_json()
 
@@ -606,7 +606,7 @@ def test_performance_summary_excludes_pending_hit_flags_and_reports_maturity(mon
             {"date": "2026-06-04", "hold_5d_ret": 0.03, "hold_20d_ret": 0.05, "hit_flag": None},
         ]
     ).to_csv(perf_dir / "candidate_performance.csv", index=False)
-    monkeypatch.setattr(auto_paper_portfolio, "auto_paper_portfolio_latest", lambda: {"ok": True})
+    monkeypatch.setattr(api_server, "auto_paper_portfolio_latest", lambda: {"ok": True})
 
     payload = app.test_client().get("/api/performance/summary").get_json()
     metrics = payload["overall"]
@@ -630,7 +630,7 @@ def test_performance_summary_keeps_audit_warning_when_no_samples(monkeypatch, tm
     watchlist_path.parent.mkdir(parents=True, exist_ok=True)
     watchlist_path.write_text(json.dumps({"items": []}), encoding="utf-8")
     monkeypatch.setattr(api_server, "PAPER_WATCHLIST_JSON", watchlist_path)
-    monkeypatch.setattr(auto_paper_portfolio, "auto_paper_portfolio_latest", lambda: {"ok": True})
+    monkeypatch.setattr(api_server, "auto_paper_portfolio_latest", lambda: {"ok": True})
 
     payload = app.test_client().get("/api/performance/summary").get_json()
 

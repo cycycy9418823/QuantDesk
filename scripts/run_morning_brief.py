@@ -56,7 +56,7 @@ def _load_sendkey() -> str | None:
 def _exit_code(payload: dict) -> int:
     status = str(payload.get("status") or "")
     reason = str(payload.get("reason_code") or "")
-    if status in {"preview_generated", "sent", "skipped_duplicate"}:
+    if status in {"preview_generated", "sent", "skipped_duplicate", "skipped_non_trading_day"}:
         return 0
     if status == "busy":
         return 3

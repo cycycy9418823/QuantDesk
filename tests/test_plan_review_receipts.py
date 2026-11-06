@@ -94,6 +94,67 @@ def test_complete_raw_review_is_sealed_and_does_not_claim_simulation(tmp_path: P
     assert result["evidence_counts"] == {"applied_to_ledger": 0, "intraday_simulation_executed": 0, "expiry_reviewed": 1}
 
 
+@pytest.mark.parametrize("route", ["declared_basis", "lifecycle_v1", "declared_basis/lifecycle_v1"])
+def test_review_archives_actual_routed_minute_evidence(tmp_path: Path, route: str) -> None:
+    plan = make_plan()
+    archive(tmp_path, plan)
+    write_minutes(tmp_path, plan)
+    original = tmp_path / "data/intraday/1m/600000.csv"
+    routed = original.parent / route / original.name
+    routed.parent.mkdir(parents=True)
+    original.rename(routed)
+    if route.startswith("declared_basis/"):
+        # The collector's legacy header routes new declared-basis evidence away
+        # from its old unknown history; neither file is rewritten by review.
+        from quantdesk.intraday.minute_storage import LEGACY_COLUMNS
+        original.write_text(",".join(sorted(LEGACY_COLUMNS)) + "\n", encoding="utf-8")
+    before = {str(p): p.read_bytes() for p in (original, routed) if p.exists()}
+    result = receipts.plan_review_snapshot(tmp_path, trade_date=plan["trade_date"],
+                                           checked_at="2026-08-03T18:30:00+08:00", write=True)
+    assert result["plan_review_summary"]["reviewed_count"] == 1
+    stored = receipts.load_plan_review_receipts(tmp_path)["review_receipts"][0]
+    assert stored["inputs"][0]["path"] == routed.relative_to(tmp_path).as_posix()
+    assert stored["review_passed"] is True and stored["simulation_executed"] is False
+    assert receipts.verify_plan_review_receipt(stored, plan=plan, project_root=tmp_path) == []
+    assert before == {p: Path(p).read_bytes() for p in before}
+    routed.write_bytes(routed.read_bytes() + b"\n")
+    assert "receipt_input_changed" in receipts.verify_plan_review_receipt(stored, plan=plan, project_root=tmp_path)
+
+
+def test_unrelated_same_byte_path_is_not_a_valid_read_route(tmp_path: Path) -> None:
+    plan = make_plan()
+    write_minutes(tmp_path, plan)
+    original = tmp_path / "data/intraday/1m/600000.csv"
+    receipt = review(tmp_path, plan)
+    unrelated = tmp_path / "unrelated/600000.csv"
+    unrelated.parent.mkdir()
+    unrelated.write_bytes(original.read_bytes())
+    receipt["inputs"][0].update(path="unrelated/600000.csv", requested_path="data/intraday/1m/600000.csv")
+    receipt = receipts._seal({k: v for k, v in receipt.items() if k != "receipt_hash"})
+    assert "receipt_input_path_invalid" in receipts.verify_plan_review_receipt(receipt, plan=plan, project_root=tmp_path)
+
+
+def test_new_lifecycle_selection_invalidates_prior_original_receipt(tmp_path: Path) -> None:
+    plan = make_plan()
+    write_minutes(tmp_path, plan)
+    receipt = review(tmp_path, plan)
+    original = tmp_path / "data/intraday/1m/600000.csv"
+    routed = original.parent / "lifecycle_v1/600000.csv"
+    routed.parent.mkdir()
+    routed.write_bytes(original.read_bytes())
+    assert "receipt_input_path_invalid" in receipts.verify_plan_review_receipt(receipt, plan=plan, project_root=tmp_path)
+
+
+@pytest.mark.parametrize("field", ["path", "requested_path"])
+def test_routed_receipt_cannot_escape_project_root(tmp_path: Path, field: str) -> None:
+    plan = make_plan()
+    write_minutes(tmp_path, plan)
+    receipt = review(tmp_path, plan)
+    receipt["inputs"][0][field] = "../outside/600000.csv"
+    receipt = receipts._seal({k: v for k, v in receipt.items() if k != "receipt_hash"})
+    assert "receipt_input_path_invalid" in receipts.verify_plan_review_receipt(receipt, plan=plan, project_root=tmp_path)
+
+
 def test_missing_minutes_are_reviewed_but_stay_explicitly_insufficient(tmp_path: Path) -> None:
     plan = make_plan(symbols=2)
     archive(tmp_path, plan)

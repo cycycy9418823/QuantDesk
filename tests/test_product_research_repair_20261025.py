@@ -171,15 +171,17 @@ def _state():
             "closed_positions": [], "realized_reductions": [], "warnings": ["paper_account_pnl_identity_mismatch", "paper_account_top_level_drift_detected"]}
 
 
-def test_cost_projection_matches_current_pnl_source_without_adjusting_ledger():
+def test_cost_projection_exposes_legacy_entry_basis_without_adjusting_ledger():
     state = _state()
     original = deepcopy(state)
     result = build_product_integrity(state)
     assert state == original
-    assert result["position_costs"][0]["pnl_cost_price"] == 40
-    assert result["position_costs"][0]["display_cost_differs"]
-    assert result["position_costs"][0]["recomputed_unrealized_pnl"] == 50
-    assert result["capital_cost_bridge"]["difference"] == 0
+    assert result["position_costs"][0]["pnl_cost_price"] == 38
+    assert result["position_costs"][0]["entry_cost_differs"]
+    assert result["position_costs"][0]["recomputed_unrealized_pnl"] == 70
+    assert result["position_costs"][0]["pnl_difference"] == -20
+    assert result["position_costs"][0]["status"] == "mismatch"
+    assert result["capital_cost_bridge"]["difference"] == -20
     assert result["pnl_identity"]["status"] == "consistent"
     assert result["industry_coverage"]["known"] == 1
     assert result["corporate_action_evidence"]["stale_symbols"] == ["600000"]
@@ -209,7 +211,9 @@ def test_incomplete_numbers_do_not_become_zero_money():
 
 def test_history_gaps_duplicates_and_zero_holding_cannot_be_called_complete():
     calendar = {"is_open_by_date": {"2026-09-01": True, "2026-09-02": True, "2026-09-03": True}}
-    history = {"items": [{"generated_at": value, "total_equity": 1000} for value in ("2026-09-01", "2026-09-03", "2026-09-03")]}
+    history = {"items": [{"valuation_date": value, "generated_at": value, "cash": 1000, "market_value": 0,
+                          "total_equity": 1000, "portfolio_review_valid": True}
+                         for value in ("2026-09-01", "2026-09-03", "2026-09-03")]}
     result = history_coverage(history, calendar=calendar, created_at="2026-05-01", target_date="2026-09-03")
     assert result["missing_dates"] == ["2026-09-02"]
     assert result["duplicate_dates"] == ["2026-09-03"]
@@ -221,7 +225,8 @@ def test_history_gaps_duplicates_and_zero_holding_cannot_be_called_complete():
 
 
 def test_no_calendar_does_not_invent_missing_trading_days():
-    result = history_coverage({"items": [{"date": "2026-09-01", "total_equity": 1000}]}, target_date="2026-09-03")
+    result = history_coverage({"items": [{"valuation_date": "2026-09-01", "cash": 1000, "market_value": 0,
+                                         "total_equity": 1000, "portfolio_review_valid": True}]}, target_date="2026-09-03")
     assert result["expected_trading_days"] is None
     assert not result["continuous_statistics_eligible"]
 
@@ -248,8 +253,8 @@ def test_invalid_records_are_visible_and_do_not_become_a_complete_ledger():
 
 def test_future_or_malformed_equity_records_cannot_pass_coverage():
     calendar = {"is_open_by_date": {"2026-09-01": True, "2026-09-02": True}}
-    result = history_coverage({"items": [{"date": "2026-09-01", "total_equity": 1000},
-                                          {"date": "2026-09-02", "total_equity": 1001}, "bad"]},
+    result = history_coverage({"items": [{"valuation_date": "2026-09-01", "cash": 1000, "market_value": 0, "total_equity": 1000},
+                                          {"valuation_date": "2026-09-02", "cash": 1001, "market_value": 0, "total_equity": 1001}, "bad"]},
                               calendar=calendar, target_date="2026-09-01")
     assert result["invalid_record_rows"] == 1
     assert result["dates_after_target"] == ["2026-09-02"]

@@ -1148,6 +1148,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pipeline-run-id", default="")
     parser.add_argument("--max-refresh-seconds", type=float, default=None)
     parser.add_argument("--refresh-attempt-id", default="")
+    parser.add_argument("--evidence-only", action="store_true",
+                        help="Pipeline-owned factor/checklist phase after the actual candidate batch; no bar refresh.")
     parser.add_argument("--discovery-snapshot-root", type=Path, action="append", default=[],
                         help="Explicit read-only project root for same-day verified discovery snapshots.")
     args = parser.parse_args(argv)
@@ -1183,6 +1185,35 @@ def main(argv: list[str] | None = None) -> int:
             with MarketWriterLease(PROJECT_ROOT, run_id=report["pipeline_run_id"], target=target) as lease:
                 if not _complete_live_session(target):
                     raise MarketWriterUnauthorized("live_snapshot_requires_today_completed_session")
+                if args.evidence_only:
+                    from quantdesk.daily_evidence_contract import audit_daily_evidence, build_requirements, publish_assessment
+                    from quantdesk.adjustment_factor_evidence import maintain_adjustment_evidence
+                    requirements = build_requirements(PROJECT_ROOT, target)
+                    remaining = _remaining_refresh_seconds()
+                    factor = maintain_adjustment_evidence(
+                        PROJECT_ROOT, requirements, network=True, assert_write=lease.assert_active,
+                        timeout_seconds=min(60.0, remaining if remaining is not None else 60.0),
+                    )
+                    report["families"] = {"adjustment_evidence": factor}
+                    report["status"] = "completed" if factor["ok"] else "completed_with_warnings"
+                    report["overall_ok"] = factor["ok"]
+                    report["canonical_write"] = True
+                    report["finished_at"] = _now_iso()
+                    assessment = audit_daily_evidence(PROJECT_ROOT, target, requirements=requirements)
+                    report["daily_evidence"] = assessment
+                    report["daily_evidence_reference"] = publish_assessment(
+                        PROJECT_ROOT, assessment, stage="close_factor_maintenance", run_id=report["pipeline_run_id"],
+                        process_status=report["status"], recorded_at=_now_iso(), assert_write=lease.assert_active,
+                    )
+                    content = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+                    latest = RESULTS_DIR / "adjustment_refresh_latest.json"
+                    _atomic_bytes(RESULTS_DIR / f"adjustment_refresh_{target}.json", content, lease=lease)
+                    _atomic_bytes(latest, content, lease=lease)
+                    printed = {**report, "artifact_path": _display_path(latest),
+                               "artifact_sha256": "sha256:" + hashlib.sha256(content).hexdigest()}
+                    if truthy(args.json):
+                        print(json.dumps(printed, ensure_ascii=False, indent=2, allow_nan=False))
+                    return 0
                 families = {
                     "bars_and_valuation": lambda: family_bars_and_valuation(target, True, lease=lease),
                     "benchmarks": lambda: family_benchmarks(True, lease=lease, target_date=target),
@@ -1235,6 +1266,9 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 }
                 report["reason_codes"] = [f"benchmarks:{code}" for code in benchmark.get("reason_codes", [])]
+                from quantdesk.daily_evidence_contract import build_requirements
+                report["evidence_requirements"] = build_requirements(PROJECT_ROOT, target)
+                report["research_evidence_status"] = "not_complete;factor_phase_follows_actual_candidates_then_evening_archive"
                 for name, family in report["families"].items():
                     if name != "benchmarks":
                         report["reason_codes"].extend(f"{name}:{code}" for code in family.get("reason_codes", []))

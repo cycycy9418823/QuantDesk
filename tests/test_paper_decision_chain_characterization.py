@@ -62,6 +62,11 @@ LEGACY_CHAIN_FILES = (
     "quantdesk/daily_workflow_orchestrator.py",
     "quantdesk/auto_strategy_sandbox.py",
     "quantdesk/paper/auto_paper_portfolio.py",
+    "quantdesk/paper/execution/__init__.py",
+    "quantdesk/paper/execution/ports.py",
+    "quantdesk/paper/execution/daily.py",
+    "quantdesk/paper/execution/conditional.py",
+    "quantdesk/paper/execution/snapshot.py",
 )
 
 

@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
 from quantdesk.paper import auto_paper_portfolio as paper
 from quantdesk.paper import position_management_engine as engine
 from quantdesk.paper.adjustment_policy import AdjustmentFactorTable
+from quantdesk.paper.execution import conditional as conditional_execution
+from quantdesk.paper.execution import daily as daily_execution
 
 ENTRY_DAY = "2026-09-21"
 PARTIAL_DAY = "2026-09-22"
@@ -318,11 +322,12 @@ def test_full_exit_realized_pnl_survives_save_and_load(tmp_path: Path, monkeypat
 
 
 def _production_latest_money(source_value: str, state: dict, actions: list[dict]) -> list[dict]:
-    syntax = ast.parse(Path(paper.__file__).read_text(encoding="utf-8-sig"))
-    function_name = {
-        "conditional_position_management": "_run_conditional_auto_paper_update",
-        "formal_candidate_daily_batch": "_run_auto_paper_portfolio_unlocked",
+    implementation = {
+        "conditional_position_management": conditional_execution.run,
+        "formal_candidate_daily_batch": daily_execution.run,
     }[source_value]
+    syntax = ast.parse(Path(inspect.getsourcefile(implementation)).read_text(encoding="utf-8-sig"))
+    function_name = implementation.__name__
     function = next(
         node for node in syntax.body
         if isinstance(node, ast.FunctionDef) and node.name == function_name
@@ -367,6 +372,7 @@ def _production_latest_money(source_value: str, state: dict, actions: list[dict]
             "summary": paper._summary(state, actions),
             "summary_for_state": paper._summary(state, actions),
             "_summary": paper._summary,
+            "ports": SimpleNamespace(valuation=SimpleNamespace(summary=paper._summary)),
         }
         snapshots.append(eval(compile(expression, "actual_latest_money_projection", "eval"), {}, context))
     return snapshots
@@ -809,10 +815,12 @@ def _production_stale_projection(state: dict, actions: list[dict]) -> dict:
        "旧历史差额"，缺口就被掩盖了。
     """
 
-    syntax = ast.parse(Path(paper.__file__).read_text(encoding="utf-8-sig"))
+    syntax = ast.parse(Path(inspect.getsourcefile(conditional_execution.run)).read_text(encoding="utf-8-sig"))
+    function = next(node for node in syntax.body if isinstance(node, ast.FunctionDef)
+                    and node.name == conditional_execution.run.__name__)
     stale = next(
         node
-        for node in (item for item in ast.walk(syntax) if isinstance(item, ast.Dict))
+        for node in (item for item in ast.walk(function) if isinstance(item, ast.Dict))
         if any(
             isinstance(key, ast.Constant)
             and key.value == "review_mode"
@@ -857,6 +865,7 @@ def _production_stale_projection(state: dict, actions: list[dict]) -> dict:
             "closed_positions": state.get("closed_positions") or [],
             "summary": paper._summary(state, actions),
             "_summary": paper._summary,
+            "ports": SimpleNamespace(valuation=SimpleNamespace(summary=paper._summary)),
             "candidate_intake": {},
         },
     )

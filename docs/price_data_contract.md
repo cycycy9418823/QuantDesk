@@ -84,7 +84,9 @@ price_data_contract:
 
     paper_valuation:
       latest_price_basis: raw
-      corporate_action_policy: raw_price_plus_canonical_adjustment_factor_for_quantity_and_cost_basis
+      corporate_action_policy: raw_price_recorded_shares_and_cost_factor_reference_only
+      factor_proxy_in_equity: false
+      corporate_action_booking: requires_independent_event_evidence_not_implemented
 
   future_target:
     feature: forward_adjusted
@@ -101,6 +103,14 @@ price_data_contract:
 ```
 
 ## Current enforcement versus future target
+
+New paper marks use recorded shares and recorded cost with raw prices. Canonical
+adjustment factors provide a labelled research reference only; they do not create
+sellable shares, cash dividends, formal market value or profit. A factor ratio is
+not evidence of a specific corporate action, and a first-entry ratio does not
+reconstruct later purchase lots. Actual share/cash event booking requires separate
+event evidence and is not implemented by this policy. Existing historical records
+are not migrated; explicit old `adjusted` records retain read-only interpretation.
 
 The current backtest engine uses one validated frame for both signals and
 simulated fills. A pure qfq/hfq run remains compatible, but its fills are

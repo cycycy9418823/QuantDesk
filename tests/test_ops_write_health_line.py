@@ -262,6 +262,35 @@ GOOD_MINUTE = {
     "target_date": TARGET_DATE, "requested_count": 90, "fresh_count": 90,
     "missing_count": 0, "provider_status": [],
 }
+
+
+def test_minute_budget_exhaustion_counts_untried_separately(tmp_path: Path) -> None:
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute={"target_date": TARGET_DATE, "requested_count": 87,
+                            "fresh_count": 70, "missing_count": 7, "status": "timed_out",
+                            "not_attempted_symbols": [f"{n:06}" for n in range(10)], "provider_status": []})
+    payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
+    assert "分钟 ✗70/87(缺7+未尝试10)" in payload["line"]
+    detail = " ".join(payload["explains"])
+    assert "数量关系未核验" not in detail
+    assert "timed_out" in detail and "不证明完整交易时段" in detail
+    assert "未尝试10" in payload["owner_plain"]
+
+
+def test_stale_minute_receipt_keeps_its_own_date(tmp_path: Path) -> None:
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute={**GOOD_MINUTE, "target_date": PREV_DATE})
+    payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
+    assert "分钟 ✗90/90" in payload["line"]
+    assert f"分钟数据日 {PREV_DATE}，目标日 {TARGET_DATE} 尚未覆盖" in payload["owner_plain"]
+
+
+def test_duplicate_untried_symbols_do_not_validate_counts(tmp_path: Path) -> None:
+    health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=48,
+                    minute={**GOOD_MINUTE, "not_attempted_symbols": ["600000", "600000"]})
+    payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
+    assert "分钟 ✗90/90" in payload["line"]
+    assert "数量关系未核验" in " ".join(payload["explains"])
 BLOCKED_MINUTE = {
     "target_date": TARGET_DATE, "requested_count": 90, "fresh_count": 82,
     "missing_count": 8,

@@ -278,20 +278,22 @@ def build_symbol_date_gap_ledger(
             elif "symbol" not in frame.columns:
                 invalid.append("original_frame_missing_symbol")
             else:
-                if not frame["symbol"].map(normalize_symbol).eq(symbol).all():
+                # Validate every spelling in the original frame, once per spelling.
+                symbol_spellings = frame["symbol"].drop_duplicates()
+                if not symbol_spellings.map(normalize_symbol).eq(symbol).all():
                     invalid.append("original_frame_symbol_mismatch")
                 parsed = pd.to_datetime(frame["date"], errors="coerce")
                 if parsed.isna().any():
                     invalid.append("original_frame_invalid_date")
-                for value in parsed.dropna().dt.strftime("%Y-%m-%d"):
+                date_labels = parsed.dt.strftime("%Y-%m-%d")
+                for value in date_labels.dropna():
                     if value in present:
                         invalid.append("duplicate_date:" + value)
                     present.add(value)
                 # Price-basis and identity checks precede filtering. A date in
                 # a CSV is not by itself evidence of a usable trading bar.
-                selected = frame.loc[parsed.dt.strftime("%Y-%m-%d").isin(days)]
-                for _, row in selected.iterrows():
-                    values = row.to_dict()
+                selected = frame.loc[date_labels.isin(days)]
+                for values in selected.to_dict(orient="records"):
                     valid, invalid_reason = daily_bar_validity_from_row(values)
                     try:
                         finite = all(math.isfinite(float(values.get(name)))

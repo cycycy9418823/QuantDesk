@@ -60,6 +60,7 @@ document.addEventListener("DOMContentLoaded", () => {
     setupThemeMapTools();
     setupSidebarCollapse();
     setupProjectStatus();
+    document.getElementById("morningBriefReadButton")?.addEventListener("click", loadMorningBrief);
     prepareVisiblePagePlaceholders();
     setupModuleNavigation();
     setupAiFundManagerLifecycle();
@@ -118,7 +119,7 @@ function visiblePageReadStatus(loader, started) {
 function visiblePageLoaders(targetId = "") {
     const watch = [loadCandidates, loadMarketOverview, () => loadRealtimeMarket(false)];
     return {
-        "": [loadProjectStatus, loadCandidates, loadHomeEquity, loadHomeAiLedger, loadStartupUpdateStatus,
+        "": [loadProjectStatus, loadMorningBrief, loadCandidates, loadHomeEquity, loadHomeAiLedger, loadStartupUpdateStatus,
             loadMarketBrainHome, loadProductIntegrity, loadDataHealthHome, loadStrategyScorecard, loadNewsStatus],
         __watch__: watch,
         "daily-focus-section": watch,
@@ -379,7 +380,7 @@ function productIntegrityHtml(data) {
     const losses = Array.isArray(loss.top_losses) ? loss.top_losses.slice(0, 5) : [];
     return `<p class="section-note">估值截至 ${escapeHtml(value(report.valuation_date || data?.as_of))} · 只读核查 · 纸面未验证</p><div class="product-integrity-grid">`
         + card("策略账核对", identityText, `纸面权益与盈亏差额 ${money(identity.difference)}；研究未验证，历史金额保持原样。`)
-        + card("净值记录", `${value(history.unique_dates)}个日期 / ${value(history.row_count)}条`, `起于 ${value(history.first_date)}；缺日 ${count(history.missing_dates)}，重复日期 ${count(history.duplicate_dates)}；${history.continuous_statistics_eligible === true ? "区间记录符合连续统计条件" : "完整连续收益统计仍不可用"}。`)
+        + card("权益记录（明确估值日）", `${value(history.unique_dates)}个日期 / ${value(history.row_count)}条原记录`, `起于 ${value(history.first_date)}；无明确估值日期 ${value(history.undated_rows)} 条，金额无效 ${value(history.invalid_amount_rows)} 条；缺日 ${count(history.missing_dates)}，重复日期 ${count(history.duplicate_dates)}；${history.continuous_statistics_eligible === true ? "区间记录符合连续统计条件" : "完整连续收益统计仍不可用"}。`)
         + card("行业与公司行动", `行业已知 ${value(industry.known)}/${value(industry.positions)}`, `复权证据陈旧 ${count(corporate.stale_symbols)}，未知 ${count(corporate.unknown_symbols)}；总回报尚未证明完整。`)
         + '</div><details class="owner-source-details"><summary>查看差额、损益贡献与研究证据</summary>'
         + `<p>缺失交易日：${escapeHtml(names(history.missing_dates))}；重复日期：${escapeHtml(names(history.duplicate_dates))}。</p>`
@@ -672,6 +673,52 @@ function looksLikeServerUnreachable(error) {
 
 let projectStatusLastOk = null;
 let projectStatusFullOpen = false;
+
+let morningBriefLastOk = null;
+
+function renderMorningBrief(data, previous = false) {
+    const host = document.getElementById("morningBriefPanel");
+    if (!host) return;
+    if (!data || data.available !== true) {
+        host.innerHTML = `<p class="section-note">${escapeHtml(data?.message || "未读到已生成的早报；查看不会触发发送。")}</p>`;
+        return;
+    }
+    const delivery = data.delivery || {};
+    const dateCheck = ({current: "生成时资料日期已核对", stale: "生成时资料已过期", future: "资料日期超前", unverified: "资料日期未核实"})[data.date_status_at_generation] || "资料日期未核实";
+    const age = previous ? "上次读取，本次结果未核实" : data.is_future ? "生成时间异常，不能当作今天早报"
+        : data.is_today ? "本日生成记录" : "历史生成记录，不能当作今天早报";
+    const evidence = Array.isArray(data.evidence) ? data.evidence : [];
+    host.innerHTML = `<p class="section-note">${escapeHtml(age)} · 生成 ${escapeHtml(data.generated_at || "时间未核实")}
+        · 资料截至 ${escapeHtml(data.as_of || "日期未核实")} · ${escapeHtml(dateCheck)}</p>
+        <p><strong>${escapeHtml(delivery.label || "发送结果未核实")}</strong> · ${escapeHtml(delivery.message || "没有可确认的投递记录。")}</p>
+        <details><summary>阅读早报原文</summary><h3>${escapeHtml(data.title || "已存早报")}</h3>
+        <p class="section-note">${escapeHtml(data.message || "原文保留生成时状态，不能代表当前状态。")}</p>
+        <pre class="project-status-pre" style="font-family:inherit;white-space:pre-wrap">${escapeHtml(data.body || "未保存可读原文")}</pre></details>
+        <details><summary>查看发送依据（${evidence.length}条）</summary>
+        ${evidence.map(item => `<p class="section-note">${escapeHtml(item.observed_at || item.started_at || "时间未核实")}
+            · ${escapeHtml(item.status || "未知")} · ${escapeHtml(item.reason_code || "原因未记录")}
+            · ${escapeHtml(item.path || "来源缺失")}</p>`).join("") || '<p class="section-note">没有与这份内容匹配的发送记录。</p>'}
+        <p class="section-note">服务商接收不等于手机收到或已读。${escapeHtml(data.label || "纸面 · 未验证")}</p></details>`;
+}
+
+async function loadMorningBrief() {
+    const isCurrent = beginReadRender("morning-brief");
+    const button = document.getElementById("morningBriefReadButton");
+    if (button) button.disabled = true;
+    try {
+        const data = await requestJson("/api/morning-brief");
+        if (!isCurrent()) return;
+        if (data?.available === true) morningBriefLastOk = data;
+        renderMorningBrief(data);
+    } catch (error) {
+        if (!isCurrent()) return;
+        renderMorningBrief(morningBriefLastOk, true);
+        const host = document.getElementById("morningBriefPanel");
+        if (host) host.innerHTML = '<p class="section-note">本次早报读取失败，发送结果未核实；没有触发生成或补发。</p>' + host.innerHTML;
+    } finally {
+        if (isCurrent() && button) button.disabled = false;
+    }
+}
 
 function setupProjectStatus() {
     const refresh = document.getElementById("projectStatusRefreshButton");
@@ -4096,26 +4143,26 @@ function paperReportDate(rows, account = {}) {
         .map((item) => isoDateText(item.date))
         .filter(Boolean)
         .sort();
-    return dates.at(-1) || isoDateText(account.valuationDate) || isoDateText(account.latestReferenceDate) || "日期未核实";
+    return isoDateText(account.valuationDate) || dates.at(-1) || isoDateText(account.latestReferenceDate) || "日期未核实";
 }
 
 function paperActionKind(row) {
-    const text = `${safeText(row?.action)} ${safeText(row?.status)} ${safeText(row?.source)}`.toLowerCase();
-    if (row?.is_pending || text.includes("exit") || text.includes("review") || text.includes("退出") || text.includes("降级")) return "exit";
-    if (text.includes("buy") || text.includes("加入") || text.includes("入池") || text.includes("纸面建仓") || text.includes("建仓")) return "entry";
+    const text = `${safeText(row?.action_code)} ${safeText(row?.action)} ${safeText(row?.status)} ${safeText(row?.source)}`.toLowerCase();
+    if (row?.is_blocked || row?.is_pending || row?.quantity_unverified || text.includes("sell") || text.includes("模拟卖出") || text.includes("exit") || text.includes("review") || text.includes("退出") || text.includes("降级")) return "exit";
+    if (text.includes("buy") || text.includes("模拟买入") || text.includes("加入") || text.includes("入池") || text.includes("纸面建仓") || text.includes("建仓")) return "entry";
     return "other";
 }
 
 function renderReportRows(rows, kind) {
     const list = (Array.isArray(rows) ? rows : []).filter((row) => paperActionKind(row) === kind);
     if (!list.length) {
-        return missingBlock(kind === "entry" ? "该日期没有新的纸面入池记录。" : "该日期没有退出复核记录。");
+        return missingBlock(kind === "entry" ? "该日期没有模拟买入或加入观察记录。" : "该日期没有卖出、拒绝或待复核记录。");
     }
     return list.map((row) => {
         const pending = row.is_pending === true;
-        const statusLabel = pending ? "待验证，未模拟成交" : humanStatus(row.status || row.action || "纸面记录");
+        const statusLabel = row.is_blocked ? "已拒绝，未模拟成交" : row.quantity_unverified ? "成交数量未核实" : pending ? "待验证，未模拟成交" : humanStatus(row.status || row.action || "纸面记录");
         const badgeClass = kind === "entry" ? "badge-ok" : "badge-exit";
-        const price = pending
+        const price = row.missing_intraday
             ? "缺分钟线"
             : hasValue(row.entry_price)
                 ? numText(row.entry_price, 2)
@@ -4147,14 +4194,15 @@ function renderDailyReport(account, actionRows) {
     const reportDate = paperReportDate(rows, account);
     const reportRows = rows.filter((row) => isoDateText(row.date) === reportDate);
     const pendingCount = reportRows.filter((row) => row.is_pending).length;
+    const blockedCount = reportRows.filter((row) => row.is_blocked).length;
     const titleEl = panel.querySelector("h3");
     const buyTitle = document.querySelector("#paperDailyBuySection h4");
     const sellTitle = document.querySelector("#paperDailySellSection h4");
     if (titleEl) titleEl.textContent = pendingCount ? "纸面待验证复核提醒" : "纸面动作报告";
-    if (buyTitle) buyTitle.textContent = "纸面入池记录";
-    if (sellTitle) sellTitle.textContent = pendingCount ? "待验证复核（未模拟成交）" : "退出复核记录";
+    if (buyTitle) buyTitle.textContent = "模拟买入 / 加入观察";
+    if (sellTitle) sellTitle.textContent = "模拟卖出 / 拒绝 / 待复核";
     if (dateEl) {
-        dateEl.textContent = `报告日期：${reportDate}；本页只展示本地纸面研究记录。${pendingCount ? `其中 ${pendingCount} 条为待盘中验证提醒，不代表已经成交。` : "无待验证成交记录。"}`;
+        dateEl.textContent = `账本估值/动作日：${reportDate}；本页只展示本地纸面研究记录。${pendingCount} 条待验证，${blockedCount} 条已拒绝；均未模拟成交。具体原因见各条记录，后续计划不替代当天结果。`;
     }
     buyList.innerHTML = renderReportRows(reportRows, "entry");
     sellList.innerHTML = renderReportRows(reportRows, "exit");
@@ -4342,15 +4390,17 @@ function buildPaperActionRows(items, paper = null) {
         ? paper.daily_actions
         : (Array.isArray(paper?.actions) ? paper.actions : []);
     paperActions.forEach((item) => {
-        const isPending = (!item.quantity || Number(item.quantity) === 0)
-            || item.fill_model === "missing_intraday"
-            || item.trigger_type === "missing_intraday"
-            || (item.action === "exit_watch" && !item.trigger_price);
+        const isBlocked = ["block", "blocked", "reject", "rejected"].includes(item.action);
+        const missingIntraday = item.fill_model === "missing_intraday" || item.trigger_type === "missing_intraday";
+        const isPending = !isBlocked && (missingIntraday || (item.action === "exit_watch" && !item.trigger_price));
+        const quantityUnverified = !isBlocked && !isPending && ["buy", "sell", "stop_loss"].includes(item.action)
+            && !(Number(item.quantity) > 0);
         rows.push({
             date: item.decision_date || item.trade_date || item.plan_date || "",
             symbol: item.symbol,
             name: item.name,
             action: item.action_label || item.action,
+            action_code: item.action,
             entry_price: item.price,
             latest_price: item.trigger_price,
             shares: item.quantity,
@@ -4359,6 +4409,9 @@ function buildPaperActionRows(items, paper = null) {
             note: item.reason || item.order_source || "本地纸面组合动作",
             source: "portfolio",
             is_pending: isPending,
+            is_blocked: isBlocked,
+            missing_intraday: missingIntraday,
+            quantity_unverified: quantityUnverified,
         });
     });
     (Array.isArray(items) ? items : []).forEach((item) => {
@@ -4406,13 +4459,16 @@ function renderTradesTable(trades) {
     if (!panel) return;
     const rows = Array.isArray(trades) ? trades : [];
     const pendingCount = rows.filter((item) => item.is_pending).length;
+    const blockedCount = rows.filter((item) => item.is_blocked).length;
     const body = rows.map((item) => {
         const pending = item.is_pending === true;
         const date = pending ? pendingDateText(item.date) : safeText(item.date);
-        const action = pending ? "保留观察" : sanitizeTradingTerms(safeText(item.action));
-        const priceText = pending ? "缺分钟线" : (item.entry_price ? numText(item.entry_price, 2) : "—");
-        const latestText = pending ? "缺分钟线" : (item.latest_price ? numText(item.latest_price, 2) : "—");
-        const statusHtml = pending ? `<span class="badge-degraded">未模拟成交</span>` : escapeHtml(humanStatus(item.status || "—"));
+        const action = item.is_blocked ? "拒绝模拟成交" : item.quantity_unverified ? "动作待核实" : pending ? "保留观察" : sanitizeTradingTerms(safeText(item.action));
+        const priceText = item.missing_intraday ? "缺分钟线" : (item.entry_price ? numText(item.entry_price, 2) : "—");
+        const latestText = item.missing_intraday ? "缺分钟线" : (item.latest_price ? numText(item.latest_price, 2) : "—");
+        const statusHtml = item.is_blocked ? `<span class="badge-degraded">已拒绝，未模拟成交</span>`
+            : item.quantity_unverified ? `<span class="badge-degraded">成交数量未核实</span>`
+            : pending ? `<span class="badge-degraded">待验证，未模拟成交</span>` : escapeHtml(humanStatus(item.status || "—"));
         const noteText = sanitizeTradingTerms(humanizeStatusTerms(item.note || ""));
         return `
             <tr${pending ? ` class="pending-row"` : ""}>
@@ -4430,8 +4486,8 @@ function renderTradesTable(trades) {
         `;
     }).join("");
     panel.innerHTML = `
-        <h3>纸面动作记录 ${pendingCount ? `<span class="badge-degraded">⚠ ${escapeHtml(safeText(pendingCount))} 条待验证</span>` : ""}</h3>
-        <p class="paper-desk-note">待验证行表示下一交易日需盘中确认，当前未模拟成交。以下为研究模拟记录，不构成投资建议，不包含真实交易指令。</p>
+        <h3>纸面动作记录 ${pendingCount || blockedCount ? `<span class="badge-degraded">${pendingCount} 条待验证 · ${blockedCount} 条已拒绝</span>` : ""}</h3>
+        <p class="paper-desk-note">已拒绝与待验证均未模拟成交；拒绝原因和资料缺口分别见记录，不推定下一日一定执行。以下为研究模拟记录，不构成投资建议，不包含真实交易指令。</p>
         <div class="paper-table-wrap">
             <table class="paper-trades-table">
                 <thead><tr><th>日期</th><th>股票</th><th>动作</th><th>股数</th><th>价格/参考</th><th>触发/最新</th><th>状态</th><th>入池以来</th><th>来源</th><th>说明</th></tr></thead>
@@ -10280,8 +10336,10 @@ async function loadHomeAiLedger() {
 function renderHomeEquity(decisionBoard) {
     const valueEl = document.getElementById("kpiPaperValue");
     const subEl = document.getElementById("kpiPaperSub");
-    const unavailableText = "后端决策看板未返回权威净值序列。";
+    const evidenceEl = document.getElementById("homeEquityEvidence");
+    const unavailableText = "明确估值日期的权益记录暂不可读。";
     if (!decisionBoard || decisionBoard.ok === false) {
+        if (evidenceEl) evidenceEl.textContent = unavailableText;
         if (valueEl && subEl) {
             valueEl.textContent = "—";
             subEl.textContent = unavailableText;
@@ -10312,15 +10370,21 @@ function renderHomeEquity(decisionBoard) {
         );
     }
     const returnSeries = decisionBoard.return_series || {};
+    const evidenceText = returnSeries.message_for_ui || "同期间对照暂不可用；纸面 · 未验证。";
+    if (evidenceEl) evidenceEl.textContent = evidenceText;
+    if (returnSeries.normalization !== "common_first_recorded_equity_and_index") {
+        showHomeChart("homeEquityChart", false, evidenceText);
+        return;
+    }
     const items = (Array.isArray(returnSeries.items) ? returnSeries.items : [])
         .map((item) => ({
             date: safeText(item.date),
             paper_return_pct: numericValue(item.paper_return_pct),
             benchmark_return_pct: numericValue(item.benchmark_return_pct),
         }))
-        .filter((item) => item.date !== "数据缺失" && item.paper_return_pct !== null && item.benchmark_return_pct !== null);
-    if (items.length < 2) {
-        showHomeChart("homeEquityChart", false, "后端对齐净值序列不足（需要至少 2 个共同交易日）。");
+        .filter((item) => item.date !== "数据缺失");
+    if (items.filter((item) => item.paper_return_pct !== null && item.benchmark_return_pct !== null).length < 2) {
+        showHomeChart("homeEquityChart", false, "相同起止日的有效权益与指数记录不足，暂不生成对照曲线。");
         return;
     }
     const paperDates = items.map((item) => item.date);
@@ -10328,21 +10392,25 @@ function renderHomeEquity(decisionBoard) {
     const chart = ensureHomeChart("homeEquityChart");
     if (!chart) return;
     const series = [{
-        name: "Paper 累计收益",
+        name: "已记录权益变化",
         type: "line",
         data: items.map((item) => item.paper_return_pct),
-        smooth: true,
-        showSymbol: false,
+        smooth: false,
+        showSymbol: true,
+        showAllSymbol: true,
+        symbolSize: 5,
         lineStyle: { width: 2, color: "#1D4ED8" },
         itemStyle: { color: "#1D4ED8" },
         areaStyle: { color: "rgba(29, 78, 216, 0.08)" },
         connectNulls: false,
     }, {
-        name: `${safeText(returnSeries.benchmark_label || "沪深300")}（后端对齐）`,
+        name: `${safeText(returnSeries.benchmark_label || "沪深300")}点位变化`,
         type: "line",
         data: items.map((item) => item.benchmark_return_pct),
-        smooth: true,
-        showSymbol: false,
+        smooth: false,
+        showSymbol: true,
+        showAllSymbol: true,
+        symbolSize: 5,
         lineStyle: { width: 1.6, color: "#94a3b8", type: "dashed" },
         itemStyle: { color: "#94a3b8" },
         connectNulls: false,

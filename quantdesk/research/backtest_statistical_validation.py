@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from quantdesk.shared import now_text, read_json, short_error_text, write_json
+from quantdesk.research.evidence_identity import nonformal_mode
 from quantdesk.research.sample_provenance import research_sample_context
 from quantdesk.version import API_SCHEMA_VERSION, APP_VERSION, PACKAGE_VERSION
 
@@ -37,6 +38,7 @@ MIN_RETURNS_FOR_VALIDATION = 8
 _TRADE_LEVEL_RETURN_SOURCES = {"trade_returns", "trades"}
 _TRADE_COUNT_KEYS = ("trades_count", "total_trades", "number_of_trades", "trade_count")
 DISCLAIMER = "统计检验仅基于历史样本，不代表未来收益。"
+NONFORMAL_INPUT_MESSAGE = "没有真实回测可用于本次检验：所选结果标记为合成、演示或试跑数据，统计检验未运行。"
 
 
 def _project_path(path: str | Path) -> Path:
@@ -337,6 +339,54 @@ def _load_backtest_result(backtest_result: Any = None, backtest_result_path: str
     return _load_backtest_result_with_source(backtest_result, backtest_result_path)[0]
 
 
+def _nonformal_input_result(
+    payload: dict[str, Any], source: dict[str, Any], *, data_mode: str,
+    symbol: str, target_date: str, network: bool, strict: bool, seed: int,
+) -> dict[str, Any]:
+    """Keep source evidence visible without computing statistics on test data."""
+    sample_context = research_sample_context(payload)
+    return {
+        "ok": False,
+        "schema_version": API_SCHEMA_VERSION,
+        "app_version": APP_VERSION,
+        "package_version": PACKAGE_VERSION,
+        "api_schema_version": API_SCHEMA_VERSION,
+        "task_type": "backtest_statistical_validation",
+        **sample_context,
+        "status": "missing",
+        "input_data_mode": data_mode,
+        "input_rejection_reason": "nonformal_backtest_input",
+        "validation_run_status": "not_run",
+        "symbol": str(symbol or payload.get("symbol") or ""),
+        "target_date": str(target_date or payload.get("target_date") or payload.get("date") or ""),
+        "network": bool(network),
+        "strict": bool(strict),
+        "sample_size": 0,
+        "trade_count": None,
+        "trade_count_source": "",
+        "negative_return_count": None,
+        "min_trades_for_validation": MIN_TRADES_FOR_VALIDATION,
+        "insufficient_sample_reasons": [],
+        "backtest_result_source": {**source, "data_mode": data_mode, "return_source": ""},
+        "reported_metric": None,
+        "actual_metric_definition": "not_computed_nonformal_input",
+        "return_evidence": {},
+        "metric_definitions": {},
+        "iterations": 0,
+        "seed": int(seed),
+        "metric_summary": {key: None for key in (
+            "annual_return", "sample_compounded_return", "sharpe", "max_drawdown", "win_rate"
+        )},
+        "permutation_test": {"enabled": False, "status": "not_run", "p_value": None},
+        "bootstrap_ci": {"enabled": False, "status": "not_run"},
+        "warnings": [sample_context["sample_limitation"], "nonformal_backtest_input:" + data_mode,
+                     NONFORMAL_INPUT_MESSAGE],
+        "interpretation": NONFORMAL_INPUT_MESSAGE,
+        "generated_at": now_text(),
+        "disclaimer": DISCLAIMER,
+    }
+
+
 def run_backtest_statistical_validation(
     backtest_result: Any = None,
     *,
@@ -352,6 +402,17 @@ def run_backtest_statistical_validation(
     report_path: str | Path = DEFAULT_REPORT_PATH,
 ) -> dict[str, Any]:
     payload, source = _load_backtest_result_with_source(backtest_result, backtest_result_path)
+    data_mode = nonformal_mode(payload)
+    if data_mode != "formal":
+        # Reject before extracting returns, including strict=False night runs.
+        # A test artifact must not become a historical-strategy conclusion.
+        result = _nonformal_input_result(
+            payload, source, data_mode=data_mode, symbol=symbol, target_date=target_date,
+            network=network, strict=strict, seed=seed,
+        )
+        if write:
+            write_statistical_validation_outputs(result, output_path=output_path, report_path=report_path)
+        return result
     sample_context = research_sample_context(payload)
     returns, return_source = _extract_returns_with_source(payload)
     source["return_source"] = return_source
@@ -480,6 +541,9 @@ def summarize_statistical_validation(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         **research_sample_context(payload),
         "status": payload.get("status") or "missing",
+        "input_data_mode": payload.get("input_data_mode"),
+        "input_rejection_reason": payload.get("input_rejection_reason"),
+        "validation_run_status": payload.get("validation_run_status"),
         "sample_size": int(payload.get("sample_size") or 0),
         "trade_count": payload.get("trade_count"),
         "negative_return_count": payload.get("negative_return_count"),

@@ -96,7 +96,7 @@ def test_reconcile_stage_version_moved_past_the_pre_repair_revision() -> None:
     assert pipeline._stage_version("reconcile") == f"{pipeline.SCHEMA_VERSION}:reconcile:4"
     assert pipeline._stage_version("reconcile") != f"{pipeline.SCHEMA_VERSION}:reconcile:3"
     # The other stages keep their own revisions.
-    assert pipeline._stage_version("research_chain") == f"{pipeline.SCHEMA_VERSION}:research_chain:3"
+    assert pipeline._stage_version("research_chain") == f"{pipeline.SCHEMA_VERSION}:research_chain:4"
 
 
 def test_completed_reconcile_is_not_reused_when_only_the_evidence_changes(tmp_path: Path) -> None:

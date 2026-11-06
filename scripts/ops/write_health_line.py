@@ -547,28 +547,40 @@ def minute_cell(root: Path, target: str) -> tuple[str, str]:
     except (TypeError, ValueError):
         requested = fresh = missing = 0
     raw_counts = [data.get(key) for key in ("requested_count", "fresh_count", "missing_count")]
-    counts_verified = all(type(value) is int and value >= 0 for value in raw_counts) and fresh + missing == requested
+    not_attempted = data.get("not_attempted_symbols", [])
+    untried_verified = (isinstance(not_attempted, list)
+                       and all(isinstance(symbol, str) and symbol for symbol in not_attempted)
+                       and len(set(not_attempted)) == len(not_attempted))
+    untried = len(not_attempted) if untried_verified else 0
+    counts_verified = (all(type(value) is int and value >= 0 for value in raw_counts)
+                       and untried_verified and fresh + missing + untried == requested)
     blocked = sum(
         1
         for row in (data.get("provider_status") or [])
         if isinstance(row, dict) and row.get("status") == "storage_blocked"
     )
     as_of = _plain_day(data.get("target_date"))
-    mark = "✓" if counts_verified and requested and missing == 0 and blocked == 0 and as_of == target else "✗"
+    run_failed = data.get("status") in {"timed_out", "failed", "blocked"}
+    mark = "✓" if counts_verified and requested and not (missing or blocked or untried or run_failed) and as_of == target else "✗"
     counts = f"{fresh}/{requested}"
     gap = []
     if missing:
         gap.append(f"缺{missing}")
     if blocked:
         gap.append(f"拒写{blocked}")
+    if untried:
+        gap.append(f"未尝试{untried}")
     cell = f"分钟 {mark}{counts}" + (f"({'+'.join(gap)})" if gap else "")
-    if mark == "✓":
-        return cell, ""
     detail = f"分钟数据日 {as_of or '缺失'}"
+    if as_of != target:
+        detail += f"，目标日 {target} 尚未覆盖"
     if not counts_verified:
         detail += "，数量关系未核验"
     if gap:
         detail += "，" + "，".join(gap)
+    if run_failed:
+        detail += f"，采集结果 {data['status']}"
+    detail += f"；{fresh}/{requested} 仅表示本轮有新数据，不证明完整交易时段可用于复盘"
     return cell, detail
 
 
@@ -685,9 +697,19 @@ def backup_cell(root: Path, target: str) -> tuple[str, str]:
     except json.JSONDecodeError:
         return "备份 ✗", f"备份未在 {target} 成功，上次成功 {last_backup_success(root) or '从未成功'}"
     formatted = stamp_date(str(row.get("stamp") or ""))
-    ok = formatted == target and bool(row.get("all_hashes_match"))
+    ok = formatted == target and row.get("all_hashes_match") is True
     if ok:
-        return "备份 ✓", ""
+        from quantdesk.daily_evidence_contract import inspect_backup_readiness
+        checked = inspect_backup_readiness(root, target)
+        if checked.get("archive_available") and not checked["archive_verified"]:
+            return "备份 ✗", "备份文件校验失败；旧复制成功记录不能证明当前备份可用。"
+        scope = checked.get("research_business_scope") or {}
+        if scope.get("ledger_current") is False:
+            return "备份 ✗", f"文件复制成功，但备份账本日为 {scope.get('strategy_valuation_date') or '缺失'}，不能证明 {target} 复盘完整。"
+        active = root / "results/daily_evidence" / str(checked.get("expected_business_date") or target) / "latest.json"
+        if active.is_file() and checked["status"] != "ready":
+            return "备份 ✗", "文件复制已核对；当日研究资料尚未证明能完整恢复，见研究资料清单。"
+        return "备份 ✓", "已核对文件复制；业务日账本与研究资料恢复另行核查。" if checked["status"] != "ready" else f"业务日{checked.get('expected_business_date')}的账本、动作原件与引用资料已在备份中核对；实际恢复演练另列。"
     prev = last_backup_success(root) or "从未成功"
     return "备份 ✗", f"备份未在 {target} 成功，上次成功 {prev}"
 
@@ -705,36 +727,88 @@ def is_trading_day(root: Path, target: str) -> tuple[bool, str]:
     return True, f"日历无 {target}"
 
 
-def rewrite_status(root: Path, header: str, section_line: str, explain: str) -> None:
+_OWN_HEADER_RE = re.compile(r"^# STATUS · 更新于 .+ · 更新者：health_line\s*$")
+
+
+def _strip_own_blocks(lines: list[bytes]) -> tuple[list[bytes], list[bytes]]:
+    """Remove health blocks this writer produced on earlier nights, wherever they sit.
+
+    Other sessions insert their notes above the health line, so yesterday's block
+    drifts down the page and piles up. Only a block that starts with this writer's
+    own header and is followed by the health section is removed; every other byte
+    is kept as it was. The removed text is returned so the caller can archive it.
+    """
+
+    kept: list[bytes] = []
+    removed: list[bytes] = []
+    index = 0
+    while index < len(lines):
+        text = lines[index].decode("utf-8", errors="replace").rstrip("\r\n")
+        if _OWN_HEADER_RE.match(text):
+            probe = index + 1
+            while probe < len(lines) and not lines[probe].strip():
+                probe += 1
+            if probe < len(lines) and lines[probe].strip() == SECTION.encode("utf-8"):
+                probe += 1
+                while probe < len(lines) and not lines[probe].strip():
+                    probe += 1
+                while probe < len(lines) and lines[probe].strip() and not lines[probe].startswith((b"#", b"<!--")):
+                    probe += 1
+                if probe < len(lines) and not lines[probe].strip():
+                    probe += 1
+                removed.extend(lines[index:probe])
+                index = probe
+                continue
+        kept.append(lines[index])
+        index += 1
+    return kept, removed
+
+
+def rewrite_status(root: Path, header: str, section_line: str, explain: str, details: str = "") -> list[bytes]:
     path = root / "STATUS.md"
-    original = path.read_text(encoding="utf-8") if path.is_file() else ""
-    rest = original
-    if rest.startswith(HEADER_MARK) or rest.startswith("# STATUS"):
-        idx = 0
-        lines = rest.splitlines()
-        if lines and lines[0].startswith("# STATUS"):
-            idx = 1
-            while idx < len(lines) and lines[idx].strip() == "":
+    original = path.read_bytes() if path.is_file() else b""
+    bom = b"\xef\xbb\xbf" if original.startswith(b"\xef\xbb\xbf") else b""
+    body = original[len(bom):]
+    lines = body.splitlines(keepends=True)
+    rest = body
+    newline = "\r\n" if lines and lines[0].endswith(b"\r\n") else "\n"
+    if lines and lines[0].startswith(b"# STATUS"):
+        idx = 1
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        if idx < len(lines) and lines[idx].strip() == SECTION.encode("utf-8"):
+            idx += 1
+            while idx < len(lines) and not lines[idx].strip():
                 idx += 1
-            if idx < len(lines) and lines[idx].strip() == SECTION:
+            if idx < len(lines) and lines[idx].startswith(("日线".encode("utf-8"), "非交易日".encode("utf-8"))):
                 idx += 1
-                while idx < len(lines) and lines[idx].strip() == "":
+                if idx < len(lines) and lines[idx].strip() and not lines[idx].startswith((b"#", b"<!--")):
                     idx += 1
-                if idx < len(lines) and lines[idx].startswith("日线"):
+                if idx < len(lines) and lines[idx].startswith("技术细节：".encode("utf-8")):
                     idx += 1
-                if idx < len(lines) and lines[idx] and not lines[idx].startswith("#") and not lines[idx].startswith("##"):
-                    if "日线" not in lines[idx][:2]:
-                        idx += 1
-                while idx < len(lines) and lines[idx].strip() == "":
+                # The new block ends with its own blank line; do not let the old
+                # separator stack up one more blank line every night.
+                while idx < len(lines) and not lines[idx].strip():
                     idx += 1
-                rest = "\n".join(lines[idx:])
-            else:
-                rest = original
-    block = [header, "", SECTION, "", section_line]
-    if explain:
-        block.extend([explain])
-    block.extend(["", rest.lstrip("\n") if rest else ""])
-    path.write_text("\n".join(block).rstrip() + "\n", encoding="utf-8")
+                rest = b"".join(lines[idx:])
+    kept, removed = _strip_own_blocks(rest.splitlines(keepends=True))
+    rest = b"".join(kept)
+    block = [header, "", SECTION, "", section_line, *([explain] if explain else []), *([details] if details else []), ""]
+    path.write_bytes(bom + (newline.join(block) + newline).encode("utf-8") + rest)
+    return removed
+
+
+def archive_removed_blocks(root: Path, removed: list[bytes], stamp: str) -> Path | None:
+    """Keep what was lifted out of STATUS.md (append-only, runtime evidence)."""
+
+    if not removed:
+        return None
+    path = root / "results" / "health_line" / "status_removed_blocks.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as handle:
+        handle.write(f"\n<!-- removed from STATUS.md at {stamp} -->\n".encode("utf-8"))
+        handle.write(b"".join(removed))
+    return path
 
 
 HEALTH_HISTORY_RELATIVE = Path("results") / "health_line" / "history"
@@ -748,17 +822,19 @@ def health_history_path(root: Path, target: str) -> Path:
 
 def append_health_history(
     root: Path, *, target: str, header: str, line: str,
-    explains: list[str], trading: bool,
+    explains: list[str], trading: bool, owner: dict | None = None,
 ) -> Path:
     """Write the day's health line; rerunning the same day replaces only that day."""
 
     path = health_history_path(root, target)
     path.parent.mkdir(parents=True, exist_ok=True)
     detail = "\n".join(f"- {item}" for item in explains if str(item).strip()) or "- （无）"
+    owner_lines = (f"- 给所有者：{owner['line']}\n- 人话：{owner['plain']}\n" if owner else "")
     body = (
         f"# 健康行 {target}\n\n"
         f"- 生成：{header}\n"
         f"- 交易日：{'是' if trading else '否'}\n"
+        f"{owner_lines}"
         f"- 健康行：{line}\n\n"
         f"## 解释\n\n{detail}\n"
     )
@@ -774,7 +850,48 @@ def append_health_history(
     return path
 
 
+def write_health_history_json(root: Path, *, target: str, header: str, line: str,
+                              explains: list[str], trading: bool, owner: dict) -> Path:
+    """Machine-readable twin of the history file; the morning brief reads it."""
+
+    path = root / HEALTH_HISTORY_RELATIVE / f"{target}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "schema_version": "health_owner_v1",
+        "target_date": target,
+        "generated": header,
+        "trading_day": trading,
+        "owner_line": owner["line"],
+        "owner_plain": owner["plain"],
+        "owner_red_sentences": owner["red_sentences"],
+        "technical_line": line,
+        "technical_explains": explains,
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return path
+
+
 def build_line(root: Path, target: str) -> tuple[str, list[str], bool]:
+    parts = line_parts(root, target)
+    return parts["line"], parts["explains"], parts["trading"]
+
+
+TECHNICAL_CELLS = (("daily", "daily_cell"), ("benchmark", "benchmark_cell"), ("snapshot", "snapshot_cell"),
+                   ("minute", "minute_cell"), ("strategy", "strategy_cell"), ("ai", "ai_cell"),
+                   ("review", "review_cell"), ("backup", "backup_cell"))
+
+
+def line_parts(root: Path, target: str) -> dict:
+    """The technical eight-cell line, plus each cell kept separately for the owner layer."""
+
     trading, cal_note = is_trading_day(root, target)
     explains: list[str] = [f"健康业务日期 {target}"]
     if cal_note:
@@ -784,15 +901,131 @@ def build_line(root: Path, target: str) -> tuple[str, list[str], bool]:
         line = f"非交易日 {target} · {backup}"
         if extra:
             explains.append(extra)
-        return line, explains, False
-    cells = []
-    for fn in (daily_cell, benchmark_cell, snapshot_cell, minute_cell,
-               strategy_cell, ai_cell, review_cell, backup_cell):
-        cell, extra = fn(root, target)
-        cells.append(cell)
+        return {"line": line, "explains": explains, "trading": False, "cells": {"backup": (backup, extra)}}
+    cells: dict[str, tuple[str, str]] = {}
+    ordered = []
+    for key, name in TECHNICAL_CELLS:
+        cell, extra = globals()[name](root, target)
+        cells[key] = (cell, extra)
+        ordered.append(cell)
         if extra:
             explains.extend(extra.splitlines())
-    return " · ".join(cells), explains, True
+    from quantdesk.daily_evidence_contract import audit_daily_evidence, readiness_note
+    try:
+        assessment = audit_daily_evidence(root, target)
+        explains.append(readiness_note(assessment))
+        if (root / "results/daily_evidence" / target / "latest.json").is_file():
+            ordered[0] += "（研究资料" + ("✓" if assessment["current"]["status"] == "ready" else "✗") + "）"
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        explains.append(f"研究资料未核实：{type(exc).__name__}；采集成功不代表复盘资料齐全。")
+    return {"line": " · ".join(ordered), "explains": explains, "trading": True, "cells": cells}
+
+
+# ---------------------------------------------------------------------------
+# Owner layer (CHARTER §7): six cells, ✓/✗ only, one plain sentence per red cell.
+# The technical eight-cell line above stays unchanged and is kept underneath.
+# ---------------------------------------------------------------------------
+
+def _strategy_plain(root: Path, target: str) -> str:
+    data = load_json(root / "results" / "auto_paper_portfolio_latest.json") or {}
+    valuation = _plain_day(data.get("valuation_date"))
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    identity = data.get("pnl_identity") if isinstance(data.get("pnl_identity"), dict) else summary.get("pnl_identity", {})
+    identity = identity if isinstance(identity, dict) else {}
+    if valuation != target:
+        return f"没有更新到 {target}（估值停在 {valuation or '读不到'}），晚上的更新可能没跑完"
+    if identity.get("status") == "mismatch" and isinstance(identity.get("difference"), (int, float)):
+        return f"账面对不上，差 {identity['difference']:+.2f} 元"
+    return "没通过账本核对，原因见技术细节"
+
+
+def owner_health(root: Path, target: str, parts: dict) -> dict:
+    from quantdesk import owner_view
+
+    cells = parts.get("cells") or {}
+    backup = owner_view.backup_copy_status(root, target)
+    archive_broken = "备份文件校验失败" in str((cells.get("backup") or ("", ""))[1])
+    backup_ok = backup["ok"] and not archive_broken
+    if backup_ok:
+        backup_plain = ""
+    elif archive_broken:
+        backup_plain = "备份：备份文件校验失败；要排查，不用你动手"
+    else:
+        backup_plain = (f"备份：{target} 尚无成功记录（上次成功 {backup['last_success'] or '没有记录'}）；"
+                        "是否未到计划时点或执行失败需查运行记录")
+    texts: list[str] = []
+    sentences: list[str] = []
+    notes: list[str] = []
+    snapshot: dict = {}
+    if not parts.get("trading"):
+        texts.append(f"非交易日 {target} · 备份 {'✓' if backup_ok else '✗'}")
+    else:
+        daily_cell_text, _ = cells["daily"]
+        found = re.match(r"日线 ([✓✗])(\d+)/(\d+)", daily_cell_text)
+        bench_text, bench_extra = cells["benchmark"]
+        daily_mark_ok = bool(found) and found.group(1) == "✓"
+        bench_ok = bench_text.startswith("基准 ✓")
+        have, universe = (found.group(2), found.group(3)) if found else ("?", "?")
+        texts.append(f"日线 {'✓' if daily_mark_ok and bench_ok else '✗'}{have}/{universe}")
+        if not daily_mark_ok:
+            sentences.append(f"日线：目标日 {target} 只有 {have}/{universe} 只通过更新核对；具体缺口见技术细节")
+        if not bench_ok:
+            sentences.append(f"日线：指数数据没更新到位（{bench_extra or '原因未知'}）")
+        if "研究资料✗" in daily_cell_text or any(
+            "研究资料 ✗" in note or "研究资料未核实" in note for note in parts.get("explains", [])
+        ):
+            notes.append("研究资料：日线采集与研究资料齐备是两项检查；研究资料仍有缺口，见技术细节")
+        snapshot = owner_view.snapshot_sheet_quality(root, target)
+        texts.append(f"快照 {'✓' if snapshot['ok'] else '✗'}{snapshot['good']}/{snapshot['expected']}")
+        notes.append(f"快照：{target} 可用报价 {snapshot['good']}/{snapshot['expected']} 张达标（每张至少99%有效、至少46张）；不代表完整OHLCV字段齐全")
+        snapshot_text, snapshot_extra = cells.get("snapshot", ("", ""))
+        if not snapshot_text.startswith("快照 ✓"):
+            fields = re.search(r"字段核实 (\d+|未知)", snapshot_text)
+            notes.append(f"快照完整字段/档案：字段核实 {fields.group(1) if fields else '未知'}/{snapshot['expected']}；详细缺口见技术细节")
+        if not snapshot["ok"]:
+            sentences.append(
+                f"快照：盘中快照只有 {snapshot['good']} 张合格（至少要 {owner_view.SNAPSHOT_MIN_GOOD_SHEETS} 张）；"
+                "依赖快照的研究或纸面成交仍需核实价格证据" if snapshot["sheets"] else
+                "快照：今天没有可核实的盘中快照；依赖快照的研究或纸面成交缺少证据")
+        minute_text, minute_extra = cells.get("minute", ("分钟 ✗", "分钟回执缺失"))
+        notes.append(f"分钟：{minute_text}；{minute_extra or '本轮有新数据不等于完整交易时段已核实'}")
+        strategy_text, _ = cells["strategy"]
+        strategy_ok = strategy_text.endswith("✓")
+        texts.append(f"策略账 {'✓' if strategy_ok else '✗'}")
+        if not strategy_ok:
+            sentences.append(f"策略账：{_strategy_plain(root, target)}；要排查，不用你动手")
+        ai_text, ai_extra = cells["ai"]
+        ai_found = re.match(r"AI账 ([✓△✗])(\d+笔|笔数未知)", ai_text)
+        ai_mark = ai_found.group(1) if ai_found else "✗"
+        ai_count = ai_found.group(2) if ai_found else "笔数未知"
+        # The owner's decision to defer AI work is not evidence that it stopped
+        # running, nor proof of a successful model decision.
+        texts.append(f"AI账 {'✓' if ai_mark == '✓' else '✗'}{ai_count}" + ("（模型未核实）" if ai_mark == "△" else ""))
+        if ai_mark == "△":
+            sentences.append(f"AI账：模型未参与或当日参与证据不足（{ai_extra or '原因未知'}）；暂缓完善AI不等于进程已暂停")
+        if ai_mark == "✗":
+            sentences.append(f"AI账：当日账本或成交记录未核实（{ai_extra or '原因未知'}）；不能据此断言进程已暂停")
+        review_text, review_extra = cells["review"]
+        texts.append(review_text)
+        if review_text != "核对 ✓":
+            mismatches = re.search(r"✗(\d+)条陈述不符", review_text)
+            sentences.append(f"核对：AI 有 {mismatches.group(1)} 条说法和数据对不上；去对错页看看它说错了什么" if mismatches
+                             else f"核对：核对记录没有更新到今天（{review_extra or '原因未知'}）；不用你动手")
+        texts.append(f"备份 {'✓' if backup_ok else '✗'}")
+    if backup_plain:
+        sentences.append(backup_plain)
+    elif not str((cells.get("backup") or ("", ""))[0]).startswith("备份 ✓"):
+        notes.append("备份：健康格仅确认文件复制；完整研究资料恢复尚未证实，见技术细节")
+    plain = "。".join([*sentences, *notes]) if sentences or notes else "当前所列检查通过"
+    return {
+        "line": " · ".join(texts),
+        "plain": plain,
+        "explain_line": f"（{plain}。健康业务日期 {target}）",
+        "red_sentences": sentences,
+        "additional_notes": notes,
+        "snapshot": snapshot,
+        "backup": backup,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -805,12 +1038,21 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root).resolve() if args.root else CANON
     now = datetime.now(SHANGHAI).replace(microsecond=0)
     target = args.target_date or now.strftime("%Y-%m-%d")
-    line, explains, trading = build_line(root, target)
+    parts = line_parts(root, target)
+    line, explains, trading = parts["line"], parts["explains"], parts["trading"]
+    try:
+        owner = owner_health(root, target, parts)
+        owner_error = ""
+    except Exception as exc:  # noqa: BLE001 - the owner layer must never cost the health line
+        owner, owner_error = None, f"owner_layer:{type(exc).__name__}"
     header = f"{HEADER_MARK} {now.strftime('%Y-%m-%d %H:%M')} · 更新者：health_line"
     payload = {
         "target_date": target,
         "line": line,
         "explains": explains,
+        "owner_line": owner["line"] if owner else "",
+        "owner_plain": owner["plain"] if owner else "",
+        "owner_error": owner_error,
         "header": header,
         "trading_day": trading,
         "dry_run": bool(args.dry_run),
@@ -818,12 +1060,23 @@ def main(argv: list[str] | None = None) -> int:
         "history_error": "",
     }
     if not args.dry_run:
-        rewrite_status(root, header, line, " · ".join(explains))
+        if owner:
+            details = "技术细节：" + " · ".join([line, *explains])
+            removed = rewrite_status(root, header, owner["line"], owner["explain_line"], details=details)
+        else:
+            removed = rewrite_status(root, header, line, " · ".join(explains))
+        try:
+            archive_removed_blocks(root, removed, now.isoformat())
+        except OSError as exc:
+            payload["history_error"] = f"archive:{type(exc).__name__}:{exc}"
         try:
             payload["history_path"] = str(append_health_history(
                 root, target=target, header=header, line=line,
-                explains=explains, trading=trading,
+                explains=explains, trading=trading, owner=owner,
             ))
+            if owner:
+                write_health_history_json(root, target=target, header=header, line=line,
+                                          explains=explains, trading=trading, owner=owner)
         except OSError as exc:
             payload["history_error"] = f"{type(exc).__name__}:{exc}"
         log = log_path(root)

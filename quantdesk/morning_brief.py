@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from quantdesk import owner_view, weekly_review
 from quantdesk.candidate_contract import strategy_label
 from quantdesk.interprocess_lock import interprocess_file_lock
 from quantdesk.notifications.redaction import redact_payload
@@ -1251,6 +1252,70 @@ def _brief_business_date(root: Path, now: datetime, as_of: object) -> dict[str, 
             "date_reason_code": "brief_business_date_stale" if observed < expected else "brief_business_date_future"}
 
 
+OWNER_BRIEF_VERSION = "owner-brief-v1-20261103"
+
+
+def _weekly_exit_replay(root: Path, payload: Mapping[str, Any], now: datetime) -> dict[str, Any]:
+    """Reuse the existing weekly brief; local replay failure never blocks its body."""
+    as_of = str(payload.get("as_of") or "")
+    today = now.astimezone(SHANGHAI).date()
+    if payload.get("status") == "blocked" or payload.get("date_status") != "current":
+        return {"status": "skipped", "reason": "brief_data_not_current"}
+    if _calendar_says_closed(root, now) or not weekly_review.is_first_session_of_week(as_of, today):
+        return {"status": "skipped", "reason": "not_first_trading_session_of_week"}
+    try:
+        from quantdesk.research.exit_rule_replay import write_report
+        return write_report(root, as_of, root / "reports/research")
+    except Exception as exc:  # noqa: BLE001 - optional research must not suppress the brief
+        return {"status": "warning", "reason": "weekly_replay_failed", "error_type": type(exc).__name__}
+
+
+def _owner_brief(root: Path, payload: Mapping[str, Any], now: datetime) -> dict[str, str] | None:
+    """Plain-language push for the owner (CHARTER §8). ``None`` means use the old text.
+
+    Any failure here falls back to the technical brief instead of losing the push.
+    """
+
+    today = now.astimezone(SHANGHAI).date()
+    try:
+        if payload.get("status") == "blocked" or payload.get("date_status") in {"stale", "future", "unverified"}:
+            title, body = owner_view.stale_owner_brief(
+                str(payload.get("as_of") or ""), str(payload.get("expected_as_of") or ""), today=today)
+        else:
+            digest = owner_view.build_owner_digest(
+                root, str(payload.get("as_of") or ""), paper_account=payload.get("paper_account"))
+            title, body = owner_view.render_owner_brief(digest, today=today)
+            as_of = str(payload.get("as_of") or "")
+            if weekly_review.is_first_session_of_week(as_of, today):
+                # The first brief of a week also carries last week's review (CHARTER §8).
+                weekly = weekly_review.render_weekly_review(weekly_review.build_weekly_review(root, as_of))
+                body = body + "\n\n" + weekly
+                replay_status = payload.get("weekly_exit_replay") or {}
+                if replay_status.get("status") == "research_partial":
+                    body += f"\n卖法研究表已用现有资料更新到{as_of}；未到期样本和缺项分别列明。"
+                elif replay_status.get("status") in {"blocked", "warning"}:
+                    body += "\n卖法研究表本次未能更新，旧表不能代表本次结果。"
+    except Exception as exc:  # noqa: BLE001 - the old brief is the safety net
+        return {"error": type(exc).__name__}
+    if not title.strip() or not body.strip() or any(term in title + body for term in PROHIBITED_MESSAGE_TERMS):
+        return {"error": "owner_brief_rejected"}
+    return {"version": OWNER_BRIEF_VERSION, "title": title, "body": body}
+
+
+def _calendar_says_closed(root: Path, now: datetime) -> bool:
+    """True only when the calendar explicitly marks today closed (weekday holidays)."""
+
+    from quantdesk.trading_calendar import load_a_share_trading_calendar
+
+    try:
+        calendar = load_a_share_trading_calendar(root / "data/calendar/a_share_trading_calendar.csv")
+    except Exception:  # noqa: BLE001 - unknown calendar keeps the old behaviour
+        return False
+    if calendar.get("weekend_only"):
+        return False
+    return (calendar.get("is_open_by_date") or {}).get(now.astimezone(SHANGHAI).date().isoformat()) is False
+
+
 def run_morning_brief(
     project_root: str | Path,
     *,
@@ -1270,6 +1335,23 @@ def run_morning_brief(
     current = now or datetime.now(SHANGHAI)
     if current.tzinfo is None:
         current = current.replace(tzinfo=SHANGHAI)
+    started = current.astimezone(SHANGHAI)
+
+    def send_time_check() -> tuple[datetime, str]:
+        # Explicit ``now`` remains a deterministic test clock. Real runs must
+        # sample wall time again after rendering and immediately before sending.
+        checked = now if now is not None else datetime.now(SHANGHAI)
+        if checked.tzinfo is None:
+            checked = checked.replace(tzinfo=SHANGHAI)
+        checked = checked.astimezone(SHANGHAI)
+        if checked < started:
+            return checked, "send_clock_moved_backwards"
+        if checked.date() != started.date():
+            return checked, "send_clock_day_changed"
+        if not allow_outside_window and not _delivery_window_open(checked):
+            return checked, "outside_delivery_window"
+        return checked, ""
+
     lock_path = root / "state/morning_brief.lock"
     try:
         with interprocess_file_lock(lock_path, timeout_seconds=0):
@@ -1280,15 +1362,27 @@ def run_morning_brief(
                 payload["reason_codes"] = _unique([*(payload.get("reason_codes") or []), date_check["date_reason_code"]])
                 if payload.get("status") != "blocked":
                     payload["status"] = "warning"
-            markdown = render_morning_brief_markdown(payload)
-            title = f"QuantDesk 研究早报 {payload.get('as_of') or '数据待核'}"
+            payload["weekly_exit_replay"] = _weekly_exit_replay(root, payload, current)
+            technical = render_morning_brief_markdown(payload)
+            owner = _owner_brief(root, payload, current)
+            if owner and "error" not in owner:
+                title, markdown = owner["title"], owner["body"]
+                payload["owner_brief"] = dict(owner)
+                preview_text = markdown + "\n\n---\n\n## 技术细节\n\n" + technical
+            else:
+                title = f"QuantDesk 研究早报 {payload.get('as_of') or '数据待核'}"
+                markdown = technical
+                payload["owner_brief"] = {"error": (owner or {}).get("error", "owner_brief_unavailable")}
+                preview_text = technical
+            # The technical text stays in the hash, so any change in the underlying
+            # snapshot still counts as new content for the same-day dedupe.
             content_sha256 = hashlib.sha256(
-                (title.rstrip() + "\n" + markdown.rstrip()).encode("utf-8")
+                (title.rstrip() + "\n" + markdown.rstrip() + "\n" + technical.rstrip()).encode("utf-8")
             ).hexdigest()
             preview_json = root / "results/morning_brief/morning_brief_latest.json"
             preview_md = root / "reports/morning_brief/morning_brief_latest.md"
             atomic_write_json(preview_json, payload)
-            _atomic_write_text(preview_md, markdown)
+            _atomic_write_text(preview_md, preview_text)
 
             base_result: dict[str, Any] = {
                 "task_type": "morning_brief_delivery",
@@ -1332,11 +1426,20 @@ def run_morning_brief(
                     "status": "blocked",
                     "reason_code": "push_not_authorized",
                 }
-            if not allow_outside_window and not _delivery_window_open(current):
+            current, clock_reason = send_time_check()
+            if clock_reason:
                 return {
                     **base_result,
                     "status": "blocked",
-                    "reason_code": "outside_delivery_window",
+                    "reason_code": clock_reason,
+                    "send_checked_at": current.isoformat(timespec="seconds"),
+                }
+            if not allow_outside_window and _calendar_says_closed(root, current):
+                # A weekday market holiday: yesterday's brief would only be repeated.
+                return {
+                    **base_result,
+                    "status": "skipped_non_trading_day",
+                    "reason_code": "non_trading_day",
                 }
             if date_check["date_reason_code"]:
                 return {
@@ -1435,6 +1538,14 @@ def run_morning_brief(
                     secret = _sendkey_loader()
                 except Exception:
                     secret = None
+            current, clock_reason = send_time_check()
+            if clock_reason:
+                return {
+                    **base_result,
+                    "status": "blocked",
+                    "reason_code": clock_reason,
+                    "send_checked_at": current.isoformat(timespec="seconds"),
+                }
             try:
                 delivery_raw = sender(
                     title=title,

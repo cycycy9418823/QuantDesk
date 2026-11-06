@@ -24,6 +24,7 @@ class ResearchRouteDeps:
     latest_research_evidence_context: Callable[[], dict[str, Any]]
     load_paper_simulation_watchlist: Callable[[], dict[str, Any]]
     build_strategy_scorecard: Callable[[], dict[str, Any]]
+    load_paper_portfolio: Callable[[], dict[str, Any]]
 
 
 _PERF_HOLD_COLS = ["hold_1d_ret", "hold_3d_ret", "hold_5d_ret", "hold_10d_ret", "hold_20d_ret"]
@@ -102,7 +103,6 @@ def create_research_blueprint(deps: ResearchRouteDeps) -> Blueprint:
         """Post-selection outcome metrics from candidate_performance.csv + paper portfolio."""
         try:
             from quantdesk.evidence_freshness import build_evidence_freshness
-            from quantdesk.paper.auto_paper_portfolio import auto_paper_portfolio_latest
             from quantdesk.research_metrics import research_metrics_to_dict, summarize_research_metrics
 
             # research_metrics expects forward_return_5d/20d + drawdown; map from hold_* columns.
@@ -180,7 +180,7 @@ def create_research_blueprint(deps: ResearchRouteDeps) -> Blueprint:
                     "path": deps.project_relative_path(paper_watchlist_json),
                     "message": "纸面模拟池来自你确认或同步的候选，用于后续跟踪复盘；不接券商、不下真实订单。",
                 },
-                "paper_portfolio": auto_paper_portfolio_latest(),
+                "paper_portfolio": deps.load_paper_portfolio(),
                 "message_for_ui": (
                     audit_warning
                     +

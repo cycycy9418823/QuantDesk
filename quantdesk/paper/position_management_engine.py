@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 from collections import Counter
 from pathlib import Path
@@ -987,30 +988,47 @@ def _position_key(row: dict[str, Any]) -> tuple[str, str]:
 
 
 def normalize_position_for_t1(position: dict[str, Any], trade_date: str) -> dict[str, Any]:
+    """Keep documented old lots sellable after an add; never guess missing lots."""
     row = dict(position)
     quantity = safe_int(row.get("quantity"), 0) or 0
-    frozen = safe_int(row.get("frozen_quantity"), 0) or 0
-    sellable = safe_int(row.get("sellable_quantity"), None)
-    last_buy_date = str(row.get("last_buy_date") or row.get("entry_date") or "")[:10]
-    if last_buy_date:
-        buy_ts = pd.to_datetime(last_buy_date, errors="coerce")
-        trade_ts = pd.to_datetime(trade_date, errors="coerce")
-        buy_day = None if pd.isna(buy_ts) else pd.Timestamp(buy_ts).date()
-        trade_day = None if pd.isna(trade_ts) else pd.Timestamp(trade_ts).date()
-        if buy_day is None or trade_day is None or trade_day <= buy_day:
-            # Same-day, reverse-date, and malformed-date replays all fail
-            # closed. T+1 thaw is allowed only when execution time is strictly
-            # later than the buy date.
-            sellable = 0
-            frozen = quantity
-        else:
-            sellable = quantity
-            frozen = 0
-    elif sellable is None:
-        sellable = quantity
+
+    def day(value: Any) -> Any:
+        parsed = pd.to_datetime(str(value or "")[:10], errors="coerce")
+        return None if pd.isna(parsed) else pd.Timestamp(parsed).date()
+
+    def shares(value: Any) -> int | None:
+        number = safe_float(value, None)
+        if isinstance(value, bool) or number is None or not math.isfinite(number) or number < 0 or number != int(number):
+            return None
+        return int(number)
+
+    entry_day = day(row.get("entry_date") or row.get("buy_date") or row.get("first_buy_date"))
+    buy_day = day(row.get("last_buy_date")) if row.get("last_buy_date") else entry_day
+    trade_day = day(trade_date)
+    sellable, frozen = 0, quantity
+    status, reason = "unverified", "missing_or_invalid_buy_date"
+    if buy_day is not None and trade_day is not None:
+        if entry_day is not None and entry_day > buy_day:
+            reason = "inconsistent_buy_dates"
+        elif trade_day > buy_day:
+            sellable, frozen = quantity, 0
+            status, reason = "verified_sellable", "buy_date_before_execution"
+        elif trade_day < buy_day:
+            reason = "execution_before_last_buy"
+        elif entry_day == trade_day:
+            status, reason = "frozen_today", "new_position_today"
+        elif entry_day is not None and entry_day < trade_day:
+            old_lot, new_lot = shares(row.get("sellable_quantity")), shares(row.get("frozen_quantity"))
+            if old_lot is not None and new_lot is not None and new_lot > 0 and old_lot + new_lot == quantity:
+                sellable, frozen = old_lot, new_lot
+                status, reason = "partial_frozen_today" if old_lot else "frozen_today", "recorded_same_day_lots"
+            else:
+                reason = "same_day_lot_balances_missing_or_inconsistent"
     row["quantity"] = quantity
     row["sellable_quantity"] = max(0, min(quantity, sellable))
     row["frozen_quantity"] = max(0, min(quantity, frozen))
+    row["t1_status"] = status
+    row["t1_reason"] = reason
     row["avg_cost"] = safe_float(row.get("avg_cost"), safe_float(row.get("entry_price"), safe_float(row.get("latest_price"), 0.0))) or 0.0
     row.setdefault("management_state", "normal")
     return row
@@ -1482,11 +1500,14 @@ def apply_conditional_execution_to_state(
             latest_date=str(latest_date or ""),
             factors=factors,
         )
+        # The policy deliberately removes obsolete factor-derived balances.
+        # Updating alone would leave those removed keys in the original row.
+        position.clear()
         position.update(adjusted)
         if valuation_warnings:
             position["valuation_warnings"] = valuation_warnings
         _apply_valuation_gate_marks(position, valuation_warnings)
-        if position.get("price_adjustment_status") in {"missing_adj_factor", "stale_adj_factor"}:
+        if position.get("price_adjustment_status") in {"missing_adj_factor", "stale_adj_factor", "factor_reference_only"}:
             warnings = list(position.get("valuation_warnings") or [])
             warnings.append(str(position.get("price_adjustment_warning") or "missing adjustment factor evidence"))
             position["valuation_warnings"] = list(dict.fromkeys(warnings))

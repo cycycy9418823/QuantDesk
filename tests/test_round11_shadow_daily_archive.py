@@ -302,9 +302,13 @@ def test_qd_registers_shadow_weekly_in_all_command_surfaces() -> None:
 
 
 def test_all_four_production_shadow_writes_share_the_archive_aware_sink() -> None:
+    from quantdesk.paper import auto_paper_portfolio as paper
+    from quantdesk.paper import position_management_engine as positions
+
     root = Path(__file__).resolve().parents[1]
-    auto_source = (root / "quantdesk" / "paper" / "auto_paper_portfolio.py").read_text(
-        encoding="utf-8"
+    auto_source = "\n".join(
+        (root / "quantdesk" / "paper" / path).read_text(encoding="utf-8")
+        for path in ("auto_paper_portfolio.py", "execution/daily.py", "execution/conditional.py", "execution/snapshot.py")
     )
     position_source = (
         root / "quantdesk" / "paper" / "position_management_engine.py"
@@ -312,6 +316,9 @@ def test_all_four_production_shadow_writes_share_the_archive_aware_sink() -> Non
 
     assert auto_source.count("write_shadow_summary(") == 3
     assert position_source.count("write_shadow_summary(") == 1
+    assert paper._daily_execution_ports().risk.write_shadow_summary is shadow.write_shadow_summary
+    assert paper._conditional_execution_ports().risk.write_shadow_summary is shadow.write_shadow_summary
+    assert positions.write_shadow_summary is shadow.write_shadow_summary
 
 
 def test_retry_repairs_latest_after_archive_succeeds_first(

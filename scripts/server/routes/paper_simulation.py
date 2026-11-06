@@ -15,6 +15,7 @@ from scripts.server.helpers.util import clean_payload, safe_int
 class PaperSimulationRouteDeps:
     """Callbacks that keep this blueprint decoupled from quant_api_server."""
 
+    load_equity_history: Callable[..., dict[str, Any]]
     data_write_lock: Callable[[], Any]
     paper_watchlist_json: Callable[[], Path]
     project_relative_path: Callable[[Path], str]
@@ -76,9 +77,7 @@ def create_paper_simulation_blueprint(deps: PaperSimulationRouteDeps) -> Bluepri
     def get_paper_simulation_equity_history() -> Any:
         """Read-only per-day paper equity series for the home dashboard."""
         try:
-            from quantdesk.paper.auto_paper_portfolio import auto_paper_portfolio_equity_history
-
-            payload = auto_paper_portfolio_equity_history(limit=safe_int(request.args.get("limit"), 250))
+            payload = deps.load_equity_history(limit=safe_int(request.args.get("limit"), 250))
             return jsonify(clean_payload(payload)), 200 if payload.get("ok", True) else 500
         except Exception as exc:  # noqa: BLE001
             return jsonify(

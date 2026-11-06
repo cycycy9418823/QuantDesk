@@ -3846,6 +3846,14 @@
             </article>
         </section>
 
+        <section id="morningBriefSection" class="section" aria-labelledby="morningBriefTitle" data-home-section data-home-page="today">
+            <div class="section-head">
+                <div><h2 id="morningBriefTitle">已生成早报</h2><p class="section-note">原文、资料日期和发送状态放在一起；纸面 · 未验证。</p></div>
+                <button id="morningBriefReadButton" type="button">重新读取早报</button>
+            </div>
+            <div id="morningBriefPanel" aria-live="polite">尚未读取早报。查看不会生成、重算或补发消息。</div>
+        </section>
+
         <section id="productIntegritySection" class="section" aria-labelledby="productIntegrityTitle" data-home-section data-home-page="today">
             <div class="section-head"><h2 id="productIntegrityTitle">今天哪些数字还需核对</h2></div>
             <div id="productIntegrityPanel" aria-live="polite">正在读取账本和研究证据，不据此认定正常…</div>
@@ -3904,8 +3912,8 @@
                     <div id="homeSectorChartEmpty" class="empty-state">正在加载板块数据…</div>
                 </article>
                 <article class="home-dash-panel">
-                    <h3>Paper 净值 vs 沪深300</h3>
-                    <p class="section-note">纸面模拟账户累计收益与基准指数对比；历史表现不代表未来。</p>
+                    <h3>已记录权益与沪深300：同期间变化</h3>
+                    <p class="section-note" id="homeEquityEvidence">只比较明确估值日期的记录，两边从共同首日归零；纸面 · 未验证。</p>
                     <div id="homeEquityChart" class="home-dash-chart" hidden></div>
                     <div id="homeEquityChartEmpty" class="empty-state">正在加载净值数据…</div>
                 </article>

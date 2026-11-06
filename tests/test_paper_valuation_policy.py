@@ -12,7 +12,7 @@ from quantdesk.paper.paper_trading import update_paper_marks
 from quantdesk.paper.position_management_engine import apply_conditional_execution_to_state
 
 
-def test_paper_adjustment_policy_marks_current_basis_cost_and_pnl(tmp_path: Path) -> None:
+def test_paper_adjustment_policy_keeps_raw_cost_and_factor_reference(tmp_path: Path) -> None:
     meta = tmp_path / "data" / "metadata"
     meta.mkdir(parents=True)
     (meta / "adjustment_factors.csv").write_text(
@@ -37,16 +37,17 @@ def test_paper_adjustment_policy_marks_current_basis_cost_and_pnl(tmp_path: Path
         factors=factors,
     )
 
-    assert updated["price_adjustment_status"] == "adjusted"
-    assert updated["price_adjustment_mode"] == "raw_price_with_adj_factor_current_basis"
+    assert updated["price_adjustment_status"] == "factor_reference_only"
+    assert updated["price_adjustment_mode"] == "raw_price_recorded_shares"
     assert updated["entry_adj_factor"] == 1.0
     assert updated["latest_adj_factor"] == 2.0
-    assert updated["adjustment_factor_ratio"] == 2.0
-    assert updated["adjusted_avg_cost"] == 5.0
-    assert updated["adjusted_quantity_for_valuation"] == 200
-    assert updated["market_value"] == 1000.0
-    assert updated["unrealized_pnl"] == 0.0
-    assert updated["return_pct"] == 0.0
+    assert updated["factor_research_proxy"]["factor_ratio"] == 2.0
+    assert updated["factor_research_proxy"]["included_in_equity"] is False
+    assert "adjusted_avg_cost" not in updated
+    assert "adjusted_quantity_for_valuation" not in updated
+    assert updated["market_value"] == 500.0
+    assert updated["unrealized_pnl"] == -500.0
+    assert updated["return_pct"] == -50.0
 
 
 def test_paper_adjustment_policy_warns_when_factor_missing(tmp_path: Path) -> None:
@@ -200,11 +201,11 @@ def test_conditional_position_management_marks_with_adjustment_factor(tmp_path: 
     )
 
     position = result["state"]["positions"][0]
-    assert position["price_adjustment_status"] == "adjusted"
-    assert position["adjusted_avg_cost"] == 5.0
-    assert position["adjusted_quantity_for_valuation"] == 200
-    assert position["market_value"] == 1000.0
-    assert position["unrealized_pnl"] == 0.0
+    assert position["price_adjustment_status"] == "factor_reference_only"
+    assert "adjusted_avg_cost" not in position
+    assert "adjusted_quantity_for_valuation" not in position
+    assert position["market_value"] == 500.0
+    assert position["unrealized_pnl"] == -500.0
 
 
 def test_manual_paper_marks_freeze_suspended_quote() -> None:

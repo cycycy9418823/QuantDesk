@@ -46,6 +46,11 @@ def register_product_review_routes(app: Flask, *, root: Callable[[], Path], capa
     def runtime_capabilities() -> Any:
         return jsonify(capabilities())
 
+    @app.route("/api/morning-brief", methods=["GET"])
+    def morning_brief() -> Any:
+        from quantdesk.morning_brief_view import build_morning_brief_view
+        return jsonify(build_morning_brief_view(root()))
+
     @app.route("/api/product-integrity", methods=["GET"])
     def product_integrity() -> Any:
         from quantdesk.product_integrity import build_product_integrity

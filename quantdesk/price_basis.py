@@ -160,8 +160,10 @@ _CURRENT_ENFORCED_POLICY: dict[str, Any] = {
     "paper_valuation": {
         "latest_price_basis": PRICE_BASIS_RAW,
         "corporate_action_policy": (
-            "raw_price_plus_canonical_adjustment_factor_for_quantity_and_cost_basis"
+            "raw_price_recorded_shares_and_cost_factor_reference_only"
         ),
+        "factor_proxy_in_equity": False,
+        "corporate_action_booking": "requires_independent_event_evidence_not_implemented",
     },
 }
 

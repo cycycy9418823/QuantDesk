@@ -36,8 +36,9 @@ def test_valuation_after_the_table_end_is_stale_not_adjusted(tmp_path: Path) -> 
     assert row["market_value"] == round(9.54 * 500, 2)  # raw valuation, numbers unchanged
 
 
-def test_valuation_inside_the_table_is_still_adjusted(tmp_path: Path) -> None:
+def test_valuation_inside_the_table_keeps_factor_as_research_reference(tmp_path: Path) -> None:
     position = {"symbol": "600000", "entry_date": "2026-06-30", "entry_price": 9.0, "quantity": 100}
     row = apply_paper_adjustment_policy(position, latest_price=9.5, latest_date="2026-07-02",
                                         factors=_table(tmp_path))
-    assert row["price_adjustment_status"] == "adjusted"
+    assert row["price_adjustment_status"] == "factor_reference_only"
+    assert row["factor_research_proxy"]["included_in_equity"] is False

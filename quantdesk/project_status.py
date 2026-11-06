@@ -470,6 +470,18 @@ def read_project_status(project_root: str | Path) -> dict[str, Any]:
         "error": None,
         "readable_means": "file_opened_not_system_health",
     }
+    from quantdesk.daily_evidence_contract import audit_daily_evidence, inspect_backup_readiness, readiness_note
+    target = payload["health_freshness"].get("observed_trade_date")
+    if target and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(target)):
+        try:
+            evidence = audit_daily_evidence(root, str(target))
+            payload["daily_evidence"] = evidence
+            payload["daily_evidence_note"] = readiness_note(evidence)
+            payload["backup_readiness"] = inspect_backup_readiness(root, str(target))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            payload["daily_evidence"] = {"status": "not_assessed", "reason_codes": [f"daily_evidence_unreadable:{type(exc).__name__}"]}
+    else:
+        payload["daily_evidence"] = {"status": "not_assessed", "reason_codes": ["health_business_date_not_declared"]}
     return payload
 
 
