@@ -72,3 +72,14 @@ test("home loads saved brief and template offers no resend button",()=>{
     assert.match(section,/data-home-page="today"/);assert.match(section,/重新读取早报/);
     assert.doesNotMatch(section,/>补发|>发送|>重算/);
 });
+
+test("date selection fetches the archive and keeps late generation visible",async()=>{
+    const p=page();p.context.data={...payload(),late_generated:true,archive_dates:["2026-11-06","bad<script>"]};
+    p.node("morningBriefDate").value="2026-11-06";p.context.calls=[];
+    p.run("requestJson=async url=>{calls.push(url);return data}");
+    await p.run("loadMorningBrief()");
+    assert.equal(p.context.calls[0],"/api/morning-brief?date=2026-11-06");
+    assert.match(p.node("morningBriefPanel").innerHTML,/晚生成/);
+    assert.match(p.node("morningBriefDate").innerHTML,/2026-11-06/);
+    assert.doesNotMatch(p.node("morningBriefDate").innerHTML,/script/);
+});

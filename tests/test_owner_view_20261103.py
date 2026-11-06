@@ -240,6 +240,8 @@ def _owner_cells(**overrides: tuple[str, str]) -> dict:
 def test_owner_line_follows_charter_six_cells_and_owner_rules(tmp_path: Path) -> None:
     _snapshot_day(tmp_path, "2026-11-02", sheets=48)
     _backup_log(tmp_path, [{"stamp": "snapshot_20261102T140017Z", "exit_code": 0, "all_hashes_match": True}])
+    _write_json(tmp_path / "results/offsite_backup/offsite_backup_latest.json",
+                {"status": "ok", "finished_at": "2026-11-02T22:00:00+08:00"})
     owner = HEALTH.owner_health(tmp_path, "2026-11-02", _owner_cells())
     assert owner["line"] == "日线 ✓5570/5576 · 快照 ✓48/48 · 策略账 ✓ · AI账 ✗0笔（模型未核实） · 核对 ✓ · 备份 ✓"
     assert "全部正常" not in owner["plain"]
@@ -266,6 +268,8 @@ def test_owner_red_cells_get_one_plain_sentence_each(tmp_path: Path) -> None:
 def test_owner_green_acquisition_never_claims_complete_minute_session(tmp_path: Path) -> None:
     _snapshot_day(tmp_path, "2026-11-02", sheets=48)
     _backup_log(tmp_path, [{"stamp": "snapshot_20261102T140017Z", "exit_code": 0, "all_hashes_match": True}])
+    _write_json(tmp_path / "results/offsite_backup/offsite_backup_latest.json",
+                {"status": "ok", "finished_at": "2026-11-02T22:00:00+08:00"})
     owner = HEALTH.owner_health(tmp_path, "2026-11-02", _owner_cells(
         daily=("日线 ✓5570/5576", ""), snapshot=("快照 ✓48张/覆盖完成 48/字段核实 48", ""),
         minute=("分钟 ✓87/87", ""), ai=("AI账 ✓0笔", "默认 2026-11-02 0笔")))

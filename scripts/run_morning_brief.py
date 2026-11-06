@@ -62,6 +62,13 @@ def _exit_code(payload: dict) -> int:
         return 3
     if reason in {"snapshot_blocked", "verified_snapshot_unavailable"}:
         return 2
+    optional_delivery = status in {"failed", "ambiguous", "skipped_uncertain_prior_attempt"} or reason in {
+        "outside_delivery_window", "network_not_authorized", "push_not_authorized",
+    }
+    if payload.get("local_brief_status") == "saved" and payload.get("delivery_optional") is True and optional_delivery:
+        # Delivery remains explicit in the JSON receipt. The owner's daily
+        # product succeeds locally even when the optional phone push does not.
+        return 0
     if status in {"failed", "ambiguous"}:
         return 5
     return 4

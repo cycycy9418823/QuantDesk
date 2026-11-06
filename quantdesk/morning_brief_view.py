@@ -1,9 +1,10 @@
 """Read the saved brief and matching delivery evidence without running a sender."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -78,6 +79,14 @@ def _content(payload: dict[str, Any]) -> tuple[str, str, str]:
     # Format only the saved snapshot, never rebuild it from today's account/data.
     from quantdesk.morning_brief import render_morning_brief_markdown
 
+    saved = payload.get("saved_content")
+    if saved is not None:
+        if not isinstance(saved, dict) or any(not isinstance(saved.get(k), str) for k in ("title", "body", "technical", "sha256")):
+            raise ValueError("invalid_saved_content")
+        digest = hashlib.sha256((saved['title'].rstrip() + "\n" + saved['body'].rstrip() + "\n" + saved['technical'].rstrip()).encode()).hexdigest()
+        if digest != saved["sha256"]:
+            raise ValueError("saved_content_hash_mismatch")
+        return saved["title"], saved["body"], digest
     technical = render_morning_brief_markdown(payload)
     owner = payload.get("owner_brief")
     if isinstance(owner, dict) and isinstance(owner.get("title"), str) and isinstance(owner.get("body"), str):
@@ -102,6 +111,8 @@ def _delivery(receipts: list[dict[str, Any]], attempts: list[dict[str, Any]], *,
     if accepted:
         return {**result, "status": "provider_accepted", "label": "服务商已接收", "message": "已有服务商接收回执；不代表手机已收到或你已读。"}
     if receipts:
+        if all(r.get("status") == "failed" for r in receipts):
+            return {**result, "status": "failed", "label": "发送失败", "message": "发送记录明确失败，本地日报仍可阅读。"}
         return {**result, "label": "发送未获确认", "message": "存在发送尝试，但没有可核实的成功回执；不自动推断手机收到了。"}
     if any(r.get("status") not in {"blocked", "preview_generated", "skipped_non_trading_day"} for r in attempts):
         return result
@@ -118,20 +129,43 @@ def _delivery(receipts: list[dict[str, Any]], attempts: list[dict[str, Any]], *,
     return result
 
 
-def build_morning_brief_view(project_root: str | Path, *, now: datetime | None = None) -> dict[str, Any]:
+def build_morning_brief_view(project_root: str | Path, *, now: datetime | None = None,
+                             requested_date: str = "") -> dict[str, Any]:
     """Return the latest saved content with independently checked delivery status."""
     reader = _Reader(Path(project_root))
     current = now or datetime.now(SHANGHAI)
     if current.tzinfo is None:
         current = current.replace(tzinfo=SHANGHAI)
     current = current.astimezone(SHANGHAI)
+    archive_dates = sorted((p.stem for p in reader.files("results/morning_brief", "????-??-??.json")
+                            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", p.stem)), reverse=True)
+    source = PREVIEW
+    selected_date = requested_date
+    if requested_date:
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", requested_date):
+                raise ValueError("invalid_date")
+            date.fromisoformat(requested_date)
+        except ValueError:
+            return {"ok": False, "available": False, "read_only": True, "message": "日报日期格式无效"}
+    elif current.date().isoformat() in archive_dates:
+        selected_date = current.date().isoformat()
+    if selected_date:
+        source = f"results/morning_brief/{selected_date}.json"
     base: dict[str, Any] = {"ok": True, "available": False, "read_only": True, "label": "纸面 · 未验证",
                             "read_at": current.isoformat(timespec="seconds"), "source": PREVIEW,
+                            "archive_dates": archive_dates, "selected_date": selected_date,
                             "source_errors": reader.errors, "source_sha256": reader.sources}
-    payload = reader.mapping(reader.root / PREVIEW)
+    base["source"] = source
+    payload = reader.mapping(reader.root / source)
     if not payload:
         return {**base, "message": "未读到已生成的早报；查看页面不会触发生成或发送。"}
     generated = _local_time(payload.get("generated_at"))
+    if selected_date:
+        report = reader.text(reader.root / "reports/morning_brief" / f"{selected_date}.md")
+        if (not generated or generated.date().isoformat() != selected_date or report is None
+                or hashlib.sha256(report.encode("utf-8")).hexdigest() != payload.get("archive_report_sha256")):
+            return {**base, "message": "当日存档正文缺失、日期或摘要不符，暂不能作为已保存日报。"}
     try:
         title, body, content_sha = _content(payload)
     except (ValueError, TypeError, AttributeError, KeyError):
@@ -188,6 +222,8 @@ def build_morning_brief_view(project_root: str | Path, *, now: datetime | None =
             return {**base, "message": "早报或发送记录在读取期间发生变化，请重新读取；本次未认定发送结果。"}
     return {**base, "available": True, "title": title, "body": body, "content_sha256": content_sha,
             "generated_at": str(payload.get("generated_at") or ""), "delivery_day": delivery_day,
+            "late_generated": bool(payload.get("late_generated")) if "late_generated" in payload else
+                bool(generated and (generated.hour, generated.minute, generated.second) > (8, 35, 0)),
             "as_of": str(payload.get("as_of") or ""), "expected_as_of": str(payload.get("expected_as_of") or ""),
             "date_status_at_generation": str(payload.get("date_status") or "unverified"),
             "is_today": generated is not None and generated.date() == current.date(),

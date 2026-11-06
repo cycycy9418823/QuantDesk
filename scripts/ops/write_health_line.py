@@ -684,7 +684,7 @@ def review_cell(root: Path, target: str) -> tuple[str, str]:
     return f"核对 ✗{total}条陈述不符", explain
 
 
-def backup_cell(root: Path, target: str) -> tuple[str, str]:
+def backup_recovery_reference(root: Path, target: str) -> tuple[str, str]:
     log = log_path(root).parent / "backup_push.log"
     if not log.is_file():
         return "备份 ✗", f"备份未在 {target} 成功，上次成功 从未成功"
@@ -712,6 +712,36 @@ def backup_cell(root: Path, target: str) -> tuple[str, str]:
         return "备份 ✓", "已核对文件复制；业务日账本与研究资料恢复另行核查。" if checked["status"] != "ready" else f"业务日{checked.get('expected_business_date')}的账本、动作原件与引用资料已在备份中核对；实际恢复演练另列。"
     prev = last_backup_success(root) or "从未成功"
     return "备份 ✗", f"备份未在 {target} 成功，上次成功 {prev}"
+
+
+def backup_cell(root: Path, target: str) -> tuple[str, str]:
+    from quantdesk.owner_view import backup_health_status
+
+    checked = backup_health_status(root, target)
+    _, recovery_note = backup_recovery_reference(root, target)
+    # A detected corrupt ledger archive remains a failure; completeness of the
+    # optional research recovery package is a separate reference check.
+    corrupt = "备份文件校验失败" in recovery_note
+    ok = checked["ok"] and not corrupt
+    detail = "备份文件校验失败" if corrupt else checked["reason"] or checked["note"]
+    log = log_path(root).parent / "backup_push.log"
+    project_note = ""
+    if log.is_file():
+        for raw in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and stamp_date(str(row.get("stamp") or "")) == target and row.get("exit_code") is not None:
+                recovery = row.get("project_recovery")
+                if isinstance(recovery, dict) and recovery.get("ok") is False:
+                    project_note = str(recovery.get("error") or row.get("error") or recovery.get("status") or "失败")
+    extra = f"{detail}；{checked['cloud_note']}"
+    if project_note:
+        extra += f"；P5项目恢复包参考（不影响备份格）：{project_note}"
+    elif recovery_note:
+        extra += f"；完整研究恢复参考（不影响备份格）：{recovery_note}"
+    return f"备份 {'✓' if ok else '✗'}", extra
 
 
 def is_trading_day(root: Path, target: str) -> tuple[bool, str]:
@@ -907,7 +937,10 @@ def line_parts(root: Path, target: str) -> dict:
     for key, name in TECHNICAL_CELLS:
         cell, extra = globals()[name](root, target)
         cells[key] = (cell, extra)
-        ordered.append(cell)
+        if key == "snapshot":
+            ordered.append("快照字段参考（不影响红绿）：" + cell.replace("快照 ✓", "").replace("快照 ✗", ""))
+        else:
+            ordered.append(cell)
         if extra:
             explains.extend(extra.splitlines())
     from quantdesk.daily_evidence_contract import audit_daily_evidence, readiness_note
@@ -923,7 +956,7 @@ def line_parts(root: Path, target: str) -> dict:
 
 # ---------------------------------------------------------------------------
 # Owner layer (CHARTER §7): six cells, ✓/✗ only, one plain sentence per red cell.
-# The technical eight-cell line above stays unchanged and is kept underneath.
+# Technical completeness checks are retained as explicit references underneath.
 # ---------------------------------------------------------------------------
 
 def _strategy_plain(root: Path, target: str) -> str:
@@ -943,7 +976,7 @@ def owner_health(root: Path, target: str, parts: dict) -> dict:
     from quantdesk import owner_view
 
     cells = parts.get("cells") or {}
-    backup = owner_view.backup_copy_status(root, target)
+    backup = owner_view.backup_health_status(root, target)
     archive_broken = "备份文件校验失败" in str((cells.get("backup") or ("", ""))[1])
     backup_ok = backup["ok"] and not archive_broken
     if backup_ok:
@@ -951,8 +984,7 @@ def owner_health(root: Path, target: str, parts: dict) -> dict:
     elif archive_broken:
         backup_plain = "备份：备份文件校验失败；要排查，不用你动手"
     else:
-        backup_plain = (f"备份：{target} 尚无成功记录（上次成功 {backup['last_success'] or '没有记录'}）；"
-                        "是否未到计划时点或执行失败需查运行记录")
+        backup_plain = f"备份：{backup['reason']}"
     texts: list[str] = []
     sentences: list[str] = []
     notes: list[str] = []
@@ -989,6 +1021,7 @@ def owner_health(root: Path, target: str, parts: dict) -> dict:
                 "快照：今天没有可核实的盘中快照；依赖快照的研究或纸面成交缺少证据")
         minute_text, minute_extra = cells.get("minute", ("分钟 ✗", "分钟回执缺失"))
         notes.append(f"分钟：{minute_text}；{minute_extra or '本轮有新数据不等于完整交易时段已核实'}")
+        notes.append(owner_view.execution_basis_digest(root, target)["message"])
         strategy_text, _ = cells["strategy"]
         strategy_ok = strategy_text.endswith("✓")
         texts.append(f"策略账 {'✓' if strategy_ok else '✗'}")
@@ -1014,8 +1047,8 @@ def owner_health(root: Path, target: str, parts: dict) -> dict:
         texts.append(f"备份 {'✓' if backup_ok else '✗'}")
     if backup_plain:
         sentences.append(backup_plain)
-    elif not str((cells.get("backup") or ("", ""))[0]).startswith("备份 ✓"):
-        notes.append("备份：健康格仅确认文件复制；完整研究资料恢复尚未证实，见技术细节")
+    if backup["offsite_ok"]:
+        notes.append(f"备份：异地回执 {backup['offsite_finished_at']}；{backup['cloud_note']}")
     plain = "。".join([*sentences, *notes]) if sentences or notes else "当前所列检查通过"
     return {
         "line": " · ".join(texts),

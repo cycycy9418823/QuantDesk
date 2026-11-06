@@ -11,9 +11,10 @@ import csv
 import json
 import math
 import re
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 from quantdesk.snapshot_history import expected_snapshot_slots, read_verified_snapshot_archive
 
@@ -158,7 +159,12 @@ def backup_copy_status(root: Path, day: str) -> dict[str, Any]:
         if not isinstance(row, dict) or row.get("exit_code") is None:
             continue
         when = _stamp_day(str(row.get("stamp") or ""))
-        success = row.get("exit_code") == 0 and row.get("all_hashes_match") is True
+        # A later optional project-recovery failure does not undo the verified
+        # ledger copy. Old receipts have no separate paper verification field.
+        success = row.get("paper_backup_verified") is True or (
+            "paper_backup_verified" not in row and row.get("exit_code") == 0
+            and row.get("all_hashes_match") is True
+        )
         if success and when:
             result["last_success"] = max(result["last_success"], when)
         if when == day:
@@ -167,6 +173,66 @@ def backup_copy_status(root: Path, day: str) -> dict[str, Any]:
                 result["ok"] = True
                 result["file_count"] = row.get("file_count")
     return result
+
+
+def backup_health_status(root: Path, day: str, *, now: datetime | None = None) -> dict[str, Any]:
+    """Judge the ledger copy and the owner's two-day offsite receipt contract."""
+    paper = backup_copy_status(root, day)
+    receipt = load_json(Path(root) / "results/offsite_backup/offsite_backup_latest.json") or {}
+    zone = ZoneInfo("Asia/Shanghai")
+    current = now or datetime.now(zone)
+    current = current.replace(tzinfo=zone) if current.tzinfo is None else current.astimezone(zone)
+    reference = min(current, datetime.combine(date.fromisoformat(day), time.max, tzinfo=zone))
+    finished: datetime | None = None
+    try:
+        finished = datetime.fromisoformat(str(receipt.get("finished_at") or "").replace("Z", "+00:00"))
+        if finished.tzinfo is None:
+            finished = None
+    except ValueError:
+        pass
+    fresh = finished is not None and timedelta(0) <= reference - finished <= timedelta(days=2)
+    offsite_ok = receipt.get("status") == "ok" and fresh
+    reasons = []
+    if not paper["ok"]:
+        reasons.append(f"账本备份在{day}尚无成功核对（上次成功 {paper['last_success'] or '没有记录'}）")
+    if not offsite_ok:
+        reasons.append("异地备份回执缺失、失败、时间异常或已超过2天")
+    cloud_confirmed = receipt.get("cloud_upload_confirmed") is True
+    return {"ok": paper["ok"] and offsite_ok, "paper": paper, "offsite_ok": offsite_ok,
+            "offsite_finished_at": receipt.get("finished_at"), "cloud_upload_confirmed": cloud_confirmed,
+            "reason": "；".join(reasons),
+            "note": "账本备份已核对；异地回执在2天内" if paper["ok"] and offsite_ok else "",
+            "cloud_note": "云端上传已确认" if cloud_confirmed else "只核对同步目录副本，云端上传尚未确认"}
+
+
+def execution_basis_digest(root: Path, day: str) -> dict[str, Any]:
+    """Count recorded fills, never infer minute use merely from file coverage."""
+    data = load_json(Path(root) / "results/auto_paper_portfolio_latest.json") or {}
+    if data.get("valuation_date") != day or not isinstance(data.get("daily_actions"), list):
+        return {"verified": False, "message": f"{day}成交依据计数未核实"}
+    counts = {"minute": 0, "daily_approx": 0, "daily_close": 0, "unknown": 0}
+    rows = []
+    for row in data["daily_actions"]:
+        if not isinstance(row, dict) or row.get("action") not in OPEN_ACTIONS | CLOSE_ACTIONS:
+            continue
+        quantity = finite(row.get("quantity"))
+        if quantity is None or quantity <= 0 or row.get("decision_date") != day:
+            continue
+        model = row.get("fill_model")
+        if model in {"intraday_1m_close", "intraday_1m", "minute_1m"}:
+            category = "minute"
+        elif model == "daily_approx":
+            category = "daily_approx"
+        elif row.get("order_source") == "auto_strategy_sandbox" and row.get("execution_source") != "intraday_swing" and not model:
+            category = "daily_close"
+        else:
+            category = "unknown"
+        counts[category] += 1
+        rows.append({"symbol": row.get("symbol"), "action": row.get("action"), "quantity": quantity,
+                     "price": row.get("price"), "basis": category})
+    message = (f"{day}已记录成交：分钟{counts['minute']}笔、盘中日线近似{counts['daily_approx']}笔、"
+               f"日终规则{counts['daily_close']}笔、依据未核实{counts['unknown']}笔；按动作记录分类，不由分钟覆盖率推断")
+    return {"verified": True, **counts, "rows": rows, "message": message}
 
 
 # --------------------------------------------------------------------------

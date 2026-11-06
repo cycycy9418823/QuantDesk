@@ -1015,6 +1015,7 @@ def render_morning_brief_markdown(payload: Mapping[str, Any]) -> str:
     daily_requested = health.get("daily_requested_count")
     minute_complete = health.get("minute_effective_complete_count")
     minute_requested = health.get("minute_requested_count")
+    legacy_pool_label = "旧池参考，不影响当前全A红绿；" if payload.get("presentation_version") == 2 else ""
     lines = [
         "# QuantDesk 研究早报",
         f"- 数据日期：{as_of}",
@@ -1033,7 +1034,7 @@ def render_morning_brief_markdown(payload: Mapping[str, Any]) -> str:
             f"{minute_requested if minute_requested is not None else '不可用'}"
         ),
         (
-            "- 数据新鲜度（最大落后交易日）：核心日线 "
+            f"- 数据新鲜度（{legacy_pool_label}最大落后交易日）：核心日线 "
             f"{_lag_text('core_daily')}；核心分钟 {_lag_text('core_minute')}；"
             f"板块快照 {_lag_text('sector_snapshot')}；宽池日线 {_lag_text('wide_daily')}；"
             f"宽池分钟 {_lag_text('wide_minute')}"
@@ -1068,10 +1069,10 @@ def render_morning_brief_markdown(payload: Mapping[str, Any]) -> str:
             else "- 风控影子：不可用"
         ),
         (
-            "- 宽池日线：已至今日 "
-            f"{pool.get('daily_current')}/{pool.get('daily_total')}"
+            (f"- 宽池日线（{legacy_pool_label.rstrip('；')}）：已至今日 " if legacy_pool_label else "- 宽池日线：已至今日 ")
+            + f"{pool.get('daily_current')}/{pool.get('daily_total')}"
             if pool
-            else "- 宽池日线：不可用"
+            else ("- 宽池日线：旧池参考，不影响当前全A红绿；不可用" if legacy_pool_label else "- 宽池日线：不可用")
         ),
         _milestone_text(),
         f"- 风险信息：{len(risk_items)} 条本地观察" if risk_items else "- 风险信息：不可用",
@@ -1356,6 +1357,7 @@ def run_morning_brief(
     try:
         with interprocess_file_lock(lock_path, timeout_seconds=0):
             payload = build_morning_brief(root, now=current)
+            payload["presentation_version"] = 2
             date_check = _brief_business_date(root, current, payload.get("as_of"))
             payload.update(date_check)
             if date_check["date_reason_code"]:
@@ -1379,10 +1381,28 @@ def run_morning_brief(
             content_sha256 = hashlib.sha256(
                 (title.rstrip() + "\n" + markdown.rstrip() + "\n" + technical.rstrip()).encode("utf-8")
             ).hexdigest()
+            # Persist the text that was actually generated. Later readers must
+            # not re-render old reports using a changed renderer or today's data.
+            generated = now if now is not None else datetime.now(SHANGHAI)
+            generated = generated.replace(tzinfo=SHANGHAI) if generated.tzinfo is None else generated.astimezone(SHANGHAI)
+            payload["generated_at"] = generated.isoformat(timespec="seconds")
+            payload["late_generated"] = (generated.hour, generated.minute, generated.second) > (8, 35, 0)
+            payload["saved_content"] = {"title": title, "body": markdown, "technical": technical,
+                                        "sha256": content_sha256}
+            generation_day = generated.date().isoformat()
+            archive_json = root / "results/morning_brief" / f"{generation_day}.json"
+            archive_md = root / "reports/morning_brief" / f"{generation_day}.md"
+            archive_header = (f"# {title}\n\n生成时间：{payload['generated_at']}"
+                              + ("（晚生成）" if payload["late_generated"] else "")
+                              + f"\n资料日期：{payload.get('as_of') or '未核实'}\n\n")
             preview_json = root / "results/morning_brief/morning_brief_latest.json"
             preview_md = root / "reports/morning_brief/morning_brief_latest.md"
             atomic_write_json(preview_json, payload)
             _atomic_write_text(preview_md, preview_text)
+            if not dry_run:
+                _atomic_write_text(archive_md, archive_header + preview_text)
+                payload["archive_report_sha256"] = hashlib.sha256(archive_md.read_bytes()).hexdigest()
+                atomic_write_json(archive_json, payload)
 
             base_result: dict[str, Any] = {
                 "task_type": "morning_brief_delivery",
@@ -1396,6 +1416,10 @@ def run_morning_brief(
                 "external_sent_count": 0,
                 "preview_json": _relative(preview_json, root),
                 "preview_report": _relative(preview_md, root),
+                "archive_json": _relative(archive_json, root) if not dry_run else None,
+                "archive_report": _relative(archive_md, root) if not dry_run else None,
+                "local_brief_status": "saved" if not dry_run else "preview_only",
+                "delivery_optional": True,
                 "research_only": True,
                 "paper_only": True,
                 "no_broker": True,

@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 
 def read_evidence(path: Path, errors: list[dict[str, str]]) -> Any:
@@ -49,7 +49,8 @@ def register_product_review_routes(app: Flask, *, root: Callable[[], Path], capa
     @app.route("/api/morning-brief", methods=["GET"])
     def morning_brief() -> Any:
         from quantdesk.morning_brief_view import build_morning_brief_view
-        return jsonify(build_morning_brief_view(root()))
+        result = build_morning_brief_view(root(), requested_date=request.args.get("date", ""))
+        return jsonify(result), 200 if result.get("ok") else 400
 
     @app.route("/api/product-integrity", methods=["GET"])
     def product_integrity() -> Any:

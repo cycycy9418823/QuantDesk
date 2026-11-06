@@ -253,9 +253,11 @@ def health_scenario(root: Path, *, daily: int, benchmark: str, slots: int, colle
     log = root / "logs" / "ops" / "backup_push.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text(
-        json.dumps({"stamp": "20260918T140001Z", "all_hashes_match": True}) + "\n",
+        json.dumps({"stamp": "20260918T140001Z", "all_hashes_match": True, "exit_code": 0}) + "\n",
         encoding="utf-8",
     )
+    write_json(root / "results/offsite_backup/offsite_backup_latest.json",
+               {"status": "ok", "finished_at": "2026-09-18T22:00:00+08:00"})
 
 
 GOOD_MINUTE = {
@@ -306,7 +308,7 @@ def test_t9_nine_cells_all_green_dry_run(tmp_path: Path) -> None:
                     minute=GOOD_MINUTE)
     payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
     assert payload["line"] == (
-        "日线 ✓100/100 · 基准 ✓2026-09-17 · 快照 ✓48张/覆盖完成 48/字段核实 48 · 分钟 ✓90/90 · "
+        "日线 ✓100/100 · 基准 ✓2026-09-17 · 快照字段参考（不影响红绿）：48张/覆盖完成 48/字段核实 48 · 分钟 ✓90/90 · "
         "策略账 ✓ · AI账 ✓0笔 · 核对 ✓ · 备份 ✓"
     )
 
@@ -335,7 +337,7 @@ def test_t12_snapshot_partial_and_blocked_minute_are_visible(tmp_path: Path) -> 
     health_scenario(tmp_path, daily=100, benchmark=PREV_DATE, slots=48, collected=0,
                     minute=BLOCKED_MINUTE)
     payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
-    assert "快照 ✗48张/覆盖完成 0/字段核实 0" in payload["line"]
+    assert "快照字段参考（不影响红绿）：48张/覆盖完成 0/字段核实 0" in payload["line"]
     assert "分钟 ✗82/90(缺8+拒写2)" in payload["line"]
     text = " ".join(payload["explains"])
     assert "快照 2026-09-18 已归档 48 张，完整字段或档案哈希仍未核实" in text
@@ -373,7 +375,7 @@ def test_t13_yesterday_quote_received_today_keeps_its_own_date(tmp_path: Path) -
 
     payload = run_cli(tmp_path, ["--dry-run", "--target-date", TARGET_DATE])
 
-    assert "快照 ✓48张/覆盖完成 48/字段核实 48（本地 09-19 10:12 收到）" in payload["line"]
+    assert "快照字段参考（不影响红绿）：48张/覆盖完成 48/字段核实 48（本地 09-19 10:12 收到）" in payload["line"]
     text = " ".join(payload["explains"])
     assert f"行情日期仍是 {TARGET_DATE}" in text
     assert "上游发布 未知" in text

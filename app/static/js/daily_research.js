@@ -61,6 +61,7 @@ document.addEventListener("DOMContentLoaded", () => {
     setupSidebarCollapse();
     setupProjectStatus();
     document.getElementById("morningBriefReadButton")?.addEventListener("click", loadMorningBrief);
+    document.getElementById("morningBriefDate")?.addEventListener("change", loadMorningBrief);
     prepareVisiblePagePlaceholders();
     setupModuleNavigation();
     setupAiFundManagerLifecycle();
@@ -679,6 +680,14 @@ let morningBriefLastOk = null;
 function renderMorningBrief(data, previous = false) {
     const host = document.getElementById("morningBriefPanel");
     if (!host) return;
+    const dateSelect = document.getElementById("morningBriefDate");
+    if (dateSelect && Array.isArray(data?.archive_dates)) {
+        const selected = dateSelect.value || "";
+        dateSelect.innerHTML = '<option value="">今天 / 最新记录</option>' + data.archive_dates
+            .filter(day => /^\d{4}-\d{2}-\d{2}$/.test(day))
+            .map(day => `<option value="${escapeHtml(day)}">${escapeHtml(day)}</option>`).join("");
+        dateSelect.value = selected;
+    }
     if (!data || data.available !== true) {
         host.innerHTML = `<p class="section-note">${escapeHtml(data?.message || "未读到已生成的早报；查看不会触发发送。")}</p>`;
         return;
@@ -689,7 +698,7 @@ function renderMorningBrief(data, previous = false) {
         : data.is_today ? "本日生成记录" : "历史生成记录，不能当作今天早报";
     const evidence = Array.isArray(data.evidence) ? data.evidence : [];
     host.innerHTML = `<p class="section-note">${escapeHtml(age)} · 生成 ${escapeHtml(data.generated_at || "时间未核实")}
-        · 资料截至 ${escapeHtml(data.as_of || "日期未核实")} · ${escapeHtml(dateCheck)}</p>
+        · 资料截至 ${escapeHtml(data.as_of || "日期未核实")} · ${escapeHtml(dateCheck)}${data.late_generated ? " · 晚生成" : ""}</p>
         <p><strong>${escapeHtml(delivery.label || "发送结果未核实")}</strong> · ${escapeHtml(delivery.message || "没有可确认的投递记录。")}</p>
         <details><summary>阅读早报原文</summary><h3>${escapeHtml(data.title || "已存早报")}</h3>
         <p class="section-note">${escapeHtml(data.message || "原文保留生成时状态，不能代表当前状态。")}</p>
@@ -704,9 +713,10 @@ function renderMorningBrief(data, previous = false) {
 async function loadMorningBrief() {
     const isCurrent = beginReadRender("morning-brief");
     const button = document.getElementById("morningBriefReadButton");
+    const selectedDate = document.getElementById("morningBriefDate")?.value || "";
     if (button) button.disabled = true;
     try {
-        const data = await requestJson("/api/morning-brief");
+        const data = await requestJson("/api/morning-brief" + (selectedDate ? `?date=${encodeURIComponent(selectedDate)}` : ""));
         if (!isCurrent()) return;
         if (data?.available === true) morningBriefLastOk = data;
         renderMorningBrief(data);
