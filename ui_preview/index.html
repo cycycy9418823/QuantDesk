@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark"><title>QuantDesk · 个人纸面财富台</title>
+  <link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/pages.css"><link rel="stylesheet" href="/drawer.css"><link rel="stylesheet" href="/research.css"><link rel="stylesheet" href="/glossary.css">
+  <script src="/charts.js" defer></script><script src="/research.js" defer></script><script src="/drawer.js" defer></script><script src="/pages.js" defer></script><script src="/ui.js" defer></script><script src="/glossary.js" defer></script>
+</head>
+<body class="app light">
+  <header class="topbar"><div class="topbar-inner">
+    <div class="brand"><span class="brand-dot">Q</span><span>QuantDesk</span></div>
+    <nav class="seg-control" id="mainNav" aria-label="主导航"><i class="seg-thumb"></i>
+      <button data-page="home" class="active" aria-current="page">财富总览</button><button data-page="review">每日复盘</button><button data-page="research">稳健研究</button><button data-page="track">对错与周报</button>
+    </nav>
+    <div class="top-actions">
+      <span class="soft-pill read-only"><i class="pulse-dot"></i>纸面 · 未验证 · 只读</span>
+      <button class="soft-pill tool-btn" id="themeBtn" title="切换到 Apple 纯黑 OLED" aria-label="切换到 Apple 纯黑 OLED"></button>
+      <button class="soft-pill tool-btn" id="sourceBtn" title="口径与来源" aria-label="口径与来源"></button>
+      <button class="soft-pill tool-btn" id="guideBtn" title="使用指引与悬停解释" aria-label="使用指引与悬停解释">?</button>
+      <a class="soft-pill tool-btn" id="researchLink" title="旧研究页（新窗口）" aria-label="旧研究页（新窗口）" href="http://127.0.0.1:8000/research" target="_blank" rel="noopener noreferrer"></a>
+    </div>
+  </div></header>
+  <main class="wrap">
+    <div id="homePage">
+      <section class="hero" aria-labelledby="balanceTitle">
+        <div class="hero-top"><div>
+          <h1 class="hero-label" id="balanceTitle">AI 蓝筹模拟账总资产 <span id="balanceDate" class="t3"></span></h1>
+          <div class="hero-amount num"><span class="currency">¥</span><span id="heroInt">—</span><span id="heroDec" class="hero-dec"></span></div>
+          <div class="hero-change num"><span id="heroReturn" class="chg-badge">区间收益 —</span><span id="heroAlpha" class="alpha-badge">相对沪深300 —</span></div>
+        </div><div class="hero-controls">
+          <div class="seg-control" id="rangeSeg" aria-label="净值区间"><i class="seg-thumb"></i><button data-range="3w">近3周</button><button data-range="1m">近1月</button><button data-range="all" class="active">全部</button></div>
+          <div class="leg-pills" aria-label="净值图例">
+            <button class="leg-btn" data-series="ai" aria-pressed="true"><i class="swatch line-ai"></i>AI 账</button><button class="leg-btn" data-series="benchmark" aria-pressed="true"><i class="swatch line-bench"></i>沪深300</button><button class="leg-btn" data-series="strategy" aria-pressed="true"><i class="swatch line-strat"></i>旧策略账</button>
+          </div>
+        </div></div>
+        <div class="canvas-stage"><canvas id="eqCanvas" aria-label="两本独立纸面账与沪深300的历史区间涨跌幅" title="滚轮缩放 · 按住左右拖拽 · 双击复原"></canvas></div>
+        <div class="canvas-hint num"><span id="chartCaption">读取历史记录中…</span><span id="cashCaption"></span></div>
+      </section>
+      <div id="todayRibbon" aria-label="今日五节点"></div>
+      <section class="story-grid" id="storyCards" aria-label="今天最关键的 3 件事"></section>
+      <section id="coachPlan" class="v6-coach-plan" aria-label="次日纸面计划与已核资料"></section>
+      <section aria-labelledby="listTitle"><div class="section-hdr">
+        <div><h2 class="section-title" id="listTitle">持仓与蓝筹观察</h2><div id="listDate" class="list-date"></div></div>
+        <div class="list-tools"><label class="search-field"><span id="searchIcon"></span><input id="stockSearch" type="search" placeholder="搜索股票或代码" aria-label="搜索股票或代码"></label>
+        <div class="seg-control" id="listSeg" aria-label="股票列表"><i class="seg-thumb"></i><button data-list="held" class="active">我的持仓</button><button data-list="pool">蓝筹池</button><button data-list="candidates">每日策略候选</button></div></div>
+      </div><div class="holdings-card" id="assetList"><p class="empty-note">正在读取本地账本…</p></div></section>
+      <details id="legacyFold" class="legacy-fold"><summary><span class="legacy-title">旧策略纸面账对照 <small id="legacyCount"></small></span><span id="legacyBalance">—</span><span class="chevron">⌄</span></summary><div id="legacyList"></div></details>
+    </div>
+    <div id="reviewPage" hidden></div><div id="researchPage" hidden></div><div id="trackPage" hidden></div>
+  </main>
+  <dialog id="infoDialog"><div class="info-heading"><h2 id="infoTitle">口径与来源</h2><button id="closeInfo" class="close-btn" aria-label="关闭弹窗">×</button></div><div id="infoBody"></div></dialog>
+</body></html>

@@ -1,0 +1,35 @@
+/* Labels only: chart canvases, scales and pointer behaviour remain untouched. */
+.qd-tips-enabled [data-tip]{text-decoration-line:underline;text-decoration-style:dotted;text-decoration-color:#aeb4bf;text-decoration-thickness:1px;text-underline-offset:4px;cursor:help}
+.qd-tips-enabled [data-tip]:focus-visible{outline:2px solid var(--bench);outline-offset:4px;border-radius:3px}
+#guideBtn{font-size:15px;font-weight:650}
+.qd-glossary-tip{position:fixed;inset:auto;margin:0;width:300px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);overflow:hidden;z-index:2147483647;padding:16px 18px;border:1px solid var(--border-strong);border-radius:17px;background:var(--sheet-bg);color:var(--ink);box-shadow:0 12px 40px #11182722;backdrop-filter:blur(24px);pointer-events:none;font-size:12px;line-height:1.65;text-align:left}
+.qd-glossary-tip[hidden]{display:none}
+.qd-glossary-tip:popover-open{animation:qd-tip-reveal .1s ease-out}
+@keyframes qd-tip-reveal{from{opacity:0}to{opacity:1}}
+.qd-glossary-tip::backdrop{background:transparent;pointer-events:none}
+.qd-glossary-tip>strong{display:block;font-size:13px;font-weight:650;margin-bottom:9px}
+.qd-glossary-tip p{margin:6px 0;color:var(--text-2)}
+.qd-glossary-tip p b{color:var(--ink);font-weight:550}
+.dark .qd-glossary-tip{background:rgba(21,24,31,.94);box-shadow:0 12px 44px #0009}
+.qd-guide{width:min(780px,calc(100vw - 32px));max-height:calc(100vh - 48px);padding:28px 30px 22px;border-radius:26px;background:var(--sheet-bg);color:var(--ink);border:1px solid var(--border-strong);box-shadow:var(--shadow-hover);backdrop-filter:blur(30px)}
+.qd-guide::backdrop{background:var(--backdrop);backdrop-filter:blur(8px)}
+.qd-guide header{display:flex;justify-content:space-between;align-items:center;gap:20px}
+.qd-guide h2{font-size:25px;letter-spacing:-.6px;margin:5px 0 0}
+.qd-guide-eyebrow{font-size:10px;font-weight:600;letter-spacing:1.5px;color:var(--text-2)}
+.qd-guide-setting{display:flex;justify-content:space-between;align-items:center;gap:20px;margin:24px 0 20px;padding:15px 18px;background:var(--surface-soft);border-radius:15px}
+.qd-guide-setting strong{font-size:13px;font-weight:600}.qd-guide-setting p{margin:4px 0 0;color:var(--text-2);font-size:11px}
+.qd-tip-switch{position:relative;display:block;width:44px;height:26px;flex:0 0 44px}
+.qd-tip-switch input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer;z-index:1}
+.qd-tip-switch>span{display:block;width:44px;height:26px;border-radius:15px;background:#9ba5b4;transition:background .18s ease}
+.qd-tip-switch>span::after{content:'';position:absolute;left:3px;top:3px;width:20px;height:20px;background:#fff;border-radius:50%;box-shadow:0 1px 4px #0003;transition:transform .18s ease}
+.qd-tip-switch input:checked+span{background:#269979}.qd-tip-switch input:checked+span::after{transform:translateX(18px)}
+.qd-tip-switch input:focus-visible+span{outline:2px solid var(--bench);outline-offset:4px}
+.qd-guide-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.qd-guide-grid article{position:relative;border:1px solid var(--border);border-radius:18px;padding:19px 20px;background:var(--surface)}
+.qd-guide-number{display:block;font-size:11px;color:var(--text-3);letter-spacing:1px;margin-bottom:9px}
+.qd-guide-grid h3{font-size:15px;font-weight:650;margin:0 0 12px}
+.qd-guide-grid h3 small{display:block;font-size:11px;font-weight:400;color:var(--text-2);margin-top:3px}
+.qd-guide-grid p{font-size:12px;color:var(--text-2);line-height:1.8;margin:6px 0}
+.qd-guide footer{font-size:11px;line-height:1.7;color:var(--text-2);margin-top:20px;padding-top:16px;border-top:1px solid var(--border)}
+@media(max-width:650px){.qd-guide{padding:22px 20px}.qd-guide-grid{grid-template-columns:1fr}.qd-guide h2{font-size:22px}}
+@media(prefers-reduced-motion:reduce){.qd-tip-switch>span,.qd-tip-switch>span::after{transition:none}.qd-glossary-tip:popover-open{animation:none}}
