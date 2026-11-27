@@ -94,3 +94,28 @@ llm.env
 # local-only: they are not project source, not to be committed, synced,
 # or included in any clean zip or release export.
 docs/product/
+
+# --- Strict Sanitized Mirror Exclusions ---
+/config/
+/data/
+/state/
+/logs/
+/results/
+/reports/
+/docs/internal/
+/docs/learning_journal.md
+/STATUS.md
+opencode.jsonc
+.env
+.env.*
+*secret*
+*secrets*
+*.key
+*.pem
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+!docs/screenshots/
+!docs/screenshots/*.png
